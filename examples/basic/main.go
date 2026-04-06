@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/flywindy/o11y/pkg/o11y"
+	"github.com/flywindy/o11y"
 	"go.opentelemetry.io/otel"
 )
 
