@@ -12,13 +12,14 @@ import (
 func main() {
 	// 1. Initialize the SDK
 	ctx := context.Background()
-	cfg := o11y.Config{
-		ServiceName:  "basic-example",
-		Environment:  "development",
-		OTLPEndpoint: "http://localhost:4318", // Default OTLP/HTTP endpoint
-	}
 
-	shutdown, err := o11y.Init(ctx, cfg)
+	// Using the new functional options pattern
+	shutdown, err := o11y.Init(ctx,
+		o11y.WithServiceName("basic-example"),
+		o11y.WithEnvironment("development"),
+		o11y.WithOTLPEndpoint("http://localhost:4318"),
+		o11y.WithLogLevel(slog.LevelInfo),
+	)
 	if err != nil {
 		slog.Error("Failed to initialize o11y SDK", slog.Any("error", err))
 		return
