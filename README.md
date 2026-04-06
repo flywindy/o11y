@@ -68,7 +68,7 @@ The SDK simplifies the initialization of OpenTelemetry and correlates it with `s
 ```go
 import (
     "context"
-    "github.com/flywindy/o11y/pkg/o11y"
+    "github.com/flywindy/o11y/"
 )
 
 func main() {
@@ -114,4 +114,4 @@ A basic example is provided in `examples/basic/main.go`. To run it:
 4. **Performance**: Non-blocking middleware and minimal overhead.
 
 ## 🤖 AI Collaboration
-This project uses `GEMINI.md` to store AI-assisted development context and specific infrastructure rules. If using an AI assistant, please refer to that file for project-specific patterns.
+This project uses `AGENTS.md` to store AI-assisted development context and specific infrastructure rules. If using an AI assistant, please refer to that file for project-specific patterns.
