@@ -112,3 +112,6 @@ A basic example is provided in `examples/basic/main.go`. To run it:
 2. **Zero Global State**: No package-level `init()` side effects.
 3. **Correlation**: `slog` output includes `trace_id` and `span_id` automatically.
 4. **Performance**: Non-blocking middleware and minimal overhead.
+
+## 🤖 AI Collaboration
+This project uses `GEMINI.md` to store AI-assisted development context and specific infrastructure rules. If using an AI assistant, please refer to that file for project-specific patterns.
