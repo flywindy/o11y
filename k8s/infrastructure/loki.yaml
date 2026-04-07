@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki
+  namespace: infra
+spec:
+  ports:
+    - port: 3100
+      protocol: TCP
+      targetPort: 3100
+  selector:
+    app: loki
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki
+  namespace: infra
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loki
+  template:
+    metadata:
+      labels:
+        app: loki
+    spec:
+      containers:
+        - name: loki
+          image: grafana/loki:latest
+          args:
+            - "-config.file=/etc/loki/local-config.yaml"
+          ports:
+            - containerPort: 3100
+          volumeMounts:
+            - name: storage
+              mountPath: /tmp/loki
+      volumes:
+        - name: storage
+          emptyDir: {}

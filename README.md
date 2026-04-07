@@ -44,11 +44,7 @@ Apply the Kubernetes manifests in the following order:
 
 ```bash
 # Infrastructure components
-kubectl apply -f k8s/infrastructure/nats.yaml
-kubectl apply -f k8s/infrastructure/mongodb.yaml
-kubectl apply -f k8s/infrastructure/tempo.yaml
-kubectl apply -f k8s/infrastructure/otel-collector.yaml
-kubectl apply -f k8s/infrastructure/grafana.yaml
+kubectl apply -f k8s/infrastructure/ -n infra
 ```
 
 ### 3. Verify Deployment
