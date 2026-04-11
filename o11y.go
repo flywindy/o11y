@@ -15,7 +15,7 @@ import (
 
 // SDK holds the initialized observability providers.
 // It does not mutate any global state; callers wire it however they like,
-// e.g. slog.SetDefault(sdk.Logger) or otel.SetTracerProvider(sdk.provider).
+// e.g. slog.SetDefault(sdk.Logger) or otel.SetTracerProvider(sdk.TracerProvider()).
 type SDK struct {
 	// Logger is a structured slog.Logger pre-populated with service.name
 	// (and environment when set) that automatically injects trace_id and
@@ -28,6 +28,13 @@ type SDK struct {
 
 	provider  *sdktrace.TracerProvider
 	shutdowns []func(context.Context) error
+}
+
+// TracerProvider returns the underlying sdktrace.TracerProvider.
+// Use this to wire the SDK's provider as the global OTel tracer provider
+// if needed, e.g. otel.SetTracerProvider(sdk.TracerProvider()).
+func (s *SDK) TracerProvider() *sdktrace.TracerProvider {
+	return s.provider
 }
 
 // Tracer returns a named tracer from the SDK's TracerProvider.

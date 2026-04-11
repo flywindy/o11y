@@ -20,7 +20,7 @@ func main() {
 		o11y.WithLogLevel(slog.LevelInfo),
 	)
 	if err != nil {
-		slog.Error("failed to initialize o11y SDK", slog.Any("error", err))
+		slog.ErrorContext(ctx, "failed to initialize o11y SDK", slog.Any("error", err))
 		return
 	}
 
@@ -33,10 +33,6 @@ func main() {
 			sdk.Logger.ErrorContext(shutdownCtx, "SDK shutdown error", slog.Any("error", err))
 		}
 	}()
-
-	// Optionally promote the SDK logger to the default so stdlib slog calls
-	// also get trace correlation. This is an explicit opt-in, not a hidden side effect.
-	slog.SetDefault(sdk.Logger)
 
 	sdk.Logger.Info("SDK initialized successfully")
 

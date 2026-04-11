@@ -36,10 +36,10 @@ func InitTracer(ctx context.Context, serviceName, serviceVersion, environment, e
 	// 2. Resource — service identity plus process and host metadata.
 	//    WithFromEnv also picks up OTEL_RESOURCE_ATTRIBUTES / OTEL_SERVICE_NAME.
 	resOpts := []resource.Option{
-		resource.WithAttributes(semconv.ServiceNameKey.String(serviceName)),
+		resource.WithFromEnv(),
 		resource.WithProcess(),
 		resource.WithHost(),
-		resource.WithFromEnv(),
+		resource.WithAttributes(semconv.ServiceNameKey.String(serviceName)),
 	}
 	if serviceVersion != "" {
 		resOpts = append(resOpts, resource.WithAttributes(

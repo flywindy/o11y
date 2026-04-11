@@ -85,12 +85,16 @@ data:
 
     loki.source.file "pods" {
       targets    = local.file_match.pod_logs.targets
-      forward_to = [loki.write.default.receiver]
+      forward_to = [otelcol.receiver.loki.pods.receiver]
     }
 
-    loki.write "default" {
-      endpoint {
-        url = "http://loki.infra.svc.cluster.local:3100/loki/api/v1/push"
+    otelcol.receiver.loki "pods" {
+      forward_to = [otelcol.exporter.otlphttp.default.input]
+    }
+
+    otelcol.exporter.otlphttp "default" {
+      client {
+        endpoint = "http://otel-collector.infra.svc.cluster.local:4318"
       }
     }
 ---

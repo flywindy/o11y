@@ -20,8 +20,14 @@ func newTestLogger(buf *bytes.Buffer, level slog.Level) *slog.Logger {
 }
 
 func spanContext(traceHex, spanHex string) trace.SpanContext {
-	tid, _ := trace.TraceIDFromHex(traceHex)
-	sid, _ := trace.SpanIDFromHex(spanHex)
+	tid, err := trace.TraceIDFromHex(traceHex)
+	if err != nil {
+		panic("spanContext: invalid trace ID hex " + traceHex + ": " + err.Error())
+	}
+	sid, err := trace.SpanIDFromHex(spanHex)
+	if err != nil {
+		panic("spanContext: invalid span ID hex " + spanHex + ": " + err.Error())
+	}
 	return trace.NewSpanContext(trace.SpanContextConfig{
 		TraceID:    tid,
 		SpanID:     sid,

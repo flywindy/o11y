@@ -20,9 +20,12 @@ func newProp() propagation.TextMapPropagator {
 	)
 }
 
-func ctxWithSpan(traceHex, spanHex string) context.Context {
-	tid, _ := trace.TraceIDFromHex(traceHex)
-	sid, _ := trace.SpanIDFromHex(spanHex)
+func ctxWithSpan(t *testing.T, traceHex, spanHex string) context.Context {
+	t.Helper()
+	tid, err := trace.TraceIDFromHex(traceHex)
+	require.NoError(t, err, "invalid trace ID hex %q", traceHex)
+	sid, err := trace.SpanIDFromHex(spanHex)
+	require.NoError(t, err, "invalid span ID hex %q", spanHex)
 	sc := trace.NewSpanContext(trace.SpanContextConfig{
 		TraceID:    tid,
 		SpanID:     sid,
@@ -36,7 +39,7 @@ func ctxWithSpan(traceHex, spanHex string) context.Context {
 // traceparent header into the message.
 func TestInject_SetsTraceparentHeader(t *testing.T) {
 	prop := newProp()
-	ctx := ctxWithSpan("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7")
+	ctx := ctxWithSpan(t, "4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7")
 
 	msg := &gonnats.Msg{}
 	o11ynats.Inject(ctx, prop, msg)
@@ -50,7 +53,7 @@ func TestInject_SetsTraceparentHeader(t *testing.T) {
 // TestInject_InitializesNilHeader verifies that Inject handles a nil Header map.
 func TestInject_InitializesNilHeader(t *testing.T) {
 	prop := newProp()
-	ctx := ctxWithSpan("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7")
+	ctx := ctxWithSpan(t, "4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7")
 	msg := &gonnats.Msg{Header: nil}
 
 	o11ynats.Inject(ctx, prop, msg)

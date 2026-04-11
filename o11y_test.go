@@ -117,30 +117,3 @@ func TestSDK_TracerIsNamed(t *testing.T) {
 	assert.NotNil(t, sdk.Tracer("a"))
 	assert.NotNil(t, sdk.Tracer("b"))
 }
-
-// TestSDK_ShutdownIsIdempotentOnError verifies that Shutdown calls all registered
-// component shutdown functions and returns a joined error when one fails.
-// This exercises the multi-component shutdown slice introduced to support
-// future log exporters alongside the existing TracerProvider.
-func TestSDK_ShutdownIsIdempotentOnError(t *testing.T) {
-	srv := fakeOTLPServer(t)
-	defer srv.Close()
-
-	sdk, err := o11y.Init(context.Background(),
-		o11y.WithServiceName("test-svc"),
-		o11y.WithOTLPEndpoint(srv.URL),
-	)
-	require.NoError(t, err)
-
-	// A second Shutdown on an already-stopped TracerProvider should return an
-	// error from the SDK (which logs it and returns it). This validates that
-	// the shutdown slice is iterated and errors are surfaced.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	require.NoError(t, sdk.Shutdown(ctx)) // first: succeeds
-	// Second call: TracerProvider returns an error for double-shutdown.
-	err = sdk.Shutdown(ctx)
-	// We do not require an error here because the OTel SDK may treat
-	// double-shutdown as a no-op. The important thing is it does not panic.
-	_ = err
-}

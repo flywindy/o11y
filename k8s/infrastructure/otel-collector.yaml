@@ -18,16 +18,21 @@ data:
         endpoint: tempo.infra.svc.cluster.local:4317
         tls:
           insecure: true
+      loki:
+        endpoint: "http://loki.infra.svc.cluster.local:3100/loki/api/v1/push"
       debug:
         verbosity: detailed
 
     service:
       pipelines:
         # Traces flow: App → OTel Collector → Tempo
-        # Logs flow:   App stdout → Alloy (DaemonSet) → Loki  (separate pipeline, not via collector)
         traces:
           receivers: [otlp]
           exporters: [otlp, debug]
+        # Logs flow: App stdout → Alloy → OTel Collector → Loki
+        logs:
+          receivers: [otlp]
+          exporters: [loki, debug]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -46,7 +51,7 @@ spec:
     spec:
       containers:
       - name: otel-collector
-        image: otel/opentelemetry-collector:0.121.0
+        image: otel/opentelemetry-collector-contrib:0.121.0
         args: ["--config=/etc/otel-collector-config.yaml"]
         ports:
         - containerPort: 4317 # OTLP gRPC
