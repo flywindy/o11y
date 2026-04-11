@@ -15,7 +15,7 @@ import (
 // InitTracer initializes the OTLP HTTP exporter and a TracerProvider.
 // It does not mutate any global state; the caller is responsible for wiring
 // the returned provider and propagator as needed.
-func InitTracer(ctx context.Context, serviceName, environment, endpoint string) (*sdktrace.TracerProvider, propagation.TextMapPropagator, error) {
+func InitTracer(ctx context.Context, serviceName, serviceVersion, environment, endpoint string) (*sdktrace.TracerProvider, propagation.TextMapPropagator, error) {
 	// 1. OTLP HTTP trace exporter
 	exporter, err := otlptracehttp.New(ctx,
 		otlptracehttp.WithEndpointURL(endpoint),
@@ -24,6 +24,15 @@ func InitTracer(ctx context.Context, serviceName, environment, endpoint string) 
 		return nil, nil, fmt.Errorf("failed to create OTLP trace exporter: %w", err)
 	}
 
+	// Guard: shut down the exporter if any subsequent step fails so we do not
+	// leak the underlying HTTP client or background flush goroutine.
+	var initSucceeded bool
+	defer func() {
+		if !initSucceeded {
+			_ = exporter.Shutdown(ctx)
+		}
+	}()
+
 	// 2. Resource — service identity plus process and host metadata.
 	//    WithFromEnv also picks up OTEL_RESOURCE_ATTRIBUTES / OTEL_SERVICE_NAME.
 	resOpts := []resource.Option{
@@ -31,6 +40,11 @@ func InitTracer(ctx context.Context, serviceName, environment, endpoint string) 
 		resource.WithProcess(),
 		resource.WithHost(),
 		resource.WithFromEnv(),
+	}
+	if serviceVersion != "" {
+		resOpts = append(resOpts, resource.WithAttributes(
+			semconv.ServiceVersionKey.String(serviceVersion),
+		))
 	}
 	if environment != "" {
 		resOpts = append(resOpts, resource.WithAttributes(
@@ -55,5 +69,6 @@ func InitTracer(ctx context.Context, serviceName, environment, endpoint string) 
 		propagation.Baggage{},
 	)
 
+	initSucceeded = true
 	return tp, prop, nil
 }

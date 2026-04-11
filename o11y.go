@@ -17,15 +17,17 @@ import (
 // It does not mutate any global state; callers wire it however they like,
 // e.g. slog.SetDefault(sdk.Logger) or otel.SetTracerProvider(sdk.provider).
 type SDK struct {
-	// Logger is a structured slog.Logger that automatically injects
-	// trace_id and span_id into every log record when a span is active.
+	// Logger is a structured slog.Logger pre-populated with service.name
+	// (and environment when set) that automatically injects trace_id and
+	// span_id into every log record when a span is active.
 	Logger *slog.Logger
 
 	// Propagator is the W3C TraceContext + Baggage composite propagator.
 	// Pass it to nats.Inject / nats.Extract for distributed tracing over NATS.
 	Propagator propagation.TextMapPropagator
 
-	provider *sdktrace.TracerProvider
+	provider  *sdktrace.TracerProvider
+	shutdowns []func(context.Context) error
 }
 
 // Tracer returns a named tracer from the SDK's TracerProvider.
@@ -33,14 +35,19 @@ func (s *SDK) Tracer(name string) oteltrace.Tracer {
 	return s.provider.Tracer(name)
 }
 
-// Shutdown gracefully flushes in-flight spans and shuts down all providers.
-// Always call this before process exit; use a context with a timeout to cap the wait.
+// Shutdown gracefully flushes and shuts down all registered SDK components.
+// Each component is attempted even if a previous one fails; all errors are
+// logged and returned joined. Always call with a context that has a timeout
+// to cap the flush wait.
 func (s *SDK) Shutdown(ctx context.Context) error {
-	if err := s.provider.Shutdown(ctx); err != nil {
-		s.Logger.ErrorContext(ctx, "failed to shut down tracer provider", slog.Any("error", err))
-		return err
+	var errs []error
+	for _, fn := range s.shutdowns {
+		if err := fn(ctx); err != nil {
+			s.Logger.ErrorContext(ctx, "SDK component shutdown failed", slog.Any("error", err))
+			errs = append(errs, err)
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // Init initializes the o11y SDK with the provided options and returns an SDK
@@ -56,20 +63,27 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	}
 
 	// 1. Initialize TracerProvider and propagator (no global state set here)
-	tp, prop, err := trace.InitTracer(ctx, cfg.serviceName, cfg.environment, cfg.otlpEndpoint)
+	tp, prop, err := trace.InitTracer(ctx, cfg.serviceName, cfg.serviceVersion, cfg.environment, cfg.otlpEndpoint)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. Build a structured logger with OTel trace correlation
+	// 2. Build a structured logger with OTel trace correlation.
+	//    Pre-populate service.name and (if set) environment so that every log
+	//    record carries these fields without the caller having to add them manually.
 	jsonHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: cfg.logLevel,
 	})
-	logger := slog.New(log.NewOTelHandler(jsonHandler))
+	logFields := []any{slog.String("service.name", cfg.serviceName)}
+	if cfg.environment != "" {
+		logFields = append(logFields, slog.String("environment", cfg.environment))
+	}
+	logger := slog.New(log.NewOTelHandler(jsonHandler)).With(logFields...)
 
 	return &SDK{
 		Logger:     logger,
 		Propagator: prop,
 		provider:   tp,
+		shutdowns:  []func(context.Context) error{tp.Shutdown},
 	}, nil
 }

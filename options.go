@@ -4,10 +4,11 @@ import "log/slog"
 
 // Config defines the configuration for the o11y SDK.
 type Config struct {
-	serviceName  string
-	environment  string
-	otlpEndpoint string
-	logLevel     slog.Level
+	serviceName    string
+	serviceVersion string
+	environment    string
+	otlpEndpoint   string
+	logLevel       slog.Level
 }
 
 // Option is a functional option for configuring the o11y SDK.
@@ -17,6 +18,15 @@ type Option func(*Config)
 func WithServiceName(name string) Option {
 	return func(c *Config) {
 		c.serviceName = name
+	}
+}
+
+// WithServiceVersion sets the service version (e.g. "1.4.2") for trace
+// resource attributes. Used in OTel as service.version and is especially
+// useful for canary deployments and version-based trace filtering.
+func WithServiceVersion(version string) Option {
+	return func(c *Config) {
+		c.serviceVersion = version
 	}
 }
 

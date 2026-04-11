@@ -14,6 +14,7 @@ func main() {
 	// 1. Initialize the SDK (no global state mutated)
 	sdk, err := o11y.Init(ctx,
 		o11y.WithServiceName("basic-example"),
+		o11y.WithServiceVersion("0.1.0"),
 		o11y.WithEnvironment("development"),
 		o11y.WithOTLPEndpoint("http://localhost:4318"),
 		o11y.WithLogLevel(slog.LevelInfo),
