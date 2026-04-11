@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: nats
+  namespace: infra
 spec:
   serviceName: "nats"
   replicas: 1
@@ -15,7 +16,7 @@ spec:
     spec:
       containers:
       - name: nats
-        image: nats:latest
+        image: nats:2.10
         ports:
         - containerPort: 4222
           name: client
@@ -26,6 +27,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: nats
+  namespace: infra
 spec:
   selector:
     app: nats

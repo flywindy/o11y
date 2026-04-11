@@ -2,6 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: otel-collector-conf
+  namespace: infra
 data:
   otel-collector-config.yaml: |
     receivers:
@@ -14,7 +15,7 @@ data:
 
     exporters:
       otlp:
-        endpoint: tempo:4317
+        endpoint: tempo.infra.svc.cluster.local:4317
         tls:
           insecure: true
       debug:
@@ -22,6 +23,8 @@ data:
 
     service:
       pipelines:
+        # Traces flow: App → OTel Collector → Tempo
+        # Logs flow:   App stdout → Alloy (DaemonSet) → Loki  (separate pipeline, not via collector)
         traces:
           receivers: [otlp]
           exporters: [otlp, debug]
@@ -30,6 +33,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: otel-collector
+  namespace: infra
 spec:
   replicas: 1
   selector:
@@ -42,7 +46,7 @@ spec:
     spec:
       containers:
       - name: otel-collector
-        image: otel/opentelemetry-collector:latest
+        image: otel/opentelemetry-collector:0.121.0
         args: ["--config=/etc/otel-collector-config.yaml"]
         ports:
         - containerPort: 4317 # OTLP gRPC
@@ -60,6 +64,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: otel-collector
+  namespace: infra
 spec:
   type: NodePort
   selector:

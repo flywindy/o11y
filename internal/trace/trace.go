@@ -2,9 +2,9 @@ package trace
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -12,42 +12,48 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
-// InitTracer initializes the OTLP exporter and TracerProvider.
-func InitTracer(ctx context.Context, serviceName, environment, endpoint string) (func(context.Context), error) {
-	// 1. Initialize OTLP HTTP Trace Exporter
+// InitTracer initializes the OTLP HTTP exporter and a TracerProvider.
+// It does not mutate any global state; the caller is responsible for wiring
+// the returned provider and propagator as needed.
+func InitTracer(ctx context.Context, serviceName, environment, endpoint string) (*sdktrace.TracerProvider, propagation.TextMapPropagator, error) {
+	// 1. OTLP HTTP trace exporter
 	exporter, err := otlptracehttp.New(ctx,
 		otlptracehttp.WithEndpointURL(endpoint),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create OTLP trace exporter: %w", err)
+		return nil, nil, fmt.Errorf("failed to create OTLP trace exporter: %w", err)
 	}
 
-	// 2. Set up Resource (service.name, deployment.environment)
-	res, err := resource.New(ctx,
-		resource.WithAttributes(
-			semconv.ServiceNameKey.String(serviceName),
+	// 2. Resource — service identity plus process and host metadata.
+	//    WithFromEnv also picks up OTEL_RESOURCE_ATTRIBUTES / OTEL_SERVICE_NAME.
+	resOpts := []resource.Option{
+		resource.WithAttributes(semconv.ServiceNameKey.String(serviceName)),
+		resource.WithProcess(),
+		resource.WithHost(),
+		resource.WithFromEnv(),
+	}
+	if environment != "" {
+		resOpts = append(resOpts, resource.WithAttributes(
 			semconv.DeploymentEnvironmentKey.String(environment),
-		),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create resource: %w", err)
+		))
 	}
 
-	// 3. Set up TracerProvider with BatchSpanProcessor
+	res, err := resource.New(ctx, resOpts...)
+	if err != nil && !errors.Is(err, resource.ErrPartialResource) {
+		return nil, nil, fmt.Errorf("failed to create resource: %w", err)
+	}
+
+	// 3. TracerProvider with BatchSpanProcessor
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(res),
 	)
 
-	// 4. Set global TracerProvider and TextMapPropagator
-	otel.SetTracerProvider(tp)
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+	// 4. Composite propagator (W3C TraceContext + Baggage)
+	prop := propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{},
 		propagation.Baggage{},
-	))
+	)
 
-	// Return shutdown function
-	return func(shutdownCtx context.Context) {
-		_ = tp.Shutdown(shutdownCtx)
-	}, nil
+	return tp, prop, nil
 }

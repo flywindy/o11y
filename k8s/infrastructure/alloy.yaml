@@ -41,8 +41,6 @@ metadata:
   namespace: infra
 data:
   config.alloy: |
-data:
-  config.alloy: |
     discovery.kubernetes "pods" {
       role = "pod"
       namespaces {
@@ -60,9 +58,9 @@ data:
           "__meta_kubernetes_pod_uid",
           "__meta_kubernetes_pod_container_name",
         ]
-        separator     = ";" 
+        separator     = ";"
         action        = "replace"
-        replacement   = "/var/log/pods/${1}_${2}_${3}/${4}/*" 
+        replacement   = "/var/log/pods/${1}_${2}_${3}/${4}/*"
         regex         = "(.+);(.+);(.+);(.+)"
         target_label  = "__path__"
       }
@@ -92,7 +90,7 @@ data:
 
     loki.write "default" {
       endpoint {
-        url = "http://loki:3100/loki/api/v1/push"
+        url = "http://loki.infra.svc.cluster.local:3100/loki/api/v1/push"
       }
     }
 ---
@@ -113,7 +111,7 @@ spec:
       serviceAccountName: alloy
       containers:
         - name: alloy
-          image: grafana/alloy:latest
+          image: grafana/alloy:v1.7.5
           args:
             - run
             - /etc/alloy/config.alloy
