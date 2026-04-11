@@ -93,6 +93,7 @@ kubectl port-forward -n infra svc/grafana 3000:3000
 ---
 
 ## Test Standards
+
 - Every public function must have a unit test
 - Use testify/mock or gomock for dependencies
 - Table-driven tests preferred
