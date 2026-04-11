@@ -59,22 +59,24 @@ go test -race ./...          # Always run with race detector
 # Start local kind cluster
 kind create cluster --config kind-config.yaml
 
-# Deploy observability stack (order matters)
+# Deploy observability stack (order matters — namespace must come first)
+kubectl apply -f k8s/infrastructure/namespace.yaml
 kubectl apply -f k8s/infrastructure/nats.yaml
 kubectl apply -f k8s/infrastructure/mongodb.yaml
 kubectl apply -f k8s/infrastructure/tempo.yaml
 kubectl apply -f k8s/infrastructure/loki.yaml
+kubectl apply -f k8s/infrastructure/alloy.yaml
 kubectl apply -f k8s/infrastructure/otel-collector.yaml
 kubectl apply -f k8s/infrastructure/grafana.yaml
 
 # Verify all pods are Running
-kubectl get pods
+kubectl get pods -n infra
 
 # Run the basic example (cluster must be up)
 go run examples/basic/main.go
 
 # Port-forward Grafana (default credentials: admin/admin)
-kubectl port-forward svc/grafana 3000:3000
+kubectl port-forward -n infra svc/grafana 3000:3000
 ```
 
 ---
@@ -87,6 +89,14 @@ kubectl port-forward svc/grafana 3000:3000
 - Prefer `errors.New` / `fmt.Errorf` with `%w` for wrapping
 - JSON log output is the default format (structured, machine-parseable)
 - Do not introduce new external dependencies without discussion
+
+---
+
+## Test Standards
+
+- Every public function must have a unit test
+- Use testify/mock or gomock for dependencies
+- Table-driven tests preferred
 
 ---
 

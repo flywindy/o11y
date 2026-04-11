@@ -41,8 +41,6 @@ metadata:
   namespace: infra
 data:
   config.alloy: |
-data:
-  config.alloy: |
     discovery.kubernetes "pods" {
       role = "pod"
       namespaces {
@@ -60,9 +58,9 @@ data:
           "__meta_kubernetes_pod_uid",
           "__meta_kubernetes_pod_container_name",
         ]
-        separator     = ";" 
+        separator     = ";"
         action        = "replace"
-        replacement   = "/var/log/pods/${1}_${2}_${3}/${4}/*" 
+        replacement   = "/var/log/pods/${1}_${2}_${3}/${4}/*"
         regex         = "(.+);(.+);(.+);(.+)"
         target_label  = "__path__"
       }
@@ -87,12 +85,16 @@ data:
 
     loki.source.file "pods" {
       targets    = local.file_match.pod_logs.targets
-      forward_to = [loki.write.default.receiver]
+      forward_to = [otelcol.receiver.loki.pods.receiver]
     }
 
-    loki.write "default" {
-      endpoint {
-        url = "http://loki:3100/loki/api/v1/push"
+    otelcol.receiver.loki "pods" {
+      forward_to = [otelcol.exporter.otlphttp.default.input]
+    }
+
+    otelcol.exporter.otlphttp "default" {
+      client {
+        endpoint = "http://otel-collector.infra.svc.cluster.local:4318"
       }
     }
 ---
@@ -113,7 +115,7 @@ spec:
       serviceAccountName: alloy
       containers:
         - name: alloy
-          image: grafana/alloy:latest
+          image: grafana/alloy:v1.7.5
           args:
             - run
             - /etc/alloy/config.alloy
