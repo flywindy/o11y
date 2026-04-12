@@ -50,7 +50,24 @@ func TestInit_Success(t *testing.T) {
 	assert.NotNil(t, sdk.Logger, "Logger must be set")
 	assert.NotNil(t, sdk.Propagator, "Propagator must be set")
 	assert.NotNil(t, sdk.Tracer("test"), "Tracer must be obtainable")
+	assert.NotNil(t, sdk.TracerProvider(), "TracerProvider must be obtainable")
 
+	doShutdown(t, sdk)
+}
+
+// TestInit_HandlesNilOption verifies that providing a nil Option to Init
+// does not cause a panic.
+func TestInit_HandlesNilOption(t *testing.T) {
+	srv := fakeOTLPServer(t)
+	defer srv.Close()
+
+	sdk, err := o11y.Init(context.Background(),
+		o11y.WithServiceName("test-svc"),
+		nil, // Should be ignored
+		o11y.WithOTLPEndpoint(srv.URL),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, sdk)
 	doShutdown(t, sdk)
 }
 

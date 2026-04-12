@@ -62,7 +62,9 @@ func (s *SDK) Shutdown(ctx context.Context) error {
 func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	cfg := defaultConfig()
 	for _, opt := range opts {
-		opt(cfg)
+		if opt != nil {
+			opt(cfg)
+		}
 	}
 
 	if cfg.serviceName == "" {

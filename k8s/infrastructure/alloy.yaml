@@ -58,12 +58,6 @@ data:
       }
 
       rule {
-        source_labels = ["__meta_kubernetes_pod_label_app", "level"]
-        regex         = "(loki|tempo);(info|debug)"
-        action        = "drop"
-      }
-
-      rule {
         source_labels = [
           "__meta_kubernetes_namespace",
           "__meta_kubernetes_pod_name",
