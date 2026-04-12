@@ -6,52 +6,56 @@ import (
 	"time"
 
 	"github.com/flywindy/o11y"
-	"go.opentelemetry.io/otel"
 )
 
 func main() {
-	// 1. Initialize the SDK
 	ctx := context.Background()
 
-	// Using the new functional options pattern
-	shutdown, err := o11y.Init(ctx,
+	// 1. Initialize the SDK (no global state mutated)
+	obs, err := o11y.Init(ctx,
 		o11y.WithServiceName("basic-example"),
+		o11y.WithServiceVersion("0.1.0"),
 		o11y.WithEnvironment("development"),
 		o11y.WithOTLPEndpoint("http://localhost:4318"),
 		o11y.WithLogLevel(slog.LevelInfo),
 	)
 	if err != nil {
-		slog.Error("Failed to initialize o11y SDK", slog.Any("error", err))
+		slog.ErrorContext(ctx, "failed to initialize o11y SDK", slog.Any("error", err))
 		return
 	}
 
-	// Ensure the TracerProvider is shut down properly at the end
-	defer shutdown(ctx)
+	// 2. Flush in-flight spans on exit.
+	//    A dedicated context with a timeout ensures the shutdown completes promptly.
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := obs.Shutdown(shutdownCtx); err != nil {
+			obs.Logger.ErrorContext(shutdownCtx, "SDK shutdown error", slog.Any("error", err))
+		}
+	}()
 
-	slog.Info("SDK initialized successfully")
+	obs.Logger.Info("SDK initialized successfully")
 
-	// 2. Start a root span
-	tracer := otel.Tracer("example-tracer")
+	// 3. Start a root span using the SDK's TracerProvider (no global OTel state needed)
+	tracer := obs.Tracer("example-tracer")
 	ctx, rootSpan := tracer.Start(ctx, "root-operation")
 	defer rootSpan.End()
 
-	// 3. Log a message within the context of the span
-	// The OtelSlogHandler will automatically extract trace_id and span_id
-	slog.InfoContext(ctx, "Processing root operation")
+	obs.Logger.InfoContext(ctx, "processing root operation")
 	time.Sleep(100 * time.Millisecond)
 
-	// 4. Simulate some work and a child span
-	performChildOperation(ctx)
+	// 4. Child span
+	performChildOperation(ctx, obs)
 
-	slog.InfoContext(ctx, "Example completed")
+	obs.Logger.InfoContext(ctx, "example completed")
 }
 
-func performChildOperation(ctx context.Context) {
-	tracer := otel.Tracer("example-tracer")
-	ctx, childSpan := tracer.Start(ctx, "child-operation")
-	defer childSpan.End()
+func performChildOperation(ctx context.Context, obs *o11y.SDK) {
+	tracer := obs.Tracer("example-tracer")
+	ctx, span := tracer.Start(ctx, "child-operation")
+	defer span.End()
 
-	slog.InfoContext(ctx, "Performing child operation")
+	obs.Logger.InfoContext(ctx, "performing child operation")
 	time.Sleep(100 * time.Millisecond)
-	slog.InfoContext(ctx, "Child operation finished")
+	obs.Logger.InfoContext(ctx, "child operation finished")
 }
