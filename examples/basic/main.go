@@ -12,7 +12,7 @@ func main() {
 	ctx := context.Background()
 
 	// 1. Initialize the SDK (no global state mutated)
-	sdk, err := o11y.Init(ctx,
+	obs, err := o11y.Init(ctx,
 		o11y.WithServiceName("basic-example"),
 		o11y.WithServiceVersion("0.1.0"),
 		o11y.WithEnvironment("development"),
@@ -29,33 +29,33 @@ func main() {
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := sdk.Shutdown(shutdownCtx); err != nil {
-			sdk.Logger.ErrorContext(shutdownCtx, "SDK shutdown error", slog.Any("error", err))
+		if err := obs.Shutdown(shutdownCtx); err != nil {
+			obs.Logger.ErrorContext(shutdownCtx, "SDK shutdown error", slog.Any("error", err))
 		}
 	}()
 
-	sdk.Logger.Info("SDK initialized successfully")
+	obs.Logger.Info("SDK initialized successfully")
 
 	// 3. Start a root span using the SDK's TracerProvider (no global OTel state needed)
-	tracer := sdk.Tracer("example-tracer")
+	tracer := obs.Tracer("example-tracer")
 	ctx, rootSpan := tracer.Start(ctx, "root-operation")
 	defer rootSpan.End()
 
-	sdk.Logger.InfoContext(ctx, "processing root operation")
+	obs.Logger.InfoContext(ctx, "processing root operation")
 	time.Sleep(100 * time.Millisecond)
 
 	// 4. Child span
-	performChildOperation(ctx, sdk)
+	performChildOperation(ctx, obs)
 
-	sdk.Logger.InfoContext(ctx, "example completed")
+	obs.Logger.InfoContext(ctx, "example completed")
 }
 
-func performChildOperation(ctx context.Context, sdk *o11y.SDK) {
-	tracer := sdk.Tracer("example-tracer")
+func performChildOperation(ctx context.Context, obs *o11y.SDK) {
+	tracer := obs.Tracer("example-tracer")
 	ctx, span := tracer.Start(ctx, "child-operation")
 	defer span.End()
 
-	sdk.Logger.InfoContext(ctx, "performing child operation")
+	obs.Logger.InfoContext(ctx, "performing child operation")
 	time.Sleep(100 * time.Millisecond)
-	sdk.Logger.InfoContext(ctx, "child operation finished")
+	obs.Logger.InfoContext(ctx, "child operation finished")
 }

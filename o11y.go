@@ -15,7 +15,7 @@ import (
 
 // SDK holds the initialized observability providers.
 // It does not mutate any global state; callers wire it however they like,
-// e.g. slog.SetDefault(sdk.Logger) or otel.SetTracerProvider(sdk.TracerProvider()).
+// e.g. slog.SetDefault(obs.Logger) or otel.SetTracerProvider(obs.TracerProvider()).
 type SDK struct {
 	// Logger is a structured slog.Logger pre-populated with service.name
 	// (and environment when set) that automatically injects trace_id and
