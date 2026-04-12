@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
       - name: nats
-        image: nats:2.10
+        image: nats:2.12.6
         ports:
         - containerPort: 4222
           name: client

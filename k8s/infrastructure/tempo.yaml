@@ -56,7 +56,7 @@ spec:
     spec:
       containers:
       - name: tempo
-        image: grafana/tempo:2.7.2
+        image: grafana/tempo:2.10.3
         args: ["-config.file=/etc/tempo/tempo.yaml", "-target=all"]
         ports:
         - containerPort: 3200 # HTTP
