@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+images:
+  - name: grafana/tempo
+    newName: internal-registry.example.com/grafana/tempo
+  - name: otel/opentelemetry-collector-contrib
+    newName: internal-registry.example.com/otel/opentelemetry-collector-contrib
+  - name: nats
+    newName: internal-registry.example.com/nats
+  - name: mongo
+    newName: internal-registry.example.com/mongo
+  - name: grafana/loki
+    newName: internal-registry.example.com/grafana/loki
+  - name: grafana/grafana
+    newName: internal-registry.example.com/grafana/grafana
+  - name: grafana/alloy
+    newName: internal-registry.example.com/grafana/alloy

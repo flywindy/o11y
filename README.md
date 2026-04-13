@@ -46,23 +46,15 @@ This configures a control-plane node with an extra port mapping for the OTel Col
 
 ### 2. Deploy Infrastructure
 
-Apply the Kubernetes manifests in the correct order:
+Apply the infrastructure components using Kustomize:
 
 ```bash
-kubectl apply -f k8s/infrastructure/namespace.yaml
-kubectl apply -f k8s/infrastructure/nats.yaml
-kubectl apply -f k8s/infrastructure/mongodb.yaml
-kubectl apply -f k8s/infrastructure/tempo.yaml
-kubectl apply -f k8s/infrastructure/loki.yaml
-kubectl apply -f k8s/infrastructure/otel-collector.yaml
-kubectl apply -f k8s/infrastructure/grafana.yaml
-kubectl apply -f k8s/infrastructure/alloy.yaml
-```
+# Standard deployment (public images)
+kubectl apply -k k8s/infrastructure/base
 
-### 3. Verify Deployment
-
-```bash
-kubectl get pods -n infra
+# OR: Private registry deployment (replace with your registry host)
+# Note: Update internal-registry.example.com in the overlay's kustomization.yaml to your host
+kubectl apply -k k8s/infrastructure/overlays/private-registry
 ```
 
 Wait for all pods to reach the `Running` state.
