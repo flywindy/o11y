@@ -52,7 +52,8 @@ Apply the infrastructure components using Kustomize:
 # Standard deployment (public images)
 kubectl apply -k k8s/infrastructure/base
 
-# OR: Private registry deployment (internal-registry.example.com)
+# OR: Private registry deployment (replace with your registry host)
+# Note: Update internal-registry.example.com in the overlay's kustomization.yaml to your host
 kubectl apply -k k8s/infrastructure/overlays/private-registry
 ```
 
