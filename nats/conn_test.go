@@ -57,7 +57,7 @@ func TestConnect(t *testing.T) {
 	_, url := startTestServer(t)
 	tp, prop, _ := newTestProviders()
 
-	conn, err := o11ynats.Connect(url, tp, prop)
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
 	require.NoError(t, err)
 	require.NotNil(t, conn)
 	conn.Close()
@@ -66,12 +66,9 @@ func TestConnect(t *testing.T) {
 func TestConnect_InvalidURL(t *testing.T) {
 	tp, prop, _ := newTestProviders()
 
-	// Port 1 is reserved and unreachable; combined with a short timeout and no
-	// reconnect attempts this ensures an immediate connection error.
-	conn, err := o11ynats.Connect("nats://127.0.0.1:1", tp, prop,
-		nats.MaxReconnects(0),
-		nats.Timeout(200*time.Millisecond),
-	)
+	// "nats://:invalid" is syntactically invalid so the connect always fails
+	// immediately at URL parsing, without relying on network reachability.
+	conn, err := o11ynats.Connect(context.Background(), "nats://:invalid", tp, prop)
 	assert.Error(t, err)
 	assert.Nil(t, conn)
 }
@@ -80,11 +77,11 @@ func TestSubscribe_ContextPropagation(t *testing.T) {
 	_, url := startTestServer(t)
 	tp, prop, sr := newTestProviders()
 
-	pub, err := o11ynats.Connect(url, tp, prop)
+	pub, err := o11ynats.Connect(context.Background(), url, tp, prop)
 	require.NoError(t, err)
 	defer pub.Close()
 
-	sub, err := o11ynats.Connect(url, tp, prop)
+	sub, err := o11ynats.Connect(context.Background(), url, tp, prop)
 	require.NoError(t, err)
 	defer sub.Close()
 
@@ -147,11 +144,11 @@ func TestQueueSubscribe(t *testing.T) {
 	_, url := startTestServer(t)
 	tp, prop, _ := newTestProviders()
 
-	pub, err := o11ynats.Connect(url, tp, prop)
+	pub, err := o11ynats.Connect(context.Background(), url, tp, prop)
 	require.NoError(t, err)
 	defer pub.Close()
 
-	sub, err := o11ynats.Connect(url, tp, prop)
+	sub, err := o11ynats.Connect(context.Background(), url, tp, prop)
 	require.NoError(t, err)
 	defer sub.Close()
 
@@ -177,7 +174,7 @@ func TestJetStream_NotNil(t *testing.T) {
 	_, url := startJetStreamServer(t)
 	tp, prop, _ := newTestProviders()
 
-	conn, err := o11ynats.Connect(url, tp, prop)
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
 	require.NoError(t, err)
 	defer conn.Close()
 

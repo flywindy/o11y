@@ -46,7 +46,7 @@ func main() {
 	logger := sdk.Logger
 
 	// 2. Connect to NATS with trace instrumentation wired from the SDK.
-	conn, err := o11ynats.Connect(natsURL, sdk.TracerProvider(), sdk.Propagator)
+	conn, err := o11ynats.Connect(ctx, natsURL, sdk.TracerProvider(), sdk.Propagator)
 	if err != nil {
 		logger.ErrorContext(ctx, "failed to connect to NATS", slog.Any("error", err))
 		os.Exit(1)

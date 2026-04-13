@@ -170,16 +170,16 @@ import (
     "github.com/nats-io/nats.go"
 )
 
-conn, err := o11ynats.Connect(nats.DefaultURL, sdk.TracerProvider(), sdk.Propagator)
+conn, err := o11ynats.Connect(ctx, nats.DefaultURL, obs.TracerProvider(), obs.Propagator)
 
 // Publisher: trace context is injected into message headers automatically.
 conn.Publish(ctx, "orders.created", payload)
 
 // Subscriber: ctx in the handler already carries the publisher's trace.
 conn.Subscribe("orders.created", func(ctx context.Context, msg *nats.Msg) {
-    ctx, span := sdk.Tracer("consumer").Start(ctx, "process-order")
+    ctx, span := obs.Tracer("consumer").Start(ctx, "process-order")
     defer span.End()
-    sdk.Logger.InfoContext(ctx, "order received") // trace_id and span_id injected automatically
+    obs.Logger.InfoContext(ctx, "order received") // trace_id and span_id injected automatically
 })
 ```
 
@@ -206,7 +206,7 @@ consumer, _ := stream.CreateOrUpdateConsumer(ctx, oteljetstream.ConsumerConfig{
     Durable: "orders-processor", AckPolicy: oteljetstream.AckExplicitPolicy,
 })
 cc, _ := consumer.Consume(func(m oteljetstream.Msg) {
-    ctx, span := sdk.Tracer("consumer").Start(m.Context(), "process-order")
+    ctx, span := obs.Tracer("consumer").Start(m.Context(), "process-order")
     defer span.End()
     m.Ack()
 })

@@ -80,7 +80,7 @@ go run examples/nats-core/subscriber/main.go
 go run examples/nats-core/publisher/main.go
 
 # Run the JetStream examples (two terminals; NATS must have JetStream enabled)
-# Start subscriber first — it expects the stream to already exist via the publisher
+# Start publisher first — it creates the JetStream stream; then start the subscriber
 go run examples/jetstream/publisher/main.go   # creates the stream and publishes
 go run examples/jetstream/subscriber/main.go  # attaches durable consumer and processes
 
@@ -139,7 +139,7 @@ All NATS connections must go through `github.com/flywindy/o11y/nats` so that the
 ### NATS Core
 
 ```go
-conn, err := o11ynats.Connect(natsURL, sdk.TracerProvider(), sdk.Propagator)
+conn, err := o11ynats.Connect(ctx, natsURL, sdk.TracerProvider(), sdk.Propagator)
 
 // Publish — trace context is injected into message headers automatically.
 conn.Publish(ctx, "o11y.events", payload)

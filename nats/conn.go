@@ -2,6 +2,7 @@ package nats
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/Marz32onE/instrumentation-go/otel-nats/oteljetstream"
 	"github.com/Marz32onE/instrumentation-go/otel-nats/otelnats"
@@ -29,13 +30,21 @@ type Conn struct {
 }
 
 // Connect establishes a traced NATS connection.
+// ctx is checked before dialing — if it is already canceled, Connect returns
+// immediately with ctx.Err(). Note: the underlying NATS client does not
+// support context cancellation during an in-progress dial; canceling ctx
+// after Connect returns has no effect on an established connection.
+//
 // tp and prop are wired directly into the underlying otelnats layer;
 // no global OTel state is read or modified.
 //
 // Typical usage with the o11y SDK:
 //
-//	conn, err := nats.Connect(url, sdk.TracerProvider(), sdk.Propagator)
-func Connect(url string, tp trace.TracerProvider, prop propagation.TextMapPropagator, natsOpts ...natsgo.Option) (*Conn, error) {
+//	conn, err := nats.Connect(ctx, url, obs.TracerProvider(), obs.Propagator)
+func Connect(ctx context.Context, url string, tp trace.TracerProvider, prop propagation.TextMapPropagator, natsOpts ...natsgo.Option) (*Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("nats connect: context already canceled: %w", err)
+	}
 	nc, err := otelnats.ConnectWithOptions(url, natsOpts,
 		otelnats.WithTracerProvider(tp),
 		otelnats.WithPropagators(prop),
@@ -53,6 +62,9 @@ func Connect(url string, tp trace.TracerProvider, prop propagation.TextMapPropag
 // include the consumer's trace_id and span_id; calls to tracer.Start(ctx, ...)
 // produce child spans of the consumer span.
 func (c *Conn) Subscribe(subject string, handler MsgHandler) (*natsgo.Subscription, error) {
+	if handler == nil {
+		return nil, fmt.Errorf("nats subscribe %q: handler must not be nil", subject)
+	}
 	return c.Conn.Subscribe(subject, func(m otelnats.Msg) {
 		handler(m.Ctx, m.Msg)
 	})
@@ -62,6 +74,9 @@ func (c *Conn) Subscribe(subject string, handler MsgHandler) (*natsgo.Subscripti
 // same queue group share message delivery round-robin, providing load balancing
 // across multiple subscriber instances.
 func (c *Conn) QueueSubscribe(subject, queue string, handler MsgHandler) (*natsgo.Subscription, error) {
+	if handler == nil {
+		return nil, fmt.Errorf("nats queue-subscribe %q/%q: handler must not be nil", subject, queue)
+	}
 	return c.Conn.QueueSubscribe(subject, queue, func(m otelnats.Msg) {
 		handler(m.Ctx, m.Msg)
 	})
