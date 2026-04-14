@@ -182,3 +182,31 @@ func TestJetStream_NotNil(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, js)
 }
+
+func TestSubscribe_NilHandler(t *testing.T) {
+	_, url := startTestServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	sub, err := conn.Subscribe("test.subject", nil)
+	assert.Error(t, err)
+	assert.Nil(t, sub)
+	assert.Contains(t, err.Error(), "handler must not be nil")
+}
+
+func TestQueueSubscribe_NilHandler(t *testing.T) {
+	_, url := startTestServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	sub, err := conn.QueueSubscribe("test.subject", "workers", nil)
+	assert.Error(t, err)
+	assert.Nil(t, sub)
+	assert.Contains(t, err.Error(), "handler must not be nil")
+}

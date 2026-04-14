@@ -30,7 +30,7 @@ func main() {
 	defer cancel()
 
 	// 1. Initialise the o11y SDK.
-	sdk, err := o11y.Init(ctx,
+	obs, err := o11y.Init(ctx,
 		o11y.WithServiceName("jetstream-publisher"),
 		o11y.WithEnvironment("development"),
 	)
@@ -39,15 +39,17 @@ func main() {
 		os.Exit(1)
 	}
 	defer func() {
-		if err := sdk.Shutdown(ctx); err != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := obs.Shutdown(shutdownCtx); err != nil {
 			slog.Error("SDK shutdown error", slog.Any("error", err))
 		}
 	}()
 
-	logger := sdk.Logger
+	logger := obs.Logger
 
 	// 2. Connect to NATS with trace instrumentation wired from the SDK.
-	conn, err := o11ynats.Connect(ctx, natsURL, sdk.TracerProvider(), sdk.Propagator)
+	conn, err := o11ynats.Connect(ctx, natsURL, obs.TracerProvider(), obs.Propagator)
 	if err != nil {
 		logger.ErrorContext(ctx, "failed to connect to NATS", slog.Any("error", err))
 		os.Exit(1)
@@ -79,7 +81,7 @@ func main() {
 		slog.String("subject", subject),
 	)
 
-	tracer := sdk.Tracer("jetstream-publisher")
+	tracer := obs.Tracer("jetstream-publisher")
 
 	ticker := time.NewTicker(publishRate)
 	defer ticker.Stop()

@@ -11,11 +11,15 @@ on:
     types: [submitted]
 
 jobs:
-  # Handles pure issue events (open/assign). No pull-request write access needed.
+  # Handles pure issue events (open/assign) and comments on regular issues.
+  # No pull-request write access needed.
   claude-issues:
     if: |
-      github.event_name == 'issues' &&
-      (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude'))
+      (github.event_name == 'issues' &&
+        (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude'))) ||
+      (github.event_name == 'issue_comment' &&
+        contains(github.event.comment.body, '@claude') &&
+        github.event.issue.pull_request == null)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -41,7 +45,9 @@ jobs:
   # Claude can post inline review replies and PR conversation comments.
   claude-pr:
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'issue_comment' &&
+        contains(github.event.comment.body, '@claude') &&
+        github.event.issue.pull_request != null) ||
       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
       (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude'))
     runs-on: ubuntu-latest

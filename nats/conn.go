@@ -50,7 +50,7 @@ func Connect(ctx context.Context, url string, tp trace.TracerProvider, prop prop
 		otelnats.WithPropagators(prop),
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("nats connect %s: %w", url, err)
 	}
 	return &Conn{Conn: nc}, nil
 }

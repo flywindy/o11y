@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/Marz32onE/instrumentation-go/otel-nats/oteljetstream"
 	"github.com/flywindy/o11y"
@@ -29,7 +30,7 @@ func main() {
 	defer cancel()
 
 	// 1. Initialise the o11y SDK.
-	sdk, err := o11y.Init(ctx,
+	obs, err := o11y.Init(ctx,
 		o11y.WithServiceName("jetstream-subscriber"),
 		o11y.WithEnvironment("development"),
 	)
@@ -38,15 +39,17 @@ func main() {
 		os.Exit(1)
 	}
 	defer func() {
-		if err := sdk.Shutdown(ctx); err != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := obs.Shutdown(shutdownCtx); err != nil {
 			slog.Error("SDK shutdown error", slog.Any("error", err))
 		}
 	}()
 
-	logger := sdk.Logger
+	logger := obs.Logger
 
 	// 2. Connect to NATS with trace instrumentation wired from the SDK.
-	conn, err := o11ynats.Connect(ctx, natsURL, sdk.TracerProvider(), sdk.Propagator)
+	conn, err := o11ynats.Connect(ctx, natsURL, obs.TracerProvider(), obs.Propagator)
 	if err != nil {
 		logger.ErrorContext(ctx, "failed to connect to NATS", slog.Any("error", err))
 		os.Exit(1)
@@ -84,7 +87,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	tracer := sdk.Tracer("jetstream-subscriber")
+	tracer := obs.Tracer("jetstream-subscriber")
 
 	// 6. Consume messages. oteljetstream extracts the publisher's trace context
 	//    from each message's headers and links it to a new consumer span.
