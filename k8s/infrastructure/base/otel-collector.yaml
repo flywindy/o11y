@@ -25,6 +25,11 @@ data:
           insecure: true
       loki:
         endpoint: "http://loki.infra.svc.cluster.local:3100/loki/api/v1/push"
+        default_labels_enabled:
+          exporter: false
+          job: true      # service.name resource attribute → job label
+          instance: false
+          level: true    # severity_text → level label
         retry_on_failure:
           enabled: true
           initial_interval: 5s
@@ -44,7 +49,8 @@ data:
           receivers: [otlp]
           processors: [batch]
           exporters: [otlp]
-        # Logs flow: App stdout → Alloy → OTel Collector → Loki
+        # Logs flow (primary):   App ──OTLP/HTTP──► OTel Collector → Loki
+        # Logs flow (secondary): App stdout → Alloy → OTel Collector → Loki
         logs:
           receivers: [otlp]
           processors: [batch]

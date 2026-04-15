@@ -8,7 +8,7 @@ This project provides a "Context-First" observability layer for Go applications,
 
 - **Language**: Go 1.25+
 - **Tracing**: OpenTelemetry Go SDK (OTLP/HTTP)
-- **Logging**: Go `slog` with a custom OTel correlation handler
+- **Logging**: Go `slog` with dual output — OTLP/HTTP via `otelslog` bridge (→ Loki) and JSON stdout (→ Alloy)
 - **Infrastructure**:
   - **NATS**: High-performance messaging
   - **MongoDB**: NoSQL database for persistence
@@ -22,8 +22,12 @@ This project provides a "Context-First" observability layer for Go applications,
 
 ```
 Traces: App ──OTLP/HTTP──► OTel Collector ──► Tempo
-Logs:   App stdout ──► Alloy ──OTLP/HTTP──► OTel Collector ──► Loki
+Logs:   App ──OTLP/HTTP──► OTel Collector ──► Loki   (primary: full OTel Log Data Model)
+        App stdout ──► Alloy ──OTLP/HTTP──► OTel Collector ──► Loki  (secondary: k8s pods via Alloy)
 ```
+
+Both log paths are active simultaneously. When running `go run` locally (outside the cluster),
+only the OTLP path reaches Loki — Alloy only scrapes pods running inside kind.
 
 ## Prerequisites
 
@@ -120,18 +124,22 @@ func main() {
 
 ### Structured Logging with Trace Correlation
 
-Use `obs.Logger` instead of the global `slog` package. When a span is active in `ctx`, every log record automatically includes `trace_id` and `span_id` as JSON fields.
+Use `obs.Logger` instead of the global `slog` package. Every log record is written to two destinations automatically:
+
+- **OTLP → Loki**: Full OTel Log Data Model. `service.name` and `deployment.environment` live in the OTel Resource (not per-record attributes). `trace_id`, `span_id`, and `trace_flags` are extracted from the context by the `otelslog` bridge.
+- **stdout (JSON)**: Human-readable output for local development. Includes `service.name`, `environment`, `trace_id`, and `span_id` as flat JSON fields.
 
 ```go
-// Without a span — no trace fields injected
+// Without a span — no trace fields in either destination
 obs.Logger.Info("service started")
 
-// With an active span — trace_id and span_id are injected automatically
+// With an active span — trace context included automatically
 ctx, span := obs.Tracer("my-tracer").Start(ctx, "my-operation")
 defer span.End()
 
 obs.Logger.InfoContext(ctx, "processing request", slog.String("user_id", "42"))
-// Output: {"time":"...","level":"INFO","msg":"processing request","trace_id":"4bf92f...","span_id":"00f067...","user_id":"42"}
+// stdout: {"time":"...","level":"INFO","msg":"processing request","service.name":"my-service","trace_id":"4bf92f...","span_id":"00f067...","user_id":"42"}
+// Loki:   OTel Log Record — Body="processing request", TraceId=4bf92f..., SpanId=00f067..., Attributes={user_id: "42"}, Resource={service.name: "my-service", ...}
 ```
 
 ### Creating Spans
@@ -218,9 +226,9 @@ defer cc.Stop()
 Before running any example, port-forward the required services from the `kind` cluster:
 
 ```bash
-kubectl port-forward -n infra svc/otel-collector 4318:4318  # OTel traces
-kubectl port-forward -n infra svc/nats          4222:4222   # NATS connection
-kubectl port-forward -n infra svc/grafana       3000:3000   # Grafana UI
+kubectl port-forward -n infra svc/otel-collector 4318:4318  # OTel traces and logs
+kubectl port-forward -n infra svc/nats           4222:4222  # NATS connection
+kubectl port-forward -n infra svc/grafana        3000:3000  # Grafana UI
 ```
 
 ### Basic (spans + logs)
@@ -255,7 +263,7 @@ Open Grafana at `http://localhost:3000` and navigate to **Explore → Tempo** to
 
 1. **Context-First**: Always propagate `context.Context` — trace information flows through context only.
 2. **Zero Global State**: No `init()` side effects, no global logger or tracer provider variables.
-3. **Correlation**: `slog` output always includes `trace_id` and `span_id` as JSON fields when a span is active.
+3. **Correlation**: Every log record includes `trace_id` and `span_id` when a span is active — as JSON fields on stdout and as OTel Log Data Model fields in Loki.
 4. **Performance**: Non-blocking middleware and minimal allocations in the hot path.
 5. **Errors**: Use `slog.ErrorContext(ctx, ...)` with structured attributes; never `panic` for recoverable errors.
 
