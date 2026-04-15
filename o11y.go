@@ -76,7 +76,17 @@ func (s *SDK) Shutdown(ctx context.Context) error {
 }
 
 // Init initializes the o11y SDK with the provided options and returns an SDK
-// instance ready for use. WithServiceName and WithTeam are required.
+// Init initializes and returns a configured *SDK for the calling service.
+//
+// Init requires a service name and team be provided (use WithServiceName and
+// WithTeam); it returns an error if either is missing. On success the returned
+// SDK contains an initialized tracer provider, meter provider (with a Prometheus
+// scrape endpoint when configured), a structured logger pre-populated with
+// service.name (and environment when set), and an ordered list of shutdown
+// functions. Shutdowns are registered in the order: scrape server, meter
+// provider, tracer provider. Init does not set global OpenTelemetry state; if
+// meter initialization fails after the tracer is created, the tracer provider
+// is shut down to avoid leaking its background processor.
 func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	cfg := defaultConfig()
 	for _, opt := range opts {
