@@ -49,7 +49,7 @@ type config struct {
 
 // WithPathNormalizer supplies a function that turns a request into its
 // route template. Without one, the middleware uses r.URL.Path as-is and
-// relies entirely on the cardinality cap for protection.
+// The provided function must be safe for concurrent use; the middleware enforces a configured cap and will collapse excess distinct routes to "other".
 func WithPathNormalizer(fn PathNormalizer) Option {
 	return func(c *config) {
 		c.normalizer = fn
@@ -57,7 +57,8 @@ func WithPathNormalizer(fn PathNormalizer) Option {
 }
 
 // WithMaxUniquePaths overrides the hard cardinality cap. Values <= 0 mean
-// "use DefaultMaxUniquePaths".
+// WithMaxUniquePaths sets the maximum number of distinct http.route label values the middleware will track.
+// n is the cap for unique routes; values <= 0 are treated as DefaultMaxUniquePaths when the middleware is constructed.
 func WithMaxUniquePaths(n int) Option {
 	return func(c *config) {
 		c.maxUniquePaths = n
@@ -66,7 +67,19 @@ func WithMaxUniquePaths(n int) Option {
 
 // New returns a net/http middleware that records request duration on the
 // supplied meter. The histogram is created once at construction time so
-// there is no per-request instrument lookup on the hot path.
+// New creates an HTTP middleware that records request durations to an OpenTelemetry
+// histogram named "http.server.request.duration".
+//
+// New applies the provided Option values to configure a PathNormalizer (defaults to
+// r.URL.Path) and a maximum distinct-route cap (defaults to DefaultMaxUniquePaths).
+// It constructs a Float64Histogram instrument at creation time; if histogram
+// creation fails New returns a no-op wrapper that leaves handlers unmodified.
+//
+// The returned middleware records the request duration in seconds and attaches the
+// following attributes: "http.request.method", "http.route" (normalized and capped
+// by the configured limit, unseen extra routes are reported as "other"), and
+// "http.response.status_code". The response status defaults to 200 if no explicit
+// status header is written.
 func New(meter metric.Meter, opts ...Option) func(http.Handler) http.Handler {
 	cfg := &config{
 		maxUniquePaths: DefaultMaxUniquePaths,
@@ -149,6 +162,9 @@ type pathLimiter struct {
 	size int
 }
 
+// newPathLimiter creates a pathLimiter that enforces a maximum of max distinct route strings.
+// max is the upper bound on distinct paths that will be tracked; once that bound is reached,
+// additional unseen paths will be treated as the literal `"other"`.
 func newPathLimiter(max int) *pathLimiter {
 	return &pathLimiter{max: max}
 }

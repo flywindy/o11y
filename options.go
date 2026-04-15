@@ -62,7 +62,7 @@ func WithOTLPEndpoint(endpoint string) Option {
 	}
 }
 
-// WithLogLevel sets the minimum logging level.
+// WithLogLevel returns an Option that sets the minimum logging level for the SDK.
 func WithLogLevel(level slog.Level) Option {
 	return func(c *Config) {
 		c.logLevel = level
@@ -72,7 +72,8 @@ func WithLogLevel(level slog.Level) Option {
 // WithTeam sets the owning team label applied to every metric emitted by
 // the SDK. It is required: Init returns an error when it is empty. The
 // value becomes a constant Prometheus label (team="...") on every series,
-// which SRE uses for alert routing and governance.
+// WithTeam returns an Option that sets the team field on a Config.
+// The team value is used by SRE for alert routing and governance.
 func WithTeam(team string) Option {
 	return func(c *Config) {
 		c.team = team
@@ -80,7 +81,8 @@ func WithTeam(team string) Option {
 }
 
 // WithMetricsAddr overrides the listen address of the built-in Prometheus
-// /metrics HTTP server. Defaults to DefaultMetricsAddr (":2112").
+// WithMetricsAddr returns an Option that sets the metrics HTTP server listen address to the provided addr.
+// If not set, the metrics server defaults to DefaultMetricsAddr (":2112").
 func WithMetricsAddr(addr string) Option {
 	return func(c *Config) {
 		c.metricsAddr = addr
@@ -89,7 +91,8 @@ func WithMetricsAddr(addr string) Option {
 
 // WithRuntimeMetrics toggles collection of Go runtime metrics (goroutines,
 // GC, memory, etc.) via the OTel runtime instrumentation. Defaults to true,
-// which is what SRE expects for the Saturation golden signal.
+// WithRuntimeMetrics sets whether collection of runtime-derived metrics is enabled.
+// When enabled, runtime metrics (e.g., goroutines, memory, GC) are collected and exposed to support saturation monitoring as expected by SRE.
 func WithRuntimeMetrics(enabled bool) Option {
 	return func(c *Config) {
 		c.runtimeMetrics = enabled
@@ -99,13 +102,16 @@ func WithRuntimeMetrics(enabled bool) Option {
 // WithHistogramBuckets overrides the histogram boundaries applied to HTTP
 // server latency histograms. Defaults to DefaultLatencyBuckets; override
 // only when your service has a genuinely different latency profile, since
-// diverging from the default breaks cross-service P99 comparisons.
+// WithHistogramBuckets returns an Option that sets the histogram bucket boundaries used for latency histograms.
+// Changing these from the package default will make cross-service P99 comparisons inconsistent.
 func WithHistogramBuckets(buckets []float64) Option {
 	return func(c *Config) {
 		c.histogramBuckets = buckets
 	}
 }
 
+// defaultConfig returns a *Config initialized with the package's built-in defaults.
+// It sets otlpEndpoint to "http://localhost:4318", logLevel to slog.LevelInfo, metricsAddr to DefaultMetricsAddr, runtimeMetrics to true, and histogramBuckets to DefaultLatencyBuckets.
 func defaultConfig() *Config {
 	return &Config{
 		otlpEndpoint:     "http://localhost:4318",
