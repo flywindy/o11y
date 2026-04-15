@@ -10,6 +10,8 @@ import (
 	"github.com/flywindy/o11y/httpmw"
 )
 
+// main initializes the observability SDK with service metadata and team labels, creates a root span and a nested child span to demonstrate tracing, and starts an HTTP server whose handlers are wrapped with httpmw to emit Prometheus metrics.
+// The program registers a deferred SDK shutdown that flushes in-flight spans and metrics with a 5-second timeout before exit.
 func main() {
 	ctx := context.Background()
 
@@ -71,6 +73,8 @@ func main() {
 	_ = srv.ListenAndServe()
 }
 
+// performChildOperation starts a child tracing span from ctx and emits logs to indicate simulated work.
+// The span is ended when the function returns, and logs are recorded with the span's context via the provided SDK.
 func performChildOperation(ctx context.Context, obs *o11y.SDK) {
 	tracer := obs.Tracer("example-tracer")
 	ctx, span := tracer.Start(ctx, "child-operation")

@@ -46,7 +46,14 @@ type Config struct {
 //
 // Bind errors are surfaced synchronously: if cfg.MetricsAddr is already in
 // use, InitMeter returns the error instead of letting a background goroutine
-// swallow it.
+// InitMeter creates an isolated Prometheus-backed OpenTelemetry MeterProvider and an HTTP server
+// that exposes a single /metrics endpoint.
+//
+// It returns the created *sdkmetric.MeterProvider and *http.Server bound to cfg.MetricsAddr, or
+// an error if initialization fails (for example, when cfg.Team is empty, exporter/resource/view
+// creation fails, runtime metrics cannot be started, or the metrics listener cannot be bound).
+// On success the caller is responsible for shutting down the HTTP server first, then shutting
+// down the returned MeterProvider.
 func InitMeter(ctx context.Context, cfg Config) (*sdkmetric.MeterProvider, *http.Server, error) {
 	if cfg.Team == "" {
 		return nil, nil, errors.New("metrics: Team is required")
