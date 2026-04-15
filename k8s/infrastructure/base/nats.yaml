@@ -17,6 +17,7 @@ spec:
       containers:
       - name: nats
         image: nats:2.12.6
+        args: ["-js"]
         ports:
         - containerPort: 4222
           name: client

@@ -59,7 +59,7 @@ kubectl apply -k k8s/infrastructure/overlays/private-registry
 
 Wait for all pods to reach the `Running` state.
 
-### 4. Access Grafana
+### 3. Access Grafana
 
 ```bash
 kubectl port-forward svc/grafana 3000:3000 -n infra
@@ -160,40 +160,96 @@ otel.SetTracerProvider(obs.TracerProvider())
 otel.SetTextMapPropagator(obs.Propagator)
 ```
 
-### Distributed Tracing over NATS
+### Distributed Tracing over NATS Core
 
-Use `obs.Propagator` together with the `nats` sub-package to propagate trace context across NATS messages.
+Use `o11ynats.Connect` to obtain a tracing-aware connection. The `TracerProvider` and `Propagator` from the SDK are wired in automatically — no global OTel state is touched.
 
 ```go
 import (
     o11ynats "github.com/flywindy/o11y/nats"
-    gonats "github.com/nats-io/nats.go"
+    "github.com/nats-io/nats.go"
 )
 
-// Publisher: inject the current span context into the message
-msg := &gonats.Msg{Subject: "orders.created"}
-o11ynats.Inject(ctx, obs.Propagator, msg)
-nc.PublishMsg(msg)
+conn, err := o11ynats.Connect(ctx, nats.DefaultURL, obs.TracerProvider(), obs.Propagator)
 
-// Subscriber: extract the span context from the incoming message
-func handler(msg *gonats.Msg) {
-    ctx := o11ynats.Extract(context.Background(), obs.Propagator, msg)
-    // ctx now carries the upstream trace — create a child span to continue it
-    ctx, span := obs.Tracer("consumer").Start(ctx, "orders.created")
+// Publisher: trace context is injected into message headers automatically.
+conn.Publish(ctx, "orders.created", payload)
+
+// Subscriber: ctx in the handler already carries the publisher's trace.
+conn.Subscribe("orders.created", func(ctx context.Context, msg *nats.Msg) {
+    ctx, span := obs.Tracer("consumer").Start(ctx, "process-order")
     defer span.End()
-}
+    obs.Logger.InfoContext(ctx, "order received") // trace_id and span_id injected automatically
+})
 ```
 
-## Running the Example
+> **Request-Reply note**: to reply while preserving trace context, use `conn.Publish(ctx, msg.Reply, data)` instead of `msg.Respond(data)`. `msg.Respond` bypasses header injection and breaks the distributed trace.
 
-A complete example is provided in `examples/basic/main.go`. It demonstrates initialization, span creation, child spans, and structured logging.
+### Distributed Tracing over JetStream
 
-1. Ensure the `kind` cluster and infrastructure are running (see above).
-2. Run the example:
-   ```bash
-   go run examples/basic/main.go
-   ```
-3. Open Grafana at `http://localhost:3000` to see correlated traces and logs.
+```go
+import "github.com/Marz32onE/instrumentation-go/otel-nats/oteljetstream"
+
+js, err := conn.JetStream()
+
+// Create or update stream (idempotent — safe to call on every startup).
+js.CreateOrUpdateStream(ctx, oteljetstream.StreamConfig{
+    Name: "ORDERS", Subjects: []string{"orders.>"},
+})
+
+// Publisher: trace context injected into JetStream message headers.
+ack, err := js.Publish(ctx, "orders.created", payload)
+
+// Subscriber: durable consumer with Consume (push-style pull delivery).
+stream, _ := js.Stream(ctx, "ORDERS")
+consumer, _ := stream.CreateOrUpdateConsumer(ctx, oteljetstream.ConsumerConfig{
+    Durable: "orders-processor", AckPolicy: oteljetstream.AckExplicitPolicy,
+})
+cc, _ := consumer.Consume(func(m oteljetstream.Msg) {
+    ctx, span := obs.Tracer("consumer").Start(m.Context(), "process-order")
+    defer span.End()
+    m.Ack()
+})
+defer cc.Stop()
+```
+
+## Running the Examples
+
+Before running any example, port-forward the required services from the `kind` cluster:
+
+```bash
+kubectl port-forward -n infra svc/otel-collector 4318:4318  # OTel traces
+kubectl port-forward -n infra svc/nats          4222:4222   # NATS connection
+kubectl port-forward -n infra svc/grafana       3000:3000   # Grafana UI
+```
+
+### Basic (spans + logs)
+
+```bash
+go run examples/basic/main.go
+```
+
+### NATS Core (two terminals)
+
+```bash
+# Terminal 1 — start subscriber first
+go run examples/nats-core/subscriber/main.go
+
+# Terminal 2 — publisher sends a message every 3 seconds
+go run examples/nats-core/publisher/main.go
+```
+
+### JetStream (two terminals; requires JetStream-enabled NATS server)
+
+```bash
+# Terminal 1 — publisher creates the stream and publishes
+go run examples/jetstream/publisher/main.go
+
+# Terminal 2 — subscriber attaches a durable consumer and processes messages
+go run examples/jetstream/subscriber/main.go
+```
+
+Open Grafana at `http://localhost:3000` and navigate to **Explore → Tempo** to see producer and consumer spans linked across services. Navigate to **Explore → Loki** to see structured log entries with correlated `trace_id` and `span_id` fields.
 
 ## Core Principles
 
