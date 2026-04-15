@@ -22,6 +22,8 @@ func TestSDK_ShutdownCombinesErrors(t *testing.T) {
 
 	sdk, err := Init(context.Background(),
 		WithServiceName("test-svc"),
+		WithTeam("test-team"),
+		WithMetricsAddr("127.0.0.1:0"),
 		WithOTLPEndpoint(srv.URL),
 	)
 	require.NoError(t, err)

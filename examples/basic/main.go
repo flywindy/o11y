@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"github.com/flywindy/o11y"
+	"github.com/flywindy/o11y/httpmw"
 )
 
 func main() {
@@ -16,6 +18,7 @@ func main() {
 		o11y.WithServiceName("basic-example"),
 		o11y.WithServiceVersion("0.1.0"),
 		o11y.WithEnvironment("development"),
+		o11y.WithTeam("platform"),
 		o11y.WithOTLPEndpoint("http://localhost:4318"),
 		o11y.WithLogLevel(slog.LevelInfo),
 	)
@@ -24,7 +27,7 @@ func main() {
 		return
 	}
 
-	// 2. Flush in-flight spans on exit.
+	// 2. Flush in-flight spans and metrics on exit.
 	//    A dedicated context with a timeout ensures the shutdown completes promptly.
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -39,7 +42,6 @@ func main() {
 	// 3. Start a root span using the SDK's TracerProvider (no global OTel state needed)
 	tracer := obs.Tracer("example-tracer")
 	ctx, rootSpan := tracer.Start(ctx, "root-operation")
-	defer rootSpan.End()
 
 	obs.Logger.InfoContext(ctx, "processing root operation")
 	time.Sleep(100 * time.Millisecond)
@@ -47,7 +49,26 @@ func main() {
 	// 4. Child span
 	performChildOperation(ctx, obs)
 
+	rootSpan.End()
 	obs.Logger.InfoContext(ctx, "example completed")
+
+	// 5. Demonstrate the HTTP middleware. Any handler wrapped with
+	//    httpmw.New will emit http_server_request_duration_seconds on
+	//    the Prometheus scrape endpoint (default :2112/metrics) with a
+	//    team="platform" label pre-populated by the SDK.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("hello\n"))
+	})
+	wrapped := httpmw.New(obs.Meter("example"))(mux)
+
+	obs.Logger.Info("serving demo handler on :8080 — curl http://localhost:2112/metrics to scrape")
+	srv := &http.Server{
+		Addr:              ":8080",
+		Handler:           wrapped,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	_ = srv.ListenAndServe()
 }
 
 func performChildOperation(ctx context.Context, obs *o11y.SDK) {

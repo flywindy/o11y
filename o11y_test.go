@@ -28,11 +28,30 @@ func doShutdown(t *testing.T, sdk *o11y.SDK) {
 	require.NoError(t, sdk.Shutdown(ctx))
 }
 
+// commonOpts returns a minimal set of options required for Init to succeed
+// under test: WithTeam (now required) and a randomly chosen metrics port so
+// concurrent tests never fight over :2112.
+func commonOpts(srvURL string) []o11y.Option {
+	return []o11y.Option{
+		o11y.WithServiceName("test-svc"),
+		o11y.WithTeam("test-team"),
+		o11y.WithMetricsAddr("127.0.0.1:0"),
+		o11y.WithOTLPEndpoint(srvURL),
+	}
+}
+
 // TestInit_MissingServiceName verifies that Init rejects an empty service name.
 func TestInit_MissingServiceName(t *testing.T) {
 	_, err := o11y.Init(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "service name is required")
+}
+
+// TestInit_MissingTeam verifies that Init rejects an empty team.
+func TestInit_MissingTeam(t *testing.T) {
+	_, err := o11y.Init(context.Background(), o11y.WithServiceName("test-svc"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "team is required")
 }
 
 // TestInit_Success verifies that Init succeeds with valid options and returns
@@ -41,16 +60,15 @@ func TestInit_Success(t *testing.T) {
 	srv := fakeOTLPServer(t)
 	defer srv.Close()
 
-	sdk, err := o11y.Init(context.Background(),
-		o11y.WithServiceName("test-svc"),
-		o11y.WithOTLPEndpoint(srv.URL),
-	)
+	sdk, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
 	require.NoError(t, err)
 	require.NotNil(t, sdk)
 	assert.NotNil(t, sdk.Logger, "Logger must be set")
 	assert.NotNil(t, sdk.Propagator, "Propagator must be set")
 	assert.NotNil(t, sdk.Tracer("test"), "Tracer must be obtainable")
 	assert.NotNil(t, sdk.TracerProvider(), "TracerProvider must be obtainable")
+	assert.NotNil(t, sdk.Meter("test"), "Meter must be obtainable")
+	assert.NotNil(t, sdk.MeterProvider(), "MeterProvider must be obtainable")
 
 	doShutdown(t, sdk)
 }
@@ -61,11 +79,8 @@ func TestInit_HandlesNilOption(t *testing.T) {
 	srv := fakeOTLPServer(t)
 	defer srv.Close()
 
-	sdk, err := o11y.Init(context.Background(),
-		o11y.WithServiceName("test-svc"),
-		nil, // Should be ignored
-		o11y.WithOTLPEndpoint(srv.URL),
-	)
+	opts := append([]o11y.Option{nil}, commonOpts(srv.URL)...)
+	sdk, err := o11y.Init(context.Background(), opts...)
 	require.NoError(t, err)
 	require.NotNil(t, sdk)
 	doShutdown(t, sdk)
@@ -76,11 +91,8 @@ func TestInit_WithEnvironment(t *testing.T) {
 	srv := fakeOTLPServer(t)
 	defer srv.Close()
 
-	sdk, err := o11y.Init(context.Background(),
-		o11y.WithServiceName("test-svc"),
-		o11y.WithEnvironment("staging"),
-		o11y.WithOTLPEndpoint(srv.URL),
-	)
+	opts := append(commonOpts(srv.URL), o11y.WithEnvironment("staging"))
+	sdk, err := o11y.Init(context.Background(), opts...)
 	require.NoError(t, err)
 	require.NotNil(t, sdk)
 	doShutdown(t, sdk)
@@ -92,11 +104,8 @@ func TestInit_EmptyEnvironment(t *testing.T) {
 	srv := fakeOTLPServer(t)
 	defer srv.Close()
 
-	sdk, err := o11y.Init(context.Background(),
-		o11y.WithServiceName("test-svc"),
-		o11y.WithEnvironment(""),
-		o11y.WithOTLPEndpoint(srv.URL),
-	)
+	opts := append(commonOpts(srv.URL), o11y.WithEnvironment(""))
+	sdk, err := o11y.Init(context.Background(), opts...)
 	require.NoError(t, err)
 	require.NotNil(t, sdk)
 	doShutdown(t, sdk)
@@ -108,12 +117,11 @@ func TestInit_WithServiceVersion(t *testing.T) {
 	srv := fakeOTLPServer(t)
 	defer srv.Close()
 
-	sdk, err := o11y.Init(context.Background(),
-		o11y.WithServiceName("test-svc"),
+	opts := append(commonOpts(srv.URL),
 		o11y.WithServiceVersion("2.3.1"),
 		o11y.WithEnvironment("production"),
-		o11y.WithOTLPEndpoint(srv.URL),
 	)
+	sdk, err := o11y.Init(context.Background(), opts...)
 	require.NoError(t, err)
 	require.NotNil(t, sdk)
 	doShutdown(t, sdk)
@@ -124,10 +132,7 @@ func TestSDK_TracerIsNamed(t *testing.T) {
 	srv := fakeOTLPServer(t)
 	defer srv.Close()
 
-	sdk, err := o11y.Init(context.Background(),
-		o11y.WithServiceName("test-svc"),
-		o11y.WithOTLPEndpoint(srv.URL),
-	)
+	sdk, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
 	require.NoError(t, err)
 	defer doShutdown(t, sdk)
 
