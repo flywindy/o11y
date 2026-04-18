@@ -32,6 +32,28 @@ so that every log entry is automatically enriched with `traceId` and `spanId`.
 
 ---
 
+## Required SDK Init Options
+
+Every service **must** provide all four options; `Init` returns an error if any are missing or invalid:
+
+| Option | semconv key | Notes |
+|--------|------------|-------|
+| `WithServiceName("my-svc")` | `service.name` | Unique service identifier |
+| `WithServiceVersion("1.2.3")` | `service.version` | Required for canary/rollback tracking |
+| `WithServiceNamespace("platform")` | `service.namespace` | Owning team/product; maps to k8s namespace |
+| `WithEnvironment("production")` | `deployment.environment.name` | Canonical values only (see below) |
+
+**Canonical environment values** — aliases are auto-normalized, unknown values are rejected:
+
+| Input | Canonical |
+|-------|-----------|
+| `production`, `prod` | `production` |
+| `staging`, `stage`, `stg` | `staging` |
+| `development`, `develop`, `dev` | `development` |
+| `testing`, `test` | `testing` |
+
+---
+
 ## Core Principles — Never Violate These
 
 1. **Context-First**: Every function must accept and propagate `context.Context`. Trace information flows through context only.
@@ -39,6 +61,7 @@ so that every log entry is automatically enriched with `traceId` and `spanId`.
 3. **Correlation**: `slog` output must always include `traceId` and `spanId` as JSON fields when a span is active.
 4. **Performance**: Middleware and handlers must be non-blocking. Minimize allocations in the hot path.
 5. **Errors**: Use `slog.ErrorContext(ctx, ...)` with structured attributes. Never use `panic` for recoverable errors.
+6. **Semconv v1.27.0**: All instrument names, attribute keys, and attribute types must conform to OTel Semantic Conventions v1.27.0. Do not mix versions.
 
 ---
 
@@ -195,6 +218,10 @@ When replying to a message inside a `Subscribe` handler, do **not** use `msg.Res
 - ❌ Use OTLP/gRPC unless explicitly asked
 - ❌ Import `github.com/sirupsen/logrus` or `go.uber.org/zap` — we use stdlib `slog`
 - ❌ Commit without running `go fmt` and `go mod tidy`
-- ❌ Add Kubernetes manifests that skip the OTel Collector (all telemetry must go through it)
+- ❌ Add Kubernetes manifests that send traces or logs directly to backends (Tempo, Loki) — traces and logs must go through the OTel Collector; Prometheus scraping `:2112` directly is intentional and correct
 - ❌ Call `otelnats.Connect` or `otelnats.ConnectWithOptions` directly — always go through `o11ynats.Connect` so the SDK providers are wired correctly
 - ❌ Use `msg.Respond(data)` inside a Subscribe handler when trace context must be preserved in the reply — use `conn.Publish(ctx, msg.Reply, data)` instead
+- ❌ Use `WithTeam` — it no longer exists; use `WithServiceNamespace` instead
+- ❌ Use non-canonical environment strings in config files or docs (code accepts aliases like `"prod"` but canonical values are preferred)
+- ❌ Mix OTel semconv versions — always import `go.opentelemetry.io/otel/semconv/v1.27.0`
+- ❌ Use high-cardinality values (user IDs, request IDs, trace IDs) as metric label values

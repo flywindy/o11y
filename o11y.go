@@ -13,8 +13,8 @@ import (
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/sdk/resource"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.27.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
@@ -62,7 +62,7 @@ func (s *SDK) MeterProvider() *sdkmetric.MeterProvider {
 }
 
 // Meter returns a named meter from the SDK's MeterProvider, mirroring the
-// shape of Tracer. Pass the returned meter to httpmw.New or to your own
+// shape of Tracer. Pass the returned meter to http.New or to your own
 // instrumentation code.
 func (s *SDK) Meter(name string) metric.Meter {
 	return s.meterProvider.Meter(name)
@@ -85,11 +85,17 @@ func (s *SDK) Shutdown(ctx context.Context) error {
 
 // Init initializes and returns a configured *SDK for the calling service.
 //
-// WithServiceName and WithTeam are both required; Init returns an error if
-// either is missing. On success the returned SDK contains an initialized
-// tracer provider, meter provider (with a Prometheus scrape endpoint),
-// logger provider (dual-output: stdout JSON + OTLP/HTTP → Loki), and an
-// ordered shutdown list. Init does not set global OpenTelemetry state.
+// The following options are required; Init returns an error if any are missing
+// or invalid:
+//   - WithServiceName    — identifies the service
+//   - WithServiceVersion — used for canary / rollback tracking
+//   - WithEnvironment    — must be one of: production, staging, development, testing
+//     (common aliases such as "prod" and "stg" are normalized automatically)
+//   - WithServiceNamespace — identifies the owning team / k8s namespace
+//
+// On success the SDK contains a tracer provider, meter provider (Prometheus
+// scrape or OTLP push), logger provider (stdout JSON + OTLP/HTTP → Loki), and
+// an ordered shutdown list. Init does not set global OpenTelemetry state.
 func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	cfg := defaultConfig()
 	for _, opt := range opts {
@@ -101,9 +107,17 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	if cfg.serviceName == "" {
 		return nil, errors.New("service name is required (use WithServiceName)")
 	}
-	if cfg.team == "" {
-		return nil, errors.New("team is required (use WithTeam)")
+	if cfg.serviceVersion == "" {
+		return nil, errors.New("service version is required (use WithServiceVersion)")
 	}
+	if cfg.namespace == "" {
+		return nil, errors.New("service namespace is required (use WithServiceNamespace)")
+	}
+	normalized, err := normalizeEnvironment(cfg.environment)
+	if err != nil {
+		return nil, err
+	}
+	cfg.environment = normalized
 
 	// 1. Build a shared Resource so TracerProvider, MeterProvider, and
 	//    LoggerProvider all carry identical service-identity attributes.
@@ -120,15 +134,14 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 
 	// 3. Initialize MeterProvider + Prometheus scrape endpoint. On failure,
 	//    shut down the already-initialized tracer to avoid leaking its
-	//    background batch processor.
-	mp, metricsServer, err := metrics.InitMeter(ctx, metrics.Config{
-		ServiceName:      cfg.serviceName,
-		ServiceVersion:   cfg.serviceVersion,
-		Environment:      cfg.environment,
-		Team:             cfg.team,
-		MetricsAddr:      cfg.metricsAddr,
-		RuntimeMetrics:   cfg.runtimeMetrics,
-		HistogramBuckets: cfg.histogramBuckets,
+	//    background batch processor. The shared Resource is passed so that
+	//    service identity attributes are identical across all three providers.
+	mp, metricsCloser, err := metrics.InitMeter(ctx, metrics.Config{
+		Resource:            res,
+		MetricsOTLPEndpoint: cfg.metricsOTLPEndpoint,
+		MetricsAddr:         cfg.metricsAddr,
+		RuntimeMetrics:      cfg.runtimeMetrics,
+		HistogramBuckets:    cfg.histogramBuckets,
 	})
 	if err != nil {
 		_ = tp.Shutdown(ctx)
@@ -139,7 +152,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	//    previously initialized providers in reverse order.
 	lp, err := o11ylog.InitLogger(ctx, cfg.otlpEndpoint, res)
 	if err != nil {
-		_ = metricsServer.Shutdown(ctx)
+		_ = metricsCloser(ctx)
 		_ = mp.Shutdown(ctx)
 		_ = tp.Shutdown(ctx)
 		return nil, err
@@ -192,7 +205,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		provider:      tp,
 		meterProvider: mp,
 		shutdowns: []func(context.Context) error{
-			metricsServer.Shutdown,
+			metricsCloser,
 			mp.Shutdown,
 			lp.Shutdown,
 			tp.Shutdown,
@@ -211,16 +224,13 @@ func buildResource(ctx context.Context, cfg *Config) (*resource.Resource, error)
 		resource.WithHost(),
 		resource.WithAttributes(semconv.ServiceNameKey.String(cfg.serviceName)),
 	}
-	if cfg.serviceVersion != "" {
-		opts = append(opts, resource.WithAttributes(
-			semconv.ServiceVersionKey.String(cfg.serviceVersion),
-		))
-	}
-	if cfg.environment != "" {
-		opts = append(opts, resource.WithAttributes(
-			semconv.DeploymentEnvironmentNameKey.String(cfg.environment),
-		))
-	}
+	opts = append(opts,
+		resource.WithAttributes(semconv.ServiceVersionKey.String(cfg.serviceVersion)),
+		resource.WithAttributes(semconv.DeploymentEnvironmentNameKey.String(cfg.environment)),
+	)
+	opts = append(opts, resource.WithAttributes(
+		semconv.ServiceNamespaceKey.String(cfg.namespace),
+	))
 	res, err := resource.New(ctx, opts...)
 	if err != nil && !errors.Is(err, resource.ErrPartialResource) {
 		return nil, fmt.Errorf("failed to create resource: %w", err)
@@ -246,4 +256,36 @@ func (h *leveledHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 
 func (h *leveledHandler) WithGroup(name string) slog.Handler {
 	return &leveledHandler{Handler: h.Handler.WithGroup(name), min: h.min}
+}
+
+// envAliases maps common shorthands to their canonical deployment.environment.name
+// values. The canonical set is: production, staging, development, testing.
+var envAliases = map[string]string{
+	"production":  "production",
+	"prod":        "production",
+	"staging":     "staging",
+	"stage":       "staging",
+	"stg":         "staging",
+	"development": "development",
+	"develop":     "development",
+	"dev":         "development",
+	"testing":     "testing",
+	"test":        "testing",
+}
+
+// normalizeEnvironment returns the canonical deployment environment name for
+// the given input, or an error if the value is not recognized. An empty input
+// is rejected so that unset environments cannot silently propagate to telemetry.
+func normalizeEnvironment(env string) (string, error) {
+	if env == "" {
+		return "", errors.New("deployment environment is required (use WithEnvironment); " +
+			"accepted values: production, staging, development, testing")
+	}
+	if canonical, ok := envAliases[env]; ok {
+		return canonical, nil
+	}
+	return "", fmt.Errorf(
+		"unknown deployment environment %q; accepted values: production, staging, development, testing",
+		env,
+	)
 }

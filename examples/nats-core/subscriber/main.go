@@ -27,7 +27,9 @@ func main() {
 	// 1. Initialise the o11y SDK.
 	obs, err := o11y.Init(ctx,
 		o11y.WithServiceName("nats-core-subscriber"),
+		o11y.WithServiceVersion("0.1.0"),
 		o11y.WithEnvironment("development"),
+		o11y.WithServiceNamespace("platform"),
 	)
 	if err != nil {
 		slog.Error("failed to initialise o11y SDK", slog.Any("error", err))

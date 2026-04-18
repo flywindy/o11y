@@ -23,10 +23,11 @@ type Config struct {
 	logLevel       slog.Level
 
 	// Metrics
-	metricsAddr      string
-	runtimeMetrics   bool
-	histogramBuckets []float64
-	team             string
+	metricsAddr         string
+	metricsOTLPEndpoint string // non-empty → OTLP push instead of Prometheus pull
+	runtimeMetrics      bool
+	histogramBuckets    []float64
+	namespace           string
 }
 
 // Option is a functional option for configuring the o11y SDK.
@@ -69,14 +70,28 @@ func WithLogLevel(level slog.Level) Option {
 	}
 }
 
-// WithTeam sets the owning team label applied to every metric emitted by
-// the SDK. It is required: Init returns an error when it is empty. The
-// value becomes a constant Prometheus label (team="...") on every series,
-// WithTeam returns an Option that sets the team field on a Config.
-// The team value is used by SRE for alert routing and governance.
-func WithTeam(team string) Option {
+// WithServiceNamespace sets the service.namespace resource attribute (OTel
+// semconv). It is required: Init returns an error when empty. The value
+// identifies the owning team or product unit and maps naturally to the
+// Kubernetes namespace when services are namespaced by product. It becomes a
+// constant Prometheus label (service_namespace="...") on every series and
+// appears on all three observability signals (traces, logs, metrics).
+func WithServiceNamespace(namespace string) Option {
 	return func(c *Config) {
-		c.team = team
+		c.namespace = namespace
+	}
+}
+
+// WithMetricsOTLPEndpoint switches the metrics exporter from Prometheus pull
+// to OTLP push. When set, the /metrics HTTP server is not started and metrics
+// are exported via OTLP/HTTP to the given endpoint. Use this for serverless
+// environments (Lambda, Cloud Run) where exposing a scrape port is not
+// possible. When unset, the default Prometheus pull model is used.
+//
+// Example: o11y.WithMetricsOTLPEndpoint("http://collector:4318")
+func WithMetricsOTLPEndpoint(endpoint string) Option {
+	return func(c *Config) {
+		c.metricsOTLPEndpoint = endpoint
 	}
 }
 

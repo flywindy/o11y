@@ -28,34 +28,82 @@ func doShutdown(t *testing.T, sdk *o11y.SDK) {
 	require.NoError(t, sdk.Shutdown(ctx))
 }
 
-// commonOpts returns a minimal set of options required for Init to succeed
-// under test: WithTeam (now required) and a randomly chosen metrics port so
-// concurrent tests never fight over :2112.
+// commonOpts returns the full set of required options for Init to succeed in
+// tests. It uses a randomly chosen metrics port so concurrent tests never
+// fight over :2112.
 func commonOpts(srvURL string) []o11y.Option {
 	return []o11y.Option{
 		o11y.WithServiceName("test-svc"),
-		o11y.WithTeam("test-team"),
+		o11y.WithServiceVersion("0.1.0"),
+		o11y.WithEnvironment("development"),
+		o11y.WithServiceNamespace("platform"),
 		o11y.WithMetricsAddr("127.0.0.1:0"),
 		o11y.WithOTLPEndpoint(srvURL),
 	}
 }
 
-// TestInit_MissingServiceName verifies that Init rejects an empty service name.
 func TestInit_MissingServiceName(t *testing.T) {
 	_, err := o11y.Init(context.Background())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "service name is required")
 }
 
-// TestInit_MissingTeam verifies that Init rejects an empty team.
-func TestInit_MissingTeam(t *testing.T) {
-	_, err := o11y.Init(context.Background(), o11y.WithServiceName("test-svc"))
+func TestInit_MissingServiceVersion(t *testing.T) {
+	_, err := o11y.Init(context.Background(),
+		o11y.WithServiceName("test-svc"),
+	)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "team is required")
+	assert.Contains(t, err.Error(), "service version is required")
 }
 
-// TestInit_Success verifies that Init succeeds with valid options and returns
-// a non-nil SDK with all fields populated.
+func TestInit_MissingNamespace(t *testing.T) {
+	_, err := o11y.Init(context.Background(),
+		o11y.WithServiceName("test-svc"),
+		o11y.WithServiceVersion("0.1.0"),
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "service namespace is required")
+}
+
+func TestInit_MissingEnvironment(t *testing.T) {
+	_, err := o11y.Init(context.Background(),
+		o11y.WithServiceName("test-svc"),
+		o11y.WithServiceVersion("0.1.0"),
+		o11y.WithServiceNamespace("platform"),
+		// WithEnvironment omitted — defaultConfig has no default env
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "deployment environment is required")
+}
+
+func TestInit_UnknownEnvironment(t *testing.T) {
+	_, err := o11y.Init(context.Background(),
+		o11y.WithServiceName("test-svc"),
+		o11y.WithServiceVersion("0.1.0"),
+		o11y.WithServiceNamespace("platform"),
+		o11y.WithEnvironment("uat"), // not in the allowed set
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown deployment environment")
+}
+
+// TestInit_EnvironmentAliases verifies that common shorthand values are
+// normalized to canonical names without error.
+func TestInit_EnvironmentAliases(t *testing.T) {
+	srv := fakeOTLPServer(t)
+	defer srv.Close()
+
+	aliases := []string{"prod", "stg", "stage", "dev", "test"}
+	for _, alias := range aliases {
+		t.Run(alias, func(t *testing.T) {
+			opts := append(commonOpts(srv.URL), o11y.WithEnvironment(alias))
+			sdk, err := o11y.Init(context.Background(), opts...)
+			require.NoError(t, err, "alias %q should be accepted", alias)
+			doShutdown(t, sdk)
+		})
+	}
+}
+
 func TestInit_Success(t *testing.T) {
 	srv := fakeOTLPServer(t)
 	defer srv.Close()
@@ -73,8 +121,6 @@ func TestInit_Success(t *testing.T) {
 	doShutdown(t, sdk)
 }
 
-// TestInit_HandlesNilOption verifies that providing a nil Option to Init
-// does not cause a panic.
 func TestInit_HandlesNilOption(t *testing.T) {
 	srv := fakeOTLPServer(t)
 	defer srv.Close()
@@ -86,48 +132,6 @@ func TestInit_HandlesNilOption(t *testing.T) {
 	doShutdown(t, sdk)
 }
 
-// TestInit_WithEnvironment verifies that a non-empty environment option is accepted.
-func TestInit_WithEnvironment(t *testing.T) {
-	srv := fakeOTLPServer(t)
-	defer srv.Close()
-
-	opts := append(commonOpts(srv.URL), o11y.WithEnvironment("staging"))
-	sdk, err := o11y.Init(context.Background(), opts...)
-	require.NoError(t, err)
-	require.NotNil(t, sdk)
-	doShutdown(t, sdk)
-}
-
-// TestInit_EmptyEnvironment verifies that an empty environment option does not
-// cause an error (the attribute is omitted from resource and log fields).
-func TestInit_EmptyEnvironment(t *testing.T) {
-	srv := fakeOTLPServer(t)
-	defer srv.Close()
-
-	opts := append(commonOpts(srv.URL), o11y.WithEnvironment(""))
-	sdk, err := o11y.Init(context.Background(), opts...)
-	require.NoError(t, err)
-	require.NotNil(t, sdk)
-	doShutdown(t, sdk)
-}
-
-// TestInit_WithServiceVersion verifies that WithServiceVersion is accepted and
-// does not cause any errors during initialisation.
-func TestInit_WithServiceVersion(t *testing.T) {
-	srv := fakeOTLPServer(t)
-	defer srv.Close()
-
-	opts := append(commonOpts(srv.URL),
-		o11y.WithServiceVersion("2.3.1"),
-		o11y.WithEnvironment("production"),
-	)
-	sdk, err := o11y.Init(context.Background(), opts...)
-	require.NoError(t, err)
-	require.NotNil(t, sdk)
-	doShutdown(t, sdk)
-}
-
-// TestSDK_TracerIsNamed verifies that Tracer() returns non-nil tracers for any name.
 func TestSDK_TracerIsNamed(t *testing.T) {
 	srv := fakeOTLPServer(t)
 	defer srv.Close()

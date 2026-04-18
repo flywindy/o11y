@@ -93,8 +93,9 @@ func main() {
 
     obs, err := o11y.Init(ctx,
         o11y.WithServiceName("my-service"),        // required
-        o11y.WithServiceVersion("1.0.0"),
-        o11y.WithEnvironment("production"),
+        o11y.WithServiceVersion("1.0.0"),          // required
+        o11y.WithEnvironment("production"),        // required; see canonical values below
+        o11y.WithServiceNamespace("platform"),     // required; maps to k8s namespace / team
         o11y.WithOTLPEndpoint("http://localhost:4318"),
         o11y.WithLogLevel(slog.LevelInfo),
     )
@@ -118,11 +119,15 @@ func main() {
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `WithServiceName(name)` | — (required) | OTel `service.name` resource attribute |
-| `WithServiceVersion(ver)` | `""` | OTel `service.version` resource attribute |
-| `WithEnvironment(env)` | `""` | OTel `deployment.environment` resource attribute |
-| `WithOTLPEndpoint(url)` | `http://localhost:4318` | OTLP/HTTP collector endpoint |
+| `WithServiceName(name)` | — **required** | OTel `service.name` resource attribute |
+| `WithServiceVersion(ver)` | — **required** | OTel `service.version`; used for canary/rollback tracking |
+| `WithEnvironment(env)` | — **required** | OTel `deployment.environment.name`; accepted: `production`, `staging`, `development`, `testing` (aliases like `prod`/`stg` are normalized) |
+| `WithServiceNamespace(ns)` | — **required** | OTel `service.namespace`; identifies the owning team/product, maps to k8s namespace |
+| `WithOTLPEndpoint(url)` | `http://localhost:4318` | OTLP/HTTP collector endpoint for traces and logs |
+| `WithMetricsOTLPEndpoint(url)` | `""` | Switch metrics to OTLP push (serverless); when unset, Prometheus pull on `:2112` is used |
+| `WithMetricsAddr(addr)` | `:2112` | Prometheus `/metrics` scrape address |
 | `WithLogLevel(level)` | `slog.LevelInfo` | Minimum log level |
+| `WithRuntimeMetrics(bool)` | `true` | Collect Go runtime metrics (goroutines, GC, memory) |
 
 ### Structured Logging with Trace Correlation
 

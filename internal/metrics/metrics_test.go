@@ -20,7 +20,7 @@ func baseConfig(addr string) metrics.Config {
 		ServiceName:      "test-svc",
 		ServiceVersion:   "0.0.1",
 		Environment:      "test",
-		Team:             "test-team",
+		Namespace:        "platform",
 		MetricsAddr:      addr,
 		RuntimeMetrics:   true,
 		HistogramBuckets: []float64{0.1, 1, 10},
@@ -47,14 +47,14 @@ func TestInitMeter_HappyPath(t *testing.T) {
 	addr := ln.Addr().String()
 	require.NoError(t, ln.Close())
 
-	mp, srv, err := metrics.InitMeter(context.Background(), baseConfig(addr))
+	mp, closer, err := metrics.InitMeter(context.Background(), baseConfig(addr))
 	require.NoError(t, err)
 	require.NotNil(t, mp)
-	require.NotNil(t, srv)
+	require.NotNil(t, closer)
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(ctx)
+		_ = closer(ctx)
 		_ = mp.Shutdown(ctx)
 	}()
 
@@ -62,7 +62,7 @@ func TestInitMeter_HappyPath(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	body := scrape(t, addr)
-	assert.Contains(t, body, `team="test-team"`, "team resource attribute must appear as a constant label")
+	assert.Contains(t, body, `service_namespace="platform"`, "service.namespace resource attribute must appear as a constant label")
 	assert.Contains(t, body, `service_name="test-svc"`, "service_name must appear as a constant label")
 	assert.True(t,
 		strings.Contains(body, "go_goroutine") ||
@@ -71,13 +71,13 @@ func TestInitMeter_HappyPath(t *testing.T) {
 	)
 }
 
-// TestInitMeter_RequiresTeam verifies the fail-fast guard on an empty team.
-func TestInitMeter_RequiresTeam(t *testing.T) {
+// TestInitMeter_RequiresNamespace verifies the fail-fast guard on an empty namespace.
+func TestInitMeter_RequiresNamespace(t *testing.T) {
 	cfg := baseConfig("127.0.0.1:0")
-	cfg.Team = ""
+	cfg.Namespace = ""
 	_, _, err := metrics.InitMeter(context.Background(), cfg)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "Team is required")
+	assert.Contains(t, err.Error(), "Namespace is required")
 }
 
 // TestInitMeter_BindFailure verifies that a port already in use surfaces
@@ -94,6 +94,27 @@ func TestInitMeter_BindFailure(t *testing.T) {
 	assert.Contains(t, err.Error(), "listen")
 }
 
+// TestInitMeter_OTLPPath verifies that when MetricsOTLPEndpoint is set, no
+// HTTP scrape server is started and the OTLP exporter is initialized.
+// We use a non-existent endpoint — the test only checks that Init succeeds
+// and the returned Closer does not panic.
+func TestInitMeter_OTLPPath(t *testing.T) {
+	mp, closer, err := metrics.InitMeter(context.Background(), metrics.Config{
+		ServiceName:         "test-svc",
+		Namespace:           "platform",
+		MetricsOTLPEndpoint: "http://127.0.0.1:19999", // nothing listening — that's OK for init
+		RuntimeMetrics:      false,
+		HistogramBuckets:    []float64{1},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, mp)
+	require.NotNil(t, closer)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = closer(ctx)
+	_ = mp.Shutdown(ctx)
+}
+
 // TestInitMeter_RuntimeMetricsOff verifies that runtime metrics can be
 // disabled via configuration.
 func TestInitMeter_RuntimeMetricsOff(t *testing.T) {
@@ -105,12 +126,12 @@ func TestInitMeter_RuntimeMetricsOff(t *testing.T) {
 	cfg := baseConfig(addr)
 	cfg.RuntimeMetrics = false
 
-	mp, srv, err := metrics.InitMeter(context.Background(), cfg)
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
 	require.NoError(t, err)
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(ctx)
+		_ = closer(ctx)
 		_ = mp.Shutdown(ctx)
 	}()
 

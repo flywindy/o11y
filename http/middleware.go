@@ -1,7 +1,7 @@
-// Package httpmw provides a net/http middleware that records Golden Signal
-// metrics (latency, traffic, errors) for every request handled by the
-// wrapped handler. It deliberately does not depend on any HTTP framework
-// so it can wrap any stdlib-compatible handler.
+// Package http provides instrumentation for net/http servers and clients.
+// The middleware records Golden Signal metrics (latency, traffic, errors) for
+// every request handled by the wrapped handler and does not depend on any
+// HTTP framework — it wraps any stdlib-compatible handler.
 //
 // The middleware emits a single histogram, http.server.request.duration,
 // which the Prometheus exporter renders as http_server_request_duration_seconds.
@@ -18,11 +18,10 @@
 //     maxUniquePaths to the literal label "other". This protects Prometheus
 //     from unbounded cardinality explosion even if the caller forgets
 //     step (1).
-package httpmw
+package http
 
 import (
 	"net/http"
-	"strconv"
 	"sync"
 	"time"
 
@@ -121,7 +120,7 @@ func New(meter metric.Meter, opts ...Option) func(http.Handler) http.Handler {
 			hist.Record(r.Context(), elapsed, metric.WithAttributes(
 				attribute.String("http.request.method", r.Method),
 				attribute.String("http.route", route),
-				attribute.String("http.response.status_code", strconv.Itoa(rec.status)),
+				attribute.Int("http.response.status_code", rec.status),
 			))
 		})
 	}

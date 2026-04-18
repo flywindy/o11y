@@ -1,4 +1,4 @@
-package httpmw_test
+package http_test
 
 import (
 	"context"
@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/flywindy/o11y/httpmw"
+	o11yhttp "github.com/flywindy/o11y/http"
 	"github.com/flywindy/o11y/internal/metrics"
 )
 
@@ -35,9 +35,9 @@ func TestMiddleware_Records(t *testing.T) {
 	addr := ln.Addr().String()
 	require.NoError(t, ln.Close())
 
-	provider, srv, err := metrics.InitMeter(context.Background(), metrics.Config{
+	provider, closer, err := metrics.InitMeter(context.Background(), metrics.Config{
 		ServiceName:      "test-svc",
-		Team:             "test-team",
+		Namespace:        "platform",
 		MetricsAddr:      addr,
 		RuntimeMetrics:   false,
 		HistogramBuckets: []float64{0.001, 0.01, 0.1, 1},
@@ -46,11 +46,11 @@ func TestMiddleware_Records(t *testing.T) {
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(ctx)
+		_ = closer(ctx)
 		_ = provider.Shutdown(ctx)
 	})
 
-	mw := httpmw.New(provider.Meter("httpmw_test"))
+	mw := o11yhttp.New(provider.Meter("httpmw_test"))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ok", func(w http.ResponseWriter, r *http.Request) {
@@ -83,7 +83,7 @@ func TestMiddleware_Records(t *testing.T) {
 	assert.Contains(t, body, `http_request_method="GET"`)
 	assert.Contains(t, body, `http_route="/ok"`)
 	assert.Contains(t, body, `http_route="/implicit"`)
-	assert.Contains(t, body, `team="test-team"`, "team constant label must propagate to every series")
+	assert.Contains(t, body, `service_namespace="platform"`, "service.namespace constant label must propagate to every series")
 	// _count is our traffic counter surrogate.
 	assert.Contains(t, body, "http_server_request_duration_seconds_count")
 }
@@ -96,9 +96,9 @@ func TestMiddleware_CardinalityCap(t *testing.T) {
 	addr := ln.Addr().String()
 	require.NoError(t, ln.Close())
 
-	provider, srv, err := metrics.InitMeter(context.Background(), metrics.Config{
+	provider, closer, err := metrics.InitMeter(context.Background(), metrics.Config{
 		ServiceName:      "test-svc",
-		Team:             "test-team",
+		Namespace:        "platform",
 		MetricsAddr:      addr,
 		RuntimeMetrics:   false,
 		HistogramBuckets: []float64{1},
@@ -107,13 +107,13 @@ func TestMiddleware_CardinalityCap(t *testing.T) {
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(ctx)
+		_ = closer(ctx)
 		_ = provider.Shutdown(ctx)
 	})
 
-	mw := httpmw.New(
+	mw := o11yhttp.New(
 		provider.Meter("cardinality_test"),
-		httpmw.WithMaxUniquePaths(3),
+		o11yhttp.WithMaxUniquePaths(3),
 	)
 	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -162,9 +162,9 @@ func TestMiddleware_CustomNormalizer(t *testing.T) {
 	addr := ln.Addr().String()
 	require.NoError(t, ln.Close())
 
-	provider, srv, err := metrics.InitMeter(context.Background(), metrics.Config{
+	provider, closer, err := metrics.InitMeter(context.Background(), metrics.Config{
 		ServiceName:      "test-svc",
-		Team:             "test-team",
+		Namespace:        "platform",
 		MetricsAddr:      addr,
 		RuntimeMetrics:   false,
 		HistogramBuckets: []float64{1},
@@ -173,13 +173,13 @@ func TestMiddleware_CustomNormalizer(t *testing.T) {
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(ctx)
+		_ = closer(ctx)
 		_ = provider.Shutdown(ctx)
 	})
 
-	mw := httpmw.New(
+	mw := o11yhttp.New(
 		provider.Meter("normalizer_test"),
-		httpmw.WithPathNormalizer(func(r *http.Request) string {
+		o11yhttp.WithPathNormalizer(func(r *http.Request) string {
 			if strings.HasPrefix(r.URL.Path, "/users/") {
 				return "/users/:id"
 			}

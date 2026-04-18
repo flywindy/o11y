@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/flywindy/o11y"
-	"github.com/flywindy/o11y/httpmw"
+	o11yhttp "github.com/flywindy/o11y/http"
 )
 
 // main initializes the observability SDK with service metadata and team labels, creates a root span and a nested child span to demonstrate tracing, and starts an HTTP server whose handlers are wrapped with httpmw to emit Prometheus metrics.
@@ -20,7 +20,7 @@ func main() {
 		o11y.WithServiceName("basic-example"),
 		o11y.WithServiceVersion("0.1.0"),
 		o11y.WithEnvironment("development"),
-		o11y.WithTeam("platform"),
+		o11y.WithServiceNamespace("platform"),
 		o11y.WithOTLPEndpoint("http://localhost:4318"),
 		o11y.WithLogLevel(slog.LevelInfo),
 	)
@@ -55,14 +55,14 @@ func main() {
 	obs.Logger.InfoContext(ctx, "example completed")
 
 	// 5. Demonstrate the HTTP middleware. Any handler wrapped with
-	//    httpmw.New will emit http_server_request_duration_seconds on
+	//    o11yhttp.New will emit http_server_request_duration_seconds on
 	//    the Prometheus scrape endpoint (default :2112/metrics) with a
 	//    team="platform" label pre-populated by the SDK.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("hello\n"))
 	})
-	wrapped := httpmw.New(obs.Meter("example"))(mux)
+	wrapped := o11yhttp.New(obs.Meter("example"))(mux)
 
 	obs.Logger.Info("serving demo handler on :8080 — curl http://localhost:2112/metrics to scrape")
 	srv := &http.Server{
