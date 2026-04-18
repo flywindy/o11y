@@ -39,6 +39,10 @@ data:
           enabled: true
           num_consumers: 10
           queue_size: 5000
+      prometheusremotewrite:
+        endpoint: "http://prometheus.infra.svc.cluster.local:9090/api/v1/write"
+        tls:
+          insecure: true
       debug:
         verbosity: basic
 
@@ -55,6 +59,11 @@ data:
           receivers: [otlp]
           processors: [batch]
           exporters: [loki]
+        # Metrics flow: App ──OTLP/HTTP──► OTel Collector ──prometheusremotewrite──► Prometheus
+        metrics:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [prometheusremotewrite]
 ---
 apiVersion: apps/v1
 kind: Deployment

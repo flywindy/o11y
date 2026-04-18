@@ -19,16 +19,18 @@ so that every log entry is automatically enriched with `traceId` and `spanId`.
 
 | Layer | Choice | Notes |
 |---|---|---|
-| Language | Go 1.23+ | Use standard library where possible |
+| Language | Go 1.25+ | Use standard library where possible |
 | Tracing | OpenTelemetry Go SDK (OTLP/HTTP) | Not gRPC — keep it simple for local dev |
 | Logging | `log/slog` + `otelslog` bridge | Dual output: OTLP/HTTP → Loki (full OTel Log Data Model) and JSON stdout; `OtelSlogHandler` injects traceId / spanId on stdout path |
+| Metrics | Prometheus pull (`:2112`) or OTLP push | Pull: k8s pods scraped by Prometheus; Push: `WithMetricsOTLPEndpoint` for local dev / serverless |
 | Messaging | NATS | High-performance pub/sub |
 | Database | MongoDB | NoSQL persistence |
 | Tracing backend | Grafana Tempo | |
 | Log backend | Grafana Loki | |
-| Visualization | Grafana | Unified traces + logs dashboard |
-| Collector | OTel Collector | Centralized telemetry pipeline |
-| Local cluster | kind (Kubernetes in Docker) | Port 4318 mapped for OTLP/HTTP |
+| Metrics backend | Prometheus | Scrapes k8s pods on `:2112`; also accepts remote write from OTel Collector |
+| Visualization | Grafana | Unified traces, logs, and metrics; exemplars link histograms → Tempo traces |
+| Collector | OTel Collector | Centralized telemetry pipeline for traces, logs, and OTLP metrics |
+| Local cluster | kind (Kubernetes in Docker) | Port 4318 mapped for OTLP/HTTP (traces, logs, and metrics push) |
 
 ---
 
@@ -82,15 +84,10 @@ go test -race ./...          # Always run with race detector
 # Start local kind cluster
 kind create cluster --config kind-config.yaml
 
-# Deploy observability stack (order matters — namespace must come first)
-kubectl apply -f k8s/infrastructure/namespace.yaml
-kubectl apply -f k8s/infrastructure/nats.yaml
-kubectl apply -f k8s/infrastructure/mongodb.yaml
-kubectl apply -f k8s/infrastructure/tempo.yaml
-kubectl apply -f k8s/infrastructure/loki.yaml
-kubectl apply -f k8s/infrastructure/alloy.yaml
-kubectl apply -f k8s/infrastructure/otel-collector.yaml
-kubectl apply -f k8s/infrastructure/grafana.yaml
+# Deploy observability stack via Kustomize (handles ordering and dependencies)
+kubectl apply -k k8s/infrastructure/base
+# OR: private registry deployment (update internal-registry.example.com first)
+kubectl apply -k k8s/infrastructure/overlays/private-registry
 
 # Verify all pods are Running
 kubectl get pods -n infra
@@ -107,8 +104,14 @@ go run examples/nats-core/publisher/main.go
 go run examples/jetstream/publisher/main.go   # creates the stream and publishes
 go run examples/jetstream/subscriber/main.go  # attaches durable consumer and processes
 
+# Run the metrics example (pushes via OTLP → OTel Collector → Prometheus; cluster must be up)
+go run examples/metrics/main.go
+
 # Port-forward Grafana (default credentials: admin/admin)
 kubectl port-forward -n infra svc/grafana 3000:3000
+
+# Port-forward Prometheus
+kubectl port-forward -n infra svc/prometheus 9090:9090
 ```
 
 ---
@@ -155,6 +158,7 @@ Full ADR documents live in [`docs/adr/`](docs/adr/).
 | Local infra | kind | Reproducible Kubernetes without cloud cost |
 | NATS instrumentation | `instrumentation-go/otel-nats` | Company-internal library; covers NATS Core + all JetStream consumer patterns with OTel semconv v1.27.0 |
 | Log format strategy | Option B — align stdout `traceId`/`spanId` field names | Preserves existing log reading habits; minimal blast radius. See [ADR 0001](docs/adr/0001-log-format-strategy.md) |
+| Metrics strategy | Prometheus pull (default `:2112`) + OTLP push opt-in (`WithMetricsOTLPEndpoint`) | Prometheus pull requires zero Collector config; OTLP push covers serverless. Exemplars enabled by default (OTel SDK `SampledFilter`). See [ADR 0002](docs/adr/0002-metrics-strategy.md) |
 
 ---
 

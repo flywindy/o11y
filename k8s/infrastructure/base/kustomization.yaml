@@ -9,4 +9,5 @@ resources:
   - loki.yaml
   - alloy.yaml
   - otel-collector.yaml
+  - prometheus.yaml
   - grafana.yaml
