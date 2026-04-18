@@ -31,9 +31,11 @@ data:
       jsonData:
         derivedFields:
           - datasourceUid: tempo
-            # Matches JSON-structured log lines produced by the o11y SDK, e.g.:
-            # {"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736", ...}
-            matcherRegex: '"trace_id"\s*:\s*"([0-9a-f]{32})"'
+            # Matches the traceid field injected by the OTel Collector Loki exporter.
+            # The exporter flattens the OTel log record's TraceID into the log line
+            # as "traceid" (lowercase, no separator), e.g.:
+            # {"traceid":"4bf92f3577b34da6a3ce929d0e0e4736", ...}
+            matcherRegex: '"traceid"\s*:\s*"([0-9a-f]{32})"'
             name: TraceID
             url: "$${__value.raw}"
             internal: true
