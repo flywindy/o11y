@@ -4,6 +4,8 @@ A lightweight Go SDK for standardized observability, integrating OpenTelemetry (
 
 ## Architecture & Tech Stack
 
+> Architecture Decision Records (ADRs) explaining key design choices are in [`docs/adr/`](docs/adr/).
+
 This project provides a "Context-First" observability layer for Go applications, ensuring that every log entry is automatically enriched with `trace_id` and `span_id`.
 
 - **Language**: Go 1.25+

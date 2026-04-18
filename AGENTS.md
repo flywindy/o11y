@@ -121,6 +121,8 @@ kubectl port-forward -n infra svc/grafana 3000:3000
 
 ## Architecture Decisions (ADR Summary)
 
+Full ADR documents live in [`docs/adr/`](docs/adr/).
+
 | Decision | Choice | Reason |
 |---|---|---|
 | Transport | OTLP/HTTP (not gRPC) | Simpler firewall / proxy rules for local dev |
@@ -129,6 +131,7 @@ kubectl port-forward -n infra svc/grafana 3000:3000
 | Log backend | Loki | OSS, integrates with Grafana and Tempo for trace-to-log correlation |
 | Local infra | kind | Reproducible Kubernetes without cloud cost |
 | NATS instrumentation | `instrumentation-go/otel-nats` | Company-internal library; covers NATS Core + all JetStream consumer patterns with OTel semconv v1.27.0 |
+| Log format strategy | Option B — align stdout `traceId`/`spanId` field names | Preserves existing log reading habits; minimal blast radius. See [ADR 0001](docs/adr/0001-log-format-strategy.md) |
 
 ---
 
