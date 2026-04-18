@@ -42,7 +42,7 @@ func spanContext(traceHex, spanHex string) trace.SpanContext {
 	})
 }
 
-// TestHandle_InjectsTraceIDs verifies that trace_id and span_id appear in the
+// TestHandle_InjectsTraceIDs verifies that traceId and spanId appear in the
 // JSON output when a valid span is present in the context.
 func TestHandle_InjectsTraceIDs(t *testing.T) {
 	var buf bytes.Buffer
@@ -55,11 +55,11 @@ func TestHandle_InjectsTraceIDs(t *testing.T) {
 
 	var record map[string]any
 	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
-	assert.Equal(t, sc.TraceID().String(), record["trace_id"], "trace_id must match")
-	assert.Equal(t, sc.SpanID().String(), record["span_id"], "span_id must match")
+	assert.Equal(t, sc.TraceID().String(), record["traceId"], "traceId must match")
+	assert.Equal(t, sc.SpanID().String(), record["spanId"], "spanId must match")
 }
 
-// TestHandle_NoSpan verifies that trace_id and span_id are absent when there
+// TestHandle_NoSpan verifies that traceId and spanId are absent when there
 // is no active span in the context.
 func TestHandle_NoSpan(t *testing.T) {
 	var buf bytes.Buffer
@@ -69,10 +69,10 @@ func TestHandle_NoSpan(t *testing.T) {
 
 	var record map[string]any
 	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
-	_, hasTraceID := record["trace_id"]
-	_, hasSpanID := record["span_id"]
-	assert.False(t, hasTraceID, "trace_id must be absent without a span")
-	assert.False(t, hasSpanID, "span_id must be absent without a span")
+	_, hasTraceID := record["traceId"]
+	_, hasSpanID := record["spanId"]
+	assert.False(t, hasTraceID, "traceId must be absent without a span")
+	assert.False(t, hasSpanID, "spanId must be absent without a span")
 }
 
 // TestWithAttrs verifies that WithAttrs wraps the inner handler and returns

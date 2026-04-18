@@ -8,7 +8,7 @@ import (
 )
 
 // OtelSlogHandler is a custom slog.Handler that wraps another handler and
-// injects trace_id and span_id into log records when a valid trace is present in the context.
+// injects traceId and spanId into log records when a valid trace is present in the context.
 type OtelSlogHandler struct {
 	slog.Handler
 }
@@ -23,8 +23,8 @@ func (h *OtelSlogHandler) Handle(ctx context.Context, r slog.Record) error {
 	span := trace.SpanFromContext(ctx)
 	if span.SpanContext().IsValid() {
 		r.AddAttrs(
-			slog.String("trace_id", span.SpanContext().TraceID().String()),
-			slog.String("span_id", span.SpanContext().SpanID().String()),
+			slog.String("traceId", span.SpanContext().TraceID().String()),
+			slog.String("spanId", span.SpanContext().SpanID().String()),
 		)
 	}
 	return h.Handler.Handle(ctx, r)
