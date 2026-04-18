@@ -9,7 +9,7 @@
 
 A lightweight Go SDK providing standardized observability for Go services.
 It integrates OpenTelemetry (OTel) tracing with structured logging (`slog`)
-so that every log entry is automatically enriched with `trace_id` and `span_id`.
+so that every log entry is automatically enriched with `traceId` and `spanId`.
 
 **Module path**: `github.com/flywindy/o11y`
 
@@ -21,7 +21,7 @@ so that every log entry is automatically enriched with `trace_id` and `span_id`.
 |---|---|---|
 | Language | Go 1.23+ | Use standard library where possible |
 | Tracing | OpenTelemetry Go SDK (OTLP/HTTP) | Not gRPC — keep it simple for local dev |
-| Logging | `log/slog` + `otelslog` bridge | Dual output: OTLP/HTTP → Loki (full OTel Log Data Model) and JSON stdout; `OtelSlogHandler` injects trace_id / span_id on stdout path |
+| Logging | `log/slog` + `otelslog` bridge | Dual output: OTLP/HTTP → Loki (full OTel Log Data Model) and JSON stdout; `OtelSlogHandler` injects traceId / spanId on stdout path |
 | Messaging | NATS | High-performance pub/sub |
 | Database | MongoDB | NoSQL persistence |
 | Tracing backend | Grafana Tempo | |
@@ -36,7 +36,7 @@ so that every log entry is automatically enriched with `trace_id` and `span_id`.
 
 1. **Context-First**: Every function must accept and propagate `context.Context`. Trace information flows through context only.
 2. **Zero Global State**: Encapsulate OTel providers in structs. No package-level `init()` with side effects. No global logger variables.
-3. **Correlation**: `slog` output must always include `trace_id` and `span_id` as JSON fields when a span is active.
+3. **Correlation**: `slog` output must always include `traceId` and `spanId` as JSON fields when a span is active.
 4. **Performance**: Middleware and handlers must be non-blocking. Minimize allocations in the hot path.
 5. **Errors**: Use `slog.ErrorContext(ctx, ...)` with structured attributes. Never use `panic` for recoverable errors.
 

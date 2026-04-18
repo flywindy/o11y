@@ -6,7 +6,7 @@ A lightweight Go SDK for standardized observability, integrating OpenTelemetry (
 
 > Architecture Decision Records (ADRs) explaining key design choices are in [`docs/adr/`](docs/adr/).
 
-This project provides a "Context-First" observability layer for Go applications, ensuring that every log entry is automatically enriched with `trace_id` and `span_id`.
+This project provides a "Context-First" observability layer for Go applications, ensuring that every log entry is automatically enriched with `traceId` and `spanId`.
 
 - **Language**: Go 1.25+
 - **Tracing**: OpenTelemetry Go SDK (OTLP/HTTP)
@@ -29,7 +29,7 @@ Logs:   App ──OTLP/HTTP──► OTel Collector ──► Loki   (primary: f
 ```
 
 Both log paths are active simultaneously. When running `go run` locally (outside the cluster),
-only the OTLP path reaches Loki — Alloy only scrapes pods running inside kind.
+only the OTLP path reaches Loki; Alloy scrapes pods exclusively inside kind.
 
 ## Prerequisites
 
@@ -128,8 +128,8 @@ func main() {
 
 Use `obs.Logger` instead of the global `slog` package. Every log record is written to two destinations automatically:
 
-- **OTLP → Loki**: Full OTel Log Data Model. `service.name` and `deployment.environment` live in the OTel Resource (not per-record attributes). `trace_id`, `span_id`, and `trace_flags` are extracted from the context by the `otelslog` bridge.
-- **stdout (JSON)**: Human-readable output for local development. Includes `service.name`, `environment`, `trace_id`, and `span_id` as flat JSON fields.
+- **OTLP → Loki**: Full OTel Log Data Model. `service.name` and `deployment.environment` live in the OTel Resource (not per-record attributes). `traceId`, `spanId`, and `trace_flags` are extracted from the context by the `otelslog` bridge.
+- **stdout (JSON)**: Human-readable output for local development. Includes `service.name`, `environment`, `traceId`, and `spanId` as flat JSON fields.
 
 ```go
 // Without a span — no trace fields in either destination
@@ -140,7 +140,7 @@ ctx, span := obs.Tracer("my-tracer").Start(ctx, "my-operation")
 defer span.End()
 
 obs.Logger.InfoContext(ctx, "processing request", slog.String("user_id", "42"))
-// stdout: {"time":"...","level":"INFO","msg":"processing request","service.name":"my-service","trace_id":"4bf92f...","span_id":"00f067...","user_id":"42"}
+// stdout: {"time":"...","level":"INFO","msg":"processing request","service.name":"my-service","traceId":"4bf92f...","spanId":"00f067...","user_id":"42"}
 // Loki:   OTel Log Record — Body="processing request", TraceId=4bf92f..., SpanId=00f067..., Attributes={user_id: "42"}, Resource={service.name: "my-service", ...}
 ```
 
@@ -189,7 +189,7 @@ conn.Publish(ctx, "orders.created", payload)
 conn.Subscribe("orders.created", func(ctx context.Context, msg *nats.Msg) {
     ctx, span := obs.Tracer("consumer").Start(ctx, "process-order")
     defer span.End()
-    obs.Logger.InfoContext(ctx, "order received") // trace_id and span_id injected automatically
+    obs.Logger.InfoContext(ctx, "order received") // traceId and spanId injected automatically
 })
 ```
 
@@ -259,13 +259,13 @@ go run examples/jetstream/publisher/main.go
 go run examples/jetstream/subscriber/main.go
 ```
 
-Open Grafana at `http://localhost:3000` and navigate to **Explore → Tempo** to see producer and consumer spans linked across services. Navigate to **Explore → Loki** to see structured log entries with correlated `trace_id` and `span_id` fields.
+Open Grafana at `http://localhost:3000` and navigate to **Explore → Tempo** to see producer and consumer spans linked across services. Navigate to **Explore → Loki** to see structured log entries with correlated `traceId` and `spanId` fields.
 
 ## Core Principles
 
 1. **Context-First**: Always propagate `context.Context` — trace information flows through context only.
 2. **Zero Global State**: No `init()` side effects, no global logger or tracer provider variables.
-3. **Correlation**: Every log record includes `trace_id` and `span_id` when a span is active — as JSON fields on stdout and as OTel Log Data Model fields in Loki.
+3. **Correlation**: Every log record includes `traceId` and `spanId` when a span is active — as JSON fields on stdout and as OTel Log Data Model fields in Loki.
 4. **Performance**: Non-blocking middleware and minimal allocations in the hot path.
 5. **Errors**: Use `slog.ErrorContext(ctx, ...)` with structured attributes; never `panic` for recoverable errors.
 

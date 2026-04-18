@@ -145,6 +145,23 @@ func newRecord(level slog.Level, msg string) slog.Record {
 	return slog.NewRecord(time.Time{}, level, msg, 0)
 }
 
+// TestMultiHandler_NilHandlersIgnored verifies that NewMultiHandler silently
+// drops nil entries and does not panic on Enabled or Handle calls.
+func TestMultiHandler_NilHandlersIgnored(t *testing.T) {
+	h := &stubHandler{minLevel: slog.LevelDebug}
+	mh := o11ylog.NewMultiHandler(nil, h)
+
+	assert.NotPanics(t, func() {
+		mh.Enabled(context.Background(), slog.LevelInfo)
+	}, "Enabled must not panic with a nil handler in the list")
+
+	assert.NotPanics(t, func() {
+		_ = mh.Handle(context.Background(), newRecord(slog.LevelInfo, "nil-test"))
+	}, "Handle must not panic with a nil handler in the list")
+
+	assert.Equal(t, 1, h.calls, "non-nil handler must still receive the record")
+}
+
 // TestMultiHandler_Enabled_TrueIfAnyEnabled verifies that Enabled returns true
 // when at least one underlying handler is enabled for the given level.
 func TestMultiHandler_Enabled_TrueIfAnyEnabled(t *testing.T) {

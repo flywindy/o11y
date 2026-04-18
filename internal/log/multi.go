@@ -12,12 +12,17 @@ type MultiHandler struct {
 }
 
 // NewMultiHandler returns a slog.Handler that forwards records to all provided
-// handlers. Enabled returns true if at least one handler is enabled for the
-// given level. Handle delivers records only to handlers that report themselves
-// as enabled, collecting and joining any errors.
+// handlers. Nil entries in handlers are silently dropped, so callers do not
+// need to guard against optional handlers. Enabled returns true if at least
+// one handler is enabled for the given level. Handle delivers records only to
+// handlers that report themselves as enabled, collecting and joining any errors.
 func NewMultiHandler(handlers ...slog.Handler) slog.Handler {
-	h := make([]slog.Handler, len(handlers))
-	copy(h, handlers)
+	var h []slog.Handler
+	for _, handler := range handlers {
+		if handler != nil {
+			h = append(h, handler)
+		}
+	}
 	return &MultiHandler{handlers: h}
 }
 

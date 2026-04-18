@@ -22,11 +22,11 @@ import (
 // e.g. slog.SetDefault(obs.Logger) or otel.SetTracerProvider(obs.TracerProvider()).
 type SDK struct {
 	// Logger writes structured log records to two destinations:
-	//   • stdout       – JSON with service.name, trace_id, and span_id fields
-	//                    (for local development and container log collection via Alloy)
+	//   • stdout       – JSON with service.name, traceId, and spanId fields
+	//                    (for local development and container log collection via Fluentd)
 	//   • OTel Collector – OTLP/HTTP → Loki (full OTel Log Data Model; service
 	//                    identity comes from the shared Resource, not per-record attrs)
-	// When a span is active in the context, trace_id and span_id are included
+	// When a span is active in the context, traceId and spanId are included
 	// automatically in both destinations.
 	Logger *slog.Logger
 
