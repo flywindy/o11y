@@ -59,7 +59,7 @@ func Connect(ctx context.Context, url string, tp trace.TracerProvider, prop prop
 // The handler's ctx carries a consumer span created by the otelnats layer. That
 // consumer span holds a span link to the publisher's trace, enabling correlation
 // across services in Grafana Tempo. Calls to slog.InfoContext(ctx, ...) will
-// include the consumer's trace_id and span_id; calls to tracer.Start(ctx, ...)
+// include the consumer's traceId and spanId; calls to tracer.Start(ctx, ...)
 // produce child spans of the consumer span.
 func (c *Conn) Subscribe(subject string, handler MsgHandler) (*natsgo.Subscription, error) {
 	if handler == nil {
