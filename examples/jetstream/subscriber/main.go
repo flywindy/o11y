@@ -92,7 +92,7 @@ func main() {
 	// 6. Consume messages. oteljetstream extracts the publisher's trace context
 	//    from each message's headers and links it to a new consumer span.
 	//    m.Context() carries that span context so slog calls will include the
-	//    correct trace_id and span_id.
+	//    correct traceId and spanId.
 	cc, err := consumer.Consume(func(m oteljetstream.Msg) {
 		msgCtx, span := tracer.Start(m.Context(), "process-event")
 		defer span.End()

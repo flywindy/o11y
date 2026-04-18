@@ -59,7 +59,7 @@ func main() {
 	//    created by the otelnats layer. That consumer span holds a span link to
 	//    the publisher's trace, enabling cross-service correlation in Tempo.
 	//    Any span started from ctx is a child of the consumer span, and any
-	//    slog call with ctx will include the correct trace_id and span_id.
+	//    slog call with ctx will include the correct traceId and spanId.
 	_, err = conn.Subscribe(subject, func(msgCtx context.Context, msg *nats.Msg) {
 		msgCtx, span := tracer.Start(msgCtx, "process-event")
 		defer span.End()
