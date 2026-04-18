@@ -13,7 +13,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.27.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
@@ -160,7 +160,7 @@ func buildResource(ctx context.Context, cfg *Config) (*resource.Resource, error)
 	}
 	if cfg.environment != "" {
 		opts = append(opts, resource.WithAttributes(
-			semconv.DeploymentEnvironmentKey.String(cfg.environment),
+			semconv.DeploymentEnvironmentNameKey.String(cfg.environment),
 		))
 	}
 	res, err := resource.New(ctx, opts...)
