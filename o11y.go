@@ -107,21 +107,28 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	//       Converts slog records to OTel Log Data Model records and exports them
 	//       via OTLP/HTTP to the OTel Collector → Loki. service.name and
 	//       deployment.environment come from the shared Resource, not as
-	//       per-record attributes. trace_id and span_id are extracted from the
+	//       per-record attributes. traceId and spanId are extracted from the
 	//       context automatically by the bridge.
 	//
 	//    b) Stdout handler:
 	//       Writes JSON to stdout for local development and container log scraping
-	//       by Alloy. service.name and environment are added as JSON fields here
+	//       by Fluentd. service.name and environment are added as JSON fields here
 	//       (they are NOT on the OTLP path to avoid duplicating Resource attrs).
-	//       OtelSlogHandler wraps this to inject trace_id and span_id.
+	//       OtelSlogHandler wraps this to inject traceId and spanId.
 	otelOpts := []otelslog.Option{
 		otelslog.WithLoggerProvider(lp),
+		otelslog.WithSchemaURL(semconv.SchemaURL),
 	}
 	if cfg.serviceVersion != "" {
 		otelOpts = append(otelOpts, otelslog.WithVersion(cfg.serviceVersion))
 	}
-	otelHandler := otelslog.NewHandler("github.com/flywindy/o11y", otelOpts...)
+	// Wrap the OTLP handler with a minimum-level gate so that both outputs
+	// honour the same logLevel. Without this, the otelslog bridge would emit
+	// records at all levels regardless of the configured threshold.
+	otelHandler := &leveledHandler{
+		Handler: otelslog.NewHandler("github.com/flywindy/o11y", otelOpts...),
+		min:     cfg.logLevel,
+	}
 
 	stdoutAttrs := []slog.Attr{slog.String("service.name", cfg.serviceName)}
 	if cfg.environment != "" {
@@ -138,7 +145,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		Logger:     logger,
 		Propagator: prop,
 		provider:   tp,
-		shutdowns:  []func(context.Context) error{tp.Shutdown, lp.Shutdown},
+		shutdowns:  []func(context.Context) error{lp.Shutdown, tp.Shutdown},
 	}, nil
 }
 
@@ -168,4 +175,24 @@ func buildResource(ctx context.Context, cfg *Config) (*resource.Resource, error)
 		return nil, fmt.Errorf("failed to create resource: %w", err)
 	}
 	return res, nil
+}
+
+// leveledHandler wraps a slog.Handler and gates Enabled on a minimum level.
+// This ensures the OTLP bridge honours the same log level configured for stdout,
+// since the otelslog bridge does not apply level filtering by default.
+type leveledHandler struct {
+	slog.Handler
+	min slog.Level
+}
+
+func (h *leveledHandler) Enabled(_ context.Context, l slog.Level) bool {
+	return l >= h.min
+}
+
+func (h *leveledHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &leveledHandler{Handler: h.Handler.WithAttrs(attrs), min: h.min}
+}
+
+func (h *leveledHandler) WithGroup(name string) slog.Handler {
+	return &leveledHandler{Handler: h.Handler.WithGroup(name), min: h.min}
 }

@@ -56,10 +56,9 @@ func logEndpointURL(endpoint string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if u.Path == "" || u.Path == "/" {
+	u.Path = strings.TrimRight(u.Path, "/")
+	if u.Path == "" {
 		u.Path = "/v1/logs"
-	} else {
-		u.Path = strings.TrimRight(u.Path, "/")
 	}
 	return u.String(), nil
 }
