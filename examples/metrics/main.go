@@ -79,7 +79,7 @@ func main() {
 		_, _ = fmt.Fprintln(w, "error")
 	})
 
-	handler := o11yhttp.New(obs.Meter("metrics-example"),
+	handler := o11yhttp.New(ctx, obs.Meter("metrics-example"),
 		o11yhttp.WithPathNormalizer(func(r *http.Request) string {
 			return r.URL.Path // paths are already static templates in this example
 		}),

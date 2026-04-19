@@ -50,7 +50,7 @@ func TestMiddleware_Records(t *testing.T) {
 		_ = provider.Shutdown(ctx)
 	})
 
-	mw := o11yhttp.New(provider.Meter("httpmw_test"))
+	mw := o11yhttp.New(context.Background(), provider.Meter("httpmw_test"))
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ok", func(w http.ResponseWriter, r *http.Request) {
@@ -112,6 +112,7 @@ func TestMiddleware_CardinalityCap(t *testing.T) {
 	})
 
 	mw := o11yhttp.New(
+		context.Background(),
 		provider.Meter("cardinality_test"),
 		o11yhttp.WithMaxUniquePaths(3),
 	)
@@ -178,6 +179,7 @@ func TestMiddleware_CustomNormalizer(t *testing.T) {
 	})
 
 	mw := o11yhttp.New(
+		context.Background(),
 		provider.Meter("normalizer_test"),
 		o11yhttp.WithPathNormalizer(func(r *http.Request) string {
 			if strings.HasPrefix(r.URL.Path, "/users/") {

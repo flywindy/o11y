@@ -62,7 +62,7 @@ func main() {
 	mux.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("hello\n"))
 	})
-	wrapped := o11yhttp.New(obs.Meter("example"))(mux)
+	wrapped := o11yhttp.New(ctx, obs.Meter("example"))(mux)
 
 	obs.Logger.Info("serving demo handler on :8080 — curl http://localhost:2112/metrics to scrape")
 	srv := &http.Server{
@@ -70,7 +70,9 @@ func main() {
 		Handler:           wrapped,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	_ = srv.ListenAndServe()
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		obs.Logger.ErrorContext(ctx, "HTTP server error", slog.Any("error", err))
+	}
 }
 
 // performChildOperation starts a child tracing span from ctx and emits logs to indicate simulated work.

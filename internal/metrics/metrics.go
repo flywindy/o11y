@@ -195,7 +195,11 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, view sdkm
 	}
 
 	initSucceeded = true
-	return provider, exporter.Shutdown, nil
+	// provider.Shutdown drains the PeriodicReader which in turn calls
+	// exporter.Shutdown. Returning exporter.Shutdown here would cause a
+	// second shutdown when o11y.go also calls mp.Shutdown, so we return a
+	// no-op: the MeterProvider shutdown path handles everything.
+	return provider, func(_ context.Context) error { return nil }, nil
 }
 
 // resolveResource returns the Resource to attach to the MeterProvider.

@@ -21,6 +21,10 @@
 package http
 
 import (
+	"bufio"
+	"context"
+	"log/slog"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -65,21 +69,20 @@ func WithMaxUniquePaths(n int) Option {
 }
 
 // New returns a net/http middleware that records request duration on the
-// supplied meter. The histogram is created once at construction time so
-// New creates an HTTP middleware that records request durations to an OpenTelemetry
-// histogram named "http.server.request.duration".
+// supplied meter. The histogram is created once at construction time.
 //
 // New applies the provided Option values to configure a PathNormalizer (defaults to
 // r.URL.Path) and a maximum distinct-route cap (defaults to DefaultMaxUniquePaths).
 // It constructs a Float64Histogram instrument at creation time; if histogram
-// creation fails New returns a no-op wrapper that leaves handlers unmodified.
+// creation fails the error is logged via slog and New returns a no-op wrapper
+// that leaves handlers unmodified.
 //
 // The returned middleware records the request duration in seconds and attaches the
 // following attributes: "http.request.method", "http.route" (normalized and capped
 // by the configured limit, unseen extra routes are reported as "other"), and
 // "http.response.status_code". The response status defaults to 200 if no explicit
 // status header is written.
-func New(meter metric.Meter, opts ...Option) func(http.Handler) http.Handler {
+func New(ctx context.Context, meter metric.Meter, opts ...Option) func(http.Handler) http.Handler {
 	cfg := &config{
 		maxUniquePaths: DefaultMaxUniquePaths,
 	}
@@ -99,9 +102,8 @@ func New(meter metric.Meter, opts ...Option) func(http.Handler) http.Handler {
 		metric.WithDescription("Duration of HTTP server requests."),
 	)
 	if err != nil {
-		// A histogram creation failure would make the middleware useless;
-		// fall back to a no-op wrapper rather than panicking. Callers who
-		// care about this can inspect the meter provider directly.
+		slog.ErrorContext(ctx, "httpmw: failed to create histogram, metrics disabled",
+			slog.Any("error", err))
 		return func(next http.Handler) http.Handler { return next }
 	}
 
@@ -148,6 +150,24 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 		s.wroteHeader = true
 	}
 	return s.ResponseWriter.Write(b)
+}
+
+// Flush delegates to the underlying ResponseWriter when it implements
+// http.Flusher. Required for SSE and chunked-streaming handlers.
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack delegates to the underlying ResponseWriter when it implements
+// http.Hijacker. Required for WebSocket upgrades and HTTP/1.1 connection
+// hijacking.
+func (s *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := s.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, http.ErrNotSupported
 }
 
 // pathLimiter enforces a hard upper bound on the distinct values that can
