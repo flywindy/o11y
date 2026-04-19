@@ -64,6 +64,8 @@ func TestInitMeter_HappyPath(t *testing.T) {
 	body := scrape(t, addr)
 	assert.Contains(t, body, `service_namespace="platform"`, "service.namespace resource attribute must appear as a constant label")
 	assert.Contains(t, body, `service_name="test-svc"`, "service_name must appear as a constant label")
+	assert.Contains(t, body, `service_version="0.0.1"`, "service_version must appear as a constant label")
+	assert.Contains(t, body, `deployment_environment_name="test"`, "deployment_environment_name must appear as a constant label")
 	assert.True(t,
 		strings.Contains(body, "go_goroutine") ||
 			strings.Contains(body, "process_runtime_go_goroutines"),

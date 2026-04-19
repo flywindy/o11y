@@ -51,7 +51,7 @@ shared Prometheus state.
 All three providers — `TracerProvider`, `MeterProvider`, and `LoggerProvider` — are
 initialized with the same `*resource.Resource` built once by `buildResource()` in
 `o11y.Init`. This guarantees that `service.name`, `service.version`,
-`deployment.environment.name`, and `team` are byte-for-byte identical across all signals,
+`deployment.environment.name`, and `service.namespace` are byte-for-byte identical across all signals,
 enabling accurate correlation in Grafana's unified explore view.
 
 `metrics.InitMeter` accepts an optional `Config.Resource`; when provided it is used
@@ -135,5 +135,5 @@ services keeps P99 comparisons directly comparable in Grafana.
   (sampling, batching, enrichment). This is an intentional simplicity trade-off.
 - The separate metrics HTTP port (`:2112`) must be opened in any firewall or Kubernetes
   `NetworkPolicy` that restricts pod-to-pod traffic.
-- Shared Resource means `team` appears as a resource attribute on traces and logs as well,
+- Shared Resource means `service.namespace` appears as a resource attribute on traces and logs as well,
   which is desirable for correlation but adds a field that some log consumers may not expect.

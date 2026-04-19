@@ -32,8 +32,8 @@ import (
 // Config is the subset of SDK configuration that the metrics subsystem needs.
 //
 // When Resource is non-nil, InitMeter uses it directly and skips building its
-// own. Service-identity attributes (service.name, service.version,
-// deployment.environment.name) and the team attribute must already be present
+// own. All service-identity attributes (service.name, service.version,
+// deployment.environment.name, service.namespace) must already be present
 // in the provided Resource; they are not validated separately.
 //
 // When MetricsOTLPEndpoint is non-empty, the Prometheus pull model is bypassed

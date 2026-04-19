@@ -95,7 +95,6 @@ func WithMetricsOTLPEndpoint(endpoint string) Option {
 	}
 }
 
-// WithMetricsAddr overrides the listen address of the built-in Prometheus
 // WithMetricsAddr returns an Option that sets the metrics HTTP server listen address to the provided addr.
 // If not set, the metrics server defaults to DefaultMetricsAddr (":2112").
 func WithMetricsAddr(addr string) Option {

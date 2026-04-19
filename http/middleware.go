@@ -170,6 +170,10 @@ func (s *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, http.ErrNotSupported
 }
 
+func (s *statusRecorder) Unwrap() http.ResponseWriter {
+	return s.ResponseWriter
+}
+
 // pathLimiter enforces a hard upper bound on the distinct values that can
 // appear in the http.route label. Everything over the cap collapses to
 // "other". It is concurrent-safe and lock-free on the hot path once the

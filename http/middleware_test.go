@@ -205,3 +205,40 @@ func TestMiddleware_CustomNormalizer(t *testing.T) {
 	assert.Contains(t, body, `http_route="/users/:id"`)
 	assert.NotContains(t, body, `http_route="/users/1"`)
 }
+
+// responseWriterWithDeadline is a mock ResponseWriter that also implements
+// SetWriteDeadline, allowing us to test ResponseController.Unwrap compatibility.
+type responseWriterWithDeadline struct {
+	http.ResponseWriter
+	deadlineSet bool
+}
+
+func (w *responseWriterWithDeadline) SetWriteDeadline(time.Time) error {
+	w.deadlineSet = true
+	return nil
+}
+
+func TestMiddleware_ResponseControllerUnwrap(t *testing.T) {
+	provider, closer, _ := metrics.InitMeter(context.Background(), metrics.Config{
+		ServiceName: "test", Namespace: "test", MetricsAddr: "127.0.0.1:0",
+	})
+	defer func() {
+		_ = closer(context.Background())
+		_ = provider.Shutdown(context.Background())
+	}()
+
+	mw := o11yhttp.New(context.Background(), provider.Meter("test"))
+	
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rc := http.NewResponseController(w)
+		err := rc.SetWriteDeadline(time.Now().Add(time.Second))
+		assert.NoError(t, err, "ResponseController.SetWriteDeadline should succeed via Unwrap")
+	}))
+
+	rec := httptest.NewRecorder()
+	mock := &responseWriterWithDeadline{ResponseWriter: rec}
+	req := httptest.NewRequest("GET", "/", nil)
+
+	handler.ServeHTTP(mock, req)
+	assert.True(t, mock.deadlineSet, "The underlying writer's SetWriteDeadline should have been called")
+}
