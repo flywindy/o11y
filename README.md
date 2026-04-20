@@ -11,11 +11,13 @@ This project provides a "Context-First" observability layer for Go applications,
 - **Language**: Go 1.25+
 - **Tracing**: OpenTelemetry Go SDK (OTLP/HTTP)
 - **Logging**: Go `slog` with dual output — OTLP/HTTP via `otelslog` bridge (→ Loki) and JSON stdout (→ Alloy)
+- **Metrics**: Prometheus pull (default `:2112`) or OTLP push (`WithMetricsOTLPEndpoint`)
 - **Infrastructure**:
   - **NATS**: High-performance messaging
   - **MongoDB**: NoSQL database for persistence
   - **Tempo**: Distributed tracing backend
   - **Loki**: Log aggregation system
+  - **Prometheus**: Metrics storage and scraping
   - **Grafana**: Unified visualization for traces, logs, and metrics
   - **OTel Collector**: Centralized pipeline — all telemetry (traces and logs) flows through it
   - **Alloy**: Log collection agent (DaemonSet), forwards logs to OTel Collector via OTLP
@@ -23,13 +25,15 @@ This project provides a "Context-First" observability layer for Go applications,
 ### Telemetry Flow
 
 ```
-Traces: App ──OTLP/HTTP──► OTel Collector ──► Tempo
-Logs:   App ──OTLP/HTTP──► OTel Collector ──► Loki   (primary: full OTel Log Data Model)
-        App stdout ──► Alloy ──OTLP/HTTP──► OTel Collector ──► Loki  (secondary: k8s pods via Alloy)
+Traces:  App ──OTLP/HTTP──► OTel Collector ──► Tempo
+Logs:    App ──OTLP/HTTP──► OTel Collector ──► Loki   (primary: full OTel Log Data Model)
+         App stdout ──► Alloy ──OTLP/HTTP──► OTel Collector ──► Loki  (secondary: k8s pods via Alloy)
+Metrics: App :2112/metrics ◄──scrape── Prometheus ──► Grafana  (pull model)
 ```
 
 Both log paths are active simultaneously. When running `go run` locally (outside the cluster),
 only the OTLP path reaches Loki; Alloy scrapes pods exclusively inside kind.
+Prometheus scraping also only works inside the cluster; locally, scrape `:2112/metrics` directly.
 
 ## Prerequisites
 
@@ -93,8 +97,9 @@ func main() {
 
     obs, err := o11y.Init(ctx,
         o11y.WithServiceName("my-service"),        // required
-        o11y.WithServiceVersion("1.0.0"),
-        o11y.WithEnvironment("production"),
+        o11y.WithServiceVersion("1.0.0"),          // required
+        o11y.WithEnvironment("production"),        // required; see canonical values below
+        o11y.WithServiceNamespace("platform"),     // required; maps to k8s namespace / team
         o11y.WithOTLPEndpoint("http://localhost:4318"),
         o11y.WithLogLevel(slog.LevelInfo),
     )
@@ -103,7 +108,7 @@ func main() {
         return
     }
 
-    // Flush in-flight spans on exit (always use a timeout).
+    // Flush in-flight spans and metrics on exit (always use a timeout).
     defer func() {
         shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
         defer cancel()
@@ -118,11 +123,15 @@ func main() {
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `WithServiceName(name)` | — (required) | OTel `service.name` resource attribute |
-| `WithServiceVersion(ver)` | `""` | OTel `service.version` resource attribute |
-| `WithEnvironment(env)` | `""` | OTel `deployment.environment` resource attribute |
-| `WithOTLPEndpoint(url)` | `http://localhost:4318` | OTLP/HTTP collector endpoint |
+| `WithServiceName(name)` | — **required** | OTel `service.name` resource attribute |
+| `WithServiceVersion(ver)` | — **required** | OTel `service.version`; used for canary/rollback tracking |
+| `WithEnvironment(env)` | — **required** | OTel `deployment.environment.name`; accepted: `production`, `staging`, `development`, `testing` (aliases like `prod`/`stg` are normalized) |
+| `WithServiceNamespace(ns)` | — **required** | OTel `service.namespace`; identifies the owning team/product, maps to k8s namespace |
+| `WithOTLPEndpoint(url)` | `http://localhost:4318` | OTLP/HTTP collector endpoint for traces and logs |
+| `WithMetricsOTLPEndpoint(url)` | `""` | Switch metrics to OTLP push (serverless); when unset, Prometheus pull on `:2112` is used |
+| `WithMetricsAddr(addr)` | `:2112` | Prometheus `/metrics` scrape address |
 | `WithLogLevel(level)` | `slog.LevelInfo` | Minimum log level |
+| `WithRuntimeMetrics(bool)` | `true` | Collect Go runtime metrics (goroutines, GC, memory) |
 
 ### Structured Logging with Trace Correlation
 
@@ -170,57 +179,65 @@ otel.SetTracerProvider(obs.TracerProvider())
 otel.SetTextMapPropagator(obs.Propagator)
 ```
 
-### Distributed Tracing over NATS Core
+### Distributed Tracing over NATS
 
-Use `o11ynats.Connect` to obtain a tracing-aware connection. The `TracerProvider` and `Propagator` from the SDK are wired in automatically — no global OTel state is touched.
+Use `obs.Propagator` together with the `nats` sub-package to propagate trace context across NATS messages.
 
 ```go
 import (
     o11ynats "github.com/flywindy/o11y/nats"
-    "github.com/nats-io/nats.go"
+    gonats "github.com/nats-io/nats.go"
 )
 
-conn, err := o11ynats.Connect(ctx, nats.DefaultURL, obs.TracerProvider(), obs.Propagator)
+conn, err := o11ynats.Connect(ctx, natsURL, obs.TracerProvider(), obs.Propagator)
 
 // Publisher: trace context is injected into message headers automatically.
-conn.Publish(ctx, "orders.created", payload)
+if err := conn.Publish(ctx, "orders.created", payload); err != nil {
+    obs.Logger.ErrorContext(ctx, "publish failed", slog.Any("error", err))
+}
 
 // Subscriber: ctx in the handler already carries the publisher's trace.
-conn.Subscribe("orders.created", func(ctx context.Context, msg *nats.Msg) {
-    ctx, span := obs.Tracer("consumer").Start(ctx, "process-order")
+conn.Subscribe("orders.created", func(ctx context.Context, msg *gonats.Msg) {
+    ctx, span := obs.Tracer("consumer").Start(ctx, "orders.created")
     defer span.End()
     obs.Logger.InfoContext(ctx, "order received") // traceId and spanId injected automatically
 })
 ```
 
-> **Request-Reply note**: to reply while preserving trace context, use `conn.Publish(ctx, msg.Reply, data)` instead of `msg.Respond(data)`. `msg.Respond` bypasses header injection and breaks the distributed trace.
+### Prometheus Metrics
 
-### Distributed Tracing over JetStream
+By default the SDK exposes a `/metrics` endpoint on `:2112` for Prometheus to scrape. Every series carries `service_namespace`, `service_name`, `service_version`, and `deployment_environment_name` as constant labels.
+
+```bash
+curl http://localhost:2112/metrics   # inspect raw output
+```
+
+HTTP handler instrumentation is provided by the `github.com/flywindy/o11y/http` package:
 
 ```go
-import "github.com/Marz32onE/instrumentation-go/otel-nats/oteljetstream"
+import o11yhttp "github.com/flywindy/o11y/http"
 
-js, err := conn.JetStream()
+mux := http.NewServeMux()
+mux.HandleFunc("/api/orders", handleOrders)
 
-// Create or update stream (idempotent — safe to call on every startup).
-js.CreateOrUpdateStream(ctx, oteljetstream.StreamConfig{
-    Name: "ORDERS", Subjects: []string{"orders.>"},
-})
+// Wrap the mux — emits http_server_request_duration_seconds histogram.
+handler := o11yhttp.New(obs.Meter("my-service"),
+    o11yhttp.WithPathNormalizer(func(r *http.Request) string {
+        // Collapse /orders/123 → /orders/:id to avoid high cardinality.
+        return pathToTemplate(r.URL.Path)
+    }),
+)(mux)
+```
 
-// Publisher: trace context injected into JetStream message headers.
-ack, err := js.Publish(ctx, "orders.created", payload)
+**Exemplars** are enabled automatically (OTel SDK default `SampledFilter`). When Prometheus is deployed with `--enable-feature=exemplar-storage` (included in `k8s/infrastructure/base/prometheus.yaml`), Grafana can navigate from a histogram bucket directly to the correlated trace in Tempo.
 
-// Subscriber: durable consumer with Consume (push-style pull delivery).
-stream, _ := js.Stream(ctx, "ORDERS")
-consumer, _ := stream.CreateOrUpdateConsumer(ctx, oteljetstream.ConsumerConfig{
-    Durable: "orders-processor", AckPolicy: oteljetstream.AckExplicitPolicy,
-})
-cc, _ := consumer.Consume(func(m oteljetstream.Msg) {
-    ctx, span := obs.Tracer("consumer").Start(m.Context(), "process-order")
-    defer span.End()
-    m.Ack()
-})
-defer cc.Stop()
+**Kubernetes pods** must opt in to scraping with the annotation:
+
+```yaml
+metadata:
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "2112"   # optional; 2112 is the default
 ```
 
 ## Running the Examples
@@ -231,6 +248,7 @@ Before running any example, port-forward the required services from the `kind` c
 kubectl port-forward -n infra svc/otel-collector 4318:4318  # OTel traces and logs
 kubectl port-forward -n infra svc/nats           4222:4222  # NATS connection
 kubectl port-forward -n infra svc/grafana        3000:3000  # Grafana UI
+kubectl port-forward -n infra svc/prometheus     9090:9090  # Prometheus UI
 ```
 
 ### Basic (spans + logs)
@@ -259,7 +277,18 @@ go run examples/jetstream/publisher/main.go
 go run examples/jetstream/subscriber/main.go
 ```
 
-Open Grafana at `http://localhost:3000` and navigate to **Explore → Tempo** to see producer and consumer spans linked across services. Navigate to **Explore → Loki** to see structured log entries with correlated `traceId` and `spanId` fields.
+### Metrics (HTTP middleware + Prometheus scraping)
+
+```bash
+go run examples/metrics/main.go
+```
+
+The example starts an HTTP server on `:8080` and generates synthetic traffic every 500 ms. Metrics flow via OTLP to the OTel Collector, which forwards them to Prometheus via remote write — the same `localhost:4318` NodePort used for traces and logs, so no extra port-forward is needed. Histogram buckets include exemplars linking each measurement to its trace.
+
+Open Grafana at `http://localhost:3000` and navigate to:
+- **Explore → Tempo** — producer and consumer spans linked across services
+- **Explore → Loki** — structured log entries with correlated `traceId` and `spanId`
+- **Explore → Prometheus** — `http_server_request_duration_seconds`; click an exemplar dot to jump to the linked trace in Tempo
 
 ## Core Principles
 

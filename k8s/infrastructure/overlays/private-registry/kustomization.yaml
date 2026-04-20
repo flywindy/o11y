@@ -19,3 +19,5 @@ images:
     newName: internal-registry.example.com/grafana/grafana
   - name: grafana/alloy
     newName: internal-registry.example.com/grafana/alloy
+  - name: prom/prometheus
+    newName: internal-registry.example.com/prom/prometheus

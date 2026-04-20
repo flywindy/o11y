@@ -19,16 +19,40 @@ so that every log entry is automatically enriched with `traceId` and `spanId`.
 
 | Layer | Choice | Notes |
 |---|---|---|
-| Language | Go 1.23+ | Use standard library where possible |
+| Language | Go 1.25+ | Use standard library where possible |
 | Tracing | OpenTelemetry Go SDK (OTLP/HTTP) | Not gRPC — keep it simple for local dev |
 | Logging | `log/slog` + `otelslog` bridge | Dual output: OTLP/HTTP → Loki (full OTel Log Data Model) and JSON stdout; `OtelSlogHandler` injects traceId / spanId on stdout path |
+| Metrics | Prometheus pull (`:2112`) or OTLP push | Pull: k8s pods scraped by Prometheus; Push: `WithMetricsOTLPEndpoint` for local dev / serverless |
 | Messaging | NATS | High-performance pub/sub |
 | Database | MongoDB | NoSQL persistence |
 | Tracing backend | Grafana Tempo | |
 | Log backend | Grafana Loki | |
-| Visualization | Grafana | Unified traces + logs dashboard |
-| Collector | OTel Collector | Centralized telemetry pipeline |
-| Local cluster | kind (Kubernetes in Docker) | Port 4318 mapped for OTLP/HTTP |
+| Metrics backend | Prometheus | Scrapes k8s pods on `:2112`; also accepts remote write from OTel Collector |
+| Visualization | Grafana | Unified traces, logs, and metrics; exemplars link histograms → Tempo traces |
+| Collector | OTel Collector | Centralized telemetry pipeline for traces, logs, and OTLP metrics |
+| Local cluster | kind (Kubernetes in Docker) | Port 4318 mapped for OTLP/HTTP (traces, logs, and metrics push) |
+
+---
+
+## Required SDK Init Options
+
+Every service **must** provide all four options; `Init` returns an error if any are missing or invalid:
+
+| Option | semconv key | Notes |
+|--------|------------|-------|
+| `WithServiceName("my-svc")` | `service.name` | Unique service identifier |
+| `WithServiceVersion("1.2.3")` | `service.version` | Required for canary/rollback tracking |
+| `WithServiceNamespace("platform")` | `service.namespace` | Owning team/product; maps to k8s namespace |
+| `WithEnvironment("production")` | `deployment.environment.name` | Canonical values only (see below) |
+
+**Canonical environment values** — aliases are auto-normalized, unknown values are rejected:
+
+| Input | Canonical |
+|-------|-----------|
+| `production`, `prod` | `production` |
+| `staging`, `stage`, `stg` | `staging` |
+| `development`, `develop`, `dev` | `development` |
+| `testing`, `test` | `testing` |
 
 ---
 
@@ -39,6 +63,7 @@ so that every log entry is automatically enriched with `traceId` and `spanId`.
 3. **Correlation**: `slog` output must always include `traceId` and `spanId` as JSON fields when a span is active.
 4. **Performance**: Middleware and handlers must be non-blocking. Minimize allocations in the hot path.
 5. **Errors**: Use `slog.ErrorContext(ctx, ...)` with structured attributes. Never use `panic` for recoverable errors.
+6. **Semconv v1.27.0**: All instrument names, attribute keys, and attribute types must conform to OTel Semantic Conventions v1.27.0. Do not mix versions.
 
 ---
 
@@ -59,15 +84,10 @@ go test -race ./...          # Always run with race detector
 # Start local kind cluster
 kind create cluster --config kind-config.yaml
 
-# Deploy observability stack (order matters — namespace must come first)
-kubectl apply -f k8s/infrastructure/namespace.yaml
-kubectl apply -f k8s/infrastructure/nats.yaml
-kubectl apply -f k8s/infrastructure/mongodb.yaml
-kubectl apply -f k8s/infrastructure/tempo.yaml
-kubectl apply -f k8s/infrastructure/loki.yaml
-kubectl apply -f k8s/infrastructure/alloy.yaml
-kubectl apply -f k8s/infrastructure/otel-collector.yaml
-kubectl apply -f k8s/infrastructure/grafana.yaml
+# Deploy observability stack via Kustomize (handles ordering and dependencies)
+kubectl apply -k k8s/infrastructure/base
+# OR: private registry deployment (update internal-registry.example.com first)
+kubectl apply -k k8s/infrastructure/overlays/private-registry
 
 # Verify all pods are Running
 kubectl get pods -n infra
@@ -84,8 +104,14 @@ go run examples/nats-core/publisher/main.go
 go run examples/jetstream/publisher/main.go   # creates the stream and publishes
 go run examples/jetstream/subscriber/main.go  # attaches durable consumer and processes
 
+# Run the metrics example (pushes via OTLP → OTel Collector → Prometheus; cluster must be up)
+go run examples/metrics/main.go
+
 # Port-forward Grafana (default credentials: admin/admin)
 kubectl port-forward -n infra svc/grafana 3000:3000
+
+# Port-forward Prometheus
+kubectl port-forward -n infra svc/prometheus 9090:9090
 ```
 
 ---
@@ -132,6 +158,7 @@ Full ADR documents live in [`docs/adr/`](docs/adr/).
 | Local infra | kind | Reproducible Kubernetes without cloud cost |
 | NATS instrumentation | `instrumentation-go/otel-nats` | Company-internal library; covers NATS Core + all JetStream consumer patterns with OTel semconv v1.27.0 |
 | Log format strategy | Option B — align stdout `traceId`/`spanId` field names | Preserves existing log reading habits; minimal blast radius. See [ADR 0001](docs/adr/0001-log-format-strategy.md) |
+| Metrics strategy | Prometheus pull (default `:2112`) + OTLP push opt-in (`WithMetricsOTLPEndpoint`) | Prometheus pull requires zero Collector config; OTLP push covers serverless. Exemplars enabled by default (OTel SDK `SampledFilter`). See [ADR 0002](docs/adr/0002-metrics-strategy.md) |
 
 ---
 
@@ -195,6 +222,10 @@ When replying to a message inside a `Subscribe` handler, do **not** use `msg.Res
 - ❌ Use OTLP/gRPC unless explicitly asked
 - ❌ Import `github.com/sirupsen/logrus` or `go.uber.org/zap` — we use stdlib `slog`
 - ❌ Commit without running `go fmt` and `go mod tidy`
-- ❌ Add Kubernetes manifests that skip the OTel Collector (all telemetry must go through it)
+- ❌ Add Kubernetes manifests that send traces or logs directly to backends (Tempo, Loki) — traces and logs must go through the OTel Collector; Prometheus scraping `:2112` directly is intentional and correct
 - ❌ Call `otelnats.Connect` or `otelnats.ConnectWithOptions` directly — always go through `o11ynats.Connect` so the SDK providers are wired correctly
 - ❌ Use `msg.Respond(data)` inside a Subscribe handler when trace context must be preserved in the reply — use `conn.Publish(ctx, msg.Reply, data)` instead
+- ❌ Use `WithTeam` — it no longer exists; use `WithServiceNamespace` instead
+- ❌ Use non-canonical environment strings in config files or docs (code accepts aliases like `"prod"` but canonical values are preferred)
+- ❌ Mix OTel semconv versions — always import `go.opentelemetry.io/otel/semconv/v1.27.0`
+- ❌ Use high-cardinality values (user IDs, request IDs, trace IDs) as metric label values

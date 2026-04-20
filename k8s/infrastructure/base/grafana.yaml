@@ -23,6 +23,18 @@ data:
         serviceMap:
           datasourceUid: prometheus
 
+    - name: Prometheus
+      type: prometheus
+      uid: prometheus
+      access: proxy
+      url: http://prometheus.infra.svc.cluster.local:9090
+      jsonData:
+        # exemplarTraceIdDestinations wires histogram exemplars to Tempo:
+        # clicking an exemplar dot in Grafana opens the linked trace directly.
+        exemplarTraceIdDestinations:
+          - name: traceID
+            datasourceUid: tempo
+
     - name: Loki
       type: loki
       uid: loki
@@ -62,8 +74,7 @@ spec:
         - containerPort: 3000
         volumeMounts:
         - name: grafana-datasources
-          mountPath: /etc/grafana/provisioning/datasources/datasources.yaml
-          subPath: datasources.yaml
+          mountPath: /etc/grafana/provisioning/datasources
       volumes:
       - name: grafana-datasources
         configMap:
