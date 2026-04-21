@@ -104,9 +104,7 @@ func WithMetricsAddr(addr string) Option {
 }
 
 // WithRuntimeMetrics toggles collection of Go runtime metrics (goroutines,
-// GC, memory, etc.) via the OTel runtime instrumentation. Defaults to true,
-// WithRuntimeMetrics sets whether collection of runtime-derived metrics is enabled.
-// When enabled, runtime metrics (e.g., goroutines, memory, GC) are collected and exposed to support saturation monitoring as expected by SRE.
+// GC, memory, etc.) via OTel runtime instrumentation. Defaults to true.
 func WithRuntimeMetrics(enabled bool) Option {
 	return func(c *Config) {
 		c.runtimeMetrics = enabled
@@ -115,12 +113,12 @@ func WithRuntimeMetrics(enabled bool) Option {
 
 // WithHistogramBuckets overrides the histogram boundaries applied to HTTP
 // server latency histograms. Defaults to DefaultLatencyBuckets; override
-// only when your service has a genuinely different latency profile, since
-// WithHistogramBuckets returns an Option that sets the histogram bucket boundaries used for latency histograms.
-// Changing these from the package default will make cross-service P99 comparisons inconsistent.
+// only when your service has a genuinely different latency profile.
+// Changing these from the package default makes cross-service P99
+// comparisons inconsistent.
 func WithHistogramBuckets(buckets []float64) Option {
 	return func(c *Config) {
-		c.histogramBuckets = buckets
+		c.histogramBuckets = cloneFloat64s(buckets)
 	}
 }
 
@@ -132,6 +130,15 @@ func defaultConfig() *Config {
 		logLevel:         slog.LevelInfo,
 		metricsAddr:      DefaultMetricsAddr,
 		runtimeMetrics:   true,
-		histogramBuckets: DefaultLatencyBuckets,
+		histogramBuckets: cloneFloat64s(DefaultLatencyBuckets),
 	}
+}
+
+func cloneFloat64s(in []float64) []float64 {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]float64, len(in))
+	copy(out, in)
+	return out
 }
