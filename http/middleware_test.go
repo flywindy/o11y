@@ -228,7 +228,7 @@ func TestMiddleware_ResponseControllerUnwrap(t *testing.T) {
 	}()
 
 	mw := o11yhttp.New(context.Background(), provider.Meter("test"))
-	
+
 	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rc := http.NewResponseController(w)
 		err := rc.SetWriteDeadline(time.Now().Add(time.Second))
