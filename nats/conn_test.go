@@ -98,6 +98,7 @@ func TestSubscribe_ContextPropagation(t *testing.T) {
 		gotTraceID = oteltrace.SpanFromContext(ctx).SpanContext().TraceID()
 	})
 	require.NoError(t, err)
+	require.NoError(t, sub.NatsConn().FlushTimeout(2*time.Second))
 
 	// Start a root span on the publisher side so there is a valid trace ID to
 	// propagate through the message headers.
@@ -159,6 +160,7 @@ func TestQueueSubscribe(t *testing.T) {
 		received <- struct{}{}
 	})
 	require.NoError(t, err)
+	require.NoError(t, sub.NatsConn().FlushTimeout(2*time.Second))
 
 	err = pub.Publish(context.Background(), subject, []byte("ping"))
 	require.NoError(t, err)

@@ -51,8 +51,8 @@ type config struct {
 }
 
 // WithPathNormalizer supplies a function that turns a request into its
-// route template. Without one, the middleware uses r.URL.Path as-is and
-// The provided function must be safe for concurrent use; the middleware enforces a configured cap and will collapse excess distinct routes to "other".
+// route template. Without one, the middleware uses r.URL.Path as-is.
+// The provided function must be safe for concurrent use.
 func WithPathNormalizer(fn PathNormalizer) Option {
 	return func(c *config) {
 		c.normalizer = fn
@@ -60,8 +60,7 @@ func WithPathNormalizer(fn PathNormalizer) Option {
 }
 
 // WithMaxUniquePaths overrides the hard cardinality cap. Values <= 0 mean
-// WithMaxUniquePaths sets the maximum number of distinct http.route label values the middleware will track.
-// n is the cap for unique routes; values <= 0 are treated as DefaultMaxUniquePaths when the middleware is constructed.
+// "use DefaultMaxUniquePaths". The cap bounds distinct http.route labels.
 func WithMaxUniquePaths(n int) Option {
 	return func(c *config) {
 		c.maxUniquePaths = n
