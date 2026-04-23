@@ -27,6 +27,28 @@ The presence of such a call anywhere in the runtime mutates **process-wide
 state**, not just the instrumented subsystem. This ADR establishes the policy
 for how the SDK and its wrapper packages must handle that risk.
 
+### Where this principle comes from
+
+"Zero Global State" is rooted primarily in **Go 2020+ library idioms** —
+the broader trend in the Go ecosystem to move away from the package-level
+globals that dominated early stdlib (`log.Printf`, `http.DefaultClient`,
+`rand.Seed`). Newer stdlib additions such as `log/slog` (Go 1.21) and
+`rand/v2` (Go 1.22), together with the long-standing discipline of
+explicit `context.Context` propagation (Go 1.7), all codify instance-based
+state over ambient globals.
+
+OpenTelemetry's own guidance for library authors happens to agree:
+*"If you are building a library, you should avoid setting the global
+TracerProvider. Instead, accept a TracerProvider as a parameter."* But
+this is a **reinforcement**, not the origin — even without OTel's
+stance, a Go SDK written in 2025 should arrive at the same conclusion
+from Go idioms alone.
+
+The practical consequence is that some third-party OTel instrumentation
+libraries (written by authors who don't share this Go-idiomatic bias)
+will not be adoptable as-is, and the SDK must do its own verification
+at the boundary.
+
 ---
 
 ## Decision
