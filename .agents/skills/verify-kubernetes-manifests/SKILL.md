@@ -45,7 +45,7 @@ Verify Kubernetes manifest changes against both repository files and live cluste
 Use these patterns for local Grafana/Loki/Tempo/Prometheus/Collector work:
 
 - Grafana datasource provisioning: read `configmap/grafana-datasources`, restart `deployment/grafana`, wait for rollout, and verify the datasource behavior when practical.
-- Loki labels and LogQL: run `curl` from the Grafana pod, for example `kubectl exec -n infra deploy/grafana -- curl -s 'http://loki.infra.svc.cluster.local:3100/loki/api/v1/labels'`.
+- Loki labels and LogQL: run `wget` from the Grafana pod, for example `kubectl exec -n infra deploy/grafana -- wget -qO- 'http://loki.infra.svc.cluster.local:3100/loki/api/v1/labels'`.
 - Collector pipelines: read `configmap/otel-collector-conf`, restart the collector if needed, and inspect collector pod logs for exporter or pipeline errors.
 - Prometheus: query the Prometheus HTTP API from an in-cluster pod or through port-forward when checking metrics behavior.
 - Tempo: verify trace queries through Grafana or Tempo's HTTP API when a trace/log/metric correlation path is changed.
