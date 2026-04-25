@@ -58,12 +58,11 @@ Every service **must** provide all four options; `Init` returns an error if any 
 
 ## Core Principles — Never Violate These
 
-1. **Context-First**: Every function must accept and propagate `context.Context`. Trace information flows through context only.
-2. **Zero Global State**: Encapsulate OTel providers in structs. No package-level `init()` with side effects. No global logger variables.
-3. **Correlation**: `slog` output must always include `traceId` and `spanId` as JSON fields when a span is active.
-4. **Performance**: Middleware and handlers must be non-blocking. Minimize allocations in the hot path.
-5. **Errors**: Use `slog.ErrorContext(ctx, ...)` with structured attributes. Never use `panic` for recoverable errors.
-6. **Semconv v1.27.0**: All instrument names, attribute keys, and attribute types must conform to OTel Semantic Conventions v1.27.0. Do not mix versions.
+1. **Context-First**: Every function must accept and propagate `context.Context`. Trace information flows through context only. *(Follows the Go stdlib `context` idiom established in Go 1.7.)*
+2. **Zero Global State**: Encapsulate OTel providers in structs. No package-level `init()` with side effects. No global logger variables. *(Rooted in Go 2020+ library idioms — newer stdlib APIs such as `log/slog`, `rand/v2`, and `http.Client` all moved away from package-level globals. See [ADR 0003](docs/adr/0003-global-state-policy.md) for the full rationale and the third-party integration policy.)*
+3. **Correlation**: `slog` output must always include `traceId` and `spanId` as JSON fields when a span is active. *(See [ADR 0001](docs/adr/0001-log-format-strategy.md) for the stdout ↔ OTLP field naming decision.)*
+4. **Errors**: Use `slog.ErrorContext(ctx, ...)` with structured attributes. Never use `panic` for recoverable errors.
+5. **Semconv v1.27.0**: All instrument names, attribute keys, and attribute types must conform to OTel Semantic Conventions v1.27.0. Do not mix versions. *(See [`docs/semconv.md`](docs/semconv.md) for the complete catalog of attributes emitted by this SDK.)*
 
 ---
 
@@ -170,9 +169,12 @@ Full ADR documents live in [`docs/adr/`](docs/adr/).
 | Tracing backend | Tempo | OSS, Grafana-native, cost-effective |
 | Log backend | Loki | OSS, integrates with Grafana and Tempo for trace-to-log correlation |
 | Local infra | kind | Reproducible Kubernetes without cloud cost |
-| NATS instrumentation | `instrumentation-go/otel-nats` | Company-internal library; covers NATS Core + all JetStream consumer patterns with OTel semconv v1.27.0 |
 | Log format strategy | Option B — align stdout `traceId`/`spanId` field names | Preserves existing log reading habits; minimal blast radius. See [ADR 0001](docs/adr/0001-log-format-strategy.md) |
 | Metrics strategy | Prometheus pull (default `:2112`) + OTLP push opt-in (`WithMetricsOTLPEndpoint`) | Prometheus pull requires zero Collector config; OTLP push covers serverless. Exemplars enabled by default (OTel SDK `SampledFilter`). See [ADR 0002](docs/adr/0002-metrics-strategy.md) |
+| Global state policy | SDK packages must not mutate OTel globals; third-party instrumentation libraries are verified per-version before adoption | See [ADR 0003](docs/adr/0003-global-state-policy.md) |
+| NATS integration | `github.com/Marz32onE/instrumentation-go/otel-nats` — verified at v0.2.1 not to mutate globals; wrapped by the `nats/` package | Covers NATS Core + all JetStream consumer patterns with OTel semconv v1.27.0. See [ADR 0004](docs/adr/0004-nats-integration.md) |
+| MongoDB integration | Native `event.CommandMonitor` on the official `go.mongodb.org/mongo-driver/v2`; `Marz32onE/instrumentation-go/otel-mongo` deliberately not used | Upstream emits attribute keys via hand-rolled string literals (post-v1.30 DB-stable rename, e.g. `db.system.name`) and does not import any `semconv/vX.Y.Z` Go package, breaking alignment with our v1.27.0 pin. Document injection is also coupled to command-span emission with no independent off-switch. ~150 LOC monitor preserves semconv consistency. See [ADR 0005](docs/adr/0005-mongodb-integration.md) |
+| Semconv version policy | Pin v1.27.0; upgrade only when concrete triggers fire | Single pin per process avoids cognitive cost and dashboard breakage. Upgrade triggers and process documented to keep version moves deliberate. See [ADR 0006](docs/adr/0006-semconv-upgrade-strategy.md) |
 
 ---
 
@@ -233,11 +235,13 @@ When replying to a message inside a `Subscribe` handler, do **not** use `msg.Res
 - ❌ Add `init()` functions with side effects in any package
 - ❌ Use `panic` for error handling — use `slog.ErrorContext` instead
 - ❌ Use a global `*slog.Logger` variable — pass logger via context or struct
+- ❌ Call `otel.SetTracerProvider` or `otel.SetTextMapPropagator` anywhere in SDK code — the SDK must not mutate OTel globals. Application `main()` may still choose to do so. See [ADR 0003](docs/adr/0003-global-state-policy.md)
 - ❌ Use OTLP/gRPC unless explicitly asked
 - ❌ Import `github.com/sirupsen/logrus` or `go.uber.org/zap` — we use stdlib `slog`
 - ❌ Commit without running `go fmt` and `go mod tidy`
 - ❌ Add Kubernetes manifests that send traces or logs directly to backends (Tempo, Loki) — traces and logs must go through the OTel Collector; Prometheus scraping `:2112` directly is intentional and correct
 - ❌ Call `otelnats.Connect` or `otelnats.ConnectWithOptions` directly — always go through `o11ynats.Connect` so the SDK providers are wired correctly
+- ❌ Import `github.com/Marz32onE/instrumentation-go/otel-mongo` (any submodule) — its hand-rolled attribute keys (post-v1.30 DB-stable rename, e.g. `db.system.name`) drift from our pinned semconv v1.27.0, and its `_oteltrace` document injection cannot be disabled independently of command spans. MongoDB instrumentation uses the official driver's `event.CommandMonitor` via the forthcoming `mongo/` package. See [ADR 0005](docs/adr/0005-mongodb-integration.md). (Note: v0.2.10 fixed the original global-state issue at our request — global state is no longer the blocker, but the two issues above remain.)
 - ❌ Use `msg.Respond(data)` inside a Subscribe handler when trace context must be preserved in the reply — use `conn.Publish(ctx, msg.Reply, data)` instead
 - ❌ Use `WithTeam` — it no longer exists; use `WithServiceNamespace` instead
 - ❌ Use non-canonical environment strings in config files or docs (code accepts aliases like `"prod"` but canonical values are preferred)

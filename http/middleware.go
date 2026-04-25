@@ -29,8 +29,8 @@ import (
 	"sync"
 	"time"
 
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	semconv "go.opentelemetry.io/otel/semconv/v1.27.0"
 )
 
 // DefaultMaxUniquePaths is the default upper bound on distinct http.route
@@ -119,9 +119,9 @@ func New(ctx context.Context, meter metric.Meter, opts ...Option) func(http.Hand
 			elapsed := time.Since(start).Seconds()
 
 			hist.Record(r.Context(), elapsed, metric.WithAttributes(
-				attribute.String("http.request.method", r.Method),
-				attribute.String("http.route", route),
-				attribute.Int("http.response.status_code", rec.status),
+				semconv.HTTPRequestMethodKey.String(r.Method),
+				semconv.HTTPRouteKey.String(route),
+				semconv.HTTPResponseStatusCodeKey.Int(rec.status),
 			))
 		})
 	}
