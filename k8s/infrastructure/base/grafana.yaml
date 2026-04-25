@@ -22,6 +22,18 @@ data:
           datasourceUid: loki
         serviceMap:
           datasourceUid: prometheus
+        tracesToLogsV2:
+          datasourceUid: loki
+          # customQuery provides the trace filter, so keep Grafana's built-in trace ID filter disabled.
+          filterByTraceID: false
+          filterBySpanID: false
+          spanStartTimeShift: '-5m'
+          spanEndTimeShift: '5m'
+          tags:
+            - key: service.name
+              value: service_name
+          customQuery: true
+          query: '{service_name=~"(.*/|)$${__span.tags["service.name"]}"} |= "$${__trace.traceId}"'
 
     - name: Prometheus
       type: prometheus
@@ -43,11 +55,13 @@ data:
       jsonData:
         derivedFields:
           - datasourceUid: tempo
-            # Matches the traceid field injected by the OTel Collector Loki exporter.
-            # The exporter flattens the OTel log record's TraceID into the log line
-            # as "traceid" (lowercase, no separator), e.g.:
-            # {"traceid":"4bf92f3577b34da6a3ce929d0e0e4736", ...}
-            matcherRegex: '"traceid"\s*:\s*"([0-9a-f]{32})"'
+            # Two log paths produce different field names:
+            # - OTLP path (App → OTel Collector → Loki): Loki exporter flattens
+            #   OTLP TraceID to "traceid" (all lowercase).
+            # - Alloy/stdout path (App stdout → Alloy → OTel Collector → Loki):
+            #   raw JSON body is preserved with "traceId" (camelCase from slog).
+            # The character class [Ii] matches both.
+            matcherRegex: '"trace[Ii]d"\s*:\s*"([0-9a-f]{32})"'
             name: TraceID
             url: "$${__value.raw}"
             internal: true

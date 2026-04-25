@@ -116,6 +116,20 @@ kubectl port-forward -n infra svc/prometheus 9090:9090
 
 ---
 
+## Kubernetes Infrastructure Verification
+
+When modifying files under `k8s/infrastructure/**`, use the repo-local `verify-kubernetes-manifests` skill at `.agents/skills/verify-kubernetes-manifests`.
+
+For changes that affect live infrastructure behavior, verify against the kind cluster with `kubectl` when access is available:
+
+- Inspect the live resource before or after the change with `kubectl get ... -o yaml`
+- Apply through the relevant Kustomize entry point, usually `kubectl apply -k k8s/infrastructure/base`
+- Restart workloads that require config reloads, such as Grafana datasource provisioning
+- Wait for rollout completion with `kubectl rollout status`
+- Verify behavior through the relevant in-cluster service API when practical
+
+---
+
 ## Code Standards
 
 - All code, comments, and documentation must be in **English**
