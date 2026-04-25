@@ -25,10 +25,32 @@ subdocument (`traceparent` + `tracestate`) into every written document so
 that asynchronous readers (change streams, outbox pattern, delayed jobs)
 can restore trace context via `ContextFromDocument`.
 
-However, its `ConnectWithOptions` constructor calls
-`otel.SetTracerProvider(cfg.TracerProvider)` and
-`otel.SetTextMapPropagator(cfg.Propagators)`. Under ADR 0003, that entry
-point is therefore unusable without a fork or patch.
+This ADR initially rejected adoption of the upstream library because its
+`ConnectWithOptions` constructor called `otel.SetTracerProvider` and
+`otel.SetTextMapPropagator`, violating ADR 0003. Following our feedback,
+the upstream maintainer released **v0.2.10** which removes those calls
+and falls back to reading globals only when no option is supplied (the
+same pattern as `otel-nats`). The global-state objection is therefore
+no longer valid.
+
+Adoption is still rejected, but for **two separate reasons** that
+emerged on closer review:
+
+1. **Semconv version drift without compile-time pin.** v0.2.10 emits
+   attribute keys via hand-rolled string constants (e.g.
+   `"db.system.name"`) rather than importing
+   `go.opentelemetry.io/otel/semconv/vX.Y.Z`. The chosen names belong
+   to the post-v1.30 DB-stable rename (`db.system` → `db.system.name`),
+   which conflicts with the SDK's pinned v1.27.0. Because no semconv
+   package is imported, the upstream library can drift further at any
+   time without a Go build-time signal.
+2. **`_oteltrace` document injection cannot be disabled independently.**
+   The library's two environment-variable toggles
+   (`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`,
+   `OTEL_MONGO_TRACING_ENABLED`) are binary on/off switches that
+   disable command spans and document injection together. The SDK's
+   commitment to ship with document injection off (Decision 5) cannot
+   be honored while keeping command spans on.
 
 ---
 
@@ -62,11 +84,25 @@ opts := options.Client().ApplyURI(uri).SetMonitor(newCommandMonitor(tp, prop))
 client, err := mongo.Connect(opts)
 ```
 
-**Why not use the upstream library.** It pins globals in its advertised
-constructor path (ADR 0003, verification below). Forking would cost
-ongoing upstream-tracking work. Writing our own monitor is ~150 LOC,
-keeps us in full control of attribute semantics, and maps directly to
-OTel's intended extension design for MongoDB.
+**Why not use the upstream library** (as of v0.2.10):
+
+- **Semconv drift without package pin.** Upstream uses hand-rolled
+  string keys (`"db.system.name"`, …) belonging to post-v1.30 DB-stable
+  conventions, conflicting with the SDK's v1.27.0 pin (`db.system`).
+  Importantly, upstream does not `import "...semconv/vX.Y.Z"` at all,
+  so any future drift is silent — no Go compile-time signal would
+  catch it. See Context above.
+- **Document injection always-on.** The two upstream env-var toggles
+  bind document injection to command-span emission; the SDK's choice
+  to ship with document injection off (Decision 5) cannot be honored.
+- **Three-way alignment break.** `o11y` internal code, `otel-nats`,
+  and the `semconv/v1.27.0` Go package are all aligned today. Adopting
+  upstream introduces the only outlier in the SDK.
+
+Writing our own monitor is ~150 LOC, keeps us in full control of
+attribute semantics (compile-time pinned through the semconv package),
+honors the document-injection-off default, and maps directly to OTel's
+intended extension design for MongoDB.
 
 **What we give up by not using the upstream.**
 - `_oteltrace` document injection / `ContextFromDocument`. Not
@@ -75,6 +111,17 @@ OTel's intended extension design for MongoDB.
   operation filter (Decision 6).
 - Upstream bug fixes for command-event edge cases. We take on that
   maintenance burden directly.
+
+**Re-evaluation triggers.** Adoption should be reconsidered if any of
+the following changes:
+
+- Upstream adds a `WithDocumentTraceInjection(bool)` option (or
+  equivalent) so document injection can be opted out independently of
+  command spans.
+- Upstream replaces hand-rolled string keys with an explicit
+  `semconv/vX.Y.Z` package import.
+- The SDK upgrades its semconv pin (per ADR 0006) to a version that
+  matches upstream's chosen attribute names.
 
 ### 3. Package layout
 
@@ -233,16 +280,33 @@ later ADR can add them without an API break.
 ## Global-state verification
 
 ### Library surveyed: `github.com/Marz32onE/instrumentation-go/otel-mongo/v2`
-### Result: ❌ NOT SAFE at `ConnectWithOptions` entry point
+### Version: `v0.2.10`
+### Result: ✅ SAFE — but **not adopted** for separate reasons (Context above, Decision 2)
 
-`ConnectWithOptions` calls
-`otel.SetTracerProvider(cfg.TracerProvider)` and
-`otel.SetTextMapPropagator(cfg.Propagators)` when those options are
-supplied. This violates ADR 0003. Confirmed by source inspection of
-`otel-mongo/v2/client.go`.
+Source inspection of `otel-mongo/v2/client.go` at v0.2.10:
 
-**Decision consequence.** We do not add this module to `go.mod`. All
-MongoDB instrumentation is implemented through the official driver's
+```go
+func ConnectWithOptions(traceOpts []ClientOption, opts ...*options.ClientOptions) (*Client, error) {
+    cfg := newClientConfig(traceOpts)
+    tp := cfg.TracerProvider
+    if tp == nil { tp = otel.GetTracerProvider() }      // fallback read only
+    prop := cfg.Propagators
+    if prop == nil { prop = otel.GetTextMapPropagator() } // fallback read only
+    tracer := tp.Tracer(ScopeName, ...)
+    // ... no otel.SetTracerProvider / otel.SetTextMapPropagator anywhere
+}
+```
+
+**History.** Earlier versions of this library (≤ v0.2.9) called
+`otel.SetTracerProvider` and `otel.SetTextMapPropagator` from
+`ConnectWithOptions`, which violated ADR 0003. The upstream maintainer
+removed those calls in v0.2.10 in response to feedback from this
+project. The fix is verified.
+
+**Decision consequence.** Despite the global-state fix, we still do not
+add this module to `go.mod`. The semconv-drift and document-injection
+issues (Context and Decision 2 above) remain blockers. All MongoDB
+instrumentation is implemented through the official driver's
 `event.CommandMonitor` extension point as specified in Decision 2.
 
 ### Library used: `go.mongodb.org/mongo-driver/v2`

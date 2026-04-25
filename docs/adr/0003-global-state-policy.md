@@ -135,7 +135,7 @@ Before introducing any `github.com/<vendor>/otel-<thing>` library, verify:
 | Library | Version | Verified | Behavior | Notes |
 |---|---|---|---|---|
 | `Marz32onE/instrumentation-go/otel-nats` | v0.2.1 | ✅ | Reads globals as fallback only; never sets. Safe when `WithTracerProvider` / `WithPropagators` options are supplied. | See ADR 0004 |
-| `Marz32onE/instrumentation-go/otel-mongo/v2` | TBD | ❌ | `ConnectWithOptions` calls `otel.SetTracerProvider` and `otel.SetTextMapPropagator`. MUST NOT be used through that entry point. | See ADR 0005 |
+| `Marz32onE/instrumentation-go/otel-mongo/v2` | v0.2.10 | ✅ | Reads globals as fallback only; never sets (fixed upstream at our request — earlier versions called `otel.SetTracerProvider` / `otel.SetTextMapPropagator` from `ConnectWithOptions`). | **Not adopted** despite the global-state fix — see ADR 0005 for the separate semconv-drift and document-injection reasons that block adoption |
 
 When a new library is added or an existing one bumped, update this table
 in the same PR as the version change.

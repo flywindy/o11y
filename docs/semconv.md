@@ -34,6 +34,37 @@ change:
 3. **Deviations require explicit justification** in the "Deviations"
    section below. The default answer is "no deviation".
 
+### Cross-library version handling — decision tree
+
+Third-party instrumentation libraries do not always pin to the same
+semconv version this SDK uses. When importing a library that touches
+attribute keys, audit it with this decision tree before adoption:
+
+```
+Does the library import "go.opentelemetry.io/otel/semconv/vX.Y.Z"?
+  ├─ NO  →  Hand-rolled string keys. No compile-time pin. Treat as
+  │         permanently drifting; reject adoption (precedent: ADR 0005
+  │         on otel-mongo). Acceptable workarounds: fork to add the
+  │         import, or push upstream to add it.
+  │
+  └─ YES →  Compare its pinned version to ours.
+            ├─ Same as ours                  → adopt as-is
+            ├─ ±1–2 versions, only adds keys → adopt; note in this catalog
+            ├─ ±1–2 versions, includes a rename of a key we use →
+            │     three options:
+            │       (a) translate at the boundary (a SpanProcessor or
+            │           wrapper that renames keys)
+            │       (b) push upstream to align
+            │       (c) trigger an SDK semconv upgrade (ADR 0006)
+            └─ ≥3 versions apart → consider writing our own
+                  instrumentation against the library's native
+                  extension point (precedent: ADR 0005 mongo monitor)
+```
+
+Whichever branch you take, document the outcome in the integration's
+own ADR under a "Semconv alignment" section, and update this catalog
+if any new attribute key starts being emitted.
+
 ---
 
 ## Resource attributes
