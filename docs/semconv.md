@@ -40,7 +40,7 @@ Third-party instrumentation libraries do not always pin to the same
 semconv version this SDK uses. When importing a library that touches
 attribute keys, audit it with this decision tree before adoption:
 
-```
+```text
 Does the library import "go.opentelemetry.io/otel/semconv/vX.Y.Z"?
   ├─ NO  →  Hand-rolled string keys. No compile-time pin. Treat as
   │         permanently drifting; reject adoption (precedent: ADR 0005

@@ -125,7 +125,7 @@ the following changes:
 
 ### 3. Package layout
 
-```
+```text
 mongo/
   conn.go           // public API: Connect / Option
   monitor.go        // event.CommandMonitor implementation
@@ -229,7 +229,7 @@ to `go.opentelemetry.io/otel/semconv/v1.27.0`):
 |---|---|---|
 | `db.system` | string | constant `"mongodb"` |
 | `db.namespace` | string | `event.DatabaseName` |
-| `db.collection.name` | string | first BSON arg (`event.Command` lookup; see below) |
+| `db.collection.name` | string | value of the command field (e.g., the value of `find` for a `find` command, `insert` for an `insert` command) |
 | `db.operation.name` | string | `event.CommandName` |
 | `server.address` | string | `event.ConnectionID` host portion |
 | `server.port` | int | `event.ConnectionID` port portion |
@@ -257,11 +257,13 @@ later ADR can add them without an API break.
 
 ### 9. Example and documentation
 
-- `examples/mongo/main.go` — insert → find → aggregate happy path; run
-  against a local Mongo (or the kind cluster once a MongoDB manifest is
-  added).
-- `README.md` gains a MongoDB section mirroring the NATS section.
-- `AGENTS.md` adds a "Do NOT" item: "Do not call
+The following are deferred to the implementation PR (this ADR is doc-only):
+
+- `examples/mongo/main.go` will demonstrate insert → find → aggregate
+  happy path; run against a local Mongo (or the kind cluster once a
+  MongoDB manifest is added).
+- `README.md` will gain a MongoDB section mirroring the NATS section.
+- `AGENTS.md` will add a "Do NOT" item: "Do not call
   `mongo.Connect` directly for services using this SDK; route through
   `o11ymongo.Connect` so the CommandMonitor and providers are wired."
 
