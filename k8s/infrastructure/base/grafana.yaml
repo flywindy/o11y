@@ -24,6 +24,7 @@ data:
           datasourceUid: prometheus
         tracesToLogsV2:
           datasourceUid: loki
+          # customQuery provides the trace filter, so keep Grafana's built-in trace ID filter disabled.
           filterByTraceID: false
           filterBySpanID: false
           spanStartTimeShift: '-5m'
@@ -32,7 +33,7 @@ data:
             - key: service.name
               value: service_name
           customQuery: true
-          query: '{service_name=~".*/$${__span.tags["service.name"]}|$${__span.tags["service.name"]}"} |= "$${__trace.traceId}"'
+          query: '{service_name=~"(.*/|)$${__span.tags["service.name"]}"} |= "$${__trace.traceId}"'
 
     - name: Prometheus
       type: prometheus
