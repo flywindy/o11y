@@ -50,6 +50,21 @@ Use these patterns for local Grafana/Loki/Tempo/Prometheus/Collector work:
 - Prometheus: query the Prometheus HTTP API from an in-cluster pod or through port-forward when checking metrics behavior.
 - Tempo: verify trace queries through Grafana or Tempo's HTTP API when a trace/log/metric correlation path is changed.
 
+### Verifying Trace-to-Logs Integration
+
+When changing Grafana's `tracesToLogsV2` or Loki's `derivedFields` configuration:
+
+1. Apply the datasource ConfigMap change and restart Grafana.
+2. Query Loki from the Grafana pod with a known trace ID, replacing `<namespace>` and `<trace-id>`:
+   ```bash
+   kubectl exec -n <namespace> deploy/grafana -- wget -qO- \
+     'http://loki.<namespace>.svc.cluster.local:3100/loki/api/v1/query_range?query={service_name=~".*"}|="<trace-id>"'
+   ```
+3. Verify the expected log entries are returned.
+4. In Grafana, open a trace span and confirm "Logs for this span" generates the expected LogQL query and returns matching Loki logs.
+5. From Loki log entries, verify the `TraceID` derived field opens the matching Tempo trace.
+6. For derived field matcher changes, test both supported log formats: `traceid` from the OTLP path and `traceId` from the stdout path.
+
 ## Safety Notes
 
 - Do not assume `kubectl apply` means the system behavior changed; ConfigMap-mounted applications may need a rollout restart.
