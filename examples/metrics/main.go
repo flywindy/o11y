@@ -32,6 +32,8 @@ import (
 
 	"github.com/flywindy/o11y"
 	o11yhttp "github.com/flywindy/o11y/http"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func main() {
@@ -79,11 +81,12 @@ func main() {
 		_, _ = fmt.Fprintln(w, "error")
 	})
 
-	handler := o11yhttp.New(ctx, obs.Meter("metrics-example"),
+	metricsHandler := o11yhttp.New(ctx, obs.Meter("metrics-example"),
 		o11yhttp.WithPathNormalizer(func(r *http.Request) string {
 			return r.URL.Path // paths are already static templates in this example
 		}),
 	)(mux)
+	handler := traceServerRequests(obs.Propagator, obs.Tracer("metrics-example"), metricsHandler)
 
 	// Start the app server on :8080.
 	ln, err := net.Listen("tcp", ":8080")
@@ -125,6 +128,7 @@ func main() {
 			path := paths[rand.IntN(len(paths))]
 
 			req, _ := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://localhost:8080"+path, nil)
+			obs.Propagator.Inject(reqCtx, propagation.HeaderCarrier(req.Header))
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				obs.Logger.ErrorContext(reqCtx, "request failed", slog.Any("error", err))
@@ -138,4 +142,14 @@ func main() {
 			span.End()
 		}
 	}
+}
+
+func traceServerRequests(propagator propagation.TextMapPropagator, tracer trace.Tracer, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parentCtx := propagator.Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+		ctx, span := tracer.Start(parentCtx, r.Method+" "+r.URL.Path, trace.WithSpanKind(trace.SpanKindServer))
+		defer span.End()
+
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }

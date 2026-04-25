@@ -44,7 +44,7 @@ data:
         # exemplarTraceIdDestinations wires histogram exemplars to Tempo:
         # clicking an exemplar dot in Grafana opens the linked trace directly.
         exemplarTraceIdDestinations:
-          - name: traceID
+          - name: trace_id
             datasourceUid: tempo
 
     - name: Loki
