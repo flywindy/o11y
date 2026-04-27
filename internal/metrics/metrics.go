@@ -50,6 +50,11 @@ type Config struct {
 	// Example: "http://otel-collector:4318"
 	MetricsOTLPEndpoint string
 
+	// OTLPHeaders, when non-empty, are attached to every OTLP/HTTP request
+	// emitted by the metrics exporter (used for authentication against
+	// managed observability backends). Ignored on the Prometheus pull path.
+	OTLPHeaders map[string]string
+
 	ServiceName    string
 	ServiceVersion string
 	Environment    string
@@ -168,9 +173,13 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 
 // initOTLP sets up the OTLP push path.
 func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, view sdkmetric.View) (*sdkmetric.MeterProvider, Closer, error) {
-	exporter, err := otlpmetrichttp.New(ctx,
+	expOpts := []otlpmetrichttp.Option{
 		otlpmetrichttp.WithEndpointURL(cfg.MetricsOTLPEndpoint),
-	)
+	}
+	if len(cfg.OTLPHeaders) > 0 {
+		expOpts = append(expOpts, otlpmetrichttp.WithHeaders(cfg.OTLPHeaders))
+	}
+	exporter, err := otlpmetrichttp.New(ctx, expOpts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("metrics: create OTLP exporter: %w", err)
 	}

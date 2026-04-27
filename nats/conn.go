@@ -61,7 +61,14 @@ func Connect(ctx context.Context, url string, tp trace.TracerProvider, prop prop
 // across services in Grafana Tempo. Calls to slog.InfoContext(ctx, ...) will
 // include the consumer's traceId and spanId; calls to tracer.Start(ctx, ...)
 // produce child spans of the consumer span.
+//
+// Subscribe rejects an empty subject up-front: an empty subject silently
+// matches no messages on the NATS server and is almost always a programming
+// error.
 func (c *Conn) Subscribe(subject string, handler MsgHandler) (*natsgo.Subscription, error) {
+	if subject == "" {
+		return nil, fmt.Errorf("nats subscribe: subject must not be empty")
+	}
 	if handler == nil {
 		return nil, fmt.Errorf("nats subscribe %q: handler must not be nil", subject)
 	}
@@ -72,8 +79,15 @@ func (c *Conn) Subscribe(subject string, handler MsgHandler) (*natsgo.Subscripti
 
 // QueueSubscribe is the queue-group variant of Subscribe. All members of the
 // same queue group share message delivery round-robin, providing load balancing
-// across multiple subscriber instances.
+// across multiple subscriber instances. Both subject and queue must be
+// non-empty.
 func (c *Conn) QueueSubscribe(subject, queue string, handler MsgHandler) (*natsgo.Subscription, error) {
+	if subject == "" {
+		return nil, fmt.Errorf("nats queue-subscribe: subject must not be empty")
+	}
+	if queue == "" {
+		return nil, fmt.Errorf("nats queue-subscribe %q: queue must not be empty", subject)
+	}
 	if handler == nil {
 		return nil, fmt.Errorf("nats queue-subscribe %q/%q: handler must not be nil", subject, queue)
 	}
