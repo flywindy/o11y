@@ -17,24 +17,12 @@ import (
 
 	o11yhttp "github.com/flywindy/o11y/http"
 	"github.com/flywindy/o11y/internal/metrics"
+	"github.com/flywindy/o11y/internal/testutil"
 )
-
-func scrapeBody(t *testing.T, addr string) string {
-	t.Helper()
-	resp, err := http.Get("http://" + addr + "/metrics")
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	return string(body)
-}
 
 // TestMiddleware_Records verifies the histogram is emitted with expected labels.
 func TestMiddleware_Records(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	addr := ln.Addr().String()
-	require.NoError(t, ln.Close())
+	addr := testutil.FreeAddr(t)
 
 	provider, closer, err := metrics.InitMeter(context.Background(), metrics.Config{
 		ServiceName:      "test-svc",
@@ -76,7 +64,7 @@ func TestMiddleware_Records(t *testing.T) {
 		_ = resp.Body.Close()
 	}
 
-	body := scrapeBody(t, addr)
+	body := testutil.ScrapeMetrics(t, addr)
 	// One histogram line per status code we exercised.
 	assert.Contains(t, body, `http_response_status_code="200"`)
 	assert.Contains(t, body, `http_response_status_code="404"`)
@@ -92,10 +80,7 @@ func TestMiddleware_Records(t *testing.T) {
 // TestMiddleware_CardinalityCap verifies that paths beyond maxUniquePaths
 // collapse to the literal "other" label.
 func TestMiddleware_CardinalityCap(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	addr := ln.Addr().String()
-	require.NoError(t, ln.Close())
+	addr := testutil.FreeAddr(t)
 
 	provider, closer, err := metrics.InitMeter(context.Background(), metrics.Config{
 		ServiceName:      "test-svc",
@@ -131,7 +116,7 @@ func TestMiddleware_CardinalityCap(t *testing.T) {
 		_ = resp.Body.Close()
 	}
 
-	body := scrapeBody(t, addr)
+	body := testutil.ScrapeMetrics(t, addr)
 	assert.Contains(t, body, `http_route="other"`, "cardinality overflow must collapse to 'other'")
 
 	// Count distinct http_route labels in the histogram _count series. With
@@ -159,10 +144,7 @@ func TestMiddleware_CardinalityCap(t *testing.T) {
 // TestMiddleware_CustomNormalizer verifies that a caller-supplied path
 // normalizer wins over the raw r.URL.Path.
 func TestMiddleware_CustomNormalizer(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	addr := ln.Addr().String()
-	require.NoError(t, ln.Close())
+	addr := testutil.FreeAddr(t)
 
 	provider, closer, err := metrics.InitMeter(context.Background(), metrics.Config{
 		ServiceName:      "test-svc",
@@ -202,7 +184,7 @@ func TestMiddleware_CustomNormalizer(t *testing.T) {
 		_ = resp.Body.Close()
 	}
 
-	body := scrapeBody(t, addr)
+	body := testutil.ScrapeMetrics(t, addr)
 	assert.Contains(t, body, `http_route="/users/:id"`)
 	assert.NotContains(t, body, `http_route="/users/1"`)
 }
@@ -367,10 +349,7 @@ func TestMiddleware_DoesNotAdvertiseUnsupportedOptionalInterfaces(t *testing.T) 
 // converted to a status_code=500 metric sample and then re-raised so the
 // http.Server's default panic handler still runs.
 func TestMiddleware_PanicRecordsAndRepanics(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	addr := ln.Addr().String()
-	require.NoError(t, ln.Close())
+	addr := testutil.FreeAddr(t)
 
 	provider, closer, err := metrics.InitMeter(context.Background(), metrics.Config{
 		ServiceName:      "test-svc",
@@ -396,7 +375,7 @@ func TestMiddleware_PanicRecordsAndRepanics(t *testing.T) {
 		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/boom", nil))
 	}, "middleware must re-raise the original panic value")
 
-	body := scrapeBody(t, addr)
+	body := testutil.ScrapeMetrics(t, addr)
 	assert.Contains(t, body, `http_response_status_code="500"`,
 		"a handler panic before WriteHeader must be recorded as status 500")
 	assert.Contains(t, body, `http_route="/boom"`)
@@ -406,10 +385,7 @@ func TestMiddleware_PanicRecordsAndRepanics(t *testing.T) {
 // middleware does not retroactively change the recorded status_code if the
 // handler had already committed a status before panicking.
 func TestMiddleware_PanicAfterWriteHeaderKeepsOriginalStatus(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	addr := ln.Addr().String()
-	require.NoError(t, ln.Close())
+	addr := testutil.FreeAddr(t)
 
 	provider, closer, err := metrics.InitMeter(context.Background(), metrics.Config{
 		ServiceName:      "test-svc",
@@ -436,7 +412,7 @@ func TestMiddleware_PanicAfterWriteHeaderKeepsOriginalStatus(t *testing.T) {
 		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/late", nil))
 	})
 
-	body := scrapeBody(t, addr)
+	body := testutil.ScrapeMetrics(t, addr)
 	assert.Contains(t, body, `http_response_status_code="202"`,
 		"status committed before panic must be preserved in the metric")
 }
