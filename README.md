@@ -134,6 +134,13 @@ func main() {
 | `WithLogLevel(level)` | `slog.LevelInfo` | Minimum log level |
 | `WithRuntimeMetrics(bool)` | `true` | Collect Go runtime metrics (goroutines, GC, memory) |
 
+> **Migration note (pre-1.0 API change)** — `DefaultLatencyBuckets` is now a
+> function (`o11y.DefaultLatencyBuckets()` returning a fresh copy) rather
+> than a package-level slice variable, so callers cannot accidentally mutate
+> the package defaults. `DefaultMetricsAddr` is now a `const` (was `var`);
+> use `WithMetricsAddr(":9090")` to override. See `CHANGELOG.md` for the
+> migration recipe.
+
 ### Structured Logging with Trace Correlation
 
 Use `obs.Logger` instead of the global `slog` package. Every log record is written to two destinations automatically:

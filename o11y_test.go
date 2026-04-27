@@ -196,7 +196,10 @@ func TestInit_OTLPHeadersForwarded(t *testing.T) {
 		if r.Header.Get("Authorization") == "Bearer secret-token" {
 			sawAuth = true
 		}
-		if r.Header.Get("X-Scope-Orgid") == "tenant-42" || r.Header.Get("X-Scope-OrgID") == "tenant-42" {
+		// http.Header.Get applies textproto.CanonicalMIMEHeaderKey, so any
+		// casing of the input maps to the same canonical key — one lookup
+		// is sufficient.
+		if r.Header.Get("X-Scope-OrgID") == "tenant-42" {
 			sawScope = true
 		}
 		if r.Header.Get("X-Honeycomb-Team") == "abc123" {

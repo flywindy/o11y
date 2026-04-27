@@ -60,9 +60,10 @@ We considered adding `WithTraceOTLPHeaders`, `WithLogOTLPHeaders`, and
    identifies the *application*, not the signal type, so per-signal granularity
    solves a problem that does not exist.
 3. **Per-signal endpoints are also not yet exposed.** When we add
-   `WithLogOTLPEndpoint` / `WithMetricsOTLPHeaders` (open question — see
-   below), per-signal headers can land alongside them as a pair. Adding split
-   header options now would commit us to an awkward intermediate API.
+   `WithLogOTLPEndpoint` / `WithMetricsOTLPEndpoint`-style per-signal
+   routing (open question — see below), per-signal headers can land
+   alongside them as a pair. Adding split header options now would
+   commit us to an awkward intermediate API.
 
 If a real use-case for per-signal headers emerges, we can add the narrower
 options later without breaking `WithOTLPHeaders` — they would simply override

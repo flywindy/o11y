@@ -1,5 +1,9 @@
 .PHONY: all test lint vuln examples bench cover fmt tidy clean help
 
+# Force bash so the examples target can use process substitution / read -d ''.
+# The default /bin/sh on Debian / Ubuntu is dash, which lacks both features.
+SHELL    := /bin/bash
+
 GO       ?= go
 PKGS     := ./...
 COVERAGE := coverage.out
@@ -20,10 +24,10 @@ vuln: ## Scan dependencies for known vulnerabilities
 
 examples: ## Build every example program
 	@set -e; \
-	for main in $$(find examples -name main.go); do \
-		dir=$$(dirname $$main); \
+	find examples -name main.go -print0 | while IFS= read -r -d '' main; do \
+		dir=$$(dirname "$$main"); \
 		echo "build $$dir"; \
-		$(GO) build -o /dev/null ./$$dir; \
+		$(GO) build -o /dev/null "./$$dir"; \
 	done
 
 bench: ## Run benchmarks (allocations included)

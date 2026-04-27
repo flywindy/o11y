@@ -59,9 +59,12 @@ jobs:
           go-version-file: go.mod
           cache: false
 
+      # golangci-lint binary version is pinned for CI reproducibility.
+      # Manage upgrades via Dependabot / Renovate so they land as PRs
+      # rather than silently changing behaviour on every CI run.
       - uses: golangci/golangci-lint-action@v6
         with:
-          version: latest
+          version: v2.11.4
           args: --timeout=5m
 
   vuln:
@@ -75,7 +78,10 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # govulncheck is pinned for CI reproducibility (format/exit-code
+      # changes between releases have broken pipelines historically).
+      # Manage upgrades via Dependabot / Renovate.
       - name: govulncheck
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
           govulncheck ./...

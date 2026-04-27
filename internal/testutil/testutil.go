@@ -10,10 +10,12 @@ package testutil
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,7 +43,7 @@ func FakeOTLPServer(t *testing.T) *httptest.Server {
 type CapturingOTLPServer struct {
 	*httptest.Server
 
-	mu       chan struct{} // used as a 1-slot mutex
+	mu       sync.Mutex
 	requests []CapturedRequest
 }
 
@@ -57,16 +59,15 @@ type CapturedRequest struct {
 // inbound request. Auto-closed via t.Cleanup.
 func NewCapturingOTLPServer(t *testing.T) *CapturingOTLPServer {
 	t.Helper()
-	c := &CapturingOTLPServer{mu: make(chan struct{}, 1)}
-	c.mu <- struct{}{} // prime the lock slot
+	c := &CapturingOTLPServer{}
 	c.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-c.mu
+		c.mu.Lock()
 		c.requests = append(c.requests, CapturedRequest{
 			Path:   r.URL.Path,
 			Method: r.Method,
 			Header: r.Header.Clone(),
 		})
-		c.mu <- struct{}{}
+		c.mu.Unlock()
 		// Drain the body so the client's connection can be reused, but do
 		// not retain it.
 		_, _ = io.Copy(io.Discard, r.Body)
@@ -79,8 +80,8 @@ func NewCapturingOTLPServer(t *testing.T) *CapturingOTLPServer {
 // Requests returns a snapshot of every request the server has received so
 // far. The returned slice is a copy and is safe to retain.
 func (c *CapturingOTLPServer) Requests() []CapturedRequest {
-	<-c.mu
-	defer func() { c.mu <- struct{}{} }()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	out := make([]CapturedRequest, len(c.requests))
 	copy(out, c.requests)
 	return out
@@ -118,12 +119,18 @@ func ScrapeMetrics(t *testing.T, addr string) string {
 // so it is safe to use inside assert.Eventually / require.Eventually
 // callbacks where transient failures should drive a retry rather than a
 // test abort.
+//
+// A non-2xx response is also reported as an error so that polling loops do
+// not silently treat error pages as a successful scrape body.
 func TryScrapeMetrics(addr string) (string, error) {
 	resp, err := http.Get("http://" + addr + "/metrics")
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return "", fmt.Errorf("scrape %s returned HTTP %d", addr, resp.StatusCode)
+	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
