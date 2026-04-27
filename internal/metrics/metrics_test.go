@@ -45,9 +45,14 @@ func TestInitMeter_HappyPath(t *testing.T) {
 
 	// runtime.Start registers async instruments lazily; the Prometheus
 	// exporter pulls them on each scrape. Poll instead of fixed-sleep so
-	// the test isn't fragile under load.
+	// the test isn't fragile under load. TryScrapeMetrics returns an error
+	// instead of calling t.FailNow so a transient scrape failure inside
+	// the polling window drives a retry rather than aborting the test.
 	assert.Eventually(t, func() bool {
-		body := testutil.ScrapeMetrics(t, addr)
+		body, err := testutil.TryScrapeMetrics(addr)
+		if err != nil {
+			return false
+		}
 		return strings.Contains(body, "go_goroutine") ||
 			strings.Contains(body, "process_runtime_go_goroutines")
 	}, 2*time.Second, 50*time.Millisecond,

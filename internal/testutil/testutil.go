@@ -102,14 +102,33 @@ func FreeAddr(t *testing.T) string {
 
 // ScrapeMetrics issues a GET against http://addr/metrics and returns the body
 // as a string. Test fails on any I/O error.
+//
+// For use inside assert.Eventually / require.Eventually polling loops, use
+// TryScrapeMetrics instead — it returns an error rather than calling
+// t.FailNow, so transient scrape failures do not abort the whole test.
 func ScrapeMetrics(t *testing.T, addr string) string {
 	t.Helper()
-	resp, err := http.Get("http://" + addr + "/metrics")
+	body, err := TryScrapeMetrics(addr)
 	require.NoError(t, err)
+	return body
+}
+
+// TryScrapeMetrics issues a GET against http://addr/metrics and returns the
+// body and any I/O error. Unlike ScrapeMetrics, it never calls t.FailNow,
+// so it is safe to use inside assert.Eventually / require.Eventually
+// callbacks where transient failures should drive a retry rather than a
+// test abort.
+func TryScrapeMetrics(addr string) (string, error) {
+	resp, err := http.Get("http://" + addr + "/metrics")
+	if err != nil {
+		return "", err
+	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	return string(body)
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
 }
 
 // Shutdowner is anything that has a context-aware Shutdown method.
