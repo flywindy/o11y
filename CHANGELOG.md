@@ -41,7 +41,7 @@ adopters can plan their upgrades.
 - `internal/testutil` package consolidates duplicated test fixtures
   (`FakeOTLPServer`, `NewCapturingOTLPServer`, `FreeAddr`, `ScrapeMetrics`,
   `TryScrapeMetrics`, `MustShutdown`).
-- ADR `0003-otlp-authentication.md` documents the `WithOTLPHeaders` design
+- ADR `0007-otlp-authentication.md` documents the `WithOTLPHeaders` design
   and rejected alternatives.
 - README **Logging Guidelines** section covering PII handling, log injection,
   and attribute payload size limits.

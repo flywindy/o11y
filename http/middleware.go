@@ -40,8 +40,8 @@ import (
 	"sync"
 	"time"
 
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	semconv "go.opentelemetry.io/otel/semconv/v1.27.0"
 )
 
 // DefaultMaxUniquePaths is the default upper bound on distinct http.route
@@ -133,9 +133,9 @@ func New(ctx context.Context, meter metric.Meter, opts ...Option) func(http.Hand
 				}
 				hist.Record(r.Context(), time.Since(start).Seconds(),
 					metric.WithAttributes(
-						attribute.String("http.request.method", r.Method),
-						attribute.String("http.route", limiter.observe(cfg.normalizer(r))),
-						attribute.Int("http.response.status_code", rec.status),
+						semconv.HTTPRequestMethodKey.String(r.Method),
+						semconv.HTTPRouteKey.String(limiter.observe(cfg.normalizer(r))),
+						semconv.HTTPResponseStatusCodeKey.Int(rec.status),
 					))
 				if panicValue != nil {
 					// Re-raise so the http.Server's default panic handler runs

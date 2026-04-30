@@ -1,4 +1,4 @@
-# ADR 0003: OTLP Authentication via `WithOTLPHeaders`
+# ADR 0007: OTLP Authentication via `WithOTLPHeaders`
 
 **Status**: Accepted
 **Date**: 2026-04-27

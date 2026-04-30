@@ -1,0 +1,4 @@
+interface:
+  display_name: "Verify Kubernetes Manifests"
+  short_description: "Verify Kubernetes manifest changes against live clusters."
+  default_prompt: "Use this skill when changing Kubernetes manifests and verify the result with kubectl."
