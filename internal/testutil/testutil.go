@@ -73,7 +73,7 @@ func NewCapturingOTLPServer(t *testing.T) *CapturingOTLPServer {
 		_, _ = io.Copy(io.Discard, r.Body)
 		w.WriteHeader(http.StatusOK)
 	}))
-	t.Cleanup(c.Server.Close)
+	t.Cleanup(c.Close)
 	return c
 }
 
@@ -102,14 +102,16 @@ func FreeAddr(t *testing.T) string {
 }
 
 // ScrapeMetrics issues a GET against http://addr/metrics and returns the body
-// as a string. Test fails on any I/O error.
+// as a string. Test fails on any I/O error. The supplied parent context is
+// honoured for cancellation; an additional 1-second deadline is applied per
+// request so a hung listener cannot freeze the test.
 //
 // For use inside assert.Eventually / require.Eventually polling loops, use
 // TryScrapeMetrics instead — it returns an error rather than calling
 // t.FailNow, so transient scrape failures do not abort the whole test.
-func ScrapeMetrics(t *testing.T, addr string) string {
+func ScrapeMetrics(ctx context.Context, t *testing.T, addr string) string {
 	t.Helper()
-	body, err := TryScrapeMetrics(addr)
+	body, err := TryScrapeMetrics(ctx, addr)
 	require.NoError(t, err)
 	return body
 }
@@ -123,13 +125,15 @@ func ScrapeMetrics(t *testing.T, addr string) string {
 // A non-2xx response is also reported as an error so that polling loops do
 // not silently treat error pages as a successful scrape body.
 //
-// Each request is bounded by a 1-second deadline so an unresponsive endpoint
-// cannot starve the surrounding poll: assert.Eventually's tick interval
-// stays meaningful even when the listener accepts but never replies.
-func TryScrapeMetrics(addr string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+// Each request is bounded by an additional 1-second deadline derived from
+// the supplied parent context so an unresponsive endpoint cannot starve the
+// surrounding poll: assert.Eventually's tick interval stays meaningful even
+// when the listener accepts but never replies. Caller cancellation of the
+// parent ctx still aborts in-flight requests.
+func TryScrapeMetrics(ctx context.Context, addr string) (string, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/metrics", nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://"+addr+"/metrics", nil)
 	if err != nil {
 		return "", err
 	}
@@ -137,7 +141,7 @@ func TryScrapeMetrics(addr string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode/100 != 2 {
 		return "", fmt.Errorf("scrape %s returned HTTP %d", addr, resp.StatusCode)
 	}
@@ -154,11 +158,13 @@ type Shutdowner interface {
 	Shutdown(context.Context) error
 }
 
-// MustShutdown runs s.Shutdown with a 5-second deadline and fails the test
-// on error. The deadline cap protects test runs from a hung exporter.
-func MustShutdown(t *testing.T, s Shutdowner) {
+// MustShutdown runs s.Shutdown with a 5-second deadline derived from the
+// supplied parent context, and fails the test on error. The deadline cap
+// protects test runs from a hung exporter while still honouring caller
+// cancellation.
+func MustShutdown(ctx context.Context, t *testing.T, s Shutdowner) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	require.NoError(t, s.Shutdown(ctx))
+	require.NoError(t, s.Shutdown(shutCtx))
 }

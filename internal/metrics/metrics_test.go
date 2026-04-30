@@ -49,7 +49,7 @@ func TestInitMeter_HappyPath(t *testing.T) {
 	// instead of calling t.FailNow so a transient scrape failure inside
 	// the polling window drives a retry rather than aborting the test.
 	assert.Eventually(t, func() bool {
-		body, err := testutil.TryScrapeMetrics(addr)
+		body, err := testutil.TryScrapeMetrics(t.Context(), addr)
 		if err != nil {
 			return false
 		}
@@ -58,7 +58,7 @@ func TestInitMeter_HappyPath(t *testing.T) {
 	}, 2*time.Second, 50*time.Millisecond,
 		"runtime metrics should appear within timeout")
 
-	body := testutil.ScrapeMetrics(t, addr)
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
 	assert.Contains(t, body, `service_namespace="platform"`, "service.namespace resource attribute must appear as a constant label")
 	assert.Contains(t, body, `service_name="test-svc"`, "service_name must appear as a constant label")
 	assert.Contains(t, body, `service_version="0.0.1"`, "service_version must appear as a constant label")
@@ -126,7 +126,7 @@ func TestInitMeter_RuntimeMetricsOff(t *testing.T) {
 		_ = mp.Shutdown(ctx)
 	}()
 
-	body := testutil.ScrapeMetrics(t, addr)
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
 	assert.NotContains(t, body, "process_runtime_go_goroutines")
 }
 

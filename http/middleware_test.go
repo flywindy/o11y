@@ -42,16 +42,16 @@ func TestMiddleware_Records(t *testing.T) {
 	mw := o11yhttp.New(context.Background(), provider.Meter("httpmw_test"))
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ok", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/ok", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	mux.HandleFunc("/notfound", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/notfound", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	})
-	mux.HandleFunc("/boom", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/boom", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	})
-	mux.HandleFunc("/implicit", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/implicit", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("hi"))
 	})
 
@@ -64,7 +64,7 @@ func TestMiddleware_Records(t *testing.T) {
 		_ = resp.Body.Close()
 	}
 
-	body := testutil.ScrapeMetrics(t, addr)
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
 	// One histogram line per status code we exercised.
 	assert.Contains(t, body, `http_response_status_code="200"`)
 	assert.Contains(t, body, `http_response_status_code="404"`)
@@ -102,7 +102,7 @@ func TestMiddleware_CardinalityCap(t *testing.T) {
 		provider.Meter("cardinality_test"),
 		o11yhttp.WithMaxUniquePaths(3),
 	)
-	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -116,7 +116,7 @@ func TestMiddleware_CardinalityCap(t *testing.T) {
 		_ = resp.Body.Close()
 	}
 
-	body := testutil.ScrapeMetrics(t, addr)
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
 	assert.Contains(t, body, `http_route="other"`, "cardinality overflow must collapse to 'other'")
 
 	// Count distinct http_route labels in the histogram _count series. With
@@ -171,7 +171,7 @@ func TestMiddleware_CustomNormalizer(t *testing.T) {
 			return r.URL.Path
 		}),
 	)
-	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
@@ -184,7 +184,7 @@ func TestMiddleware_CustomNormalizer(t *testing.T) {
 		_ = resp.Body.Close()
 	}
 
-	body := testutil.ScrapeMetrics(t, addr)
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
 	assert.Contains(t, body, `http_route="/users/:id"`)
 	assert.NotContains(t, body, `http_route="/users/1"`)
 }
@@ -224,7 +224,7 @@ func TestMiddleware_ResponseControllerUnwrap(t *testing.T) {
 	mw, shutdown := quickMeter(t)
 	defer shutdown()
 
-	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		rc := http.NewResponseController(w)
 		err := rc.SetWriteDeadline(time.Now().Add(time.Second))
 		assert.NoError(t, err, "ResponseController.SetWriteDeadline should succeed via Unwrap")
@@ -375,7 +375,7 @@ func TestMiddleware_PanicRecordsAndRepanics(t *testing.T) {
 		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/boom", nil))
 	}, "middleware must re-raise the original panic value")
 
-	body := testutil.ScrapeMetrics(t, addr)
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
 	assert.Contains(t, body, `http_response_status_code="500"`,
 		"a handler panic before WriteHeader must be recorded as status 500")
 	assert.Contains(t, body, `http_route="/boom"`)
@@ -412,7 +412,7 @@ func TestMiddleware_PanicAfterWriteHeaderKeepsOriginalStatus(t *testing.T) {
 		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/late", nil))
 	})
 
-	body := testutil.ScrapeMetrics(t, addr)
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
 	assert.Contains(t, body, `http_response_status_code="202"`,
 		"status committed before panic must be preserved in the metric")
 }

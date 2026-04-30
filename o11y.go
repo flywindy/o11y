@@ -1,3 +1,13 @@
+// Package o11y is the top-level entry point for the SDK. It exposes Init for
+// constructing a configured *SDK that bundles trace, metric, and log
+// providers together with the W3C TraceContext+Baggage propagator and a
+// dual-output slog logger.
+//
+// The SDK never mutates global OpenTelemetry state; callers wire the returned
+// providers into their application explicitly (e.g. otel.SetTracerProvider).
+//
+// See ADR 0001 (log format strategy), ADR 0002 (metrics strategy), and
+// ADR 0007 (OTLP authentication) for the design rationale.
 package o11y
 
 import (

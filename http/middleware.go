@@ -295,11 +295,11 @@ type pathLimiter struct {
 	size int
 }
 
-// newPathLimiter creates a pathLimiter that enforces a maximum of max distinct route strings.
-// max is the upper bound on distinct paths that will be tracked; once that bound is reached,
-// additional unseen paths will be treated as the literal `"other"`.
-func newPathLimiter(max int) *pathLimiter {
-	return &pathLimiter{max: max}
+// newPathLimiter creates a pathLimiter that enforces a maximum of n distinct
+// route strings. Once that bound is reached, additional unseen paths are
+// treated as the literal "other".
+func newPathLimiter(n int) *pathLimiter {
+	return &pathLimiter{max: n}
 }
 
 func (p *pathLimiter) observe(path string) string {

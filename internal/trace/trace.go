@@ -1,3 +1,7 @@
+// Package trace encapsulates the OTel TracerProvider and OTLP/HTTP trace
+// exporter used by the top-level o11y SDK. It does not mutate any global
+// OpenTelemetry state; the caller is responsible for wiring the returned
+// provider and propagator.
 package trace
 
 import (

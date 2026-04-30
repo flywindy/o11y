@@ -81,7 +81,7 @@ func TestInit_EnvironmentAliases(t *testing.T) {
 			opts := append(commonOpts(srv.URL), o11y.WithEnvironment(alias))
 			sdk, err := o11y.Init(context.Background(), opts...)
 			require.NoError(t, err, "alias %q should be accepted", alias)
-			testutil.MustShutdown(t, sdk)
+			testutil.MustShutdown(t.Context(), t, sdk)
 		})
 	}
 }
@@ -99,7 +99,7 @@ func TestInit_Success(t *testing.T) {
 	assert.NotNil(t, sdk.Meter("test"), "Meter must be obtainable")
 	assert.NotNil(t, sdk.MeterProvider(), "MeterProvider must be obtainable")
 
-	testutil.MustShutdown(t, sdk)
+	testutil.MustShutdown(t.Context(), t, sdk)
 }
 
 func TestInit_HandlesNilOption(t *testing.T) {
@@ -109,7 +109,7 @@ func TestInit_HandlesNilOption(t *testing.T) {
 	sdk, err := o11y.Init(context.Background(), opts...)
 	require.NoError(t, err)
 	require.NotNil(t, sdk)
-	testutil.MustShutdown(t, sdk)
+	testutil.MustShutdown(t.Context(), t, sdk)
 }
 
 func TestSDK_TracerIsNamed(t *testing.T) {
@@ -117,7 +117,7 @@ func TestSDK_TracerIsNamed(t *testing.T) {
 
 	sdk, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
 	require.NoError(t, err)
-	defer testutil.MustShutdown(t, sdk)
+	defer testutil.MustShutdown(t.Context(), t, sdk)
 
 	assert.NotNil(t, sdk.Tracer("a"))
 	assert.NotNil(t, sdk.Tracer("b"))
@@ -159,7 +159,7 @@ func TestInit_AcceptsExtremeValidBuckets(t *testing.T) {
 	)
 	sdk, err := o11y.Init(context.Background(), opts...)
 	require.NoError(t, err)
-	testutil.MustShutdown(t, sdk)
+	testutil.MustShutdown(t.Context(), t, sdk)
 }
 
 // TestInit_OTLPHeadersForwarded confirms WithOTLPHeaders reaches the
@@ -171,8 +171,8 @@ func TestInit_OTLPHeadersForwarded(t *testing.T) {
 
 	opts := append(commonOpts(srv.URL),
 		o11y.WithOTLPHeaders(map[string]string{
-			"Authorization":   "Bearer secret-token",
-			"X-Scope-OrgID":   "tenant-42",
+			"Authorization":    "Bearer secret-token",
+			"X-Scope-OrgID":    "tenant-42",
 			"X-Honeycomb-Team": "abc123",
 		}),
 	)
@@ -184,7 +184,7 @@ func TestInit_OTLPHeadersForwarded(t *testing.T) {
 	_, span := sdk.Tracer("hdr-test").Start(context.Background(), "probe")
 	span.End()
 	require.NoError(t, sdk.TracerProvider().ForceFlush(context.Background()))
-	testutil.MustShutdown(t, sdk)
+	testutil.MustShutdown(t.Context(), t, sdk)
 
 	requests := srv.Requests()
 	require.NotEmpty(t, requests, "exporter should have made at least one OTLP request")
