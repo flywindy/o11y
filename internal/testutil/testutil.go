@@ -122,8 +122,18 @@ func ScrapeMetrics(t *testing.T, addr string) string {
 //
 // A non-2xx response is also reported as an error so that polling loops do
 // not silently treat error pages as a successful scrape body.
+//
+// Each request is bounded by a 1-second deadline so an unresponsive endpoint
+// cannot starve the surrounding poll: assert.Eventually's tick interval
+// stays meaningful even when the listener accepts but never replies.
 func TryScrapeMetrics(addr string) (string, error) {
-	resp, err := http.Get("http://" + addr + "/metrics")
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+"/metrics", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", err
 	}
