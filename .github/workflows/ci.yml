@@ -20,6 +20,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Tests run on the Go version declared in go.mod so we exercise
+      # exactly the stdlib surface our minimum-supported toolchain ships.
+      # govulncheck (in the vuln job below) uses `stable` instead so it
+      # sees the latest stdlib CVE patches.
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -62,7 +66,9 @@ jobs:
       # golangci-lint binary version is pinned for CI reproducibility.
       # Manage upgrades via Dependabot / Renovate so they land as PRs
       # rather than silently changing behaviour on every CI run.
-      - uses: golangci/golangci-lint-action@v6
+      # NOTE: golangci-lint-action@v7 is required for golangci-lint v2.x;
+      # the older @v6 line only supports v1.x.
+      - uses: golangci/golangci-lint-action@v7
         with:
           version: v2.11.4
           args: --timeout=5m
@@ -73,9 +79,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # govulncheck must see the latest stdlib so vulnerability matches
+      # reflect what a freshly-built binary would actually link. Using the
+      # go.mod version (1.25.0) here would surface only the patches that
+      # were available on the day go.mod was last bumped, which is rarely
+      # what the user wants from a vuln scan. `stable` + check-latest
+      # always installs the newest released Go, which is the source of
+      # truth for stdlib CVE coverage.
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: stable
+          check-latest: true
           cache: true
 
       # govulncheck is pinned for CI reproducibility (format/exit-code
