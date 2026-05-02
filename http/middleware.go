@@ -18,11 +18,22 @@
 //     maxUniquePaths to the literal label "other". This protects Prometheus
 //     from unbounded cardinality explosion even if the caller forgets
 //     step (1).
+//
+// The wrapper preserves optional ResponseWriter capabilities. It only
+// advertises http.Flusher / http.Hijacker / io.ReaderFrom to the handler when
+// the underlying writer actually implements them, so feature-detection by
+// type-assertion (the legacy pattern still used by net/http itself, gin,
+// echo and many other frameworks) returns the correct answer. Unwrap is
+// always exposed so http.ResponseController can walk the chain.
+//
+// Handler panics are converted to a status_code=500 metric sample and then
+// re-raised so net/http's default panic handling still runs.
 package http
 
 import (
 	"bufio"
 	"context"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -80,7 +91,9 @@ func WithMaxUniquePaths(n int) Option {
 // following attributes: "http.request.method", "http.route" (normalized and capped
 // by the configured limit, unseen extra routes are reported as "other"), and
 // "http.response.status_code". The response status defaults to 200 if no explicit
-// status header is written.
+// status header is written; if the handler panics before writing a header, the
+// metric is recorded with status_code=500 and the panic is re-raised so the
+// http.Server's default recovery still runs.
 func New(ctx context.Context, meter metric.Meter, opts ...Option) func(http.Handler) http.Handler {
 	cfg := &config{
 		maxUniquePaths: DefaultMaxUniquePaths,
@@ -101,7 +114,7 @@ func New(ctx context.Context, meter metric.Meter, opts ...Option) func(http.Hand
 		metric.WithDescription("Duration of HTTP server requests."),
 	)
 	if err != nil {
-		slog.ErrorContext(ctx, "httpmw: failed to create histogram, metrics disabled",
+		slog.ErrorContext(ctx, "http middleware: failed to create histogram, metrics disabled",
 			slog.Any("error", err))
 		return func(next http.Handler) http.Handler { return next }
 	}
@@ -111,25 +124,39 @@ func New(ctx context.Context, meter metric.Meter, opts ...Option) func(http.Hand
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
-			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+			rec, wrapped := wrapResponseWriter(w)
 
-			next.ServeHTTP(rec, r)
+			defer func() {
+				panicValue := recover()
+				if panicValue != nil && !rec.wroteHeader {
+					rec.status = http.StatusInternalServerError
+				}
+				hist.Record(r.Context(), time.Since(start).Seconds(),
+					metric.WithAttributes(
+						semconv.HTTPRequestMethodKey.String(r.Method),
+						semconv.HTTPRouteKey.String(limiter.observe(cfg.normalizer(r))),
+						semconv.HTTPResponseStatusCodeKey.Int(rec.status),
+					))
+				if panicValue != nil {
+					// Re-raise so the http.Server's default panic handler runs
+					// (writes a 500 if nothing was sent and logs the stack via
+					// Server.ErrorLog). Using the original value preserves
+					// http.ErrAbortHandler semantics.
+					panic(panicValue)
+				}
+			}()
 
-			route := limiter.observe(cfg.normalizer(r))
-			elapsed := time.Since(start).Seconds()
-
-			hist.Record(r.Context(), elapsed, metric.WithAttributes(
-				semconv.HTTPRequestMethodKey.String(r.Method),
-				semconv.HTTPRouteKey.String(route),
-				semconv.HTTPResponseStatusCodeKey.Int(rec.status),
-			))
+			next.ServeHTTP(wrapped, r)
 		})
 	}
 }
 
 // statusRecorder captures the response status code so we can label metrics
 // with it. It defaults to 200 to match Go's implicit first-Write behavior
-// when a handler never calls WriteHeader.
+// when a handler never calls WriteHeader. It deliberately does not implement
+// any optional ResponseWriter interfaces directly; wrapResponseWriter selects
+// a concrete wrapper variant that exposes only the optional interfaces the
+// underlying writer actually supports.
 type statusRecorder struct {
 	http.ResponseWriter
 	status      int
@@ -151,26 +178,110 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 	return s.ResponseWriter.Write(b)
 }
 
-// Flush delegates to the underlying ResponseWriter when it implements
-// http.Flusher. Required for SSE and chunked-streaming handlers.
-func (s *statusRecorder) Flush() {
-	if f, ok := s.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-// Hijack delegates to the underlying ResponseWriter when it implements
-// http.Hijacker. Required for WebSocket upgrades and HTTP/1.1 connection
-// hijacking.
-func (s *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	if h, ok := s.ResponseWriter.(http.Hijacker); ok {
-		return h.Hijack()
-	}
-	return nil, nil, http.ErrNotSupported
-}
-
+// Unwrap exposes the underlying writer so http.ResponseController (Go 1.20+)
+// can walk the wrapper chain to access SetReadDeadline / SetWriteDeadline /
+// EnableFullDuplex / etc.
 func (s *statusRecorder) Unwrap() http.ResponseWriter {
 	return s.ResponseWriter
+}
+
+// wrapResponseWriter returns a *statusRecorder for inspection alongside an
+// http.ResponseWriter that conditionally implements http.Flusher,
+// http.Hijacker, and io.ReaderFrom — but only the interfaces the underlying
+// writer actually supports. This preserves the contract of the legacy
+// type-assertion feature-detection pattern used by handlers and frameworks
+// (e.g. net/http itself uses io.ReaderFrom for sendfile-style copies, SSE
+// handlers use http.Flusher, WebSocket upgraders use http.Hijacker).
+func wrapResponseWriter(w http.ResponseWriter) (*statusRecorder, http.ResponseWriter) {
+	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	_, hasFlusher := w.(http.Flusher)
+	_, hasHijacker := w.(http.Hijacker)
+	_, hasReaderFrom := w.(io.ReaderFrom)
+
+	switch {
+	case hasFlusher && hasHijacker && hasReaderFrom:
+		return rec, recFHR{rec}
+	case hasFlusher && hasHijacker:
+		return rec, recFH{rec}
+	case hasFlusher && hasReaderFrom:
+		return rec, recFR{rec}
+	case hasHijacker && hasReaderFrom:
+		return rec, recHR{rec}
+	case hasFlusher:
+		return rec, recF{rec}
+	case hasHijacker:
+		return rec, recH{rec}
+	case hasReaderFrom:
+		return rec, recR{rec}
+	default:
+		return rec, rec
+	}
+}
+
+// The recX wrapper types below embed *statusRecorder so they inherit Header,
+// Write, WriteHeader, and Unwrap. Each variant adds only the optional
+// interface methods the underlying writer is known to support, so a
+// `w.(http.Flusher)` type assertion in user code reflects reality.
+
+type recF struct{ *statusRecorder }
+
+func (r recF) Flush() { r.ResponseWriter.(http.Flusher).Flush() }
+
+type recH struct{ *statusRecorder }
+
+func (r recH) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return r.ResponseWriter.(http.Hijacker).Hijack()
+}
+
+type recR struct{ *statusRecorder }
+
+func (r recR) ReadFrom(src io.Reader) (int64, error) {
+	if !r.wroteHeader {
+		r.wroteHeader = true
+	}
+	return r.ResponseWriter.(io.ReaderFrom).ReadFrom(src)
+}
+
+type recFH struct{ *statusRecorder }
+
+func (r recFH) Flush() { r.ResponseWriter.(http.Flusher).Flush() }
+func (r recFH) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return r.ResponseWriter.(http.Hijacker).Hijack()
+}
+
+type recFR struct{ *statusRecorder }
+
+func (r recFR) Flush() { r.ResponseWriter.(http.Flusher).Flush() }
+func (r recFR) ReadFrom(src io.Reader) (int64, error) {
+	if !r.wroteHeader {
+		r.wroteHeader = true
+	}
+	return r.ResponseWriter.(io.ReaderFrom).ReadFrom(src)
+}
+
+type recHR struct{ *statusRecorder }
+
+func (r recHR) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return r.ResponseWriter.(http.Hijacker).Hijack()
+}
+func (r recHR) ReadFrom(src io.Reader) (int64, error) {
+	if !r.wroteHeader {
+		r.wroteHeader = true
+	}
+	return r.ResponseWriter.(io.ReaderFrom).ReadFrom(src)
+}
+
+type recFHR struct{ *statusRecorder }
+
+func (r recFHR) Flush() { r.ResponseWriter.(http.Flusher).Flush() }
+func (r recFHR) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return r.ResponseWriter.(http.Hijacker).Hijack()
+}
+func (r recFHR) ReadFrom(src io.Reader) (int64, error) {
+	if !r.wroteHeader {
+		r.wroteHeader = true
+	}
+	return r.ResponseWriter.(io.ReaderFrom).ReadFrom(src)
 }
 
 // pathLimiter enforces a hard upper bound on the distinct values that can
@@ -184,11 +295,11 @@ type pathLimiter struct {
 	size int
 }
 
-// newPathLimiter creates a pathLimiter that enforces a maximum of max distinct route strings.
-// max is the upper bound on distinct paths that will be tracked; once that bound is reached,
-// additional unseen paths will be treated as the literal `"other"`.
-func newPathLimiter(max int) *pathLimiter {
-	return &pathLimiter{max: max}
+// newPathLimiter creates a pathLimiter that enforces a maximum of n distinct
+// route strings. Once that bound is reached, additional unseen paths are
+// treated as the literal "other".
+func newPathLimiter(n int) *pathLimiter {
+	return &pathLimiter{max: n}
 }
 
 func (p *pathLimiter) observe(path string) string {

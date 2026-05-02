@@ -2,31 +2,15 @@ package o11y_test
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
+	"math"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/flywindy/o11y"
+	"github.com/flywindy/o11y/internal/testutil"
 )
-
-// fakeOTLPServer returns an httptest.Server that accepts any OTLP/HTTP request.
-func fakeOTLPServer(t *testing.T) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-}
-
-func doShutdown(t *testing.T, sdk *o11y.SDK) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	require.NoError(t, sdk.Shutdown(ctx))
-}
 
 // commonOpts returns the full set of required options for Init to succeed in
 // tests. It uses a randomly chosen metrics port so concurrent tests never
@@ -90,8 +74,7 @@ func TestInit_UnknownEnvironment(t *testing.T) {
 // TestInit_EnvironmentAliases verifies that common shorthand values are
 // normalized to canonical names without error.
 func TestInit_EnvironmentAliases(t *testing.T) {
-	srv := fakeOTLPServer(t)
-	defer srv.Close()
+	srv := testutil.FakeOTLPServer(t)
 
 	aliases := []string{"prod", "stg", "stage", "dev", "test"}
 	for _, alias := range aliases {
@@ -99,14 +82,13 @@ func TestInit_EnvironmentAliases(t *testing.T) {
 			opts := append(commonOpts(srv.URL), o11y.WithEnvironment(alias))
 			sdk, err := o11y.Init(context.Background(), opts...)
 			require.NoError(t, err, "alias %q should be accepted", alias)
-			doShutdown(t, sdk)
+			testutil.MustShutdown(t.Context(), t, sdk)
 		})
 	}
 }
 
 func TestInit_Success(t *testing.T) {
-	srv := fakeOTLPServer(t)
-	defer srv.Close()
+	srv := testutil.FakeOTLPServer(t)
 
 	sdk, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
 	require.NoError(t, err)
@@ -118,28 +100,111 @@ func TestInit_Success(t *testing.T) {
 	assert.NotNil(t, sdk.Meter("test"), "Meter must be obtainable")
 	assert.NotNil(t, sdk.MeterProvider(), "MeterProvider must be obtainable")
 
-	doShutdown(t, sdk)
+	testutil.MustShutdown(t.Context(), t, sdk)
 }
 
 func TestInit_HandlesNilOption(t *testing.T) {
-	srv := fakeOTLPServer(t)
-	defer srv.Close()
+	srv := testutil.FakeOTLPServer(t)
 
 	opts := append([]o11y.Option{nil}, commonOpts(srv.URL)...)
 	sdk, err := o11y.Init(context.Background(), opts...)
 	require.NoError(t, err)
 	require.NotNil(t, sdk)
-	doShutdown(t, sdk)
+	testutil.MustShutdown(t.Context(), t, sdk)
 }
 
 func TestSDK_TracerIsNamed(t *testing.T) {
-	srv := fakeOTLPServer(t)
-	defer srv.Close()
+	srv := testutil.FakeOTLPServer(t)
 
 	sdk, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
 	require.NoError(t, err)
-	defer doShutdown(t, sdk)
+	defer testutil.MustShutdown(t.Context(), t, sdk)
 
 	assert.NotNil(t, sdk.Tracer("a"))
 	assert.NotNil(t, sdk.Tracer("b"))
+}
+
+// TestInit_RejectsInvalidHistogramBuckets locks down the validation paths so
+// future refactors cannot quietly disable them.
+func TestInit_RejectsInvalidHistogramBuckets(t *testing.T) {
+	srv := testutil.FakeOTLPServer(t)
+
+	cases := []struct {
+		name    string
+		buckets []float64
+		want    string
+	}{
+		{"empty", []float64{}, "must not be empty"},
+		{"non-positive", []float64{0, 1}, "must be strictly positive"},
+		{"negative", []float64{-1, 1}, "must be strictly positive"},
+		{"unsorted", []float64{0.5, 0.1}, "strictly increasing"},
+		{"duplicate", []float64{0.5, 0.5}, "strictly increasing"},
+		{"nan", []float64{math.NaN(), 1}, "must be a finite number"},
+		{"posinf", []float64{math.Inf(1), 1}, "must be a finite number"},
+		{"neginf", []float64{math.Inf(-1), 1}, "must be a finite number"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := append(commonOpts(srv.URL), o11y.WithHistogramBuckets(tc.buckets))
+			_, err := o11y.Init(context.Background(), opts...)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+// TestInit_AcceptsExtremeValidBuckets ensures very small and very large
+// finite values pass validation; only NaN/Inf/non-positive should be rejected.
+func TestInit_AcceptsExtremeValidBuckets(t *testing.T) {
+	srv := testutil.FakeOTLPServer(t)
+
+	opts := append(commonOpts(srv.URL),
+		o11y.WithHistogramBuckets([]float64{1e-9, 1, 1e9}),
+	)
+	sdk, err := o11y.Init(context.Background(), opts...)
+	require.NoError(t, err)
+	testutil.MustShutdown(t.Context(), t, sdk)
+}
+
+// TestInit_OTLPHeadersForwarded confirms WithOTLPHeaders reaches the
+// outbound HTTP request. We use a capturing fake server in place of a real
+// OTel Collector and trigger a forced flush so the trace exporter sends at
+// least one request before shutdown.
+func TestInit_OTLPHeadersForwarded(t *testing.T) {
+	srv := testutil.NewCapturingOTLPServer(t)
+
+	opts := append(commonOpts(srv.URL),
+		o11y.WithOTLPHeaders(map[string]string{
+			"Authorization":    "Bearer secret-token",
+			"X-Scope-OrgID":    "tenant-42",
+			"X-Honeycomb-Team": "abc123",
+		}),
+	)
+	sdk, err := o11y.Init(context.Background(), opts...)
+	require.NoError(t, err)
+
+	// Emit at least one span so the exporter has something to send, then
+	// force a flush before shutdown to make the assertion deterministic.
+	_, span := sdk.Tracer("hdr-test").Start(context.Background(), "probe")
+	span.End()
+	require.NoError(t, sdk.TracerProvider().ForceFlush(context.Background()))
+	testutil.MustShutdown(t.Context(), t, sdk)
+
+	requests := srv.Requests()
+	require.NotEmpty(t, requests, "exporter should have made at least one OTLP request")
+
+	// Verify every captured request carries every configured header — not
+	// just at least one. An existential check would silently miss a
+	// regression that drops the header on retries or later batches.
+	// http.Header.Get applies textproto.CanonicalMIMEHeaderKey, so any
+	// casing of the input maps to the same canonical key.
+	for i, r := range requests {
+		assert.Equal(t, "Bearer secret-token", r.Header.Get("Authorization"),
+			"Authorization header must propagate on every OTLP request (request[%d] %s %s)",
+			i, r.Method, r.Path)
+		assert.Equal(t, "tenant-42", r.Header.Get("X-Scope-OrgID"),
+			"X-Scope-OrgID header must propagate on every OTLP request (request[%d])", i)
+		assert.Equal(t, "abc123", r.Header.Get("X-Honeycomb-Team"),
+			"custom auth header must propagate on every OTLP request (request[%d])", i)
+	}
 }

@@ -2,9 +2,7 @@ package metrics_test
 
 import (
 	"context"
-	"io"
 	"net"
-	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/flywindy/o11y/internal/metrics"
+	"github.com/flywindy/o11y/internal/testutil"
 )
 
 func baseConfig(addr string) metrics.Config {
@@ -27,25 +26,11 @@ func baseConfig(addr string) metrics.Config {
 	}
 }
 
-func scrape(t *testing.T, addr string) string {
-	t.Helper()
-	resp, err := http.Get("http://" + addr + "/metrics")
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	return string(body)
-}
-
 // TestInitMeter_HappyPath verifies that InitMeter stands up a working
 // /metrics endpoint whose scrape output includes runtime metrics and the
 // team resource attribute as a constant label.
 func TestInitMeter_HappyPath(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	addr := ln.Addr().String()
-	require.NoError(t, ln.Close())
+	addr := testutil.FreeAddr(t)
 
 	mp, closer, err := metrics.InitMeter(context.Background(), baseConfig(addr))
 	require.NoError(t, err)
@@ -58,19 +43,26 @@ func TestInitMeter_HappyPath(t *testing.T) {
 		_ = mp.Shutdown(ctx)
 	}()
 
-	// Give runtime.Start a tick to register its instruments.
-	time.Sleep(100 * time.Millisecond)
+	// runtime.Start registers async instruments lazily; the Prometheus
+	// exporter pulls them on each scrape. Poll instead of fixed-sleep so
+	// the test isn't fragile under load. TryScrapeMetrics returns an error
+	// instead of calling t.FailNow so a transient scrape failure inside
+	// the polling window drives a retry rather than aborting the test.
+	assert.Eventually(t, func() bool {
+		body, err := testutil.TryScrapeMetrics(t.Context(), addr)
+		if err != nil {
+			return false
+		}
+		return strings.Contains(body, "go_goroutine") ||
+			strings.Contains(body, "process_runtime_go_goroutines")
+	}, 2*time.Second, 50*time.Millisecond,
+		"runtime metrics should appear within timeout")
 
-	body := scrape(t, addr)
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
 	assert.Contains(t, body, `service_namespace="platform"`, "service.namespace resource attribute must appear as a constant label")
 	assert.Contains(t, body, `service_name="test-svc"`, "service_name must appear as a constant label")
 	assert.Contains(t, body, `service_version="0.0.1"`, "service_version must appear as a constant label")
 	assert.Contains(t, body, `deployment_environment_name="test"`, "deployment_environment_name must appear as a constant label")
-	assert.True(t,
-		strings.Contains(body, "go_goroutine") ||
-			strings.Contains(body, "process_runtime_go_goroutines"),
-		"runtime metrics should be present when RuntimeMetrics=true",
-	)
 }
 
 // TestInitMeter_RequiresNamespace verifies the fail-fast guard on an empty namespace.
@@ -120,10 +112,7 @@ func TestInitMeter_OTLPPath(t *testing.T) {
 // TestInitMeter_RuntimeMetricsOff verifies that runtime metrics can be
 // disabled via configuration.
 func TestInitMeter_RuntimeMetricsOff(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	addr := ln.Addr().String()
-	require.NoError(t, ln.Close())
+	addr := testutil.FreeAddr(t)
 
 	cfg := baseConfig(addr)
 	cfg.RuntimeMetrics = false
@@ -137,6 +126,40 @@ func TestInitMeter_RuntimeMetricsOff(t *testing.T) {
 		_ = mp.Shutdown(ctx)
 	}()
 
-	body := scrape(t, addr)
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
 	assert.NotContains(t, body, "process_runtime_go_goroutines")
+}
+
+// TestInitMeter_OTLPHeadersAttached confirms that the OTLP push path forwards
+// configured headers on every outbound request.
+func TestInitMeter_OTLPHeadersAttached(t *testing.T) {
+	srv := testutil.NewCapturingOTLPServer(t)
+
+	mp, closer, err := metrics.InitMeter(context.Background(), metrics.Config{
+		ServiceName:         "test-svc",
+		Namespace:           "platform",
+		MetricsOTLPEndpoint: srv.URL,
+		OTLPHeaders:         map[string]string{"Authorization": "Bearer xyz"},
+		RuntimeMetrics:      false,
+		HistogramBuckets:    []float64{1},
+	})
+	require.NoError(t, err)
+
+	// Force a metrics export via Shutdown's drain so the capturing server
+	// observes at least one request.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, mp.ForceFlush(ctx))
+	_ = closer(ctx)
+	_ = mp.Shutdown(ctx)
+
+	requests := srv.Requests()
+	require.NotEmpty(t, requests, "OTLP metrics exporter should produce at least one request")
+	// Asserting every captured request — not just one — catches a regression
+	// where the header is dropped on retries or later periodic exports.
+	for i, r := range requests {
+		assert.Equal(t, "Bearer xyz", r.Header.Get("Authorization"),
+			"Authorization header must propagate to every OTLP metrics request (request[%d] %s %s)",
+			i, r.Method, r.Path)
+	}
 }

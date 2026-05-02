@@ -1,3 +1,7 @@
+// Package trace encapsulates the OTel TracerProvider and OTLP/HTTP trace
+// exporter used by the top-level o11y SDK. It does not mutate any global
+// OpenTelemetry state; the caller is responsible for wiring the returned
+// provider and propagator.
 package trace
 
 import (
@@ -15,11 +19,19 @@ import (
 // and LoggerProvider to share identical service-identity attributes.
 // It does not mutate any global state; the caller is responsible for wiring
 // the returned provider and propagator as needed.
-func InitTracer(ctx context.Context, endpoint string, res *resource.Resource) (*sdktrace.TracerProvider, propagation.TextMapPropagator, error) {
+//
+// headers is optional; when non-empty, every OTLP/HTTP request emitted by
+// the exporter carries the given headers (used for authentication against
+// managed observability backends).
+func InitTracer(ctx context.Context, endpoint string, headers map[string]string, res *resource.Resource) (*sdktrace.TracerProvider, propagation.TextMapPropagator, error) {
 	// 1. OTLP HTTP trace exporter
-	exporter, err := otlptracehttp.New(ctx,
+	expOpts := []otlptracehttp.Option{
 		otlptracehttp.WithEndpointURL(endpoint),
-	)
+	}
+	if len(headers) > 0 {
+		expOpts = append(expOpts, otlptracehttp.WithHeaders(headers))
+	}
+	exporter, err := otlptracehttp.New(ctx, expOpts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create OTLP trace exporter: %w", err)
 	}

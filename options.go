@@ -4,14 +4,22 @@ import "log/slog"
 
 // DefaultMetricsAddr is the default listen address for the built-in
 // Prometheus /metrics HTTP server.
-var DefaultMetricsAddr = ":2112"
+const DefaultMetricsAddr = ":2112"
 
-// DefaultLatencyBuckets is the SLO-friendly histogram boundary set applied
+// defaultLatencyBuckets is the SLO-friendly histogram boundary set applied
 // to all http.server.* histograms when the caller does not override it.
 // Standardizing these boundaries across the company keeps P99 calculations
-// directly comparable between services.
-var DefaultLatencyBuckets = []float64{
+// directly comparable between services. Exposed via DefaultLatencyBuckets()
+// so the slice cannot be mutated by callers.
+var defaultLatencyBuckets = []float64{
 	.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10,
+}
+
+// DefaultLatencyBuckets returns a fresh copy of the SDK's default histogram
+// boundaries. It returns a copy so that callers who keep a reference cannot
+// accidentally mutate the package-level defaults.
+func DefaultLatencyBuckets() []float64 {
+	return cloneFloat64s(defaultLatencyBuckets)
 }
 
 // Config defines the configuration for the o11y SDK.
@@ -20,6 +28,7 @@ type Config struct {
 	serviceVersion string
 	environment    string
 	otlpEndpoint   string
+	otlpHeaders    map[string]string
 	logLevel       slog.Level
 
 	// Metrics
@@ -56,10 +65,50 @@ func WithEnvironment(env string) Option {
 	}
 }
 
-// WithOTLPEndpoint sets the OTLP/HTTP collector endpoint.
+// WithOTLPEndpoint sets the OTLP/HTTP collector endpoint used for traces and
+// logs. The endpoint must be reachable by the SDK's process (no proxy is
+// configured by this package).
+//
+// Production note: prefer https:// in production deployments. The default
+// http://localhost:4318 is intended for local development against an OTel
+// Collector running on the same host. When sending telemetry across a
+// network boundary, use TLS — observability traffic carries trace IDs,
+// hostnames, error messages and stack traces that should not be exposed in
+// plaintext.
+//
+// If the endpoint requires authentication (Grafana Cloud, Honeycomb, NewRelic,
+// Datadog, ...), pair this option with WithOTLPHeaders to attach the API
+// token / Bearer header to every OTLP request.
 func WithOTLPEndpoint(endpoint string) Option {
 	return func(c *Config) {
 		c.otlpEndpoint = endpoint
+	}
+}
+
+// WithOTLPHeaders attaches custom HTTP headers to every OTLP/HTTP request
+// emitted by the SDK (traces, logs, and OTLP metrics push). Typical use
+// cases:
+//
+//   - Authentication against managed observability backends, e.g.
+//     {"Authorization": "Bearer <token>"} or
+//     {"X-Honeycomb-Team": "<api-key>"}.
+//   - Multi-tenant routing on a shared Collector, e.g.
+//     {"X-Scope-OrgID": "<tenant>"}.
+//
+// Calling WithOTLPHeaders multiple times merges into the same map; later
+// calls overwrite earlier values for the same header key. Header values are
+// not logged.
+func WithOTLPHeaders(headers map[string]string) Option {
+	return func(c *Config) {
+		if len(headers) == 0 {
+			return
+		}
+		if c.otlpHeaders == nil {
+			c.otlpHeaders = make(map[string]string, len(headers))
+		}
+		for k, v := range headers {
+			c.otlpHeaders[k] = v
+		}
 	}
 }
 
@@ -130,7 +179,7 @@ func defaultConfig() *Config {
 		logLevel:         slog.LevelInfo,
 		metricsAddr:      DefaultMetricsAddr,
 		runtimeMetrics:   true,
-		histogramBuckets: cloneFloat64s(DefaultLatencyBuckets),
+		histogramBuckets: cloneFloat64s(defaultLatencyBuckets),
 	}
 }
 

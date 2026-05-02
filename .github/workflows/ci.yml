@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (race + cover)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tests run on the Go version declared in go.mod so we exercise
+      # exactly the stdlib surface our minimum-supported toolchain ships.
+      # govulncheck (in the vuln job below) uses `stable` instead so it
+      # sees the latest stdlib CVE patches.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go build ./...
+        run: go build ./...
+
+      - name: go test -race -cover
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: build examples
+        run: |
+          set -euo pipefail
+          # Guard for repos that haven't shipped examples yet — keeps this
+          # workflow reusable as a baseline.
+          if [ ! -d examples ]; then
+            echo "no examples/ directory; skipping"
+            exit 0
+          fi
+          while IFS= read -r main; do
+            dir=$(dirname "$main")
+            echo "::group::build $dir"
+            go build -o /dev/null "./$dir"
+            echo "::endgroup::"
+          done < <(find examples -name main.go)
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: ignore
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # golangci-lint binary version is pinned for CI reproducibility.
+      # Manage upgrades via Dependabot / Renovate so they land as PRs
+      # rather than silently changing behaviour on every CI run.
+      # NOTE: golangci-lint-action@v7 is required for golangci-lint v2.x;
+      # the older @v6 line only supports v1.x.
+      - uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.11.4
+          args: --timeout=5m
+
+  vuln:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # govulncheck must see the latest stdlib so vulnerability matches
+      # reflect what a freshly-built binary would actually link. Using the
+      # go.mod version (1.25.0) here would surface only the patches that
+      # were available on the day go.mod was last bumped, which is rarely
+      # what the user wants from a vuln scan. `stable` + check-latest
+      # always installs the newest released Go, which is the source of
+      # truth for stdlib CVE coverage.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+
+      # govulncheck is pinned for CI reproducibility (format/exit-code
+      # changes between releases have broken pipelines historically).
+      # Manage upgrades via Dependabot / Renovate.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
+          govulncheck ./...

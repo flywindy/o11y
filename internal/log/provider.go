@@ -16,7 +16,10 @@ import (
 // attributes (service.name, deployment.environment, etc.) are consistent across
 // traces and logs without being duplicated as per-record attributes.
 // The returned provider must be shut down via Shutdown when no longer needed.
-func InitLogger(ctx context.Context, endpoint string, res *resource.Resource) (*sdklog.LoggerProvider, error) {
+//
+// headers is optional; when non-empty, every OTLP/HTTP request emitted by
+// the exporter carries the given headers (used for authentication).
+func InitLogger(ctx context.Context, endpoint string, headers map[string]string, res *resource.Resource) (*sdklog.LoggerProvider, error) {
 	// otlploghttp.WithEndpointURL does not append a default path when none is
 	// provided (unlike otlptracehttp). Explicitly set /v1/logs so that a bare
 	// endpoint like "http://localhost:4318" routes correctly to the collector.
@@ -24,7 +27,11 @@ func InitLogger(ctx context.Context, endpoint string, res *resource.Resource) (*
 	if err != nil {
 		return nil, fmt.Errorf("invalid OTLP endpoint %q: %w", endpoint, err)
 	}
-	exp, err := otlploghttp.New(ctx, otlploghttp.WithEndpointURL(logEndpoint))
+	expOpts := []otlploghttp.Option{otlploghttp.WithEndpointURL(logEndpoint)}
+	if len(headers) > 0 {
+		expOpts = append(expOpts, otlploghttp.WithHeaders(headers))
+	}
+	exp, err := otlploghttp.New(ctx, expOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create OTLP log exporter: %w", err)
 	}

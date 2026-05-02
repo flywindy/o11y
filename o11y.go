@@ -1,3 +1,13 @@
+// Package o11y is the top-level entry point for the SDK. It exposes Init for
+// constructing a configured *SDK that bundles trace, metric, and log
+// providers together with the W3C TraceContext+Baggage propagator and a
+// dual-output slog logger.
+//
+// The SDK never mutates global OpenTelemetry state; callers wire the returned
+// providers into their application explicitly (e.g. otel.SetTracerProvider).
+//
+// See ADR 0001 (log format strategy), ADR 0002 (metrics strategy), and
+// ADR 0007 (OTLP authentication) for the design rationale.
 package o11y
 
 import (
@@ -5,7 +15,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
+	"sync"
 
 	o11ylog "github.com/flywindy/o11y/internal/log"
 	"github.com/flywindy/o11y/internal/metrics"
@@ -40,6 +52,9 @@ type SDK struct {
 	provider      *sdktrace.TracerProvider
 	meterProvider *sdkmetric.MeterProvider
 	shutdowns     []func(context.Context) error
+
+	shutdownOnce sync.Once
+	shutdownErr  error
 }
 
 // TracerProvider returns the underlying sdktrace.TracerProvider.
@@ -72,15 +87,23 @@ func (s *SDK) Meter(name string) metric.Meter {
 // Each component is attempted even if a previous one fails; all errors are
 // logged and returned joined. Always call with a context that has a timeout
 // to cap the flush wait.
+//
+// Shutdown is idempotent: subsequent calls return the same joined error
+// without rerunning any closer. Callers may safely register Shutdown in
+// multiple defer chains (for example, both in main and in a signal handler)
+// without risking double-shutdown of underlying exporters.
 func (s *SDK) Shutdown(ctx context.Context) error {
-	var errs []error
-	for _, fn := range s.shutdowns {
-		if err := fn(ctx); err != nil {
-			s.Logger.ErrorContext(ctx, "SDK component shutdown failed", slog.Any("error", err))
-			errs = append(errs, err)
+	s.shutdownOnce.Do(func() {
+		var errs []error
+		for _, fn := range s.shutdowns {
+			if err := fn(ctx); err != nil {
+				s.Logger.ErrorContext(ctx, "SDK component shutdown failed", slog.Any("error", err))
+				errs = append(errs, err)
+			}
 		}
-	}
-	return errors.Join(errs...)
+		s.shutdownErr = errors.Join(errs...)
+	})
+	return s.shutdownErr
 }
 
 // Init initializes and returns a configured *SDK for the calling service.
@@ -119,6 +142,10 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	}
 	cfg.environment = normalized
 
+	if err := validateHistogramBuckets(cfg.histogramBuckets); err != nil {
+		return nil, err
+	}
+
 	// 1. Build a shared Resource so TracerProvider, MeterProvider, and
 	//    LoggerProvider all carry identical service-identity attributes.
 	res, err := buildResource(ctx, cfg)
@@ -127,7 +154,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	}
 
 	// 2. Initialize TracerProvider (no global state).
-	tp, prop, err := trace.InitTracer(ctx, cfg.otlpEndpoint, res)
+	tp, prop, err := trace.InitTracer(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, res)
 	if err != nil {
 		return nil, err
 	}
@@ -139,6 +166,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	mp, metricsCloser, err := metrics.InitMeter(ctx, metrics.Config{
 		Resource:            res,
 		MetricsOTLPEndpoint: cfg.metricsOTLPEndpoint,
+		OTLPHeaders:         cfg.otlpHeaders,
 		MetricsAddr:         cfg.metricsAddr,
 		RuntimeMetrics:      cfg.runtimeMetrics,
 		HistogramBuckets:    cfg.histogramBuckets,
@@ -150,7 +178,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 
 	// 4. Initialize LoggerProvider (no global state). On failure, shut down
 	//    previously initialized providers in reverse order.
-	lp, err := o11ylog.InitLogger(ctx, cfg.otlpEndpoint, res)
+	lp, err := o11ylog.InitLogger(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, res)
 	if err != nil {
 		_ = metricsCloser(ctx)
 		_ = mp.Shutdown(ctx)
@@ -271,6 +299,33 @@ var envAliases = map[string]string{
 	"dev":         "development",
 	"testing":     "testing",
 	"test":        "testing",
+}
+
+// validateHistogramBuckets ensures the histogram boundaries are in a state
+// that the OTel SDK can consume safely. It rejects empty slices, NaN, ±Inf,
+// non-positive values, and unsorted sequences. The OTel spec leaves behavior
+// undefined for invalid inputs, so we fail fast at Init time instead of
+// emitting silently broken histograms in production.
+func validateHistogramBuckets(buckets []float64) error {
+	if len(buckets) == 0 {
+		return errors.New("histogram buckets must not be empty (use WithHistogramBuckets " +
+			"to override, or accept the default)")
+	}
+	for i, b := range buckets {
+		if math.IsNaN(b) || math.IsInf(b, 0) {
+			return fmt.Errorf("histogram bucket[%d] = %v must be a finite number", i, b)
+		}
+		if b <= 0 {
+			return fmt.Errorf("histogram bucket[%d] = %v must be strictly positive (seconds)", i, b)
+		}
+		if i > 0 && b <= buckets[i-1] {
+			return fmt.Errorf(
+				"histogram buckets must be strictly increasing: bucket[%d]=%v is not greater than bucket[%d]=%v",
+				i, b, i-1, buckets[i-1],
+			)
+		}
+	}
+	return nil
 }
 
 // normalizeEnvironment returns the canonical deployment environment name for

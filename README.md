@@ -128,10 +128,18 @@ func main() {
 | `WithEnvironment(env)` | — **required** | OTel `deployment.environment.name`; accepted: `production`, `staging`, `development`, `testing` (aliases like `prod`/`stg` are normalized) |
 | `WithServiceNamespace(ns)` | — **required** | OTel `service.namespace`; identifies the owning team/product, maps to k8s namespace |
 | `WithOTLPEndpoint(url)` | `http://localhost:4318` | OTLP/HTTP collector endpoint for traces and logs |
+| `WithOTLPHeaders(map[string]string)` | `nil` | Headers attached to every OTLP/HTTP request (auth tokens, multi-tenant routing) |
 | `WithMetricsOTLPEndpoint(url)` | `""` | Switch metrics to OTLP push (serverless); when unset, Prometheus pull on `:2112` is used |
 | `WithMetricsAddr(addr)` | `:2112` | Prometheus `/metrics` scrape address |
 | `WithLogLevel(level)` | `slog.LevelInfo` | Minimum log level |
 | `WithRuntimeMetrics(bool)` | `true` | Collect Go runtime metrics (goroutines, GC, memory) |
+
+> **Migration note (pre-1.0 API change)** — `DefaultLatencyBuckets` is now a
+> function (`o11y.DefaultLatencyBuckets()` returning a fresh copy) rather
+> than a package-level slice variable, so callers cannot accidentally mutate
+> the package defaults. `DefaultMetricsAddr` is now a `const` (was `var`);
+> use `WithMetricsAddr(":9090")` to override. See `CHANGELOG.md` for the
+> migration recipe.
 
 ### Structured Logging with Trace Correlation
 
@@ -152,6 +160,33 @@ obs.Logger.InfoContext(ctx, "processing request", slog.String("user_id", "42"))
 // stdout: {"time":"...","level":"INFO","msg":"processing request","service.name":"my-service","traceId":"4bf92f...","spanId":"00f067...","user_id":"42"}
 // Loki:   OTel Log Record — Body="processing request", TraceId=4bf92f..., SpanId=00f067..., Attributes={user_id: "42"}, Resource={service.name: "my-service", ...}
 ```
+
+### Logging Guidelines
+
+The dual-output logger forwards every record to two backends. Treat both as
+shared, queryable infrastructure — anything you log is searchable by every
+engineer with cluster access.
+
+- **Never log secrets**: API tokens, session cookies, signed URLs, full
+  `Authorization` headers, internal IPs, JWTs, raw OAuth state, encryption
+  keys. Redact before passing to `slog`. The `WithOTLPHeaders` option
+  intentionally does not log header values for the same reason.
+- **Hash or truncate user identifiers**: prefer `slog.String("user_id", hash(uid))`
+  over the raw email/phone. `traceId` already lets you correlate a single user's
+  request across logs without storing PII.
+- **Never log raw request bodies**: a malicious client can plant `\n{"level":"INFO",...}`
+  inside a body field and inject a synthetic log line into your stdout JSON
+  pipeline. If you must record body shape, log only the field count or a
+  schema hash.
+- **Use `*Context` variants**: `Logger.InfoContext(ctx, ...)` (not `Info(...)`)
+  so that `traceId` and `spanId` are populated. A log without trace correlation
+  is operationally a needle in a haystack.
+- **Pre-validate attribute keys**: `slog.String(userInput, ...)` lets the
+  attacker control the log's field name. Use a fixed key and put untrusted
+  data in the value.
+- **Watch attribute size**: `slog.Any` happily serializes arbitrary structs.
+  A 10 MB struct logged at 1 kHz overruns both stdout and the OTLP exporter's
+  batch queue. Cap or summarise large payloads before logging.
 
 ### Creating Spans
 
@@ -197,11 +232,19 @@ if err := conn.Publish(ctx, "orders.created", payload); err != nil {
 }
 
 // Subscriber: ctx in the handler already carries the publisher's trace.
-conn.Subscribe("orders.created", func(ctx context.Context, msg *gonats.Msg) {
+// Subscribe returns (*nats.Subscription, error) — capture both: the error
+// surfaces invalid input (empty subject, nil handler, cancelled ctx) and the
+// Subscription handle is what you call Unsubscribe()/Drain() on at shutdown.
+sub, err := conn.Subscribe(ctx, "orders.created", func(ctx context.Context, msg *gonats.Msg) {
     ctx, span := obs.Tracer("consumer").Start(ctx, "orders.created")
     defer span.End()
     obs.Logger.InfoContext(ctx, "order received") // traceId and spanId injected automatically
 })
+if err != nil {
+    obs.Logger.ErrorContext(ctx, "subscribe failed", slog.Any("error", err))
+    return
+}
+defer func() { _ = sub.Drain() }() // gracefully drain on shutdown
 ```
 
 ### Prometheus Metrics

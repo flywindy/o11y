@@ -1,3 +1,7 @@
+// Package log encapsulates the OTel LoggerProvider and the slog handler
+// chain (multi-handler, OTel-aware trace context injector) used by the
+// top-level o11y SDK. Nothing in this package touches global slog or OTel
+// state — the SDK wires returned types into the application.
 package log
 
 import (

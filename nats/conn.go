@@ -1,3 +1,8 @@
+// Package nats provides a tracing-aware NATS connection wrapper that wires
+// the o11y SDK's TracerProvider and Propagator into otelnats / oteljetstream.
+// All NATS connections in a service should go through this package so that
+// trace context propagates across publishers and subscribers without touching
+// global OpenTelemetry state.
 package nats
 
 import (
@@ -61,7 +66,25 @@ func Connect(ctx context.Context, url string, tp trace.TracerProvider, prop prop
 // across services in Grafana Tempo. Calls to slog.InfoContext(ctx, ...) will
 // include the consumer's traceId and spanId; calls to tracer.Start(ctx, ...)
 // produce child spans of the consumer span.
-func (c *Conn) Subscribe(subject string, handler MsgHandler) (*natsgo.Subscription, error) {
+//
+// ctx is checked at registration time only. If ctx is already cancelled or
+// past its deadline, Subscribe returns ctx.Err() without registering the
+// subscription. Subsequent ctx cancellation does NOT stop the subscription —
+// long-running subscriptions are torn down via the returned
+// *natsgo.Subscription's Unsubscribe / Drain methods. Each delivered message
+// gets its own consumer-side context derived from the inbound headers, so
+// the caller's ctx is intentionally not retained for handler invocation.
+//
+// Subscribe rejects an empty subject up-front: an empty subject silently
+// matches no messages on the NATS server and is almost always a programming
+// error.
+func (c *Conn) Subscribe(ctx context.Context, subject string, handler MsgHandler) (*natsgo.Subscription, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("nats subscribe %q: %w", subject, err)
+	}
+	if subject == "" {
+		return nil, fmt.Errorf("nats subscribe: subject must not be empty")
+	}
 	if handler == nil {
 		return nil, fmt.Errorf("nats subscribe %q: handler must not be nil", subject)
 	}
@@ -72,8 +95,22 @@ func (c *Conn) Subscribe(subject string, handler MsgHandler) (*natsgo.Subscripti
 
 // QueueSubscribe is the queue-group variant of Subscribe. All members of the
 // same queue group share message delivery round-robin, providing load balancing
-// across multiple subscriber instances.
-func (c *Conn) QueueSubscribe(subject, queue string, handler MsgHandler) (*natsgo.Subscription, error) {
+// across multiple subscriber instances. Both subject and queue must be
+// non-empty.
+//
+// ctx semantics match Subscribe: it is consulted at registration only;
+// cancel the returned *natsgo.Subscription via Unsubscribe / Drain to stop
+// delivery.
+func (c *Conn) QueueSubscribe(ctx context.Context, subject, queue string, handler MsgHandler) (*natsgo.Subscription, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("nats queue-subscribe %q/%q: %w", subject, queue, err)
+	}
+	if subject == "" {
+		return nil, fmt.Errorf("nats queue-subscribe: subject must not be empty")
+	}
+	if queue == "" {
+		return nil, fmt.Errorf("nats queue-subscribe %q: queue must not be empty", subject)
+	}
 	if handler == nil {
 		return nil, fmt.Errorf("nats queue-subscribe %q/%q: handler must not be nil", subject, queue)
 	}
