@@ -230,3 +230,22 @@ func TestQueueSubscribe_NilHandler(t *testing.T) {
 	assert.Nil(t, sub)
 	assert.Contains(t, err.Error(), "handler must not be nil")
 }
+
+// TestQueueSubscribe_CanceledContext mirrors TestSubscribe_CanceledContext for
+// the queue-group variant: registration must fail fast when the supplied ctx
+// is already cancelled, leaving no dangling subscription on the server.
+func TestQueueSubscribe_CanceledContext(t *testing.T) {
+	_, url := startTestServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	sub, err := conn.QueueSubscribe(ctx, "test.subject", "workers", func(_ context.Context, _ *nats.Msg) {})
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, sub)
+}
