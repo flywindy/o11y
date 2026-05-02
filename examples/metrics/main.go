@@ -27,11 +27,15 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/flywindy/o11y"
 	o11yhttp "github.com/flywindy/o11y/http"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func main() {
@@ -79,11 +83,11 @@ func main() {
 		_, _ = fmt.Fprintln(w, "error")
 	})
 
-	handler := o11yhttp.New(ctx, obs.Meter("metrics-example"),
-		o11yhttp.WithPathNormalizer(func(r *http.Request) string {
-			return r.URL.Path // paths are already static templates in this example
-		}),
+	tracer := obs.Tracer("metrics-example")
+	metricsHandler := o11yhttp.New(ctx, obs.Meter("metrics-example"),
+		o11yhttp.WithPathNormalizer(normalizeMetricsPath),
 	)(mux)
+	handler := traceServerRequests(obs.Propagator, tracer, normalizeMetricsPath, metricsHandler)
 
 	// Start the app server on :8080.
 	ln, err := net.Listen("tcp", ":8080")
@@ -100,7 +104,6 @@ func main() {
 	)
 
 	// Generate synthetic traffic so metrics accumulate without manual curling.
-	tracer := obs.Tracer("metrics-example")
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -124,7 +127,14 @@ func main() {
 			reqCtx, span := tracer.Start(ctx, "synthetic-request")
 			path := paths[rand.IntN(len(paths))]
 
-			req, _ := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://localhost:8080"+path, nil)
+			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://localhost:8080"+path, nil)
+			if err != nil {
+				obs.Logger.ErrorContext(reqCtx, "failed to create request", slog.Any("error", err))
+				span.End()
+				continue
+			}
+
+			obs.Propagator.Inject(reqCtx, propagation.HeaderCarrier(req.Header))
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				obs.Logger.ErrorContext(reqCtx, "request failed", slog.Any("error", err))
@@ -138,4 +148,48 @@ func main() {
 			span.End()
 		}
 	}
+}
+
+func normalizeMetricsPath(r *http.Request) string {
+	path := strings.TrimRight(r.URL.Path, "/")
+	if path == "" {
+		return "/"
+	}
+	switch path {
+	case "/api/fast", "/api/slow", "/api/error":
+		return path
+	default:
+		return "/unknown"
+	}
+}
+
+type traceStatusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *traceStatusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *traceStatusRecorder) Write(body []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	return r.ResponseWriter.Write(body)
+}
+
+func traceServerRequests(propagator propagation.TextMapPropagator, tracer trace.Tracer, normalize o11yhttp.PathNormalizer, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parentCtx := propagator.Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+		ctx, span := tracer.Start(parentCtx, r.Method+" "+normalize(r), trace.WithSpanKind(trace.SpanKindServer))
+		defer span.End()
+
+		recorder := &traceStatusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(recorder, r.WithContext(ctx))
+		if recorder.status >= http.StatusInternalServerError {
+			span.SetStatus(codes.Error, http.StatusText(recorder.status))
+		}
+	})
 }

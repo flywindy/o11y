@@ -221,7 +221,7 @@ mux := http.NewServeMux()
 mux.HandleFunc("/api/orders", handleOrders)
 
 // Wrap the mux — emits http_server_request_duration_seconds histogram.
-handler := o11yhttp.New(obs.Meter("my-service"),
+handler := o11yhttp.New(ctx, obs.Meter("my-service"),
     o11yhttp.WithPathNormalizer(func(r *http.Request) string {
         // Collapse /orders/123 → /orders/:id to avoid high cardinality.
         return pathToTemplate(r.URL.Path)
@@ -229,7 +229,7 @@ handler := o11yhttp.New(obs.Meter("my-service"),
 )(mux)
 ```
 
-**Exemplars** are enabled automatically (OTel SDK default `SampledFilter`). When Prometheus is deployed with `--enable-feature=exemplar-storage` (included in `k8s/infrastructure/base/prometheus.yaml`), Grafana can navigate from a histogram bucket directly to the correlated trace in Tempo.
+**Exemplars** are enabled automatically (OTel SDK default trace-based filter). When Prometheus is deployed with `--enable-feature=exemplar-storage` (included in `k8s/infrastructure/base/prometheus.yaml`), Grafana can navigate from a histogram bucket directly to the correlated trace in Tempo. The measurement context must contain an active sampled span; exemplar trace IDs are stored as exemplar metadata (`trace_id` / `span_id`), not as metric labels, so they do not create high-cardinality time series.
 
 **Kubernetes pods** must opt in to scraping with the annotation:
 
@@ -289,6 +289,7 @@ Open Grafana at `http://localhost:3000` and navigate to:
 - **Explore → Tempo** — producer and consumer spans linked across services
 - **Explore → Loki** — structured log entries with correlated `traceId` and `spanId`
 - **Explore → Prometheus** — `http_server_request_duration_seconds`; click an exemplar dot to jump to the linked trace in Tempo
+- **Dashboards → Observability → Metrics Correlation** — HTTP latency metrics with a data link that opens the matching `metrics-example` logs in Loki
 
 ## Core Principles
 
