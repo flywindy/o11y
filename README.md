@@ -232,11 +232,19 @@ if err := conn.Publish(ctx, "orders.created", payload); err != nil {
 }
 
 // Subscriber: ctx in the handler already carries the publisher's trace.
-conn.Subscribe(ctx, "orders.created", func(ctx context.Context, msg *gonats.Msg) {
+// Subscribe returns (*nats.Subscription, error) — capture both: the error
+// surfaces invalid input (empty subject, nil handler, cancelled ctx) and the
+// Subscription handle is what you call Unsubscribe()/Drain() on at shutdown.
+sub, err := conn.Subscribe(ctx, "orders.created", func(ctx context.Context, msg *gonats.Msg) {
     ctx, span := obs.Tracer("consumer").Start(ctx, "orders.created")
     defer span.End()
     obs.Logger.InfoContext(ctx, "order received") // traceId and spanId injected automatically
 })
+if err != nil {
+    obs.Logger.ErrorContext(ctx, "subscribe failed", slog.Any("error", err))
+    return
+}
+defer func() { _ = sub.Drain() }() // gracefully drain on shutdown
 ```
 
 ### Prometheus Metrics

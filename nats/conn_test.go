@@ -185,7 +185,16 @@ func TestJetStream_NotNil(t *testing.T) {
 	require.NotNil(t, js)
 }
 
-func TestSubscribe_NilHandler(t *testing.T) {
+// noopHandler is a do-nothing MsgHandler used as a stand-in by validation
+// tests that exercise the registration-time guards on Subscribe /
+// QueueSubscribe.
+func noopHandler(_ context.Context, _ *nats.Msg) {}
+
+// TestSubscribe_Validation locks down every registration-time guard in
+// Conn.Subscribe: empty subject, nil handler, and an already-cancelled ctx.
+// Per AGENTS.md every public function must have a unit test, and table-driven
+// tests are preferred — this single table covers all three error paths.
+func TestSubscribe_Validation(t *testing.T) {
 	_, url := startTestServer(t)
 	tp, prop, _ := newTestProviders()
 
@@ -193,31 +202,34 @@ func TestSubscribe_NilHandler(t *testing.T) {
 	require.NoError(t, err)
 	defer conn.Close()
 
-	sub, err := conn.Subscribe(context.Background(), "test.subject", nil)
-	assert.Error(t, err)
-	assert.Nil(t, sub)
-	assert.Contains(t, err.Error(), "handler must not be nil")
-}
-
-// TestSubscribe_CanceledContext ensures Subscribe rejects an already-cancelled
-// ctx at registration without leaving a dangling subscription on the server.
-func TestSubscribe_CanceledContext(t *testing.T) {
-	_, url := startTestServer(t)
-	tp, prop, _ := newTestProviders()
-
-	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
-	require.NoError(t, err)
-	defer conn.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
+	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	sub, err := conn.Subscribe(ctx, "test.subject", func(_ context.Context, _ *nats.Msg) {})
-	assert.ErrorIs(t, err, context.Canceled)
-	assert.Nil(t, sub)
+	cases := []struct {
+		name    string
+		ctx     context.Context
+		subject string
+		handler o11ynats.MsgHandler
+		wantErr string
+	}{
+		{"canceled ctx", canceled, "test.subject", noopHandler, context.Canceled.Error()},
+		{"empty subject", context.Background(), "", noopHandler, "subject must not be empty"},
+		{"nil handler", context.Background(), "test.subject", nil, "handler must not be nil"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sub, err := conn.Subscribe(tc.ctx, tc.subject, tc.handler)
+			require.Error(t, err)
+			assert.Nil(t, sub)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
 }
 
-func TestQueueSubscribe_NilHandler(t *testing.T) {
+// TestQueueSubscribe_Validation mirrors TestSubscribe_Validation for the
+// queue-group variant. QueueSubscribe has one extra guard (empty queue), so
+// the table carries four rows instead of three.
+func TestQueueSubscribe_Validation(t *testing.T) {
 	_, url := startTestServer(t)
 	tp, prop, _ := newTestProviders()
 
@@ -225,27 +237,28 @@ func TestQueueSubscribe_NilHandler(t *testing.T) {
 	require.NoError(t, err)
 	defer conn.Close()
 
-	sub, err := conn.QueueSubscribe(context.Background(), "test.subject", "workers", nil)
-	assert.Error(t, err)
-	assert.Nil(t, sub)
-	assert.Contains(t, err.Error(), "handler must not be nil")
-}
-
-// TestQueueSubscribe_CanceledContext mirrors TestSubscribe_CanceledContext for
-// the queue-group variant: registration must fail fast when the supplied ctx
-// is already cancelled, leaving no dangling subscription on the server.
-func TestQueueSubscribe_CanceledContext(t *testing.T) {
-	_, url := startTestServer(t)
-	tp, prop, _ := newTestProviders()
-
-	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
-	require.NoError(t, err)
-	defer conn.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
+	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	sub, err := conn.QueueSubscribe(ctx, "test.subject", "workers", func(_ context.Context, _ *nats.Msg) {})
-	assert.ErrorIs(t, err, context.Canceled)
-	assert.Nil(t, sub)
+	cases := []struct {
+		name    string
+		ctx     context.Context
+		subject string
+		queue   string
+		handler o11ynats.MsgHandler
+		wantErr string
+	}{
+		{"canceled ctx", canceled, "test.subject", "workers", noopHandler, context.Canceled.Error()},
+		{"empty subject", context.Background(), "", "workers", noopHandler, "subject must not be empty"},
+		{"empty queue", context.Background(), "test.subject", "", noopHandler, "queue must not be empty"},
+		{"nil handler", context.Background(), "test.subject", "workers", nil, "handler must not be nil"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sub, err := conn.QueueSubscribe(tc.ctx, tc.subject, tc.queue, tc.handler)
+			require.Error(t, err)
+			assert.Nil(t, sub)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
 }

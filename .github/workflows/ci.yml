@@ -39,6 +39,12 @@ jobs:
       - name: build examples
         run: |
           set -euo pipefail
+          # Guard for repos that haven't shipped examples yet — keeps this
+          # workflow reusable as a baseline.
+          if [ ! -d examples ]; then
+            echo "no examples/ directory; skipping"
+            exit 0
+          fi
           while IFS= read -r main; do
             dir=$(dirname "$main")
             echo "::group::build $dir"
