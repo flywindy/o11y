@@ -93,7 +93,7 @@ func TestSubscribe_ContextPropagation(t *testing.T) {
 	)
 	wg.Add(1)
 
-	_, err = sub.Subscribe(subject, func(ctx context.Context, _ *nats.Msg) {
+	_, err = sub.Subscribe(context.Background(), subject, func(ctx context.Context, _ *nats.Msg) {
 		defer wg.Done()
 		gotTraceID = oteltrace.SpanFromContext(ctx).SpanContext().TraceID()
 	})
@@ -156,7 +156,7 @@ func TestQueueSubscribe(t *testing.T) {
 	subject := "test.queue"
 	received := make(chan struct{}, 1)
 
-	_, err = sub.QueueSubscribe(subject, "workers", func(_ context.Context, _ *nats.Msg) {
+	_, err = sub.QueueSubscribe(context.Background(), subject, "workers", func(_ context.Context, _ *nats.Msg) {
 		received <- struct{}{}
 	})
 	require.NoError(t, err)
@@ -193,10 +193,28 @@ func TestSubscribe_NilHandler(t *testing.T) {
 	require.NoError(t, err)
 	defer conn.Close()
 
-	sub, err := conn.Subscribe("test.subject", nil)
+	sub, err := conn.Subscribe(context.Background(), "test.subject", nil)
 	assert.Error(t, err)
 	assert.Nil(t, sub)
 	assert.Contains(t, err.Error(), "handler must not be nil")
+}
+
+// TestSubscribe_CanceledContext ensures Subscribe rejects an already-cancelled
+// ctx at registration without leaving a dangling subscription on the server.
+func TestSubscribe_CanceledContext(t *testing.T) {
+	_, url := startTestServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	sub, err := conn.Subscribe(ctx, "test.subject", func(_ context.Context, _ *nats.Msg) {})
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, sub)
 }
 
 func TestQueueSubscribe_NilHandler(t *testing.T) {
@@ -207,7 +225,7 @@ func TestQueueSubscribe_NilHandler(t *testing.T) {
 	require.NoError(t, err)
 	defer conn.Close()
 
-	sub, err := conn.QueueSubscribe("test.subject", "workers", nil)
+	sub, err := conn.QueueSubscribe(context.Background(), "test.subject", "workers", nil)
 	assert.Error(t, err)
 	assert.Nil(t, sub)
 	assert.Contains(t, err.Error(), "handler must not be nil")

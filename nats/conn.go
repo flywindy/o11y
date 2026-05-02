@@ -67,10 +67,21 @@ func Connect(ctx context.Context, url string, tp trace.TracerProvider, prop prop
 // include the consumer's traceId and spanId; calls to tracer.Start(ctx, ...)
 // produce child spans of the consumer span.
 //
+// ctx is checked at registration time only. If ctx is already cancelled or
+// past its deadline, Subscribe returns ctx.Err() without registering the
+// subscription. Subsequent ctx cancellation does NOT stop the subscription —
+// long-running subscriptions are torn down via the returned
+// *natsgo.Subscription's Unsubscribe / Drain methods. Each delivered message
+// gets its own consumer-side context derived from the inbound headers, so
+// the caller's ctx is intentionally not retained for handler invocation.
+//
 // Subscribe rejects an empty subject up-front: an empty subject silently
 // matches no messages on the NATS server and is almost always a programming
 // error.
-func (c *Conn) Subscribe(subject string, handler MsgHandler) (*natsgo.Subscription, error) {
+func (c *Conn) Subscribe(ctx context.Context, subject string, handler MsgHandler) (*natsgo.Subscription, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("nats subscribe %q: %w", subject, err)
+	}
 	if subject == "" {
 		return nil, fmt.Errorf("nats subscribe: subject must not be empty")
 	}
@@ -86,7 +97,14 @@ func (c *Conn) Subscribe(subject string, handler MsgHandler) (*natsgo.Subscripti
 // same queue group share message delivery round-robin, providing load balancing
 // across multiple subscriber instances. Both subject and queue must be
 // non-empty.
-func (c *Conn) QueueSubscribe(subject, queue string, handler MsgHandler) (*natsgo.Subscription, error) {
+//
+// ctx semantics match Subscribe: it is consulted at registration only;
+// cancel the returned *natsgo.Subscription via Unsubscribe / Drain to stop
+// delivery.
+func (c *Conn) QueueSubscribe(ctx context.Context, subject, queue string, handler MsgHandler) (*natsgo.Subscription, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("nats queue-subscribe %q/%q: %w", subject, queue, err)
+	}
 	if subject == "" {
 		return nil, fmt.Errorf("nats queue-subscribe: subject must not be empty")
 	}

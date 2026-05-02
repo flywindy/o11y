@@ -78,12 +78,20 @@ func NewCapturingOTLPServer(t *testing.T) *CapturingOTLPServer {
 }
 
 // Requests returns a snapshot of every request the server has received so
-// far. The returned slice is a copy and is safe to retain.
+// far. The returned slice and every Header within it are independent copies,
+// so callers may freely mutate them in assertions without affecting the
+// server's internal state.
 func (c *CapturingOTLPServer) Requests() []CapturedRequest {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out := make([]CapturedRequest, len(c.requests))
-	copy(out, c.requests)
+	for i, r := range c.requests {
+		out[i] = CapturedRequest{
+			Path:   r.Path,
+			Method: r.Method,
+			Header: r.Header.Clone(),
+		}
+	}
 	return out
 }
 

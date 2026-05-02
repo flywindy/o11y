@@ -155,12 +155,11 @@ func TestInitMeter_OTLPHeadersAttached(t *testing.T) {
 
 	requests := srv.Requests()
 	require.NotEmpty(t, requests, "OTLP metrics exporter should produce at least one request")
-	saw := false
-	for _, r := range requests {
-		if r.Header.Get("Authorization") == "Bearer xyz" {
-			saw = true
-			break
-		}
+	// Asserting every captured request — not just one — catches a regression
+	// where the header is dropped on retries or later periodic exports.
+	for i, r := range requests {
+		assert.Equal(t, "Bearer xyz", r.Header.Get("Authorization"),
+			"Authorization header must propagate to every OTLP metrics request (request[%d] %s %s)",
+			i, r.Method, r.Path)
 	}
-	assert.True(t, saw, "Authorization header must propagate to OTLP metrics requests")
 }

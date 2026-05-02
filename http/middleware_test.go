@@ -345,6 +345,209 @@ func TestMiddleware_DoesNotAdvertiseUnsupportedOptionalInterfaces(t *testing.T) 
 	assert.False(t, gotReaderFrom, "wrapper must NOT advertise ReaderFrom when underlying doesn't support it")
 }
 
+// The capX wrapper types below implement strict subsets of the optional
+// ResponseWriter interfaces. Each one tracks whether the relevant method was
+// actually called on the underlying writer, letting the partial-capability
+// table test below assert that wrapResponseWriter (a) advertises exactly the
+// expected interfaces and (b) faithfully delegates to the underlying.
+
+type capF struct {
+	*plainWriter
+	flushed bool
+}
+
+func (c *capF) Flush() { c.flushed = true }
+
+type capH struct {
+	*plainWriter
+	hijacked bool
+}
+
+func (c *capH) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	c.hijacked = true
+	return nil, nil, nil
+}
+
+type capR struct {
+	*plainWriter
+	readFromSrc string
+}
+
+func (c *capR) ReadFrom(r io.Reader) (int64, error) {
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return 0, err
+	}
+	c.readFromSrc = string(b)
+	return int64(len(b)), nil
+}
+
+type capFH struct {
+	*plainWriter
+	flushed, hijacked bool
+}
+
+func (c *capFH) Flush() { c.flushed = true }
+func (c *capFH) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	c.hijacked = true
+	return nil, nil, nil
+}
+
+type capFR struct {
+	*plainWriter
+	flushed     bool
+	readFromSrc string
+}
+
+func (c *capFR) Flush() { c.flushed = true }
+func (c *capFR) ReadFrom(r io.Reader) (int64, error) {
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return 0, err
+	}
+	c.readFromSrc = string(b)
+	return int64(len(b)), nil
+}
+
+type capHR struct {
+	*plainWriter
+	hijacked    bool
+	readFromSrc string
+}
+
+func (c *capHR) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	c.hijacked = true
+	return nil, nil, nil
+}
+func (c *capHR) ReadFrom(r io.Reader) (int64, error) {
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return 0, err
+	}
+	c.readFromSrc = string(b)
+	return int64(len(b)), nil
+}
+
+// inspectorPair returns side-effect probes for the optional interfaces a
+// wrapper advertised. Probes for unsupported interfaces are nil.
+type inspectorPair struct {
+	flushed     func() bool
+	hijacked    func() bool
+	readFromSrc func() string
+}
+
+// TestMiddleware_PartialCapabilityWrappers exercises every partial subset of
+// (Flusher, Hijacker, ReaderFrom). Together with
+// TestMiddleware_DelegatesFlusherHijackerReaderFrom (full set) and
+// TestMiddleware_DoesNotAdvertiseUnsupportedOptionalInterfaces (empty set),
+// this locks down all 8 branches of wrapResponseWriter so a copy/paste in
+// any one branch is caught.
+func TestMiddleware_PartialCapabilityWrappers(t *testing.T) {
+	mw, shutdown := quickMeter(t)
+	defer shutdown()
+
+	cases := []struct {
+		name                string
+		new                 func() (http.ResponseWriter, inspectorPair)
+		wantF, wantH, wantR bool
+	}{
+		{
+			name: "F",
+			new: func() (http.ResponseWriter, inspectorPair) {
+				w := &capF{plainWriter: &plainWriter{}}
+				return w, inspectorPair{flushed: func() bool { return w.flushed }}
+			},
+			wantF: true,
+		},
+		{
+			name: "H",
+			new: func() (http.ResponseWriter, inspectorPair) {
+				w := &capH{plainWriter: &plainWriter{}}
+				return w, inspectorPair{hijacked: func() bool { return w.hijacked }}
+			},
+			wantH: true,
+		},
+		{
+			name: "R",
+			new: func() (http.ResponseWriter, inspectorPair) {
+				w := &capR{plainWriter: &plainWriter{}}
+				return w, inspectorPair{readFromSrc: func() string { return w.readFromSrc }}
+			},
+			wantR: true,
+		},
+		{
+			name: "FH",
+			new: func() (http.ResponseWriter, inspectorPair) {
+				w := &capFH{plainWriter: &plainWriter{}}
+				return w, inspectorPair{
+					flushed:  func() bool { return w.flushed },
+					hijacked: func() bool { return w.hijacked },
+				}
+			},
+			wantF: true, wantH: true,
+		},
+		{
+			name: "FR",
+			new: func() (http.ResponseWriter, inspectorPair) {
+				w := &capFR{plainWriter: &plainWriter{}}
+				return w, inspectorPair{
+					flushed:     func() bool { return w.flushed },
+					readFromSrc: func() string { return w.readFromSrc },
+				}
+			},
+			wantF: true, wantR: true,
+		},
+		{
+			name: "HR",
+			new: func() (http.ResponseWriter, inspectorPair) {
+				w := &capHR{plainWriter: &plainWriter{}}
+				return w, inspectorPair{
+					hijacked:    func() bool { return w.hijacked },
+					readFromSrc: func() string { return w.readFromSrc },
+				}
+			},
+			wantH: true, wantR: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			underlying, probes := tc.new()
+			var hasF, hasH, hasR bool
+
+			handler := mw(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, hasF = w.(http.Flusher)
+				_, hasH = w.(http.Hijacker)
+				_, hasR = w.(io.ReaderFrom)
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				if h, ok := w.(http.Hijacker); ok {
+					_, _, _ = h.Hijack()
+				}
+				if rf, ok := w.(io.ReaderFrom); ok {
+					_, _ = rf.ReadFrom(strings.NewReader("payload"))
+				}
+			}))
+			handler.ServeHTTP(underlying, httptest.NewRequest("GET", "/", nil))
+
+			assert.Equal(t, tc.wantF, hasF, "Flusher advertisement must match underlying")
+			assert.Equal(t, tc.wantH, hasH, "Hijacker advertisement must match underlying")
+			assert.Equal(t, tc.wantR, hasR, "ReaderFrom advertisement must match underlying")
+
+			if tc.wantF {
+				assert.True(t, probes.flushed(), "Flush must reach underlying writer")
+			}
+			if tc.wantH {
+				assert.True(t, probes.hijacked(), "Hijack must reach underlying writer")
+			}
+			if tc.wantR {
+				assert.Equal(t, "payload", probes.readFromSrc(), "ReadFrom payload must reach underlying writer")
+			}
+		})
+	}
+}
+
 // TestMiddleware_PanicRecordsAndRepanics verifies that a handler panic is
 // converted to a status_code=500 metric sample and then re-raised so the
 // http.Server's default panic handler still runs.

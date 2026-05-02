@@ -2,6 +2,7 @@ package o11y_test
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -138,6 +139,9 @@ func TestInit_RejectsInvalidHistogramBuckets(t *testing.T) {
 		{"negative", []float64{-1, 1}, "must be strictly positive"},
 		{"unsorted", []float64{0.5, 0.1}, "strictly increasing"},
 		{"duplicate", []float64{0.5, 0.5}, "strictly increasing"},
+		{"nan", []float64{math.NaN(), 1}, "must be a finite number"},
+		{"posinf", []float64{math.Inf(1), 1}, "must be a finite number"},
+		{"neginf", []float64{math.Inf(-1), 1}, "must be a finite number"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -189,24 +193,18 @@ func TestInit_OTLPHeadersForwarded(t *testing.T) {
 	requests := srv.Requests()
 	require.NotEmpty(t, requests, "exporter should have made at least one OTLP request")
 
-	// Find a trace request — log requests may also flow through the same
-	// server but we only need a single hit to confirm header forwarding.
-	var sawAuth, sawScope, sawTeam bool
-	for _, r := range requests {
-		if r.Header.Get("Authorization") == "Bearer secret-token" {
-			sawAuth = true
-		}
-		// http.Header.Get applies textproto.CanonicalMIMEHeaderKey, so any
-		// casing of the input maps to the same canonical key — one lookup
-		// is sufficient.
-		if r.Header.Get("X-Scope-OrgID") == "tenant-42" {
-			sawScope = true
-		}
-		if r.Header.Get("X-Honeycomb-Team") == "abc123" {
-			sawTeam = true
-		}
+	// Verify every captured request carries every configured header — not
+	// just at least one. An existential check would silently miss a
+	// regression that drops the header on retries or later batches.
+	// http.Header.Get applies textproto.CanonicalMIMEHeaderKey, so any
+	// casing of the input maps to the same canonical key.
+	for i, r := range requests {
+		assert.Equal(t, "Bearer secret-token", r.Header.Get("Authorization"),
+			"Authorization header must propagate on every OTLP request (request[%d] %s %s)",
+			i, r.Method, r.Path)
+		assert.Equal(t, "tenant-42", r.Header.Get("X-Scope-OrgID"),
+			"X-Scope-OrgID header must propagate on every OTLP request (request[%d])", i)
+		assert.Equal(t, "abc123", r.Header.Get("X-Honeycomb-Team"),
+			"custom auth header must propagate on every OTLP request (request[%d])", i)
 	}
-	assert.True(t, sawAuth, "Authorization header must be forwarded on OTLP requests")
-	assert.True(t, sawScope, "X-Scope-OrgID header must be forwarded on OTLP requests")
-	assert.True(t, sawTeam, "custom auth header must be forwarded on OTLP requests")
 }
