@@ -2,7 +2,7 @@
 
 **Status**: Accepted (implementation pending; upstream adoption candidate)
 **Date**: 2026-04-22
-**Updated**: 2026-05-02
+**Updated**: 2026-05-03
 
 ---
 
@@ -32,9 +32,12 @@ Those blockers have changed:
 - v0.2.11 supports `WithTracePropagationEnabled(bool)` and
   `OTEL_MONGO_PROPAGATION_ENABLED`, so `_oteltrace` document injection can be
   disabled independently of command spans.
-- This SDK is moving its semconv pin to v1.39.0, aligning with the DB stable
+- This SDK has moved its semconv pin to v1.39.0, aligning with the DB stable
   names used by upstream (`db.system.name`, `db.collection.name`,
-  `db.operation.name`, ...).
+  `db.operation.name`, ...). Source inspection of upstream `client.go` confirms
+  it imports the same `go.opentelemetry.io/otel/semconv/v1.39.0` package, and
+  `semconv.go` uses string constants that match the v1.39 catalog (no legacy
+  `db.system`).
 
 ---
 
@@ -133,6 +136,44 @@ The o11y wrapper must always pass both options.
 
 ---
 
+## Upstream Env-Gate Semantics (v0.2.11)
+
+Source inspection of `client.go` and `env_flags.go` at v0.2.11 shows three env
+flags that sit in front of every code path the o11y wrapper relies on. These
+were not present when the original ADR was written and change how the wrapper
+must be configured.
+
+| Env var | Default when unset | Effect |
+|---|---|---|
+| `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` | disabled | Master gate. When off, `ConnectWithOptions` swaps the supplied `TracerProvider` for a `noop.NewTracerProvider()`, so no command spans are emitted regardless of `WithTracerProvider`. Also forces document propagation off. |
+| `OTEL_MONGO_TRACING_ENABLED` | disabled | Module gate. Both this and the master gate must be truthy for `mongoTracingEnabled()` to return true. |
+| `OTEL_MONGO_PROPAGATION_ENABLED` | disabled | Default for `_oteltrace` document propagation. `WithTracePropagationEnabled` overrides this, but the master gate still has to be on. |
+
+Implications for the wrapper:
+
+1. **Command spans require both env vars.** A service that calls
+   `o11ymongo.Connect(...)` without setting
+   `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true` and
+   `OTEL_MONGO_TRACING_ENABLED=true` will silently get a no-op tracer. The
+   wrapper must either:
+   - document those env vars as deployment requirements, or
+   - set them programmatically before calling upstream `ConnectWithOptions`.
+     The wrapper should only do this for the env vars it knows about and must
+     not mutate them if already set by the operator. Note that environment
+     variables are process-global and cannot be scoped to a specific call site;
+     `os.Setenv` from the wrapper affects the entire process, so deployment-
+     requirement documentation is the preferred option.
+2. **Document propagation option is gated by the master env.**
+   `WithDocumentTracePropagation(true)` cannot enable injection while
+   `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is unset or false. This is a
+   useful safety property (default-off is enforced from two sides) but the
+   wrapper docs must call it out so opt-in services do not silently fail.
+3. **Test setup must set both env vars** for the unit tests in the Testing
+   section to observe spans at all. Without them, "Connect passes the supplied
+   tracer provider" would technically pass but emit nothing.
+
+---
+
 ## Synthetic Delivery Tracer Policy
 
 `otel-mongo/v2` can create an independent `TracerProvider` for synthetic
@@ -140,12 +181,35 @@ delivery spans when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. The o11y wrapper
 must disable this path by default so a MongoDB integration cannot silently
 create an extra provider outside the SDK-owned provider graph.
 
+In v0.2.11 the upstream call site is now further guarded:
+
+```go
+if mongoTracingEnabled() {
+    mongoTP, deliverTracer = initMongoProvider(addr, port)
+}
+```
+
+So three conditions must all be met before the synthetic provider spins up:
+`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true`, `OTEL_MONGO_TRACING_ENABLED=true`,
+and `OTEL_EXPORTER_OTLP_ENDPOINT` set. This is stricter than the policy
+originally feared, and the synthetic provider will not appear under the o11y
+default deployment posture.
+
+However, upstream **does not expose a per-client option to disable
+`initMongoProvider`** — there is no `WithSyntheticDeliveryTracer(false)` on
+the upstream side. The wrapper therefore cannot offer the explicit opt-in
+originally proposed; it can only:
+
+- rely on the env-gate default (off) and document the three-env activation,
+- and, for services that legitimately need MongoDB tracing but must not get
+  the synthetic provider, document that `OTEL_EXPORTER_OTLP_ENDPOINT` must be
+  unset in that process (the o11y exporters use their own configuration paths
+  and do not require this env var to be set on the consumer process).
+
 This follows ADR 0003's zero global state principle: providers are encapsulated
-in structs and lifecycle ownership remains explicit. If a service needs
-synthetic delivery spans, the wrapper may expose an explicit opt-in such as
-`WithSyntheticDeliveryTracer(true)`, documented with the operational trade-offs
-and shutdown behavior. Environment variables alone must not enable this path
-through o11y.
+in structs and lifecycle ownership remains explicit. Environment variables
+alone must not enable a hidden second provider through o11y; v0.2.11's three-
+env requirement satisfies that bar.
 
 ---
 
@@ -156,9 +220,20 @@ through o11y.
   - `Connect` passes the supplied tracer provider and propagator.
   - document trace propagation defaults off.
   - synthetic delivery tracing defaults off even when
-    `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
+    `OTEL_EXPORTER_OTLP_ENDPOINT` is set (relies on the v0.2.11 env-gate; the
+    test must assert the gate semantics, not just the wrapper's own knobs).
   - `WithDocumentTracePropagation(true)` maps to upstream
-    `WithTracePropagationEnabled(true)`.
+    `WithTracePropagationEnabled(true)`, **and** is a no-op when the master
+    env gate is unset (regression guard for the v0.2.11 behavior).
+  - tests that need to observe emitted spans must set
+    `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true` and
+    `OTEL_MONGO_TRACING_ENABLED=true` in `t.Setenv`; tests that assert "no
+    spans emitted in default posture" must leave them unset. Because
+    `t.Setenv` mutates process-global state, env-gated tests must not call
+    `t.Parallel()` and must not share a process with other parallel tests
+    that read the same vars; serialize them within the package or isolate
+    them in a dedicated build-tag/test binary to avoid flaky span/no-span
+    assertions.
 - Compatibility tests for emitted MongoDB attributes:
   - `db.system.name="mongodb"`.
   - `db.collection.name`, `db.namespace`, and `db.operation.name` are present
@@ -181,9 +256,13 @@ through o11y.
 **Negative / Trade-offs**
 
 - We depend on upstream wrapper API stability.
-- Upstream's optional synthetic delivery tracer creates an independent
-  `TracerProvider` when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. The local wrapper
-  must keep that path disabled by default and expose it only through explicit
-  opt-in.
+- Upstream's synthetic delivery tracer creates an independent `TracerProvider`
+  when `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`, `OTEL_MONGO_TRACING_ENABLED`,
+  and `OTEL_EXPORTER_OTLP_ENDPOINT` are all set. Upstream does not expose a
+  per-client option to disable it, so the wrapper cannot ship a
+  `WithSyntheticDeliveryTracer(false)` opt-out. The wrapper relies on the
+  three-env default-off posture and documents the activation path; services
+  that need MongoDB tracing without the synthetic provider must keep
+  `OTEL_EXPORTER_OTLP_ENDPOINT` unset in that process.
 - Compatibility tests are required because some DB attributes are still emitted
   through upstream string constants rather than typed semconv helpers.
