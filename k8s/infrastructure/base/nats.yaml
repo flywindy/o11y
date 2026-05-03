@@ -1,3 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nats-conf
+  namespace: infra
+data:
+  nats.conf: |
+    jetstream: enabled
+
+    websocket {
+      port: 4223
+      no_tls: true
+    }
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -17,12 +31,22 @@ spec:
       containers:
       - name: nats
         image: nats:2.12.6
-        args: ["-js"]
+        args: ["-c", "/etc/nats/nats.conf"]
         ports:
         - containerPort: 4222
           name: client
+        - containerPort: 4223
+          name: websocket
         - containerPort: 8222
           name: monitor
+        volumeMounts:
+        - name: nats-conf
+          mountPath: /etc/nats/nats.conf
+          subPath: nats.conf
+      volumes:
+      - name: nats-conf
+        configMap:
+          name: nats-conf
 ---
 apiVersion: v1
 kind: Service
@@ -35,5 +59,10 @@ spec:
   ports:
   - name: client
     port: 4222
+  - name: websocket
+    port: 4223
+    targetPort: 4223
+    nodePort: 30001
   - name: monitor
     port: 8222
+  type: NodePort
