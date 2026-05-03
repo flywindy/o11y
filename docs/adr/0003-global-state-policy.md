@@ -134,8 +134,8 @@ Before introducing any `github.com/<vendor>/otel-<thing>` library, verify:
 
 | Library | Version | Verified | Behavior | Notes |
 |---|---|---|---|---|
-| `Marz32onE/instrumentation-go/otel-nats` | v0.2.1 | ✅ | Reads globals as fallback only; never sets. Safe when `WithTracerProvider` / `WithPropagators` options are supplied. | See ADR 0004 |
-| `Marz32onE/instrumentation-go/otel-mongo/v2` | v0.2.10 | ✅ | Reads globals as fallback only; never sets (fixed upstream at our request — earlier versions called `otel.SetTracerProvider` / `otel.SetTextMapPropagator` from `ConnectWithOptions`). | **Not adopted** despite the global-state fix — see ADR 0005 for the separate semconv-drift and document-injection reasons that block adoption |
+| `Marz32onE/instrumentation-go/otel-nats` | v0.2.11 | ✅ | Reads globals as fallback only; never sets. Safe when `WithTracerProvider` / `WithPropagators` options are supplied. | See ADR 0004 |
+| `Marz32onE/instrumentation-go/otel-mongo/v2` | v0.2.11 | ✅ | Reads globals as fallback only; never sets. Supports disabling document trace propagation independently with `WithTracePropagationEnabled(false)`. | Adoption candidate after the semconv v1.39.0 upgrade; see ADR 0005 |
 
 When a new library is added or an existing one bumped, update this table
 in the same PR as the version change.

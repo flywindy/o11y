@@ -1,140 +1,108 @@
-# ADR 0006 — Semantic Convention Version Upgrade Strategy
+# ADR 0006 - Semantic Convention Version Upgrade Strategy
 
-**Status**: Accepted (placeholder; no upgrade currently scheduled)
+**Status**: Accepted
 **Date**: 2026-04-25
+**Updated**: 2026-05-02
 
 ---
 
 ## Context
 
-ADR 0002 §5 pinned the SDK to OpenTelemetry Semantic Conventions
-**v1.27.0** (released September 2024). At the time of that pin, the
-subsystems the SDK uses (Resource, HTTP, Messaging) were already stable
-in v1.27.0 and Database semconv was still experimental.
+ADR 0002 originally pinned the SDK to OpenTelemetry Semantic Conventions
+v1.27.0. That was appropriate while the SDK used only Resource, HTTP, and
+Messaging conventions and while MongoDB instrumentation was still pending.
 
-Since then, OTel semconv has continued to evolve. As of this ADR's
-date the upstream specification has reached **v1.40+**. Notable
-movement relevant to us:
+Two upgrade triggers have now fired:
 
-- **Database** attributes were promoted to stable around v1.30+ with
-  renames (`db.system` → `db.system.name`, etc.).
-- Other subsystems we do not currently use (GenAI, Feature Flags,
-  Cache, …) reached initial stable status.
+1. `github.com/Marz32onE/instrumentation-go/otel-nats` v0.2.11 imports
+   `go.opentelemetry.io/otel/semconv/v1.39.0`.
+2. MongoDB adoption is being reconsidered, and `otel-mongo/v2` v0.2.11 emits
+   DB stable names such as `db.system.name` that align with semconv v1.39.0.
 
-This creates a recurring decision: when does the SDK upgrade its pin?
-Without a written framework, every upgrade discussion starts from
-zero — including the temptation to upgrade subsystem-by-subsystem,
-which mixes versions and defeats the pin.
-
-This ADR establishes the framework. It does **not** schedule an
-upgrade.
-
----
-
-## Why we do not chase the latest version
-
-1. **Cost is across the SDK.** Every import of
-   `go.opentelemetry.io/otel/semconv/v1.27.0` must change. Every
-   helper that emits an attribute must be reviewed. Every dashboard
-   query that hard-codes a key may break.
-2. **Library ecosystem lags.** Pinning ahead of our key dependencies
-   (currently `otel-nats`, plus any future instrumentation libraries)
-   creates alignment problems we currently do not have.
-3. **Stability promotion is the meaningful signal.** Most semconv
-   changes between minor versions are additive or in experimental
-   areas. "Subsystem X is now stable" is the trigger that justifies
-   work; raw version chasing is not.
-4. **Multi-version imports are forbidden.** The SDK is one process;
-   one pin. Mixing `semconv/v1.X.X` and `semconv/v1.Y.Y` in the same
-   module is a `Do NOT` (AGENTS.md).
+The current latest Go semconv package is v1.40.0, but the SDK intentionally
+targets v1.39.0 in this migration to align with both primary upstream
+instrumentation libraries (`otel-nats` and `otel-mongo/v2`) without introducing
+a v1.39/v1.40 split.
 
 ---
 
 ## Decision
 
-### Upgrade triggers
+The SDK semconv pin moves from v1.27.0 to **v1.39.0**.
 
-The SDK pin moves only when **at least one** of the following triggers
-fires. Any one of them is sufficient justification to open a dedicated
-upgrade ADR.
+SDK-owned code must import:
 
-1. **Stability-promotion trigger.** A subsystem the SDK already uses
-   is promoted to stable in a newer version, **AND** the promotion
-   includes a key rename that affects an attribute the SDK currently
-   emits.
-2. **New-subsystem trigger.** The SDK plans to instrument a new
-   subsystem (Cache, GenAI, …) and the attribute set we need is only
-   stable in a later version.
-3. **Dependency-alignment trigger.** A primary dependency we use
-   (e.g. `otel-nats`) bumps its `semconv/vX.Y.Z` import to a newer
-   version, and we choose to align rather than translate at the
-   boundary.
-4. **Backend-requirement trigger.** A backend or downstream consumer
-   (Grafana dashboard package, a Tempo / Loki / Mimir version requirement,
-   an external alert rule library) requires a newer attribute key.
+```go
+semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
+```
 
-### Process when a trigger fires
+SDK-owned code must not import older or newer semconv packages unless a future
+upgrade ADR moves the pin again.
 
-1. Open a dedicated ADR titled `Upgrade semconv to vX.Y.Z`.
-2. Audit every import of the current pin in the codebase (`grep -r
-   semconv/v1` will catch them all).
-3. Identify the target version using the criteria above plus the
-   "decision tree" in `docs/semconv.md`.
-4. Update in a **single PR**: imports, attribute helpers, ADR 0002
-   §5, ADR 0005 §7, `docs/semconv.md` catalog, tests.
-5. Run integration tests against the dashboards and alerts that
-   consume the metrics, spans, and logs.
-6. Tag the commit (e.g. `semconv-v1.30.0`) so a revert is trivial if
-   downstream breakage is discovered after merge.
+Third-party instrumentation is acceptable when it either:
 
-### What we explicitly do NOT do
-
-- Upgrade subsystem-by-subsystem (e.g. "let DB use v1.30 but keep
-  HTTP at v1.27").
-- Mix `semconv/v1.X.X` and `semconv/v1.Y.Y` imports in the same
-  module.
-- Allow a third-party library that hand-rolls semconv string keys (no
-  Go package import) to drive our pin choice. See ADR 0005's
-  rejection of `Marz32onE/instrumentation-go/otel-mongo` for the
-  precedent — we treat such libraries as "permanently drifting" and
-  refuse to pin around them.
+- imports `semconv/v1.39.0`, or
+- emits documented string keys that match the v1.39 catalog and has a local
+  compatibility test proving the emitted attributes.
 
 ---
 
-## Currently known upgrade candidates
+## Migration Scope
 
-| Trigger | Status | Estimated target version |
-|---|---|---|
-| DB stable (`db.system` → `db.system.name`) | **Pending** — no MongoDB query, dashboard, or alert in production yet depends on either name | v1.30+ |
-| Backend requires newer keys | Not observed | — |
-| `otel-nats` upgrades semconv import | Not observed (still `semconv/v1.27.0` in v0.2.3) | — |
-| New subsystem instrumentation | Not planned | — |
+The semconv v1.39.0 migration updates:
 
-When MongoDB instrumentation ships per ADR 0005, the resulting
-`db.system="mongodb"` spans will be the first concrete pressure point
-on the DB-stable trigger. At that moment, evaluate whether to:
+- SDK-owned Go imports in `o11y.go`, `http/`, and `internal/metrics/`.
+- `otel-nats` to v0.2.11.
+- Documentation and ADRs that referenced v1.27.0.
+- `docs/semconv.md` to list the v1.39 attribute catalog.
+- MongoDB integration guidance in ADR 0005 so `otel-mongo/v2` v0.2.11 becomes
+  an adoption candidate.
 
-- **(a)** accept the gap (we ship `db.system`; the broader OTel
-  ecosystem prefers `db.system.name`; backends typically tolerate
-  both), or
-- **(b)** trigger an upgrade ADR.
+The migration does **not** implement the MongoDB wrapper itself. That should be
+a follow-up PR so the semconv move and Mongo feature work remain reviewable.
+
+---
+
+## Future Upgrade Process
+
+The SDK pin moves only when at least one trigger fires:
+
+1. **Stability-promotion trigger.** A subsystem the SDK already uses is
+   promoted to stable in a newer version and the promotion includes a key
+   rename that affects an emitted attribute.
+2. **New-subsystem trigger.** The SDK plans to instrument a new subsystem and
+   the required attribute set is only stable in a later version.
+3. **Dependency-alignment trigger.** A primary dependency bumps its semconv
+   import and we choose to align rather than translate at the boundary.
+4. **Backend-requirement trigger.** A dashboard, alert, or backend requires a
+   newer attribute key.
+
+When a trigger fires:
+
+1. Open or update an ADR for the target version.
+2. Audit every `semconv/v1` import in SDK-owned code.
+3. Update imports, attribute helpers, `docs/semconv.md`, integration ADRs, and
+   tests in a single PR.
+4. Run `go fmt ./...`, `go mod tidy`, `go vet ./...`, `go test ./...`, and
+   `go test -race ./...`.
+5. Verify dashboards and alerts that hard-code changed attribute keys.
 
 ---
 
 ## Consequences
 
 **Positive**
-- Upgrades are deliberate, scoped, and reviewable.
-- Dependency upgrades cannot quietly drag the SDK's semconv version
-  along with them.
-- ADRs accumulate institutional memory of why each pin was held or
-  moved.
+
+- NATS and MongoDB integration decisions align on v1.39.0.
+- MongoDB can use DB stable keys such as `db.system.name`.
+- The SDK avoids drifting to v1.40.0 ahead of its primary instrumentation
+  dependencies.
 
 **Negative / Trade-offs**
-- The SDK will sometimes lag behind the OTel community-recommended
-  version, especially for newly-stable subsystems.
-- Translation wrappers (per `docs/semconv.md` "decision tree") may be
-  required for libraries that move ahead of our pin.
-- Operators who follow OTel ecosystem trends closely may find the SDK
-  conservative; upgrade conversations should reference this ADR to
-  keep the discussion structured.
+
+- Dashboards or queries written for `db.system` must migrate to
+  `db.system.name` when MongoDB spans are introduced.
+- The SDK intentionally does not chase the latest semconv package until a
+  concrete trigger justifies moving beyond v1.39.0.
+- Any future dependency that moves to v1.40.0 will require another deliberate
+  alignment decision.

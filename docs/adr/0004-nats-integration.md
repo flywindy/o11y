@@ -18,7 +18,7 @@ Relevant files:
   `JetStream`)
 - `nats/middleware.go` — auxiliary helpers
 - Upstream: `github.com/Marz32onE/instrumentation-go/otel-nats` (internal
-  company library, covers NATS Core + JetStream with OTel semconv v1.27.0)
+  company library, covers NATS Core + JetStream with OTel semconv v1.39.0)
 
 ---
 
@@ -30,9 +30,9 @@ Selected over alternatives because it:
 
 - Covers both NATS Core and all JetStream consumer patterns (push,
   pull-with-`Consume`, pull-with-`Fetch`) in a single library.
-- Aligns attribute names with OTel semconv v1.27.0
+- Aligns attribute names with OTel semconv v1.39.0
   (`messaging.system`, `messaging.destination.name`,
-  `messaging.operation`, …).
+  `messaging.operation.name`, `messaging.operation.type`, ...).
 - Is internally owned, so semconv upgrades and bug fixes are within
   reach.
 
@@ -96,7 +96,7 @@ canceled.
 ## Global-state verification
 
 ### Library: `github.com/Marz32onE/instrumentation-go/otel-nats`
-### Version: `v0.2.1` (per `go.mod`)
+### Version: `v0.2.11` (per `go.mod`)
 ### Result: ✅ SAFE — does not set globals
 
 **Verification method.** Source inspection of
@@ -127,6 +127,13 @@ it would only *read* globals, never set them.
 
 **No refactor required.** Adoption of ADR 0003 does not change
 `nats/conn.go` or any of its tests.
+
+## Semconv Alignment
+
+`otel-nats` v0.2.11 imports `go.opentelemetry.io/otel/semconv/v1.39.0`,
+matching the SDK pin after the semconv upgrade. The emitted messaging
+attributes use the v1.39 names documented in `docs/semconv.md`, including
+`messaging.operation.name` and `messaging.operation.type`.
 
 ---
 

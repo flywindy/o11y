@@ -41,7 +41,7 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel/metric"
-	semconv "go.opentelemetry.io/otel/semconv/v1.27.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 )
 
 // DefaultMaxUniquePaths is the default upper bound on distinct http.route

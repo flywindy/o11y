@@ -10,7 +10,7 @@
 The o11y SDK needs a metrics pillar that satisfies two requirements simultaneously:
 
 1. **OTel Semantic Conventions compliance** — instrument names, attribute keys, and attribute
-   types must match OTel semconv v1.27.0 so that dashboards and alerts written against the
+   types must match the pinned OTel semconv version so that dashboards and alerts written against the
    specification work without manual field mapping.
 2. **Operational simplicity** — the chosen export path must work out of the box with the
    existing Grafana stack without requiring additional OTel Collector pipeline configuration
@@ -69,10 +69,10 @@ The Prometheus exporter's `WithResourceAsConstantLabels` filter promotes `servic
 constant labels on every series, including runtime metrics started by
 `go.opentelemetry.io/contrib/instrumentation/runtime`.
 
-### 5. Instrument naming and attribute types follow OTel semconv v1.27.0
+### 5. Instrument naming and attribute types follow pinned OTel semconv
 
 All instruments and their attributes must conform to the OTel Semantic Conventions
-specification at version **v1.27.0**. Key rules:
+specification at the repository pin, currently **v1.39.0**. Key rules:
 
 | Signal | Rule |
 |--------|------|
@@ -80,7 +80,7 @@ specification at version **v1.27.0**. Key rules:
 | `http.response.status_code` | **`attribute.Int`**, not `attribute.String` — the semconv type is `int` |
 | `http.request.method` | `attribute.String` |
 | `http.route` | `attribute.String`; must be a normalized route template, never a raw URL path |
-| `deployment.environment.name` | v1.27.0 key (replaces the deprecated `deployment.environment` from v1.26.0) |
+| `deployment.environment.name` | Current canonical deployment environment resource key |
 
 ### 6. HTTP middleware emits one histogram; `_count` doubles as traffic and error counter
 

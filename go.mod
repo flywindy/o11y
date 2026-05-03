@@ -3,7 +3,7 @@ module github.com/flywindy/o11y
 go 1.25.0
 
 require (
-	github.com/Marz32onE/instrumentation-go/otel-nats v0.2.1
+	github.com/Marz32onE/instrumentation-go/otel-nats v0.2.11
 	github.com/nats-io/nats-server/v2 v2.12.6
 	github.com/nats-io/nats.go v1.50.0
 	github.com/prometheus/client_golang v1.23.2

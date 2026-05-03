@@ -340,11 +340,11 @@ Open Grafana at `http://localhost:3000` and navigate to:
 2. **Zero Global State**: No `init()` side effects, no global logger or tracer provider variables. See [ADR 0003](docs/adr/0003-global-state-policy.md).
 3. **Correlation**: Every log record includes `traceId` and `spanId` when a span is active — as JSON fields on stdout and as OTel Log Data Model fields in Loki. See [ADR 0001](docs/adr/0001-log-format-strategy.md).
 4. **Errors**: Use `slog.ErrorContext(ctx, ...)` with structured attributes; never `panic` for recoverable errors.
-5. **Semconv v1.27.0**: All instrument names, attribute keys, and types conform to OTel Semantic Conventions v1.27.0. See [`docs/semconv.md`](docs/semconv.md).
+5. **Semconv v1.39.0**: All instrument names, attribute keys, and types conform to OTel Semantic Conventions v1.39.0. See [`docs/semconv.md`](docs/semconv.md).
 
 ## Acknowledgements
 
-- [`github.com/Marz32onE/instrumentation-go/otel-nats`](https://github.com/Marz32onE/instrumentation-go) — provides the underlying NATS Core + JetStream tracing semantics used by the `nats/` wrapper. Verified at v0.2.1 not to mutate OTel globals. See [ADR 0004](docs/adr/0004-nats-integration.md) for the integration decision and audit discipline.
+- [`github.com/Marz32onE/instrumentation-go/otel-nats`](https://github.com/Marz32onE/instrumentation-go) — provides the underlying NATS Core + JetStream tracing semantics used by the `nats/` wrapper. Verified at v0.2.11 not to mutate OTel globals and to import semconv v1.39.0. See [ADR 0004](docs/adr/0004-nats-integration.md) for the integration decision and audit discipline.
 
 ## AI Collaboration
 
