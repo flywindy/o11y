@@ -115,7 +115,9 @@ compatibility tests that assert emitted spans use the documented keys.
 ## Global-State Verification
 
 ### Library surveyed: `github.com/Marz32onE/instrumentation-go/otel-mongo/v2`
+
 ### Version: `v0.2.11`
+
 ### Result: SAFE
 
 Source inspection of `client.go` shows `ConnectWithOptions` uses explicit
@@ -128,12 +130,30 @@ The o11y wrapper must always pass both options.
 
 ---
 
+## Synthetic Delivery Tracer Policy
+
+`otel-mongo/v2` can create an independent `TracerProvider` for synthetic
+delivery spans when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. The o11y wrapper
+must disable this path by default so a MongoDB integration cannot silently
+create an extra provider outside the SDK-owned provider graph.
+
+This follows ADR 0003's zero global state principle: providers are encapsulated
+in structs and lifecycle ownership remains explicit. If a service needs
+synthetic delivery spans, the wrapper may expose an explicit opt-in such as
+`WithSyntheticDeliveryTracer(true)`, documented with the operational trade-offs
+and shutdown behavior. Environment variables alone must not enable this path
+through o11y.
+
+---
+
 ## Testing
 
 - Unit tests for the local wrapper:
   - `Connect` rejects canceled contexts before dialing.
   - `Connect` passes the supplied tracer provider and propagator.
   - document trace propagation defaults off.
+  - synthetic delivery tracing defaults off even when
+    `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
   - `WithDocumentTracePropagation(true)` maps to upstream
     `WithTracePropagationEnabled(true)`.
 - Compatibility tests for emitted MongoDB attributes:
@@ -158,8 +178,9 @@ The o11y wrapper must always pass both options.
 **Negative / Trade-offs**
 
 - We depend on upstream wrapper API stability.
-- Upstream's optional synthetic deliver tracer creates an independent
+- Upstream's optional synthetic delivery tracer creates an independent
   `TracerProvider` when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. The local wrapper
-  and docs must decide whether to expose or disable that behavior.
+  must keep that path disabled by default and expose it only through explicit
+  opt-in.
 - Compatibility tests are required because some DB attributes are still emitted
   through upstream string constants rather than typed semconv helpers.
