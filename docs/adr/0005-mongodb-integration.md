@@ -228,7 +228,12 @@ env requirement satisfies that bar.
   - tests that need to observe emitted spans must set
     `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true` and
     `OTEL_MONGO_TRACING_ENABLED=true` in `t.Setenv`; tests that assert "no
-    spans emitted in default posture" must leave them unset.
+    spans emitted in default posture" must leave them unset. Because
+    `t.Setenv` mutates process-global state, env-gated tests must not call
+    `t.Parallel()` and must not share a process with other parallel tests
+    that read the same vars; serialize them within the package or isolate
+    them in a dedicated build-tag/test binary to avoid flaky span/no-span
+    assertions.
 - Compatibility tests for emitted MongoDB attributes:
   - `db.system.name="mongodb"`.
   - `db.collection.name`, `db.namespace`, and `db.operation.name` are present
@@ -251,9 +256,13 @@ env requirement satisfies that bar.
 **Negative / Trade-offs**
 
 - We depend on upstream wrapper API stability.
-- Upstream's optional synthetic delivery tracer creates an independent
-  `TracerProvider` when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. The local wrapper
-  must keep that path disabled by default and expose it only through explicit
-  opt-in.
+- Upstream's synthetic delivery tracer creates an independent `TracerProvider`
+  when `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`, `OTEL_MONGO_TRACING_ENABLED`,
+  and `OTEL_EXPORTER_OTLP_ENDPOINT` are all set. Upstream does not expose a
+  per-client option to disable it, so the wrapper cannot ship a
+  `WithSyntheticDeliveryTracer(false)` opt-out. The wrapper relies on the
+  three-env default-off posture and documents the activation path; services
+  that need MongoDB tracing without the synthetic provider must keep
+  `OTEL_EXPORTER_OTLP_ENDPOINT` unset in that process.
 - Compatibility tests are required because some DB attributes are still emitted
   through upstream string constants rather than typed semconv helpers.
