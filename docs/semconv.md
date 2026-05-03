@@ -1,4 +1,4 @@
-# OpenTelemetry Semantic Conventions — v1.27.0 Catalog
+# OpenTelemetry Semantic Conventions - v1.39.0 Catalog
 
 This document is the single source of truth for which OTel attributes and
 instruments the o11y SDK emits. Every PR that introduces a new attribute
@@ -6,86 +6,55 @@ key or instrument name MUST update this catalog in the same commit.
 
 ---
 
-## Version pin
+## Version Pin
 
-- **Active version**: `v1.27.0`
-- **Go package**: `go.opentelemetry.io/otel/semconv/v1.27.0`
+- **Active version**: `v1.39.0`
+- **Go package**: `go.opentelemetry.io/otel/semconv/v1.39.0`
 - **Upstream spec**: <https://opentelemetry.io/docs/specs/semconv/>
 
-### Upgrade rule
+### Upgrade Rule
 
-Mixing semconv versions is forbidden. A version bump is a single atomic
-change:
+Mixing semconv versions in SDK-owned code is forbidden. A version bump is
+a single atomic change:
 
-1. Replace every `semconv/v1.27.0` import with the new version.
-2. Re-map any renamed keys (e.g. `deployment.environment` in v1.26.0
-   became `deployment.environment.name` in v1.27.0).
+1. Replace every SDK-owned `semconv/v1.X.Y` import with the new version.
+2. Re-map any renamed keys.
 3. Update this document with the new version and any key deltas.
 4. Run `go vet ./...` and `go test ./...` after the change.
 
-### Enforcement rules
+Third-party instrumentation may import the same pinned semconv version, or
+may emit documented string keys that match the pinned version after source
+inspection. Any exception must be recorded in the integration ADR.
 
-1. **No string literals for attribute keys.** Always reference the
-   constant from the pinned semconv package (e.g.
-   `semconv.ServiceNameKey.String(name)`). String literals bypass
-   compile-time version checking.
-2. **New attribute? Update this catalog.** The PR reviewer checks that
-   this file lists any new key introduced in the diff.
+### Enforcement Rules
+
+1. **No string literals for SDK-owned semconv keys.** Always reference the
+   constant from the pinned semconv package where the package exposes one.
+2. **New attribute? Update this catalog.** The PR reviewer checks that this
+   file lists any new key introduced in the diff.
 3. **Deviations require explicit justification** in the "Deviations"
    section below. The default answer is "no deviation".
 
-### Cross-library version handling — decision tree
-
-Third-party instrumentation libraries do not always pin to the same
-semconv version this SDK uses. When importing a library that touches
-attribute keys, audit it with this decision tree before adoption:
-
-```text
-Does the library import "go.opentelemetry.io/otel/semconv/vX.Y.Z"?
-  ├─ NO  →  Hand-rolled string keys. No compile-time pin. Treat as
-  │         permanently drifting; reject adoption (precedent: ADR 0005
-  │         on otel-mongo). Acceptable workarounds: fork to add the
-  │         import, or push upstream to add it.
-  │
-  └─ YES →  Compare its pinned version to ours.
-            ├─ Same as ours                  → adopt as-is
-            ├─ ±1–2 versions, only adds keys → adopt; note in this catalog
-            ├─ ±1–2 versions, includes a rename of a key we use →
-            │     three options:
-            │       (a) translate at the boundary (a SpanProcessor or
-            │           wrapper that renames keys)
-            │       (b) push upstream to align
-            │       (c) trigger an SDK semconv upgrade (ADR 0006)
-            └─ ≥3 versions apart → consider writing our own
-                  instrumentation against the library's native
-                  extension point (precedent: ADR 0005 mongo monitor)
-```
-
-Whichever branch you take, document the outcome in the integration's
-own ADR under a "Semconv alignment" section, and update this catalog
-if any new attribute key starts being emitted.
-
 ---
 
-## Resource attributes
+## Resource Attributes
 
-Emitted once per process via `o11y.Init` → `buildResource` and attached
-to every signal (traces, metrics, logs) so that service identity is
-byte-for-byte identical across backends.
+Emitted once per process via `o11y.Init` / `buildResource` and attached to
+every signal so that service identity is identical across backends.
 
 | Key | Type | Source | Required |
 |---|---|---|---|
-| `service.name` | string | `WithServiceName` | ✅ |
-| `service.version` | string | `WithServiceVersion` | ✅ |
-| `service.namespace` | string | `WithServiceNamespace` | ✅ |
-| `deployment.environment.name` | string | `WithEnvironment` (canonicalized: `production` / `staging` / `development` / `testing`) | ✅ |
+| `service.name` | string | `WithServiceName` | yes |
+| `service.version` | string | `WithServiceVersion` | yes |
+| `service.namespace` | string | `WithServiceNamespace` | yes |
+| `deployment.environment.name` | string | `WithEnvironment` (canonicalized: `production` / `staging` / `development` / `testing`) | yes |
 | `host.*` | various | `resource.WithHost()` | detected |
 | `process.*` | various | `resource.WithProcess()` | detected |
-| (env-provided) | various | `resource.WithFromEnv()` → `OTEL_RESOURCE_ATTRIBUTES` | optional |
+| (env-provided) | various | `resource.WithFromEnv()` / `OTEL_RESOURCE_ATTRIBUTES` | optional |
 
 ---
 
-## HTTP server (package `github.com/flywindy/o11y/http`)
+## HTTP Server (package `github.com/flywindy/o11y/http`)
 
 ### Instruments
 
@@ -94,137 +63,125 @@ byte-for-byte identical across backends.
 | `http.server.request.duration` | Float64Histogram | `s` | Duration of HTTP server requests. `_count` doubles as traffic + error counter; no separate counter emitted. |
 
 Histogram boundaries pinned via an OTel View to
-`[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]` seconds
-(see ADR 0002 §9).
+`[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]` seconds.
 
 ### Attributes
 
 | Key | Type | Notes |
 |---|---|---|
 | `http.request.method` | string | e.g. `GET`, `POST`. |
-| `http.route` | string | Normalized route template (e.g. `/users/:id`), **never** the raw URL path. Cardinality-capped via `WithPathNormalizer` + `WithMaxUniquePaths` (default 1000) → overflow collapses to literal `"other"`. |
-| `http.response.status_code` | **int** | Must be `attribute.Int`, not `attribute.String`, per semconv v1.27.0. |
+| `http.route` | string | Normalized route template (e.g. `/users/:id`), never the raw URL path. Cardinality-capped via `WithPathNormalizer` + `WithMaxUniquePaths` (default 1000); overflow collapses to `"other"`. |
+| `http.response.status_code` | int | Must be `attribute.Int`, not `attribute.String`. |
 
 ---
 
-## Go runtime (package `go.opentelemetry.io/contrib/instrumentation/runtime`)
+## Go Runtime (package `go.opentelemetry.io/contrib/instrumentation/runtime`)
 
-Enabled by default via `WithRuntimeMetrics(true)`. The emitted metric
-set is defined by the contrib package and covers the Saturation golden
-signal (goroutines, GC pauses, heap allocations, scheduler latency).
+Enabled by default via `WithRuntimeMetrics(true)`. The emitted metric set is
+defined by the contrib package and covers the Saturation golden signal
+(goroutines, GC pauses, heap allocations, scheduler latency).
 
-This catalog **does not duplicate** the upstream metric list because
-the contrib package is the authoritative source and changes across
-contrib versions. Refer to:
-
-- Go package docs: <https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/runtime>
-- Spec: <https://opentelemetry.io/docs/specs/semconv/runtime/go-metrics/>
-
-When the contrib package version is bumped in `go.mod`, the reviewer
-confirms that no metric name collides with one defined by the SDK
-itself and that cardinality stays bounded.
+This catalog does not duplicate the upstream metric list because the contrib
+package is the authoritative source and changes across contrib versions.
 
 ---
 
-## Messaging — NATS (package `github.com/flywindy/o11y/nats`)
+## Messaging - NATS (package `github.com/flywindy/o11y/nats`)
 
-Spans are emitted by the upstream
-`github.com/Marz32onE/instrumentation-go/otel-nats` library. The
-wrapper adds no attributes of its own.
+Spans are emitted by
+`github.com/Marz32onE/instrumentation-go/otel-nats` v0.2.11. The upstream
+package imports `go.opentelemetry.io/otel/semconv/v1.39.0`; the o11y wrapper
+adds no attributes of its own.
 
-### Attributes (produced by upstream, pinned to semconv v1.27.0)
+### Core and JetStream Attributes
 
 | Key | Type | Notes |
 |---|---|---|
-| `messaging.system` | string | Constant `"nats"` |
-| `messaging.destination.name` | string | NATS subject (e.g. `events.created`) |
-| `messaging.operation` | string | `publish` / `receive` / `process` |
-| `messaging.message.id` | string | Per-message identifier, when available |
-| `server.address` | string | NATS endpoint host |
-| `server.port` | int | NATS endpoint port |
+| `messaging.system` | string | Constant `"nats"`. |
+| `messaging.destination.name` | string | NATS subject (e.g. `events.created`). |
+| `messaging.operation.type` | string | `send`, `receive`, or `process`. |
+| `messaging.operation.name` | string | `publish`, `receive`, or `process`. |
+| `messaging.message.body.size` | int | Emitted when payload is non-empty. |
+| `messaging.message.conversation_id` | string | Request/reply inbox, when present. |
+| `messaging.consumer.group.name` | string | Queue group, when present. |
+| `server.address` | string | NATS endpoint host. |
+| `server.port` | int | NATS endpoint port, omitted for default port 4222. |
 
-JetStream-specific attributes (stream name, consumer name, delivery
-count, ack policy) follow the same upstream semconv mapping. The
-full list is reviewed whenever the upstream library is bumped; see
-ADR 0004's "Audit discipline for upstream bumps".
+### Upstream NATS Trace-Event Attributes
 
-### Known cardinality risks
+`otel-nats` also emits NATS-server infrastructure trace-event spans when the
+optional `Nats-Trace-Dest` flow is enabled. These use intentionally
+NATS-specific keys such as `nats.server.name`, `nats.event.type`, and
+`nats.subject`; they are listed as a documented deviation because OTel
+semconv has no direct stable equivalent for the NATS server trace-event
+payload.
 
-- `messaging.destination.name` per raw subject can explode if
-  applications publish to unbounded subject spaces (e.g.
-  `events.user.<userID>`). Use subject templates or hash the dynamic
-  portion before publishing.
+### Known Cardinality Risks
+
+- `messaging.destination.name` per raw subject can explode if applications
+  publish to unbounded subject spaces (e.g. `events.user.<userID>`). Use
+  bounded subject templates or hash the dynamic portion before publishing.
 
 ---
 
-## Database — MongoDB (package `github.com/flywindy/o11y/mongo`, per ADR 0005)
+## Database - MongoDB
 
-**Status**: catalog entry reserved; implementation pending per ADR 0005.
+**Status**: integration pending; `otel-mongo/v2` v0.2.11 is now an adoption
+candidate after the SDK semconv pin moved to v1.39.0. See ADR 0005.
 
-### Spans
-
-Span kind: `trace.SpanKindClient`.
-Span name: `{db.operation.name} {db.namespace}.{db.collection.name}` —
-e.g. `find orders.events`. Falls back to `{db.operation.name}` when
-the collection cannot be determined.
-
-### Attributes
+### Expected Attributes
 
 | Key | Type | Notes |
 |---|---|---|
-| `db.system` | string | Constant `"mongodb"` |
-| `db.namespace` | string | Database name |
-| `db.collection.name` | string | Collection name (best-effort; see ADR 0005 §7) |
-| `db.operation.name` | string | Command name (`insert`, `find`, `update`, …) |
-| `server.address` | string | MongoDB host |
-| `server.port` | int | MongoDB port |
-| `network.peer.address` | string | Mirror of `server.address`; required by semconv client-span rules |
-| `network.peer.port` | int | Mirror of `server.port` |
+| `db.system.name` | string | Constant `"mongodb"`. |
+| `db.namespace` | string | Database name. |
+| `db.collection.name` | string | Collection name. |
+| `db.operation.name` | string | Operation name (`insert`, `find`, `update`, ...). |
+| `db.operation.batch.size` | int | Batch size for multi-document operations, when applicable. |
+| `db.response.status_code` | string | MongoDB error code, when available. |
+| `error.type` | string | MongoDB error code or `_OTHER`, when an operation fails. |
+| `server.address` | string | MongoDB host. |
+| `server.port` | int | MongoDB port, omitted for default port 27017 by upstream. |
 
-### Explicitly NOT emitted (privacy / security)
+### Explicitly NOT Emitted by Default
 
 | Key | Reason |
 |---|---|
-| `db.query.text` / `db.statement` | Query documents routinely contain PII and secrets. Future opt-in (`WithCapturedQueryText(true)`) must carry an explicit warning. |
+| `db.query.text` | Query documents routinely contain PII and secrets. Future opt-in must carry an explicit warning. |
 | Response document contents | Same rationale. |
 
-### Skipped operations by default
+### Document Trace Propagation
 
-No spans emitted for `getMore`, `killCursors`, `ping`, `hello`,
-`isMaster`. Rationale and override knob in ADR 0005 §6.
+`otel-mongo/v2` supports `_oteltrace` document injection through
+`WithTracePropagationEnabled(bool)` and `OTEL_MONGO_PROPAGATION_ENABLED`.
+The o11y wrapper must default this off unless an application explicitly opts in.
 
 ---
 
 ## Logs
 
-All log records pass through the `otelslog` bridge, which applies OTel
-Log Data Model attributes automatically.
+All log records pass through the `otelslog` bridge, which applies OTel Log
+Data Model attributes automatically.
 
-### Per-record attributes injected by the SDK
+### Per-Record Attributes Injected by the SDK
 
 | Key | Source | Notes |
 |---|---|---|
 | `traceId` (stdout JSON) / `trace_id` (OTLP) | Active span from ctx | Via `OtelSlogHandler` on stdout path; via `otelslog` bridge on OTLP path. See ADR 0001. |
 | `spanId` (stdout JSON) / `span_id` (OTLP) | Active span from ctx | Same mechanism as above. |
-| `service.name` | Stdout JSON top-level field (explicit); OTLP: Resource attribute | ADR 0001 §Option B |
-| `environment` | Stdout JSON top-level field (explicit); OTLP: Resource attribute `deployment.environment.name` | Legacy stdout name retained for backward compatibility |
-
-### Log severity
-
-- stdout: `"level"` (slog default)
-- OTLP: `severityNumber` + `severityText` (OTel Log Data Model)
-
-See ADR 0001 for the full table of intentional stdout↔OTLP differences.
+| `service.name` | Stdout JSON top-level field; OTLP Resource attribute | ADR 0001 Option B. |
+| `environment` | Stdout JSON top-level field; OTLP Resource attribute `deployment.environment.name` | Legacy stdout name retained for backward compatibility. |
 
 ---
 
-## Deviations / exceptions
+## Deviations / Exceptions
 
-None at this time.
+| Key family | Source | Reason |
+|---|---|---|
+| `nats.*` | `otel-nats` trace-event spans | NATS server trace-event payload fields have no direct stable OTel semconv equivalent. They are isolated to the optional infrastructure trace-event flow. |
 
-If a deviation is required (e.g. a backend constraint forces a
-non-semconv key), it must be listed here with:
+Any new deviation must list:
 
 1. The non-standard key and type.
 2. The reason no standard alternative works.
-3. The mitigation plan (deprecation path or upstream spec issue link).
+3. The mitigation plan or upstream spec issue link.

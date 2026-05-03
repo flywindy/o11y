@@ -1,5 +1,5 @@
-github.com/Marz32onE/instrumentation-go/otel-nats v0.2.1 h1:dkQtoXwaB62rxzuP/Ja6IWQPWZGHfJ6tuUBcQxmj/Tg=
-github.com/Marz32onE/instrumentation-go/otel-nats v0.2.1/go.mod h1:MXmU2P0aNZdefCrMDm8yW7/rW3K5giPA2KUINzin30o=
+github.com/Marz32onE/instrumentation-go/otel-nats v0.2.11 h1:pgVr0TrFcmTEDIiohCCwIOD4uDFVoSR2iDkzO5+8N1M=
+github.com/Marz32onE/instrumentation-go/otel-nats v0.2.11/go.mod h1:MXmU2P0aNZdefCrMDm8yW7/rW3K5giPA2KUINzin30o=
 github.com/antithesishq/antithesis-sdk-go v0.6.0-default-no-op h1:kpBdlEPbRvff0mDD1gk7o9BhI16b9p5yYAXRlidpqJE=
 github.com/antithesishq/antithesis-sdk-go v0.6.0-default-no-op/go.mod h1:IUpT2DPAKh6i/YhSbt6Gl3v2yvUZjmKncl7U91fup7E=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=

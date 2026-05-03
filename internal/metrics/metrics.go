@@ -26,7 +26,7 @@ import (
 	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
-	semconv "go.opentelemetry.io/otel/semconv/v1.27.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 )
 
 // Config is the subset of SDK configuration that the metrics subsystem needs.
@@ -111,7 +111,7 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 
 	// Resource attributes in the allow filter become constant labels on every
 	// series, so service_namespace="..." is guaranteed on every instrument including runtime.
-	// The key "deployment.environment.name" matches semconv v1.27.0.
+	// The key "deployment.environment.name" matches the pinned semconv version.
 	exporter, err := otelprom.New(
 		otelprom.WithRegisterer(reg),
 		otelprom.WithResourceAsConstantLabels(attribute.NewAllowKeysFilter(

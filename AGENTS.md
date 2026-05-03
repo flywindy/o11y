@@ -62,7 +62,7 @@ Every service **must** provide all four options; `Init` returns an error if any 
 2. **Zero Global State**: Encapsulate OTel providers in structs. No package-level `init()` with side effects. No global logger variables. *(Rooted in Go 2020+ library idioms — newer stdlib APIs such as `log/slog`, `rand/v2`, and `http.Client` all moved away from package-level globals. See [ADR 0003](docs/adr/0003-global-state-policy.md) for the full rationale and the third-party integration policy.)*
 3. **Correlation**: `slog` output must always include `traceId` and `spanId` as JSON fields when a span is active. *(See [ADR 0001](docs/adr/0001-log-format-strategy.md) for the stdout ↔ OTLP field naming decision.)*
 4. **Errors**: Use `slog.ErrorContext(ctx, ...)` with structured attributes. Never use `panic` for recoverable errors.
-5. **Semconv v1.27.0**: All instrument names, attribute keys, and attribute types must conform to OTel Semantic Conventions v1.27.0. Do not mix versions. *(See [`docs/semconv.md`](docs/semconv.md) for the complete catalog of attributes emitted by this SDK.)*
+5. **Semconv v1.39.0**: All instrument names, attribute keys, and attribute types must conform to OTel Semantic Conventions v1.39.0. Do not mix SDK-owned semconv imports. *(See [`docs/semconv.md`](docs/semconv.md) for the complete catalog of attributes emitted by this SDK.)*
 
 ---
 
@@ -172,9 +172,9 @@ Full ADR documents live in [`docs/adr/`](docs/adr/).
 | Log format strategy | Option B — align stdout `traceId`/`spanId` field names | Preserves existing log reading habits; minimal blast radius. See [ADR 0001](docs/adr/0001-log-format-strategy.md) |
 | Metrics strategy | Prometheus pull (default `:2112`) + OTLP push opt-in (`WithMetricsOTLPEndpoint`) | Prometheus pull requires zero Collector config; OTLP push covers serverless. Exemplars enabled by default (OTel SDK `SampledFilter`). See [ADR 0002](docs/adr/0002-metrics-strategy.md) |
 | Global state policy | SDK packages must not mutate OTel globals; third-party instrumentation libraries are verified per-version before adoption | See [ADR 0003](docs/adr/0003-global-state-policy.md) |
-| NATS integration | `github.com/Marz32onE/instrumentation-go/otel-nats` — verified at v0.2.1 not to mutate globals; wrapped by the `nats/` package | Covers NATS Core + all JetStream consumer patterns with OTel semconv v1.27.0. See [ADR 0004](docs/adr/0004-nats-integration.md) |
-| MongoDB integration | Native `event.CommandMonitor` on the official `go.mongodb.org/mongo-driver/v2`; `Marz32onE/instrumentation-go/otel-mongo` deliberately not used | Upstream emits attribute keys via hand-rolled string literals (post-v1.30 DB-stable rename, e.g. `db.system.name`) and does not import any `semconv/vX.Y.Z` Go package, breaking alignment with our v1.27.0 pin. Document injection is also coupled to command-span emission with no independent off-switch. ~150 LOC monitor preserves semconv consistency. See [ADR 0005](docs/adr/0005-mongodb-integration.md) |
-| Semconv version policy | Pin v1.27.0; upgrade only when concrete triggers fire | Single pin per process avoids cognitive cost and dashboard breakage. Upgrade triggers and process documented to keep version moves deliberate. See [ADR 0006](docs/adr/0006-semconv-upgrade-strategy.md) |
+| NATS integration | `github.com/Marz32onE/instrumentation-go/otel-nats` — verified at v0.2.11 not to mutate globals; wrapped by the `nats/` package | Covers NATS Core + all JetStream consumer patterns with OTel semconv v1.39.0. See [ADR 0004](docs/adr/0004-nats-integration.md) |
+| MongoDB integration | `github.com/Marz32onE/instrumentation-go/otel-mongo/v2` is an adoption candidate after the semconv v1.39.0 upgrade | v0.2.11 no longer mutates globals and supports disabling `_oteltrace` document injection independently with `WithTracePropagationEnabled(false)`. See [ADR 0005](docs/adr/0005-mongodb-integration.md) |
+| Semconv version policy | Pin v1.39.0; upgrade only when concrete triggers fire | Single SDK-owned pin avoids cognitive cost and dashboard breakage. Upgrade triggers and process documented to keep version moves deliberate. See [ADR 0006](docs/adr/0006-semconv-upgrade-strategy.md) |
 
 ---
 
@@ -241,9 +241,9 @@ When replying to a message inside a `Subscribe` handler, do **not** use `msg.Res
 - ❌ Commit without running `go fmt` and `go mod tidy`
 - ❌ Add Kubernetes manifests that send traces or logs directly to backends (Tempo, Loki) — traces and logs must go through the OTel Collector; Prometheus scraping `:2112` directly is intentional and correct
 - ❌ Call `otelnats.Connect` or `otelnats.ConnectWithOptions` directly — always go through `o11ynats.Connect` so the SDK providers are wired correctly
-- ❌ Import `github.com/Marz32onE/instrumentation-go/otel-mongo` (any submodule) — its hand-rolled attribute keys (post-v1.30 DB-stable rename, e.g. `db.system.name`) drift from our pinned semconv v1.27.0, and its `_oteltrace` document injection cannot be disabled independently of command spans. MongoDB instrumentation uses the official driver's `event.CommandMonitor` via the forthcoming `mongo/` package. See [ADR 0005](docs/adr/0005-mongodb-integration.md). (Note: v0.2.10 fixed the original global-state issue at our request — global state is no longer the blocker, but the two issues above remain.)
+- ❌ Enable MongoDB `_oteltrace` document injection by default — if `otel-mongo/v2` is adopted, pass `WithTracePropagationEnabled(false)` unless an application explicitly opts in and accepts the schema/cardinality trade-offs.
 - ❌ Use `msg.Respond(data)` inside a Subscribe handler when trace context must be preserved in the reply — use `conn.Publish(ctx, msg.Reply, data)` instead
 - ❌ Use `WithTeam` — it no longer exists; use `WithServiceNamespace` instead
 - ❌ Use non-canonical environment strings in config files or docs (code accepts aliases like `"prod"` but canonical values are preferred)
-- ❌ Mix OTel semconv versions — always import `go.opentelemetry.io/otel/semconv/v1.27.0`
+- ❌ Mix SDK-owned OTel semconv imports — always import `go.opentelemetry.io/otel/semconv/v1.39.0` in this repository's own code
 - ❌ Use high-cardinality values (user IDs, request IDs, trace IDs) as metric label values

@@ -53,6 +53,12 @@ func newTestProviders() (oteltrace.TracerProvider, propagation.TextMapPropagator
 	return tp, prop, sr
 }
 
+func enableNATSTracing(t *testing.T) {
+	t.Helper()
+	t.Setenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", "true")
+	t.Setenv("OTEL_NATS_TRACING_ENABLED", "true")
+}
+
 func TestConnect(t *testing.T) {
 	_, url := startTestServer(t)
 	tp, prop, _ := newTestProviders()
@@ -74,6 +80,8 @@ func TestConnect_InvalidURL(t *testing.T) {
 }
 
 func TestSubscribe_ContextPropagation(t *testing.T) {
+	enableNATSTracing(t)
+
 	_, url := startTestServer(t)
 	tp, prop, sr := newTestProviders()
 
