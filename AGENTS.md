@@ -106,6 +106,12 @@ go run examples/jetstream/subscriber/main.go  # attaches durable consumer and pr
 # Run the metrics example (pushes via OTLP → OTel Collector → Prometheus; cluster must be up)
 go run examples/metrics/main.go
 
+# Run the MongoDB example (cluster must be up with OTel Collector; MongoDB must be reachable)
+# Command spans require:
+#   OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true
+#   OTEL_MONGO_TRACING_ENABLED=true
+go run examples/mongodb/main.go
+
 # Port-forward Grafana (default credentials: admin/admin)
 kubectl port-forward -n infra svc/grafana 3000:3000
 
@@ -173,7 +179,7 @@ Full ADR documents live in [`docs/adr/`](docs/adr/).
 | Metrics strategy | Prometheus pull (default `:2112`) + OTLP push opt-in (`WithMetricsOTLPEndpoint`) | Prometheus pull requires zero Collector config; OTLP push covers serverless. Exemplars enabled by default (OTel SDK `SampledFilter`). See [ADR 0002](docs/adr/0002-metrics-strategy.md) |
 | Global state policy | SDK packages must not mutate OTel globals; third-party instrumentation libraries are verified per-version before adoption | See [ADR 0003](docs/adr/0003-global-state-policy.md) |
 | NATS integration | `github.com/Marz32onE/instrumentation-go/otel-nats` — verified at v0.2.11 not to mutate globals; wrapped by the `nats/` package | Covers NATS Core + all JetStream consumer patterns with OTel semconv v1.39.0. See [ADR 0004](docs/adr/0004-nats-integration.md) |
-| MongoDB integration | `github.com/Marz32onE/instrumentation-go/otel-mongo/v2` is an adoption candidate after the semconv v1.39.0 upgrade | v0.2.11 no longer mutates globals and supports disabling `_oteltrace` document injection independently with `WithTracePropagationEnabled(false)`. See [ADR 0005](docs/adr/0005-mongodb-integration.md) |
+| MongoDB integration | `github.com/Marz32onE/instrumentation-go/otel-mongo/v2` — wrapped by the `mongo/` package | Uses the upstream `otel-mongo/v2/v0.2.11` tag commit through a Go pseudo-version. The wrapper wires SDK providers explicitly and keeps `_oteltrace` document injection off by default. See [ADR 0005](docs/adr/0005-mongodb-integration.md) |
 | Semconv version policy | Pin v1.39.0; upgrade only when concrete triggers fire | Single SDK-owned pin avoids cognitive cost and dashboard breakage. Upgrade triggers and process documented to keep version moves deliberate. See [ADR 0006](docs/adr/0006-semconv-upgrade-strategy.md) |
 
 ---
@@ -230,6 +236,28 @@ When replying to a message inside a `Subscribe` handler, do **not** use `msg.Res
 
 ---
 
+## MongoDB Usage
+
+All MongoDB clients must go through `github.com/flywindy/o11y/mongo` so that
+the SDK's `TracerProvider` and `Propagator` are wired into `otel-mongo/v2`
+without reading global OpenTelemetry state.
+
+Command spans require the upstream env gates:
+
+```bash
+OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true
+OTEL_MONGO_TRACING_ENABLED=true
+```
+
+Document trace propagation writes `_oteltrace` into persisted documents and
+must remain opt-in through `mongo.WithDocumentTracePropagation(true)`.
+
+```go
+client, err := o11ymongo.Connect(ctx, mongoURI, sdk.TracerProvider(), sdk.Propagator)
+```
+
+---
+
 ## Do NOT
 
 - ❌ Add `init()` functions with side effects in any package
@@ -241,7 +269,8 @@ When replying to a message inside a `Subscribe` handler, do **not** use `msg.Res
 - ❌ Commit without running `go fmt` and `go mod tidy`
 - ❌ Add Kubernetes manifests that send traces or logs directly to backends (Tempo, Loki) — traces and logs must go through the OTel Collector; Prometheus scraping `:2112` directly is intentional and correct
 - ❌ Call `otelnats.Connect` or `otelnats.ConnectWithOptions` directly — always go through `o11ynats.Connect` so the SDK providers are wired correctly
-- ❌ Enable MongoDB `_oteltrace` document injection by default — if `otel-mongo/v2` is adopted, pass `WithTracePropagationEnabled(false)` unless an application explicitly opts in and accepts the schema/cardinality trade-offs.
+- ❌ Import `github.com/Marz32onE/instrumentation-go/otel-mongo/v2` directly from services — always go through `o11ymongo.Connect` so the SDK providers are wired correctly and `_oteltrace` defaults stay enforced
+- ❌ Enable MongoDB `_oteltrace` document injection by default — only use `o11ymongo.WithDocumentTracePropagation(true)` when an application explicitly opts in and accepts the schema/cardinality trade-offs
 - ❌ Use `msg.Respond(data)` inside a Subscribe handler when trace context must be preserved in the reply — use `conn.Publish(ctx, msg.Reply, data)` instead
 - ❌ Use `WithTeam` — it no longer exists; use `WithServiceNamespace` instead
 - ❌ Use non-canonical environment strings in config files or docs (code accepts aliases like `"prod"` but canonical values are preferred)
