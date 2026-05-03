@@ -158,9 +158,11 @@ Implications for the wrapper:
    wrapper must either:
    - document those env vars as deployment requirements, or
    - set them programmatically before calling upstream `ConnectWithOptions`.
-     The wrapper should only do this for the env vars it knows about, must not
-     mutate them if already set by the operator, and must scope the change to
-     the wrapper's own call site.
+     The wrapper should only do this for the env vars it knows about and must
+     not mutate them if already set by the operator. Note that environment
+     variables are process-global and cannot be scoped to a specific call site;
+     `os.Setenv` from the wrapper affects the entire process, so deployment-
+     requirement documentation is the preferred option.
 2. **Document propagation option is gated by the master env.**
    `WithDocumentTracePropagation(true)` cannot enable injection while
    `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is unset or false. This is a
