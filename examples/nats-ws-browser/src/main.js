@@ -20,9 +20,17 @@ function addLogItem(text, traceId, type) {
   const li = document.createElement('li');
   li.className = type;
   const ts = new Date().toISOString().replace('T', ' ').slice(0, -1);
-  li.innerHTML =
-    `<span class="ts">${ts}</span>${text}` +
-    (traceId ? `<span class="trace">trace: ${traceId}</span>` : '');
+  const tsSpan = document.createElement('span');
+  tsSpan.className = 'ts';
+  tsSpan.textContent = ts;
+  li.append(tsSpan);
+  li.append(document.createTextNode(text));
+  if (traceId) {
+    const traceSpan = document.createElement('span');
+    traceSpan.className = 'trace';
+    traceSpan.textContent = `trace: ${traceId}`;
+    li.append(traceSpan);
+  }
   logEl.prepend(li);
 }
 
@@ -45,6 +53,7 @@ function publish() {
       'messaging.system':             'nats',
       'messaging.destination.name':   PUB_SUBJECT,
       'messaging.operation.type':     'publish',
+      'messaging.operation.name':     'publish',
     },
   });
 
@@ -90,6 +99,7 @@ async function listenForReplies(sub) {
         'messaging.system':           'nats',
         'messaging.destination.name': SUB_SUBJECT,
         'messaging.operation.type':   'receive',
+        'messaging.operation.name':   'receive',
       },
     }, parentCtx);
 
@@ -115,7 +125,11 @@ async function init() {
   addLogItem('Connected to NATS', null, 'info');
 
   const sub = nc.subscribe(SUB_SUBJECT);
-  listenForReplies(sub);
+  void listenForReplies(sub).catch((err) => {
+    const message = err instanceof Error ? err.message : String(err);
+    addLogItem(`✗ subscriber error: ${message}`, null, 'error');
+    setStatus('Disconnected', 'disconnected');
+  });
 
   publishBtn.addEventListener('click', publish);
   messageInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') publish(); });

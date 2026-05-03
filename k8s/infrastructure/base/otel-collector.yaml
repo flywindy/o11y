@@ -14,9 +14,13 @@ data:
             endpoint: 0.0.0.0:4318
             cors:
               allowed_origins:
-                - "http://localhost:*"
+                - "http://localhost:5173"
+                - "http://localhost:4173"
               allowed_headers:
-                - "*"
+                - "content-type"
+                - "traceparent"
+                - "tracestate"
+                - "baggage"
 
     processors:
       batch:

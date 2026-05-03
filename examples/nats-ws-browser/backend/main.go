@@ -45,14 +45,14 @@ func main() {
 		o11y.WithMetricsAddr(metricsAddr()),
 	)
 	if err != nil {
-		slog.Error("failed to initialise o11y SDK", slog.Any("error", err))
+		slog.ErrorContext(ctx, "failed to initialise o11y SDK", slog.Any("error", err))
 		os.Exit(1)
 	}
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := obs.Shutdown(shutdownCtx); err != nil {
-			slog.Error("SDK shutdown error", slog.Any("error", err))
+			slog.ErrorContext(shutdownCtx, "SDK shutdown error", slog.Any("error", err))
 		}
 	}()
 
