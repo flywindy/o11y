@@ -48,8 +48,11 @@ v1 must migrate before adopting the wrapper.
 ### 2. Instrumentation mechanism: adopt upstream wrapper, behind o11y API
 
 The SDK should adopt `github.com/Marz32onE/instrumentation-go/otel-mongo/v2`
-v0.2.11 or newer through a local `mongo/` wrapper package, instead of writing
-and maintaining a native `event.CommandMonitor`.
+v0.2.11 through a local `mongo/` wrapper package, instead of writing and
+maintaining a native `event.CommandMonitor`.
+
+Future upstream version changes require a separate ADR/PR decision with a fresh
+global-state, semconv, document-propagation, and synthetic-delivery-tracer audit.
 
 The local wrapper remains important:
 
