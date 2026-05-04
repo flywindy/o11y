@@ -87,7 +87,11 @@ async function listenForReplies(sub) {
     // Extract the trace context the backend injected into the reply headers.
     // This links the browser's receive span to the backend's processing span.
     const carrier = {};
-    if (msg.headers && typeof msg.headers.keys === 'function') {
+    if (
+      msg.headers &&
+      typeof msg.headers.keys === 'function' &&
+      typeof msg.headers.get === 'function'
+    ) {
       for (const key of msg.headers.keys()) {
         const value = msg.headers.get(key);
         if (typeof value === 'string') {
