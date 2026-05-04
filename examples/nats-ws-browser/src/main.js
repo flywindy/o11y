@@ -86,9 +86,12 @@ async function listenForReplies(sub) {
     // Extract the trace context the backend injected into the reply headers.
     // This links the browser's receive span to the backend's processing span.
     const carrier = {};
-    if (msg.headers) {
+    if (msg.headers && typeof msg.headers.keys === 'function') {
       for (const key of msg.headers.keys()) {
-        carrier[key] = msg.headers.get(key);
+        const value = msg.headers.get(key);
+        if (typeof value === 'string') {
+          carrier[key] = value;
+        }
       }
     }
     const parentCtx = propagation.extract(ROOT_CONTEXT, carrier);
@@ -103,8 +106,18 @@ async function listenForReplies(sub) {
       },
     }, parentCtx);
 
-    addLogItem(`← reply: "${codec.decode(msg.data)}"`, span.spanContext().traceId, 'received');
-    span.end();
+    try {
+      if (!(msg.data instanceof Uint8Array)) {
+        throw new Error('invalid reply payload type');
+      }
+      addLogItem(`← reply: "${codec.decode(msg.data)}"`, span.spanContext().traceId, 'received');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      addLogItem(`✗ reply handling error: ${message}`, span.spanContext().traceId, 'error');
+      span.recordException(err instanceof Error ? err : new Error(message));
+    } finally {
+      span.end();
+    }
   }
 }
 
