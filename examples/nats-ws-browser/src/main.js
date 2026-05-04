@@ -145,6 +145,7 @@ async function init() {
 
   const sub = nc.subscribe(SUB_SUBJECT);
   void listenForReplies(sub).catch((err) => {
+    nc = null;
     const message = err instanceof Error ? err.message : String(err);
     addLogItem(`✗ subscriber error: ${message}`, null, 'error');
     setStatus('Disconnected', 'disconnected');
@@ -154,6 +155,7 @@ async function init() {
   messageInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') publish(); });
 
   nc.closed().then(() => {
+    nc = null;
     setStatus('Disconnected', 'disconnected');
     addLogItem('Connection closed', null, 'info');
   });
