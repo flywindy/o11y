@@ -73,8 +73,9 @@ function publish() {
     nc.publish(PUB_SUBJECT, codec.encode(payload), { headers: h });
     addLogItem(`→ sent: "${payload}"`, span.spanContext().traceId, 'sent');
   } catch (err) {
-    addLogItem(`✗ publish error: ${err.message}`, null, 'error');
-    span.recordException(err);
+    const message = err instanceof Error ? err.message : String(err);
+    addLogItem(`✗ publish error: ${message}`, null, 'error');
+    span.recordException(err instanceof Error ? err : new Error(message));
   } finally {
     span.end();
   }
@@ -130,7 +131,8 @@ async function init() {
     nc = await connect({ servers: NATS_WS_URL });
   } catch (err) {
     setStatus('Connection failed', 'disconnected');
-    addLogItem(`✗ ${err.message}`, null, 'error');
+    const message = err instanceof Error ? err.message : String(err);
+    addLogItem(`✗ ${message}`, null, 'error');
     return;
   }
 
