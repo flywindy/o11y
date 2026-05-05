@@ -1,5 +1,5 @@
 import { connect, StringCodec, headers } from 'nats.ws';
-import { propagation, context, trace, ROOT_CONTEXT, SpanKind } from '@opentelemetry/api';
+import { propagation, context, trace, ROOT_CONTEXT, SpanKind, SpanStatusCode } from '@opentelemetry/api';
 import { tracer } from './tracing.js';
 
 const NATS_WS_URL  = 'ws://localhost:4223';
@@ -76,6 +76,7 @@ function publish() {
     const message = err instanceof Error ? err.message : String(err);
     addLogItem(`✗ publish error: ${message}`, null, 'error');
     span.recordException(err instanceof Error ? err : new Error(message));
+    span.setStatus({ code: SpanStatusCode.ERROR, message });
   } finally {
     span.end();
   }
@@ -120,6 +121,7 @@ async function listenForReplies(sub) {
       const message = err instanceof Error ? err.message : String(err);
       addLogItem(`✗ reply handling error: ${message}`, span.spanContext().traceId, 'error');
       span.recordException(err instanceof Error ? err : new Error(message));
+      span.setStatus({ code: SpanStatusCode.ERROR, message });
     } finally {
       span.end();
     }
@@ -154,10 +156,15 @@ async function init() {
   publishBtn.addEventListener('click', publish);
   messageInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') publish(); });
 
-  nc.closed().then(() => {
+  nc.closed().then((err) => {
     nc = null;
     setStatus('Disconnected', 'disconnected');
-    addLogItem('Connection closed', null, 'info');
+    if (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      addLogItem(`✗ connection closed: ${message}`, null, 'error');
+    } else {
+      addLogItem('Connection closed', null, 'info');
+    }
   });
 }
 
