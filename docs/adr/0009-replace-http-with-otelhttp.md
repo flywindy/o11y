@@ -191,6 +191,97 @@ The ADR 0003 §"Approved integrations" table is updated in the same PR:
 |---|---|---|---|---|
 | `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` | (pinned) | ✅ | Reads globals as fallback only; never sets. | See ADR 0009 |
 
+### 5. Migration checklist (ship in the implementation PR)
+
+This ADR records a behavioral substitution, not just a code swap.
+The implementation PR must verify each item below and attach the
+results to its description before merge. Items are grouped by the
+three observability data planes that downstream consumers
+(dashboards, alerts, log queries) bind to.
+
+**Spans** — `otelhttp` and the old `http/` middleware differ in span
+emission:
+
+- [ ] `otelhttp` **creates** a server span; old `http/` did not.
+      Confirm the trace tree now includes the entry-point span and
+      that `slog.InfoContext(r.Context(), ...)` inside handlers
+      carries the span's `traceId`/`spanId` (not the upstream's).
+- [ ] Default span name. `otelhttp` uses the `operation` argument as
+      span name root, optionally augmented by the route via the span
+      name formatter. Verify the chosen formatter produces names
+      with bounded cardinality (`{METHOD} {route}` for matched
+      routes, `{METHOD}` otherwise) and document the choice in
+      `examples/basic/`.
+- [ ] Span attributes. Capture the attribute set produced by
+      `otelhttp` for one matched-route request, one 404, one 500,
+      and one panicked handler; compare against the old set
+      (`http.request.method`, `http.route`, `http.response.status_code`).
+      Differences become a row in the migration notes; user-visible
+      changes go into CHANGELOG.
+
+**Metrics** — `otelhttp` and old `http/` both emit
+`http.server.request.duration`, but the attribute set and bucket
+boundaries can differ:
+
+- [ ] Histogram name and unit are unchanged
+      (`http.server.request.duration`, seconds). If `otelhttp`'s
+      pinned version uses a different name or unit, the
+      `metric.View` from §2 renames before export so existing
+      Prometheus queries continue to match.
+- [ ] Default histogram boundaries. Compare `otelhttp`'s default
+      bucket boundaries to the OTel SDK's default; document any
+      change. If the new boundaries materially shift latency
+      percentiles, configure a `metric.View` to override.
+- [ ] Attribute keyspace under the allowlist view. Run a smoke
+      service through the migration and dump
+      `:2112/metrics`; the label set on `http_server_request_duration_seconds`
+      must equal `{method, route, status_code}` exactly. No
+      `url_full`, `client_address`, `network_protocol_version`, or
+      similar high-cardinality leaks.
+- [ ] Cap reader behavior. Force the route cap by issuing requests
+      against `MaxUniqueRoutes + 5` distinct synthetic paths; verify
+      that the first N appear with their own labels and the rest
+      collapse to `route="other"` without dropping samples.
+
+**Queryability and dashboards** — the migration must not silently
+break downstream queries:
+
+- [ ] Loki LogQL: log lines emitted from inside handlers retain the
+      same shape (`traceId`, `spanId`, `service.name`, the JSON keys
+      from `slog`'s structured fields). Run a representative log
+      query before and after.
+- [ ] Tempo TraceQL: at least one search clause used in existing
+      dashboards (e.g. `{ name = "GET /users/:id" && status = error }`)
+      still returns the expected traces. The span-name formatter
+      choice is the load-bearing factor here.
+- [ ] Grafana panels referencing `http_server_request_duration_seconds`:
+      the rate, p95, error-rate panels in the example Grafana
+      provisioning produce non-empty results against a smoke service
+      after the migration.
+- [ ] Alerts: any alert rule referencing the metric or its labels
+      continues to fire on the same conditions. The default
+      cardinality allowlist (`method`, `route`, `status_code`)
+      preserves the most common alert shapes; if an alert depends on
+      a now-filtered label, the migration PR explicitly extends the
+      allowlist or deletes the alert.
+
+**Code paths removed** — confirm the old behaviors gone with `http/`
+are either replaced or intentionally dropped:
+
+- [ ] ResponseWriter wrapping (`recF`/`recH`/`recR`/...).
+      `otelhttp` handles `http.Flusher`, `http.Hijacker`, `io.ReaderFrom`,
+      `http.Pusher`, and trailers. Smoke-test SSE and WebSocket
+      upgrade paths through a wrapped handler.
+- [ ] Panic re-raise. `otelhttp` records the panic on the span and
+      re-panics so `http.Server`'s default recovery still runs.
+      Confirm with a panicking handler test.
+- [ ] `WithPathNormalizer` callers in `examples/`. Each callsite is
+      either deleted (route comes from `r.Pattern`) or rewritten to
+      use `otelhttp.WithSpanNameFormatter`.
+
+The PR description embeds this checklist with each item ticked, plus
+the captured before/after attribute and metric snapshots.
+
 ---
 
 ## Rationale

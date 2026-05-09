@@ -246,7 +246,86 @@ The ADR 0003 §"Approved integrations" table is updated in the same PR:
 |---|---|---|---|---|
 | `github.com/go-resty/resty/v2` | (pinned) | ✅ | Pure HTTP client; no OTel coupling. | See ADR 0011 |
 
-### 8. Resty v3 readiness
+### 8. `resty.error.kind` taxonomy
+
+`otelhttp` sets OTel's standard `error.type` from Go error class
+names (`*net.OpError`, `*url.Error`, `context.DeadlineExceeded`,
+`context.Canceled`). That is correct for protocol/transport
+classification but hides whether the failure came from resty's
+retry policy, the user's timeout, or the network itself — which is
+what an SRE actually wants to filter dashboards by.
+
+This package adds a **span-only** attribute `resty.error.kind`
+(intentionally not on metrics; see §3 cardinality logic) with a
+fixed, closed enumeration. The enum is set from the wrapper's
+`OnError` hook based on the structured error returned by
+resty/`http`/`net`/`context`:
+
+| Value | Trigger | Detection |
+|---|---|---|
+| `transport` | DNS resolution failure, TCP connect refused, RST mid-stream, TLS handshake failure | `errors.As` to `*net.OpError`; not preceded by user cancel or deadline |
+| `tls` | Certificate verification failure, protocol mismatch | `errors.As` to `*tls.CertificateVerificationError` or other `tls.*` error types |
+| `client_timeout` | The user's `context.WithTimeout` deadline expired before the response was complete | `errors.Is(err, context.DeadlineExceeded)` |
+| `client_canceled` | The user cancelled the context (deliberate abort) | `errors.Is(err, context.Canceled)` |
+| `server_timeout` | The downstream server returned 408 or 504 | inspected post-response in `OnAfterResponse`; sets the kind on the same span before `OnError` even fires |
+| `retry_exhausted` | Resty's retry policy gave up; the underlying error of the last attempt is whichever of the above applies | `c.Request.Attempt == c.Request.RetryCount + 1 && err != nil`; **wrapped on the parent caller span** if one exists, alongside the per-attempt kind on each child span |
+| `protocol` | HTTP/2 stream error, malformed response, framing error | `errors.As` to `http2.StreamError` or similar; final fallback for `http.*` errors |
+| `unknown` | Default when no other classifier matches | otherwise |
+
+Detection runs in this order; first match wins. The mapping function
+is unit-tested with table-driven cases for each row using the
+relevant fixture errors (`fixtures.DialRefused()`,
+`fixtures.TLSBadCert()`, etc., constructed with the real
+underlying types so `errors.As`/`Is` behave as in production).
+
+The attribute is also written to `slog.LogAttrs` from the OnError
+hook so that error logs carry the same kind label, enabling
+join-friendly queries like
+`{kind="client_timeout"} |= "service=billing"` in Loki + Tempo
+correlation.
+
+`resty.error.kind` is **not** an `otel.error.type` replacement; both
+attributes coexist on the span. `error.type` answers "what Go type
+was the error" (programmer view); `resty.error.kind` answers "what
+class of failure does an operator see" (SRE view).
+
+### 9. Golden trace tests for retry / timeout
+
+Retry and timeout flows are the highest-value resty behaviors and the
+most likely to regress when upstream `otelhttp` changes its span
+boundaries or the resty hook ordering shifts. The implementation PR
+ships a **golden-trace** test suite that asserts the recorded span
+tree byte-for-byte against committed expected JSON (with timestamp
+and span-id fields blanked out).
+
+Test fixtures use an in-process `httptest.Server` that can be
+configured per scenario; the trace is captured via an in-memory
+`tracetest.SpanRecorder` exporter wired to the SDK's TracerProvider.
+
+| # | Scenario | Server behavior | Resty config | Expected span tree shape |
+|---|---|---|---|---|
+| 1 | Single success | 200 OK | no retries, no timeout | Caller → 1 client span (`status_code=200`, no `resend_count`, no `resty.error.kind`) |
+| 2 | Single transport error, no retry | connection refused | no retries | Caller → 1 client span (status `Error`, `error.type=*net.OpError`, `resty.error.kind=transport`) |
+| 3 | Retry succeeds on attempt 2 | 503, 200 | `SetRetryCount(3)` | Caller → 2 sibling client spans: span#1 (`status_code=503`, `resend_count` absent), span#2 (`status_code=200`, `resend_count=1`) |
+| 4 | Retry exhausted | 503 × 4 | `SetRetryCount(3)` | Caller → 4 sibling client spans, attempt indices 0..3, last span has `resty.error.kind=retry_exhausted` |
+| 5 | Client timeout mid-attempt | server hangs | `SetTimeout(50ms)`, no retries | Caller → 1 client span, status `Error`, `error.type=context.DeadlineExceeded`, `resty.error.kind=client_timeout` |
+| 6 | Client timeout across multiple attempts | server hangs | `SetTimeout(50ms)`, `SetRetryCount(3)` | Caller → N sibling spans (N ≤ retry count, depends on how many attempts fit in 50 ms); last span has `resty.error.kind=client_timeout`; `retry_exhausted` is **not** set because the failure mode was the user-level deadline, not resty's policy giving up |
+| 7 | Caller-cancelled mid-flight | server hangs | no timeout, but caller cancels at 100 ms | Caller → 1 client span, `error.type=context.Canceled`, `resty.error.kind=client_canceled`, `Error` status |
+| 8 | Server returns 504 (not retried by default) | 504 | no retries | Caller → 1 client span, `status_code=504`, `Error` status, `resty.error.kind=server_timeout` |
+| 9 | TLS handshake failure | `httptest.NewTLSServer` with mismatched CA | resty pointed at the server, no `SetTLSClientConfig` skip | Caller → 1 client span, `error.type=*tls.CertificateVerificationError`, `resty.error.kind=tls` |
+| 10 | Trace propagation across attempts | 503, 200 | `SetRetryCount(1)` | Both attempt requests' inbound `traceparent` headers (captured server-side) reference the **same trace id** as the caller span, but **different parent-span ids** matching their respective attempt spans |
+
+Rows 1–9 assert one trace tree each. Row 10 additionally asserts the
+propagator behavior across retries by inspecting the headers the
+test server received.
+
+The expected JSON files live at
+`resty/testdata/golden/<scenario>.json`. The test harness includes
+an `UPDATE_GOLDEN=1` env-gated regenerator (mirrors a common Go
+testing idiom) so intentional changes to span shape are explicit
+diffs in the PR.
+
+### 10. Resty v3 readiness
 
 resty v3 is in pre-release at the time of this ADR. Hook signatures
 shift between v2 and v3. This ADR commits to v2 only. A v3 port lands

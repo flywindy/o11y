@@ -144,13 +144,87 @@ ADR:
 | `resty/` | (planned T3) | **Justified T3** (no maintained otelresty passes §2) | ADR 0011 (forthcoming) |
 | Future: gRPC | n/a | T2 over `otelgrpc` | future ADR |
 | Future: Cassandra | n/a | T2 over `otelgocql` | future ADR |
-| Future: Kafka | n/a | T2 over `otelsarama` / `otelkgo` | future ADR |
-| Future: Redis | n/a | T2 over `redisotel` (built into go-redis v9) | future ADR |
+| Future: Redis (`go-redis`) | n/a | T2 over `redisotel` (built into `go-redis` v9) | future ADR |
+| Future: Valkey (`valkey-go`) | n/a | T2 over the upstream OTel hook, kept **architecturally consistent with Redis**: same package shape, same option names, same metric naming. Valkey and Redis differ at the protocol-fork level but at this SDK's API surface they should be interchangeable. | future ADR |
 | Future: pgx | n/a | T2 over `otelpgx` | future ADR |
 | Future: stdlib http client | n/a | T2 over `otelhttp.NewTransport` | covered by ADR 0009 |
 
+Kafka and other messaging systems are out of immediate scope and not
+listed; when one becomes a target, it goes through the §2 checklist
+on entry.
+
 The reversal of `http/` is the price of adopting this policy. It is
 acceptable because no external project consumes the SDK yet.
+
+### 6. Periodic re-evaluation discipline
+
+The §2 evaluation is a snapshot at adoption time. Library landscapes
+shift: stale community libs get adopted by maintainers, OTel contrib
+adds new instrumentation, our own pinned versions drift behind
+upstream stable channels.
+
+Two cadences:
+
+**Quarterly — T2 health check** (lightweight, ~1 hour per quarter):
+
+For every entry in ADR 0003's Approved-integrations table:
+1. Confirm the pinned version is within 2 minor versions of upstream
+   stable; if not, either bump or document the gap.
+2. Re-run the global-state grep used at adoption time
+   (`grep -r 'otel.SetTracerProvider\|otel.SetTextMapPropagator' vendor/<lib>`).
+3. Confirm the upstream maintenance signal (last commit date, open
+   issues with maintainer reply within 30 days).
+
+The check produces an issue tagged `adr-quarterly-review` with the
+results and any required follow-ups.
+
+**Annually — T3 escape-hatch review** (deeper, ~half a day per year):
+
+For every T3 integration (currently `resty/`, possibly more in the
+future), revisit the §2 checklist for **all** candidate libraries
+that exist at review time, not just the ones that existed at original
+adoption. If any new candidate now passes the full checklist:
+
+1. Open an ADR amending the relevant integration's ADR (e.g.
+   "ADR 0011 amendment: adopt `xyz/otelresty` as upstream").
+2. Schedule the migration as a separate PR; the original T3 code is
+   removed only after the T2 facade reaches behavioral parity.
+
+The annual review prevents T3 packages from becoming forgotten dead
+weight when the ecosystem catches up.
+
+### 7. CI gate
+
+The policy is enforced at PR time by a small check that runs in CI.
+The gate has three concrete responsibilities; implementation detail
+is deferred to the PR introducing it (target: same PR as ADR 0009),
+but the contract is fixed here:
+
+1. **OTel instrumentation imports must appear in ADR 0003.**
+   The check parses `go.mod` for module paths matching
+   `go.opentelemetry.io/contrib/instrumentation/...` (and the
+   approved corporate prefix `github.com/Marz32onE/instrumentation-go/...`).
+   Every match must have a corresponding row in ADR 0003's
+   Approved-integrations table. Unmatched imports fail the build.
+
+2. **T3 packages must declare themselves.**
+   Any package directory under the module root containing a `doc.go`
+   without a `// Tier:` annotation fails the check. T3-tagged
+   packages must have a corresponding ADR file under `docs/adr/`
+   that mentions the package path.
+
+3. **No direct `otel.SetX` calls in non-test code.**
+   `grep -r 'otel\.\(SetTracerProvider\|SetTextMapPropagator\|SetMeterProvider\|SetLoggerProvider\)' --include='*.go' --exclude='*_test.go'`
+   under the module root must return zero matches. This enforces ADR
+   0003 at the source level for our own code.
+
+The gate runs on every PR via GitHub Actions, plus locally via
+`make lint` (the existing `Makefile` target).
+
+When the gate fails, the PR description must either fix the import
+graph or reference the ADR PR that adds the missing row. The two-PR
+workflow is acceptable: the integration PR can land in the same
+merge queue as its ADR PR.
 
 ---
 

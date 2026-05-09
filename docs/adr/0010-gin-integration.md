@@ -167,26 +167,67 @@ matched route template. The cap reader from ADR 0009 §2 still applies
 as defense in depth (in particular, gin's `NoRoute` handler can write
 arbitrary paths if user code abuses `c.Request.URL.Path`).
 
-### 5. Recovery interaction documented
+### 5. Recovery interaction and middleware ordering
 
-`otelgin.Middleware` and `gin.Recovery()` are both registered. The
-recommended order:
+`otelgin.Middleware`, `ErrorRecorder`, and `gin.Recovery()` form a
+three-layer stack whose ordering determines correctness. The
+**recommended canonical order** that `Middleware(...)` returns is:
 
 ```go
-r.Use(o11ygin.Middleware("svc", tp, mp, prop)...) // otelgin + ErrorRecorder
-r.Use(gin.Recovery())                              // inner
+r.Use(o11ygin.Middleware("svc", tp, mp, prop)...) // [0] otelgin span open
+                                                  // [1] ErrorRecorder (defer)
+r.Use(gin.Recovery())                             // [2] panic recover (innermost)
+// ... user handlers below
 ```
 
-In this order, a panic inside a handler is recovered by
-`gin.Recovery()` (which writes a 500 to the response writer),
-control returns through the otelgin span-end logic, and the span is
-marked Error because of the 5xx status (per §2). `ErrorRecorder`
-sees `c.Errors` empty (`gin.Recovery` does not push the panic into
-`c.Errors` by default) and is a no-op.
+Execution order on a request:
 
-If the user pushes the recovered panic into `c.Errors` themselves
-(via a custom recovery middleware), `ErrorRecorder` picks it up
-automatically.
+1. `[0] otelgin` runs first → opens server span, replaces
+   `c.Request.Context()`.
+2. `[1] ErrorRecorder` enters → registers its `defer`, calls `c.Next()`.
+3. `[2] gin.Recovery` enters → registers its `defer`, calls `c.Next()`.
+4. Handler runs.
+5. Unwind: `gin.Recovery` defer (recover if panic), `ErrorRecorder`
+   defer (read `c.Errors`, annotate span), `otelgin` defer (set
+   span attributes from `c.Writer.Status()`, end span).
+
+This ordering produces the expected behavior on every documented
+case in the matrix below. If a service inverts the order (e.g.
+`gin.Recovery()` outermost), the matrix changes — most notably,
+panic-induced 500s do not get a span because the span has already
+been closed by the time control returns. The package godoc and
+`AGENTS.md` explicitly call this out, and `Middleware(...)` returns
+the slice in the canonical order to make the wrong order require
+manual effort.
+
+#### Middleware-ordering test matrix (ship in the implementation PR)
+
+The PR adds tests covering each row. Each test asserts the recorded
+span attributes, span status, recorded errors, and the
+`http.server.request.duration` sample for the request.
+
+| # | Scenario | Recovery present | Custom recovery | Handler outcome | Expected span status | Expected `c.Errors` surfaced | Expected metric `status_code` |
+|---|---|---|---|---|---|---|---|
+| 1 | Happy path | `gin.Recovery()` | n/a | 200 OK | Unset | none | 200 |
+| 2 | 4xx via `c.JSON(400, ...)` | `gin.Recovery()` | n/a | 400 | Unset | none | 400 |
+| 3 | 4xx via `c.AbortWithError(400, err)` | `gin.Recovery()` | n/a | 400 | Unset (4xx is not server error per OTel) | one error recorded with `gin.error.type` | 400 |
+| 4 | 5xx via `c.AbortWithError(500, err)` | `gin.Recovery()` | n/a | 500 | Error, message = err.Error() | one error recorded | 500 |
+| 5 | Multiple `c.Error(err1)` + `c.AbortWithError(500, err2)` | `gin.Recovery()` | n/a | 500 | Error, message = err2.Error() | both errors recorded in order | 500 |
+| 6 | Handler panics, default Recovery | `gin.Recovery()` | n/a | 500 | Error, message from panic value | none (`gin.Recovery` does not push panic into `c.Errors`) | 500 |
+| 7 | Handler panics, custom Recovery that **does** push into `c.Errors` | none | custom that calls `c.Error(panicErr); c.AbortWithStatus(500)` | 500 | Error | one error recorded with the panic value | 500 |
+| 8 | Handler panics, custom Recovery that swallows the panic and writes 200 | none | custom that recovers and `c.JSON(200, fallback)` | 200 | Unset | none | 200 |
+| 9 | `c.Abort()` without error, status 204 | `gin.Recovery()` | n/a | 204 | Unset | none | 204 |
+| 10 | Inverted order: `gin.Recovery()` outermost, then `Middleware(...)` | `gin.Recovery()` | n/a | 500 (panic) | **No span at all** (otelgin span never opened because Recovery short-circuited) | none | not recorded |
+
+Row 10 documents the failure mode of the wrong order; the test
+asserts the failure as a regression guard. The README's gin section
+references this row to discourage the inversion.
+
+The custom-recovery cases (rows 7 and 8) are the load-bearing tests
+because they prove `ErrorRecorder` composes correctly with
+non-default recovery patterns common in production services
+(structured-logging recoveries, Sentry-style recoveries that capture
+the panic and continue, fallback handlers).
 
 ### 6. Compliance with ADR 0003
 
