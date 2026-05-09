@@ -87,9 +87,10 @@ func TestConnect_Validation(t *testing.T) {
 func TestConnect_InvalidURI(t *testing.T) {
 	tp, prop, _ := newTestProviders()
 
-	client, err := Connect(context.Background(), "mongodb://:invalid", tp, prop)
+	client, err := Connect(context.Background(), "://garbage", tp, prop)
 	require.Error(t, err)
 	assert.Nil(t, client)
+	assert.NotContains(t, err.Error(), "://garbage")
 }
 
 func TestConnect_DefaultTracingGateEmitsNoSpans(t *testing.T) {

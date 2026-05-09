@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -23,6 +24,13 @@ const (
 )
 
 func main() {
+	if err := run(); err != nil {
+		slog.Error("MongoDB example failed", slog.Any("error", err))
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -35,8 +43,7 @@ func main() {
 		o11y.WithLogLevel(slog.LevelInfo),
 	)
 	if err != nil {
-		slog.ErrorContext(ctx, "failed to initialize o11y SDK", slog.Any("error", err))
-		os.Exit(1)
+		return fmt.Errorf("initialize o11y SDK: %w", err)
 	}
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -48,9 +55,9 @@ func main() {
 
 	logger := obs.Logger
 	mongoURI := envOrDefault("MONGODB_URI", defaultMongoURI)
-	documentTracePropagation := envEnabled("O11Y_MONGO_DOCUMENT_TRACE_PROPAGATION")
+	documentTracePropagation := exampleOptInEnabled("O11Y_MONGO_DOCUMENT_TRACE_PROPAGATION")
 
-	if !envEnabled("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED") || !envEnabled("OTEL_MONGO_TRACING_ENABLED") {
+	if !upstreamEnvEnabled("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED") || !upstreamEnvEnabled("OTEL_MONGO_TRACING_ENABLED") {
 		logger.WarnContext(ctx, "MongoDB command spans are disabled until upstream tracing gates are enabled",
 			slog.String("required_env_1", "OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true"),
 			slog.String("required_env_2", "OTEL_MONGO_TRACING_ENABLED=true"),
@@ -65,8 +72,7 @@ func main() {
 		o11ymongo.WithDocumentTracePropagation(documentTracePropagation),
 	)
 	if err != nil {
-		logger.ErrorContext(ctx, "failed to create MongoDB client", slog.Any("error", err))
-		os.Exit(1)
+		return fmt.Errorf("create MongoDB client: %w", err)
 	}
 	defer func() {
 		disconnectCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -84,11 +90,11 @@ func main() {
 	defer cancel()
 
 	if err := client.Ping(opCtx, readpref.Primary()); err != nil {
-		logger.ErrorContext(opCtx, "MongoDB ping failed", slog.Any("error", err), slog.String("uri", mongoURI))
-		os.Exit(1)
+		return fmt.Errorf("ping MongoDB: %w", err)
 	}
 	logger.InfoContext(opCtx, "connected to MongoDB",
-		slog.String("uri", mongoURI),
+		slog.String("db.namespace", databaseName),
+		slog.String("db.collection.name", collectionName),
 		slog.Bool("document_trace_propagation", documentTracePropagation),
 	)
 
@@ -100,32 +106,32 @@ func main() {
 		"type":       "example.created",
 		"created_at": time.Now().UTC(),
 	}); err != nil {
-		logger.ErrorContext(opCtx, "insert failed", slog.Any("error", err), slog.String("event_id", eventID))
-		os.Exit(1)
+		return fmt.Errorf("insert document %s: %w", eventID, err)
 	}
 	logger.InfoContext(opCtx, "document inserted", slog.String("event_id", eventID))
 
 	var found bson.M
 	if err := collection.FindOne(opCtx, bson.M{"_id": eventID}).Decode(&found); err != nil {
-		logger.ErrorContext(opCtx, "find failed", slog.Any("error", err), slog.String("event_id", eventID))
-		os.Exit(1)
+		return fmt.Errorf("find document %s: %w", eventID, err)
 	}
-	logger.InfoContext(opCtx, "document found", slog.String("event_id", eventID))
+	logger.InfoContext(opCtx, "document found",
+		slog.String("event_id", eventID),
+		slog.Any("type", found["type"]),
+	)
 
 	if _, err := collection.UpdateOne(opCtx,
 		bson.M{"_id": eventID},
 		bson.M{"$set": bson.M{"processed_at": time.Now().UTC()}},
 	); err != nil {
-		logger.ErrorContext(opCtx, "update failed", slog.Any("error", err), slog.String("event_id", eventID))
-		os.Exit(1)
+		return fmt.Errorf("update document %s: %w", eventID, err)
 	}
 	logger.InfoContext(opCtx, "document updated", slog.String("event_id", eventID))
 
 	if _, err := collection.DeleteOne(opCtx, bson.M{"_id": eventID}); err != nil {
-		logger.ErrorContext(opCtx, "delete failed", slog.Any("error", err), slog.String("event_id", eventID))
-		os.Exit(1)
+		return fmt.Errorf("delete document %s: %w", eventID, err)
 	}
 	logger.InfoContext(opCtx, "document deleted", slog.String("event_id", eventID))
+	return nil
 }
 
 func envOrDefault(key, fallback string) string {
@@ -135,15 +141,28 @@ func envOrDefault(key, fallback string) string {
 	return fallback
 }
 
-func envEnabled(key string) bool {
+func upstreamEnvEnabled(key string) bool {
 	v, ok := os.LookupEnv(key)
 	if !ok {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "", "0", "false", "no", "off":
+	case "0", "false", "no", "off":
 		return false
 	default:
 		return true
+	}
+}
+
+func exampleOptInEnabled(key string) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
 }

@@ -24,6 +24,15 @@ type config struct {
 	documentTracePropagation bool
 }
 
+// Client is a tracing-aware MongoDB client.
+//
+// It embeds the upstream otel-mongo/v2 client so driver methods remain
+// available while application code can name the type without importing the
+// upstream instrumentation package directly.
+type Client struct {
+	*otelmongo.Client
+}
+
 // WithDocumentTracePropagation controls whether the upstream MongoDB wrapper
 // injects W3C trace context into persisted documents under the "_oteltrace"
 // field.
@@ -70,7 +79,7 @@ func Connect(
 	tp trace.TracerProvider,
 	prop propagation.TextMapPropagator,
 	opts ...Option,
-) (*otelmongo.Client, error) {
+) (*Client, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("mongo connect: context already canceled: %w", err)
 	}
@@ -94,7 +103,7 @@ func Connect(
 		options.Client().ApplyURI(uri),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("mongo connect %s: %w", uri, err)
+		return nil, fmt.Errorf("mongo connect: %w", err)
 	}
-	return client, nil
+	return &Client{Client: client}, nil
 }
