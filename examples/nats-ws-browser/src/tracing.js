@@ -1,5 +1,5 @@
 import { WebTracerProvider } from '@opentelemetry/sdk-trace-web';
-import { BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { Resource } from '@opentelemetry/resources';
 import { ATTR_SERVICE_NAME } from '@opentelemetry/semantic-conventions';
@@ -15,7 +15,7 @@ const provider = new WebTracerProvider({
     [ATTR_SERVICE_NAME]: 'nats-ws-browser',
     'deployment.environment.name': 'development',
   }),
-  spanProcessors: [new BatchSpanProcessor(exporter)],
+  spanProcessors: [new SimpleSpanProcessor(exporter)],
 });
 
 provider.register({

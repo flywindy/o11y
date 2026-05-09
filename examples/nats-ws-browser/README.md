@@ -1,27 +1,25 @@
 # nats-ws-browser
 
-Demonstrates **end-to-end distributed tracing** between a browser frontend and a Go backend, connected via NATS Core over WebSocket.
+Demonstrates end-to-end distributed tracing between a browser frontend and a Go backend, connected via NATS Core over WebSocket.
 
-```
+```text
 Browser (nats.ws + OTel JS)
-  └─ publish → [traceparent header] → NATS Server (ws://localhost:4223)
-                                             │
-                                    Go backend subscriber
-                                    (otel-nats extracts traceparent → child span)
-                                             │
-                                    publish reply → [traceparent header] → Browser
-                                                                  └─ receive span (child of backend span)
+  publish -> traceparent header -> NATS WebSocket
+      -> Go backend extracts traceparent
+      -> backend process span
+      -> reply with backend traceparent
+      -> browser receive span
 ```
 
-Both services export spans to the same OTel Collector → Tempo. In Grafana Tempo you see a single distributed trace spanning the browser publish, the backend processing, and the browser receive.
+Both services export spans to the same OTel Collector and Tempo. In Grafana Tempo you should see one distributed trace that spans the browser publish, backend processing, backend reply publish, and browser receive.
 
 ## Prerequisites
 
-- [kind](https://kind.sigs.k8s.io/) + [kubectl](https://kubernetes.io/docs/tasks/tools/)
-- [Node.js](https://nodejs.org/) ≥ 20 + npm
-- Go ≥ 1.21
+- kind + kubectl
+- Node.js 20+ and npm
+- Go 1.25+
 
-## 1 — Start the infrastructure
+## 1. Start the infrastructure
 
 ```sh
 # From the repo root
@@ -30,25 +28,40 @@ kubectl apply -k k8s/infrastructure/base/
 ```
 
 The kind cluster maps:
-- `localhost:4318` → OTel Collector HTTP (traces/logs/metrics)
-- `localhost:4223` → NATS WebSocket
+
+- `localhost:4318`: OTel Collector HTTP for traces, logs, and metrics
+- `localhost:4223`: NATS WebSocket
+
+The browser connects directly to `ws://localhost:4223`. That host port is exposed by three pieces working together:
+
+1. `k8s/infrastructure/base/nats.yaml` enables NATS WebSocket on container port `4223`.
+2. The `nats-websocket` Kubernetes `NodePort` service exposes that port as node port `30001`.
+3. `kind-config.yaml` maps host port `4223` to kind node port `30001`.
+
+If you created the kind cluster before this mapping existed, recreate it so kind picks up the port mapping:
+
+```sh
+kind delete cluster
+kind create cluster --config kind-config.yaml
+kubectl apply -k k8s/infrastructure/base/
+```
 
 Wait for pods to be ready:
+
 ```sh
 kubectl get pods -n infra -w
 ```
 
-## 2 — Start the Go backend subscriber
+## 2. Start the Go backend subscriber
 
 ```sh
 # From the repo root
 go run ./examples/nats-ws-browser/backend/
 ```
 
-The backend listens on `demo.frontend.events` and replies to `demo.frontend.replies`.
-Its Prometheus metrics are on `:2114` (override with `METRICS_ADDR`).
+The backend listens on `demo.frontend.events` and replies to `demo.frontend.replies`. Its Prometheus metrics are on `:2114` (override with `METRICS_ADDR`).
 
-## 3 — Start the frontend
+## 3. Start the frontend
 
 ```sh
 cd examples/nats-ws-browser
@@ -58,49 +71,83 @@ npm run dev
 
 Open <http://localhost:5173> in your browser.
 
-## 4 — Send a message
+Use `localhost`, not `127.0.0.1`, for the frontend URL. The OTel Collector CORS config allows `http://localhost:5173` so browser spans can export to `http://localhost:4318/v1/traces`.
 
-1. Wait for the status badge to show **Connected**.
-2. Type a payload (or keep the default) and click **Publish**.
+## 4. Send a message
+
+1. Wait for the status badge to show `Connected`.
+2. Type a payload, or keep the default, and click `Publish`.
 3. The browser publishes to NATS with a `traceparent` header.
 4. The Go backend receives it, logs it, and replies.
 5. The browser receives the reply and logs it.
 
-## 5 — View the trace in Grafana
+## 5. View the trace in Grafana
 
-Open <http://localhost:3000> → **Explore** → select **Tempo** as the data source.
+Open <http://localhost:3000>, go to Explore, and select Tempo as the data source.
 
-Search by service name `nats-ws-browser` or `nats-ws-browser-backend`. You will see a trace with three spans:
+Search by service name `nats-ws-browser` or `nats-ws-browser-backend`. You should see one trace containing these spans:
 
 | Span | Service | Description |
-|------|---------|-------------|
-| `nats.publish` | nats-ws-browser (browser) | Root span created when clicking Publish |
-| `process-frontend-event` | nats-ws-browser-backend (Go) | Child span; parent is the browser publish span |
-| `nats.receive` | nats-ws-browser (browser) | Child span of the backend reply span; same trace ID |
+| --- | --- | --- |
+| `nats.publish` | `nats-ws-browser` | Root span created when clicking Publish and ended when the reply arrives |
+| `process-frontend-event` | `nats-ws-browser-backend` | Child span of the browser publish span |
+| `send demo.frontend.replies` | `nats-ws-browser-backend` | Reply publish span that explicitly injects backend context into NATS headers |
+| `nats.receive` | `nats-ws-browser` | Child span of the backend reply publish span |
 
 ## How trace propagation works
 
-The browser uses the OTel JS SDK with the **W3C TraceContext** propagator (matching the Go backend's composite propagator). On publish:
+The browser uses the OTel JS SDK with the W3C TraceContext propagator, matching the Go backend's composite propagator.
 
-1. `propagation.inject(ctx, carrier)` writes `traceparent` (and optionally `tracestate`) into a plain JS object.
+On publish:
+
+1. `propagation.inject(ctx, carrier)` writes `traceparent` and optional `tracestate` into a plain JS object.
 2. Each key is copied to the NATS `MsgHdrs` object and sent with the message.
-3. The Go `otel-nats` layer calls `nats.Extract(ctx, msg)` on the subscriber side, reading those headers and creating a child span with the browser span as its parent.
+3. The Go backend extracts those headers with `obs.Propagator.Extract` and starts `process-frontend-event` as a child span.
 
-On reply the backend uses `conn.Publish(msgCtx, repSubject, data)` (not `msg.Respond`) so the reply also carries the backend's `traceparent` header for the browser to extract.
+On reply, the backend starts `send demo.frontend.replies`, explicitly injects that span context into a NATS message header, and publishes through the raw NATS connection. The browser subscriber extracts that header and starts `nats.receive` as a child span.
+
+Note: the normal `o11ynats.Subscribe` and `conn.Publish` wrapper methods intentionally follow `otel-nats` behavior, including env-gated NATS instrumentation and OTel messaging correlation through span links. This example uses raw NATS subscribe/publish plus explicit extraction/injection because its purpose is to show one parent-child trace tree in Tempo.
+
+## Verification helper
+
+This browser example needs one extra local port that the other examples do not: the Go backend connects to NATS over TCP at `nats://localhost:4222`. If you are running the stack in kind, open that port before starting the backend:
+
+```sh
+kubectl port-forward -n infra svc/nats 4222:4222
+```
+
+Grafana also needs a local port-forward unless you already have one open:
+
+```sh
+kubectl port-forward -n infra svc/grafana 3000:3000
+```
+
+Then run the backend and frontend:
+
+```sh
+# Terminal 1
+go run ./examples/nats-ws-browser/backend/
+
+# Terminal 2
+cd examples/nats-ws-browser
+npm run dev
+```
+
+Open <http://localhost:5173>, click `Publish`, then open <http://localhost:3000> and search Tempo for service name `nats-ws-browser` or `nats-ws-browser-backend`.
 
 ## Known limitations
 
-- **Reply fan-out**: the backend always replies to the fixed subject `demo.frontend.replies`. All connected browser tabs receive every reply. Open only one tab at a time, or use distinct reply subjects per client.
-- **No auto-reconnect**: if the NATS WebSocket connection drops, the status badge shows "Disconnected" and you must reload the page.
+- Reply fan-out: the backend always replies to the fixed subject `demo.frontend.replies`. All connected browser tabs receive every reply. Open only one tab at a time, or use distinct reply subjects per client.
+- No auto-reconnect: if the NATS WebSocket connection drops, the status badge shows `Disconnected` and you must reload the page.
 
 ## Port reference
 
 | Port | Service |
-|------|---------|
-| `4222` | NATS TCP (Go clients) |
-| `4223` | NATS WebSocket (browser) |
+| --- | --- |
+| `4222` | NATS TCP for Go clients |
+| `4223` | NATS WebSocket for browser clients |
 | `4318` | OTel Collector HTTP |
-| `2113` | Prometheus metrics (nats-core subscriber, overridable via `METRICS_ADDR`) |
-| `2114` | Prometheus metrics (nats-ws-browser backend, overridable via `METRICS_ADDR`) |
-| `2115` | Prometheus metrics (jetstream subscriber, overridable via `METRICS_ADDR`) |
-| `5173` | Vite dev server (frontend) |
+| `2113` | Prometheus metrics for the nats-core subscriber, overridable via `METRICS_ADDR` |
+| `2114` | Prometheus metrics for this backend, overridable via `METRICS_ADDR` |
+| `2115` | Prometheus metrics for the JetStream subscriber, overridable via `METRICS_ADDR` |
+| `5173` | Vite dev server |
