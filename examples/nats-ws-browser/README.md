@@ -10,7 +10,7 @@ Browser (nats.ws + OTel JS)
                                     (otel-nats extracts traceparent → child span)
                                              │
                                     publish reply → [traceparent header] → Browser
-                                                                  └─ receive span (linked to backend span)
+                                                                  └─ receive span (child of backend span)
 ```
 
 Both services export spans to the same OTel Collector → Tempo. In Grafana Tempo you see a single distributed trace spanning the browser publish, the backend processing, and the browser receive.
@@ -76,7 +76,7 @@ Search by service name `nats-ws-browser` or `nats-ws-browser-backend`. You will 
 |------|---------|-------------|
 | `nats.publish` | nats-ws-browser (browser) | Root span created when clicking Publish |
 | `process-frontend-event` | nats-ws-browser-backend (Go) | Child span; parent is the browser publish span |
-| `nats.receive` | nats-ws-browser (browser) | Receive span linked to the backend reply span |
+| `nats.receive` | nats-ws-browser (browser) | Child span of the backend reply span; same trace ID |
 
 ## How trace propagation works
 
@@ -88,6 +88,11 @@ The browser uses the OTel JS SDK with the **W3C TraceContext** propagator (match
 
 On reply the backend uses `conn.Publish(msgCtx, repSubject, data)` (not `msg.Respond`) so the reply also carries the backend's `traceparent` header for the browser to extract.
 
+## Known limitations
+
+- **Reply fan-out**: the backend always replies to the fixed subject `demo.frontend.replies`. All connected browser tabs receive every reply. Open only one tab at a time, or use distinct reply subjects per client.
+- **No auto-reconnect**: if the NATS WebSocket connection drops, the status badge shows "Disconnected" and you must reload the page.
+
 ## Port reference
 
 | Port | Service |
@@ -95,5 +100,7 @@ On reply the backend uses `conn.Publish(msgCtx, repSubject, data)` (not `msg.Res
 | `4222` | NATS TCP (Go clients) |
 | `4223` | NATS WebSocket (browser) |
 | `4318` | OTel Collector HTTP |
-| `2114` | Prometheus metrics (backend, overridable via `METRICS_ADDR`) |
+| `2113` | Prometheus metrics (nats-core subscriber, overridable via `METRICS_ADDR`) |
+| `2114` | Prometheus metrics (nats-ws-browser backend, overridable via `METRICS_ADDR`) |
+| `2115` | Prometheus metrics (jetstream subscriber, overridable via `METRICS_ADDR`) |
 | `5173` | Vite dev server (frontend) |

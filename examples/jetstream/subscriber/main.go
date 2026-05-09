@@ -29,7 +29,7 @@ func metricsAddr() string {
 	if v := os.Getenv("METRICS_ADDR"); v != "" {
 		return v
 	}
-	return ":2113"
+	return ":2115"
 }
 
 func main() {

@@ -23,9 +23,7 @@ const (
 	natsURL    = nats.DefaultURL
 )
 
-// metricsAddr allows the Prometheus scrape port to be overridden via
-// METRICS_ADDR so this process can run alongside other example services
-// on the same machine without port conflicts.
+// metricsAddr returns the Prometheus scrape address, overridable via METRICS_ADDR.
 func metricsAddr() string {
 	if v := os.Getenv("METRICS_ADDR"); v != "" {
 		return v

@@ -5,6 +5,8 @@ metadata:
   namespace: infra
 data:
   nats.conf: |
+    http_port: 8222
+
     jetstream: enabled
 
     websocket {
