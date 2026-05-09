@@ -52,7 +52,21 @@ Wait for pods to be ready:
 kubectl get pods -n infra -w
 ```
 
-## 2. Start the Go backend subscriber
+## 2. Open local ports
+
+The browser connects to NATS WebSocket through `localhost:4223`, which is mapped by kind. The Go backend also needs a local NATS TCP port, and Grafana needs a local UI port:
+
+```sh
+# Terminal 1: NATS TCP for the Go backend
+kubectl port-forward -n infra svc/nats 4222:4222
+
+# Terminal 2: Grafana UI for Tempo verification
+kubectl port-forward -n infra svc/grafana 3000:3000
+```
+
+Keep both port-forward commands running while you use the example. If another tool such as k9s already owns one of these ports, reuse that port-forward instead of starting a duplicate.
+
+## 3. Start the Go backend subscriber
 
 ```sh
 # From the repo root
@@ -61,7 +75,7 @@ go run ./examples/nats-ws-browser/backend/
 
 The backend listens on `demo.frontend.events` and replies to `demo.frontend.replies`. Its Prometheus metrics are on `:2114` (override with `METRICS_ADDR`).
 
-## 3. Start the frontend
+## 4. Start the frontend
 
 ```sh
 cd examples/nats-ws-browser
@@ -73,7 +87,7 @@ Open <http://localhost:5173> in your browser.
 
 Use `localhost`, not `127.0.0.1`, for the frontend URL. The OTel Collector CORS config allows `http://localhost:5173` so browser spans can export to `http://localhost:4318/v1/traces`.
 
-## 4. Send a message
+## 5. Send a message
 
 1. Wait for the status badge to show `Connected`.
 2. Type a payload, or keep the default, and click `Publish`.
@@ -81,7 +95,7 @@ Use `localhost`, not `127.0.0.1`, for the frontend URL. The OTel Collector CORS 
 4. The Go backend receives it, logs it, and replies.
 5. The browser receives the reply and logs it.
 
-## 5. View the trace in Grafana
+## 6. View the trace in Grafana
 
 Open <http://localhost:3000>, go to Explore, and select Tempo as the data source.
 
@@ -107,33 +121,6 @@ On publish:
 On reply, the backend starts `send demo.frontend.replies`, explicitly injects that span context into a NATS message header, and publishes through the raw NATS connection. The browser subscriber extracts that header and starts `nats.receive` as a child span.
 
 Note: the normal `o11ynats.Subscribe` and `conn.Publish` wrapper methods intentionally follow `otel-nats` behavior, including env-gated NATS instrumentation and OTel messaging correlation through span links. This example uses raw NATS subscribe/publish plus explicit extraction/injection because its purpose is to show one parent-child trace tree in Tempo.
-
-## Verification helper
-
-This browser example needs one extra local port that the other examples do not: the Go backend connects to NATS over TCP at `nats://localhost:4222`. If you are running the stack in kind, open that port before starting the backend:
-
-```sh
-kubectl port-forward -n infra svc/nats 4222:4222
-```
-
-Grafana also needs a local port-forward unless you already have one open:
-
-```sh
-kubectl port-forward -n infra svc/grafana 3000:3000
-```
-
-Then run the backend and frontend:
-
-```sh
-# Terminal 1
-go run ./examples/nats-ws-browser/backend/
-
-# Terminal 2
-cd examples/nats-ws-browser
-npm run dev
-```
-
-Open <http://localhost:5173>, click `Publish`, then open <http://localhost:3000> and search Tempo for service name `nats-ws-browser` or `nats-ws-browser-backend`.
 
 ## Known limitations
 
