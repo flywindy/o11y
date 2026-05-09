@@ -30,7 +30,7 @@ ADR 0008 §2 checklist applied to
 | Maintenance signal | ✅ Maintained by OpenTelemetry contrib; releases track gin and OTel SDK semver. |
 | Semconv alignment | ✅ Recent versions emit v1.30+ stable HTTP attributes; we pin to a release that emits v1.39.0 to match ADR 0006. If no such release exists at adoption time, we either wait or pin one minor version behind and document the gap. |
 | Configurability | ✅ Span name formatter, attribute injector, and filter all overridable. |
-| Framework signal access | ⚠️ `otelgin` does **not** populate `c.Errors` onto the span. This is the single gap; it is closed by a small in-tree middleware (see §2). |
+| Framework signal access | ⚠️ Modern `otelgin` writes `c.Errors.String()` as a single concatenated `gin.errors` string attribute, but does **not** call `span.RecordError` per-error nor classify by `gin.ErrorType`. ErrorRecorder (§2) **enhances** rather than replaces this: it adds typed `RecordError` calls with `gin.error.type` so each error becomes a span event queryable in TraceQL. |
 
 Four full passes plus one gap closable in <30 lines of facade code.
 T2 adoption is justified.
@@ -182,23 +182,41 @@ r.Use(gin.Recovery())                             // [2] panic recover (innermos
 
 Execution order on a request:
 
-1. `[0] otelgin` runs first → opens server span, replaces
-   `c.Request.Context()`.
-2. `[1] ErrorRecorder` enters → registers its `defer`, calls `c.Next()`.
-3. `[2] gin.Recovery` enters → registers its `defer`, calls `c.Next()`.
+1. `[0] otelgin` runs first → opens server span, registers
+   `defer span.End()`, replaces `c.Request.Context()`, calls `c.Next()`.
+2. `[1] ErrorRecorder` enters → calls `c.Next()` directly (no defer;
+   it inspects `c.Errors` after `c.Next()` returns).
+3. `[2] gin.Recovery` enters → registers a `defer { recover() ... }`,
+   calls `c.Next()`.
 4. Handler runs.
-5. Unwind: `gin.Recovery` defer (recover if panic), `ErrorRecorder`
-   defer (read `c.Errors`, annotate span), `otelgin` defer (set
-   span attributes from `c.Writer.Status()`, end span).
+5. Unwind:
+   - `gin.Recovery`'s `defer` recovers any panic and writes 500 to
+     the response writer. Control then returns up the chain
+     **normally** (the default `gin.Recovery` does not re-panic).
+   - `ErrorRecorder`'s post-`c.Next()` code runs, reads `c.Errors`,
+     annotates the active span via `span.RecordError`. With the
+     default `gin.Recovery`, `c.Errors` is empty after a panic
+     (Recovery does not push the panic into `c.Errors`), so
+     `ErrorRecorder` is a no-op for that case.
+   - `otelgin`'s post-`c.Next()` code reads `c.Writer.Status()` (now
+     500), sets the OTel span status from it, sets the
+     `http.response.status_code` attribute, and writes
+     `c.Errors.String()` as the `gin.errors` attribute. Then
+     `defer span.End()` fires.
 
-This ordering produces the expected behavior on every documented
-case in the matrix below. If a service inverts the order (e.g.
-`gin.Recovery()` outermost), the matrix changes — most notably,
-panic-induced 500s do not get a span because the span has already
-been closed by the time control returns. The package godoc and
-`AGENTS.md` explicitly call this out, and `Middleware(...)` returns
-the slice in the canonical order to make the wrong order require
-manual effort.
+The end-state span for a panic in canonical order: status `Error`
+(from the 500 status code), `http.response.status_code=500`, but
+**no panic value or stack trace** captured — because the panic was
+swallowed by `gin.Recovery` before any tracing layer saw it. To
+capture the panic value itself, callers either replace
+`gin.Recovery` with a custom recovery that pushes the panic into
+`c.Errors` (then `ErrorRecorder` records it) or move the recovery
+**outside** of otelgin, accepting the trade-off in row 10 below.
+
+If a service inverts the order (e.g. `gin.Recovery()` outermost,
+otelgin inner), behavior changes substantially — see row 10.
+`Middleware(...)` returns the slice in the canonical order so
+inversion requires manual effort.
 
 #### Middleware-ordering test matrix (ship in the implementation PR)
 
@@ -213,11 +231,11 @@ span attributes, span status, recorded errors, and the
 | 3 | 4xx via `c.AbortWithError(400, err)` | `gin.Recovery()` | n/a | 400 | Unset (4xx is not server error per OTel) | one error recorded with `gin.error.type` | 400 |
 | 4 | 5xx via `c.AbortWithError(500, err)` | `gin.Recovery()` | n/a | 500 | Error, message = err.Error() | one error recorded | 500 |
 | 5 | Multiple `c.Error(err1)` + `c.AbortWithError(500, err2)` | `gin.Recovery()` | n/a | 500 | Error, message = err2.Error() | both errors recorded in order | 500 |
-| 6 | Handler panics, default Recovery | `gin.Recovery()` | n/a | 500 | Error, message from panic value | none (`gin.Recovery` does not push panic into `c.Errors`) | 500 |
+| 6 | Handler panics, default Recovery | `gin.Recovery()` | n/a | 500 | Error (from status code), description **empty** — panic was swallowed by inner Recovery before any tracing layer saw it | none (`gin.Recovery` does not push panic into `c.Errors`) | 500 |
 | 7 | Handler panics, custom Recovery that **does** push into `c.Errors` | none | custom that calls `c.Error(panicErr); c.AbortWithStatus(500)` | 500 | Error | one error recorded with the panic value | 500 |
 | 8 | Handler panics, custom Recovery that swallows the panic and writes 200 | none | custom that recovers and `c.JSON(200, fallback)` | 200 | Unset | none | 200 |
 | 9 | `c.Abort()` without error, status 204 | `gin.Recovery()` | n/a | 204 | Unset | none | 204 |
-| 10 | Inverted order: `gin.Recovery()` outermost, then `Middleware(...)` | `gin.Recovery()` | n/a | 500 (panic) | **No span at all** (otelgin span never opened because Recovery short-circuited) | none | not recorded |
+| 10 | Inverted order: `gin.Recovery()` outermost, then `Middleware(...)` (handler panics) | `gin.Recovery()` | n/a | 500 (panic, recovered by outer Recovery) | **Span exists but is incomplete**: opened by otelgin's pre-`c.Next()` code, ended by its `defer span.End()`, but `status_code` attribute and span status are **not set** because otelgin's post-`c.Next()` code was skipped by the propagating panic. ErrorRecorder is also skipped. | none | **not recorded** (otelgin's metric is also written post-`c.Next()`, which never ran) |
 
 Row 10 documents the failure mode of the wrong order; the test
 asserts the failure as a regression guard. The README's gin section

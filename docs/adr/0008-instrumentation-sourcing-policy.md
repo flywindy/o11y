@@ -165,7 +165,7 @@ upstream stable channels.
 
 Two cadences:
 
-**Quarterly — T2 health check** (lightweight, ~1 hour per quarter):
+**Quarterly — T2 health check** (lightweight):
 
 For every entry in ADR 0003's Approved-integrations table:
 1. Confirm the pinned version is within 2 minor versions of upstream
@@ -178,7 +178,7 @@ For every entry in ADR 0003's Approved-integrations table:
 The check produces an issue tagged `adr-quarterly-review` with the
 results and any required follow-ups.
 
-**Annually — T3 escape-hatch review** (deeper, ~half a day per year):
+**Annually — T3 escape-hatch review** (deeper):
 
 For every T3 integration (currently `resty/`, possibly more in the
 future), revisit the §2 checklist for **all** candidate libraries
@@ -207,16 +207,31 @@ but the contract is fixed here:
    Every match must have a corresponding row in ADR 0003's
    Approved-integrations table. Unmatched imports fail the build.
 
-2. **T3 packages must declare themselves.**
-   Any package directory under the module root containing a `doc.go`
-   without a `// Tier:` annotation fails the check. T3-tagged
-   packages must have a corresponding ADR file under `docs/adr/`
-   that mentions the package path.
+2. **T3 packages must self-declare via tier annotation.**
+   Every package directory under the module root **that ships
+   instrumentation** (currently `nats/`, `mongo/`, `http/`, `gin/`,
+   `resty/`, and any future sibling) must contain a `doc.go` with a
+   `// Tier: T2 ...` or `// Tier: T3 ...` line. The check fails the
+   build if such a directory is missing the annotation. T3-tagged
+   packages must additionally have a corresponding ADR file under
+   `docs/adr/` that mentions the package path.
+
+   Out of scope: T1 packages (`o11y.go` at module root, `options.go`,
+   `internal/*`, `examples/*`, `docs/*`) — the gate uses an explicit
+   include-list of integration directories rather than scanning every
+   `doc.go`. The list is part of the gate's config, updated in the
+   same PR that adds a new integration package.
 
 3. **No direct `otel.SetX` calls in non-test code.**
-   `grep -r 'otel\.\(SetTracerProvider\|SetTextMapPropagator\|SetMeterProvider\|SetLoggerProvider\)' --include='*.go' --exclude='*_test.go'`
+   `grep -E 'otel\.(SetTracerProvider|SetTextMapPropagator|SetMeterProvider|SetLoggerProvider)\b' --include='*.go' --exclude='*_test.go'`
    under the module root must return zero matches. This enforces ADR
    0003 at the source level for our own code.
+
+   Caveat: `grep` matches inside comments and string literals. False
+   positives have been rare in practice; if they appear, the
+   pragmatic fix is a `// nolint:o11y-globals` suppression with a
+   review-required comment. Upgrading to an AST-based check (a small
+   `go/analysis` pass) is open future work.
 
 The gate runs on every PR via GitHub Actions, plus locally via
 `make lint` (the existing `Makefile` target).
@@ -318,10 +333,6 @@ to apply, not clearer.
   bumps? Lean: exact pin for instrumentation libs (ADR 0003 audit
   burden), `^` for non-instrumentation deps. To be confirmed before
   this ADR moves to Accepted.
-- **Tier label in package doc.** Should every instrumentation
-  package's `doc.go` declare its tier explicitly (e.g.
-  `// Tier: T2 facade over github.com/foo/bar`)? Lean: yes, it makes
-  the policy self-documenting at the source. To be confirmed.
 - **Test coverage expectation per tier.** T1 must have full unit +
   integration coverage. T2 typically needs only "we wired the
   options correctly" tests because the upstream library carries its

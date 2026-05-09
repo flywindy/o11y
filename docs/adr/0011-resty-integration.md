@@ -228,10 +228,19 @@ themselves before calling `client.R().Do()`.
 
 ### 6. `Wrap` idempotency
 
-The wrapper stamps a sentinel onto the resty client (private struct
-key in the client's value store) on first call and short-circuits
-subsequent calls. This protects against double-installation when a
-service calls `Wrap` from multiple init paths.
+`Wrap` must be safe to call twice on the same `*resty.Client`. The
+exact mechanism is an implementation detail of the PR (resty v2 does
+not expose a general-purpose value store on `Client`, so the
+sentinel cannot be a simple key/value); candidate mechanisms include
+(a) checking whether the client's transport is already an instance
+of our intermediate `RoundTripper` type, (b) maintaining a
+package-level `sync.Map` keyed by `*resty.Client` with weak-reference
+semantics, or (c) stamping a marker hook in the client's
+`OnBeforeRequest` chain and detecting it on second call.
+
+The implementation PR picks one and documents the choice in godoc.
+This ADR commits only to the **contract** (idempotent `Wrap`), not to
+the mechanism.
 
 ### 7. Compliance with ADR 0003
 
@@ -258,36 +267,45 @@ what an SRE actually wants to filter dashboards by.
 This package adds a **span-only** attribute `resty.error.kind`
 (intentionally not on metrics; see §3 cardinality logic) with a
 fixed, closed enumeration. The enum is set from the wrapper's
-`OnError` hook based on the structured error returned by
-resty/`http`/`net`/`context`:
+`OnError` (and, for `server_timeout`, `OnAfterResponse`) hook based
+on the structured error returned by resty/`http`/`net`/`context`.
 
-| Value | Trigger | Detection |
-|---|---|---|
-| `transport` | DNS resolution failure, TCP connect refused, RST mid-stream, TLS handshake failure | `errors.As` to `*net.OpError`; not preceded by user cancel or deadline |
-| `tls` | Certificate verification failure, protocol mismatch | `errors.As` to `*tls.CertificateVerificationError` or other `tls.*` error types |
-| `client_timeout` | The user's `context.WithTimeout` deadline expired before the response was complete | `errors.Is(err, context.DeadlineExceeded)` |
-| `client_canceled` | The user cancelled the context (deliberate abort) | `errors.Is(err, context.Canceled)` |
-| `server_timeout` | The downstream server returned 408 or 504 | inspected post-response in `OnAfterResponse`; sets the kind on the same span before `OnError` even fires |
-| `retry_exhausted` | Resty's retry policy gave up; the underlying error of the last attempt is whichever of the above applies | `c.Request.Attempt == c.Request.RetryCount + 1 && err != nil`; **wrapped on the parent caller span** if one exists, alongside the per-attempt kind on each child span |
-| `protocol` | HTTP/2 stream error, malformed response, framing error | `errors.As` to `http2.StreamError` or similar; final fallback for `http.*` errors |
-| `unknown` | Default when no other classifier matches | otherwise |
+**Detection runs in the order listed below; first match wins.** The
+ordering matters because some Go error sentinels have an
+`Is`-relationship: `context.DeadlineExceeded` is a kind of "context
+cancellation" but is more specific than `context.Canceled`, so it
+must be checked first.
 
-Detection runs in this order; first match wins. The mapping function
-is unit-tested with table-driven cases for each row using the
-relevant fixture errors (`fixtures.DialRefused()`,
-`fixtures.TLSBadCert()`, etc., constructed with the real
-underlying types so `errors.As`/`Is` behave as in production).
+| # | Value | Trigger | Detection |
+|---|---|---|---|
+| 1 | `client_canceled` | The user cancelled the context (deliberate abort, no deadline involved) | `errors.Is(err, context.Canceled)` **and not** `errors.Is(err, context.DeadlineExceeded)` |
+| 2 | `client_timeout` | The user's `context.WithTimeout` / `SetTimeout` deadline expired before the response was complete | `errors.Is(err, context.DeadlineExceeded)` |
+| 3 | `server_timeout` | The downstream server returned 408 or 504 | inspected post-response in `OnAfterResponse`; sets the kind on the span before `OnError` would fire |
+| 4 | `tls` | TLS handshake or certificate verification failure | `errors.As` to `*tls.CertificateVerificationError`, `tls.RecordHeaderError`, or a `*net.OpError` with `Op == "remote error"` and a TLS-shaped inner error |
+| 5 | `transport` | DNS resolution failure, TCP connect refused, RST mid-stream (non-TLS) | `errors.As` to `*net.OpError` (after the `tls` row excluded the TLS sub-cases) |
+| 6 | `protocol` | HTTP/2 stream error, malformed response, framing error | `errors.As` to `http2.StreamError`, or other `http.*` parse errors |
+| 7 | `retry_exhausted` | Resty's retry policy gave up: the request reached its configured retry limit and the last attempt still failed | per-attempt span keeps the kind from rows 1–6 above; the **last** attempt's span also gets `resty.error.kind=retry_exhausted` (additional attribute, not overwriting). If a caller-supplied parent span exists in `req.Context()`, the same `retry_exhausted` event is recorded on that parent span via `span.AddEvent`. Detected in `OnError` by inspecting resty's request attempt count against its retry budget. |
+| 8 | `unknown` | Default when no row above matches | otherwise |
 
-The attribute is also written to `slog.LogAttrs` from the OnError
-hook so that error logs carry the same kind label, enabling
-join-friendly queries like
-`{kind="client_timeout"} |= "service=billing"` in Loki + Tempo
-correlation.
+The mapping function is unit-tested with table-driven cases for each
+row using the relevant fixture errors (`fixtures.DialRefused()`,
+`fixtures.TLSBadCert()`, `fixtures.ContextCanceled()`,
+`fixtures.ContextDeadline()`, etc.), constructed with the real
+underlying types so `errors.As`/`Is` behave as in production.
+
+**Logging is left to the caller.** The wrapper sets the attribute on
+the span only; it does not call `slog` itself. Services that want
+"log-on-error" either install their own resty `OnError` hook (it
+runs alongside ours, no conflict) or read the active span's
+attributes from inside the handler. This keeps the wrapper focused
+on the trace/metric pipeline and lets callers decide their own
+log volume policy.
 
 `resty.error.kind` is **not** an `otel.error.type` replacement; both
 attributes coexist on the span. `error.type` answers "what Go type
-was the error" (programmer view); `resty.error.kind` answers "what
-class of failure does an operator see" (SRE view).
+was the error" (programmer view, set by `otelhttp`);
+`resty.error.kind` answers "what class of failure does an operator
+see" (SRE view, set by this package).
 
 ### 9. Golden trace tests for retry / timeout
 
@@ -309,7 +327,7 @@ configured per scenario; the trace is captured via an in-memory
 | 3 | Retry succeeds on attempt 2 | 503, 200 | `SetRetryCount(3)` | Caller → 2 sibling client spans: span#1 (`status_code=503`, `resend_count` absent), span#2 (`status_code=200`, `resend_count=1`) |
 | 4 | Retry exhausted | 503 × 4 | `SetRetryCount(3)` | Caller → 4 sibling client spans, attempt indices 0..3, last span has `resty.error.kind=retry_exhausted` |
 | 5 | Client timeout mid-attempt | server hangs | `SetTimeout(50ms)`, no retries | Caller → 1 client span, status `Error`, `error.type=context.DeadlineExceeded`, `resty.error.kind=client_timeout` |
-| 6 | Client timeout across multiple attempts | server hangs | `SetTimeout(50ms)`, `SetRetryCount(3)` | Caller → N sibling spans (N ≤ retry count, depends on how many attempts fit in 50 ms); last span has `resty.error.kind=client_timeout`; `retry_exhausted` is **not** set because the failure mode was the user-level deadline, not resty's policy giving up |
+| 6 | Client timeout across multiple attempts | server delays response by `2 * timeout` per attempt (deterministic) | `SetTimeout(50ms)`, `SetRetryCount(3)` | Caller → ≥ 1 client span; **the last span** has `resty.error.kind=client_timeout` and `error.type=context.DeadlineExceeded`; `retry_exhausted` is **not** set because the failure mode was the user-level deadline. Assertions are restricted to the last span and the kind attribute — span count is not asserted, since it depends on scheduler timing. |
 | 7 | Caller-cancelled mid-flight | server hangs | no timeout, but caller cancels at 100 ms | Caller → 1 client span, `error.type=context.Canceled`, `resty.error.kind=client_canceled`, `Error` status |
 | 8 | Server returns 504 (not retried by default) | 504 | no retries | Caller → 1 client span, `status_code=504`, `Error` status, `resty.error.kind=server_timeout` |
 | 9 | TLS handshake failure | `httptest.NewTLSServer` with mismatched CA | resty pointed at the server, no `SetTLSClientConfig` skip | Caller → 1 client span, `error.type=*tls.CertificateVerificationError`, `resty.error.kind=tls` |
