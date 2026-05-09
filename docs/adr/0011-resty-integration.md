@@ -337,7 +337,7 @@ must be checked first.
 
 | # | Value | Trigger | Detection |
 |---|---|---|---|
-| 1 | `client_canceled` | The user cancelled the context (deliberate abort, no deadline involved) | `errors.Is(err, context.Canceled)` **and not** `errors.Is(err, context.DeadlineExceeded)` |
+| 1 | `client_canceled` | The user canceled the context (deliberate abort, no deadline involved) | `errors.Is(err, context.Canceled)` **and not** `errors.Is(err, context.DeadlineExceeded)` |
 | 2 | `client_timeout` | The user's `context.WithTimeout` / `SetTimeout` deadline expired before the response was complete | `errors.Is(err, context.DeadlineExceeded)` |
 | 3 | `server_timeout` | The downstream server returned 408 or 504 | inspected post-response in `OnAfterResponse`; sets the kind on the span before `OnError` would fire |
 | 4 | `tls` | TLS handshake or certificate verification failure | `errors.As` to `*tls.CertificateVerificationError`, `tls.RecordHeaderError`, or a `*net.OpError` with `Op == "remote error"` and a TLS-shaped inner error |
@@ -387,7 +387,7 @@ configured per scenario; the trace is captured via an in-memory
 | 4 | Retry exhausted | 503 × 4 | `SetRetryCount(3)` | Caller → 4 sibling client spans, attempt indices 0..3, last span has `resty.error.kind=retry_exhausted` |
 | 5 | Client timeout mid-attempt | server hangs | `SetTimeout(50ms)`, no retries | Caller → 1 client span, status `Error`, `error.type=context.DeadlineExceeded`, `resty.error.kind=client_timeout` |
 | 6 | Client timeout across multiple attempts | server delays response by `2 * timeout` per attempt (deterministic) | `SetTimeout(50ms)`, `SetRetryCount(3)` | Caller → ≥ 1 client span; **the last span** has `resty.error.kind=client_timeout` and `error.type=context.DeadlineExceeded`; `retry_exhausted` is **not** set because the failure mode was the user-level deadline. Assertions are restricted to the last span and the kind attribute — span count is not asserted, since it depends on scheduler timing. |
-| 7 | Caller-cancelled mid-flight | server hangs | no timeout, but caller cancels at 100 ms | Caller → 1 client span, `error.type=context.Canceled`, `resty.error.kind=client_canceled`, `Error` status |
+| 7 | Caller-canceled mid-flight | server hangs | no timeout, but caller cancels at 100 ms | Caller → 1 client span, `error.type=context.Canceled`, `resty.error.kind=client_canceled`, `Error` status |
 | 8 | Server returns 504 (not retried by default) | 504 | no retries | Caller → 1 client span, `status_code=504`, `Error` status, `resty.error.kind=server_timeout` |
 | 9 | TLS handshake failure | `httptest.NewTLSServer` with mismatched CA | resty pointed at the server, no `SetTLSClientConfig` skip | Caller → 1 client span, `error.type=*tls.CertificateVerificationError`, `resty.error.kind=tls` |
 | 10 | Trace propagation across attempts | 503, 200 | `SetRetryCount(1)` | Both attempt requests' inbound `traceparent` headers (captured server-side) reference the **same trace id** as the caller span, but **different parent-span ids** matching their respective attempt spans |
