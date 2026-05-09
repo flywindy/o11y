@@ -137,7 +137,7 @@ sdkmetric.NewView(
     sdkmetric.Instrument{Name: "http.client.request.duration"},
     sdkmetric.Stream{
         AttributeFilter: attribute.NewAllowKeysFilter(
-            "http.request.method", "server.address",
+            "http.request.method", "server.address", "server.port",
             "http.response.status_code", "error.type",
         ),
     },
@@ -145,10 +145,19 @@ sdkmetric.NewView(
 ```
 
 The server-side allowlist trims to method/route/status. The client-side
-allowlist trims to method/server.address/status/error.type and
-deliberately excludes `http.route` (path/route on client metrics is
-opt-in per ADR 0011 §3, where the caller takes responsibility for the
-keyspace via `WithRouteFromContext`).
+allowlist trims to method/server.address/server.port/status/error.type
+and deliberately excludes `http.route` (path/route on client metrics
+is opt-in per ADR 0011 §3, where the caller takes responsibility for
+the keyspace via `WithRouteFromContext`).
+
+`server.port` is included for the client allowlist because in many
+deployment topologies (sidecars sharing a host, local dev with
+multiple services on `127.0.0.1`, internal services behind a single
+cluster IP) `server.address` collapses to identical values across
+distinct downstreams; the port is the actual differentiator. Port
+cardinality is bounded (a service typically calls a small set of
+known ports) so adding the label does not threaten the cardinality
+budget.
 
 This trims the attribute set produced by any upstream lib down to the
 keys the SDK considers cardinality-safe. `url.full`, `client.address`,

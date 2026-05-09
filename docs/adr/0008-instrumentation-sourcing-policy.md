@@ -283,12 +283,16 @@ explicitly, listing the alternatives that were tested.
 
 ### Why not also support a "T2.5" (combine multiple libs)
 
-Resty's planned design (ADR 0011) is a hybrid: it would be reasonable
-to argue it is "otelhttp transport + resty-aware hooks" rather than
-pure self-writing. We deliberately avoid creating a fourth tier; the
-distinction is captured in ADR 0011 itself, which explains which
-upstream pieces it composes. Adding more tiers makes the policy harder
-to apply, not clearer.
+An earlier draft of ADR 0011 explored a hybrid resty design that
+composed `otelhttp.NewTransport` with resty hooks. The design was
+abandoned (see ADR 0011 §"Conclusion") because `otelhttp`'s
+per-RoundTrip span ends before resty's `OnAfterResponse` /
+`OnError` hooks fire, so resty-level signals could not reach the
+otelhttp-created span. The lesson generalizes: hybrids only work
+when the lifecycles of the composed libraries align, which is rarely
+true across instrumentation boundaries. Codifying a "T2.5" would
+encourage exploring more such hybrids and produce more failed
+designs. The three-tier model stays.
 
 ---
 
@@ -327,12 +331,17 @@ to apply, not clearer.
 
 ## Open questions
 
-- **Vendor pinning policy.** Should `go.mod` pin upstream
-  instrumentation libraries to exact versions and require an ADR
-  refresh on every bump, or allow `^` semver and audit at major
-  bumps? Lean: exact pin for instrumentation libs (ADR 0003 audit
-  burden), `^` for non-instrumentation deps. To be confirmed before
-  this ADR moves to Accepted.
+- **Vendor pinning policy.** Go modules use Minimum Version Selection
+  (MVS) and `go.mod` `require` directives accept exact versions or
+  pseudo-versions only — npm-style `^` ranges do not exist in this
+  ecosystem. The policy choice is therefore: (a) **strict pinning**,
+  where every minor / patch bump requires an ADR refresh and a fresh
+  §2 audit; or (b) **MVS-driven floor**, where minor / patch bumps
+  flow through `go get` automatically and audits run at major bumps
+  only. Lean: (a) for instrumentation libs (the ADR 0003 audit
+  burden makes it cheap to also re-confirm at every bump), (b) for
+  non-instrumentation deps. To be confirmed before this ADR moves
+  to Accepted.
 - **Test coverage expectation per tier.** T1 must have full unit +
   integration coverage. T2 typically needs only "we wired the
   options correctly" tests because the upstream library carries its

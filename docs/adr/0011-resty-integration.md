@@ -3,8 +3,10 @@
 **Status**: Proposed
 **Date**: 2026-05-08
 
-**Applies** ADR 0008 (sourcing policy); **builds on** ADR 0009
-(`otelhttp` transport facade and metric.View cardinality control).
+**Applies** ADR 0008 (sourcing policy); **inherits the metric.View
+cardinality controls established by** ADR 0009 (the
+`http.client.request.duration` allowlist applies to histograms
+emitted by this package automatically).
 
 ---
 
@@ -53,62 +55,96 @@ reasons services choose resty over `net/http`.
 
 ### Conclusion
 
-The decision under ADR 0008 is a **justified T3** integration. We
-write the resty wrapper ourselves, using `otelhttp.NewTransport` as
-an internal building block where it carries weight (the actual span
-creation and `traceparent` injection happen there) and adding resty-
-aware glue on top via resty's hook system.
+The decision under ADR 0008 is **pure T3**: write the resty wrapper
+from OTel primitives, with **no otelhttp dependency** in this
+package. The earlier draft of this ADR proposed a hybrid (otelhttp
+as base transport + resty hooks for annotations), but a careful read
+of `otelhttp.Transport.RoundTrip` shows the hybrid cannot work:
+
+- `otelhttp` opens its per-attempt span at the entry of `RoundTrip`
+  and ends it via `defer span.End()` before `RoundTrip` returns.
+- Resty's `OnAfterResponse` / `OnError` hooks fire **after**
+  `Client.execute` receives the result of `RoundTrip` — i.e. after
+  the span has already been ended.
+- The OTel SDK contract is that `SetAttributes` / `RecordError` /
+  `SetStatus` / `AddEvent` are no-ops on an Ended span. So
+  resty-level signals (`resty.error.kind`, `http.request.resend_count`
+  for the just-completed attempt, route-from-context, retry-exhausted
+  marker) cannot reach the otelhttp-created span via hooks.
+
+Workarounds (custom base RoundTripper that annotates from inside
+`otelhttp`'s RoundTrip; emitting an outer "logical" span in addition
+to otelhttp's per-attempt spans; double-spanning) all either fail to
+deliver retry-aware signals or violate the ~100 LOC budget for a
+single integration. Owning span lifecycle in the resty hooks is
+strictly simpler and matches what resty hooks were designed for.
 
 This is not a contradiction with ADR 0008. The policy permits T3
 when the §2 checklist fails for every candidate library; it requires
-the ADR to enumerate the failures (done above) and the upstream pieces
-that are nonetheless reused (next section).
+the ADR to enumerate the failures (done above) and to justify that
+self-writing is the smallest viable answer (the lifecycle analysis
+above).
 
 Relevant existing files / context:
 
 - ADR 0008 — sourcing policy
-- ADR 0009 — `otelhttp` facade and metric.View cardinality
+- ADR 0009 — `otelhttp` facade and metric.View cardinality (the
+  metric.View defined there covers `http.client.request.duration`
+  regardless of which library produces the histogram, so this
+  package's metric inherits the cardinality view automatically)
 - ADR 0010 — gin integration (parallel decision, server-side)
 
 ---
 
 ## Decisions
 
-### 1. Architecture: `otelhttp.NewTransport` for span/metric, resty hooks for resty-only signals
+### 1. Architecture: resty hooks own span and metric lifecycle
 
-The wrapper composes two layers, each owning a distinct concern:
+The wrapper installs three resty hooks. No custom `RoundTripper` and
+no `otelhttp` involvement; resty's default transport handles the
+network and the hooks own everything observability-related.
 
-| Layer | Source | Owns |
-|---|---|---|
-| Transport | `otelhttp.NewTransport` (T2 building block) | Client span creation, status code, `server.address`, `server.port`, base metric `http.client.request.duration`, `traceparent` injection |
-| Hooks | Self-written, this package | Per-attempt span attribute `http.request.resend_count`, `OnError` error classification, optional `http.route` from context, sentinel for `Wrap` idempotency |
+| Hook | Owns |
+|---|---|
+| `OnBeforeRequest` | Start client span via `tp.Tracer(...).Start`, set client attributes (`http.request.method`, `server.address`, `server.port`, `url.full`, `http.request.resend_count` on attempts ≥ 2, `http.route` if `WithRouteFromContext` resolves), inject `traceparent` into `req.Header` via `prop.Inject`, attach the span to `req.Context()` so handler-side hooks and the resty Request itself see it, capture `time.Now()` for the histogram. |
+| `OnAfterResponse` | Set `http.response.status_code`; set span status (Error for ≥ 4xx per OTel client semconv, Unset otherwise); for status 408/504 also set `resty.error.kind=server_timeout`; record the histogram sample; end the span. |
+| `OnError` | Classify the error into `resty.error.kind` (§8); set `error.type` to the underlying Go type name; set span status Error; record the histogram sample with `error.type` label; end the span. If the error is the last attempt under retry policy, additionally tag `resty.error.kind=retry_exhausted` (§8 row 7). |
 
-The hooks **do not start their own span**. They annotate the span
-that `otelhttp.NewTransport` is about to create or has just created
-via `c.Request.Context()` reads. This avoids duplicate spans and
-inherits `otelhttp`'s correctness for the network-level signals.
-
-Where resty's hook fires before `otelhttp`'s span exists
-(`OnBeforeRequest`), the wrapper sets the attempt index into the
-request `context.Context` via a private key; a small custom
-`http.RoundTripper` interposed between resty and `otelhttp.NewTransport`
-reads the key and calls `trace.SpanFromContext` after `otelhttp`
-creates the span, then sets `http.request.resend_count`.
-
+```text
+resty.Client.R().Get(...)
+   │
+   ├─ OnBeforeRequest ──► tracer.Start(ctx, "{METHOD}"...)
+   │                       prop.Inject(req.Header)
+   │                       req.SetContext(ctxWithSpan)
+   │                       record start time
+   │
+   ▼
+resty's default transport ──► http.DefaultTransport.RoundTrip
+   │                            (no instrumentation here)
+   ▼
+   response or error
+   │
+   ├─ OnAfterResponse ──► span.SetAttributes(status_code, ...)
+   │                       span.SetStatus(...)
+   │                       histogram.Record(elapsed, attrs)
+   │                       span.End()
+   │
+   └─ OnError ──────────► classify error → resty.error.kind
+                           span.RecordError(err)
+                           span.SetStatus(Error)
+                           histogram.Record(elapsed, attrs)
+                           span.End()
 ```
-resty.Client
-   │
-   ├─ OnBeforeRequest hook ──► writes attempt index into req.Context
-   │
-   ▼
-custom RoundTripper (this package) ──► reads attempt index, prepares ctx
-   │
-   ▼
-otelhttp.NewTransport ──► creates client span, injects traceparent,
-   │                       records http.client.request.duration
-   ▼
-http.DefaultTransport (or user-supplied base)
-```
+
+We control the span open/close window so both `OnAfterResponse` and
+`OnError` operate on a live span. The lifecycle problem that ruled
+out the otelhttp-hybrid design (Conclusion above) does not exist
+here.
+
+The hooks are **idempotent under retry**: each attempt enters
+`OnBeforeRequest` fresh and produces its own span. Retries become
+sibling spans under whatever caller-supplied parent span is in
+`req.Context()` when the request is initiated.
 
 ### 2. Public API
 
@@ -158,20 +194,34 @@ func NewClient(
 
 ### 3. Metrics
 
-`otelhttp.NewTransport` already records `http.client.request.duration`.
-Default labels emitted by `otelhttp`: `http.request.method`,
-`server.address`, `http.response.status_code`, `error.type`, plus
-`network.protocol.version`.
+The wrapper creates one histogram instrument at `Wrap` time:
+
+```go
+hist, _ := mp.Meter("github.com/flywindy/o11y/resty").
+    Float64Histogram(
+        "http.client.request.duration",
+        metric.WithUnit("s"),
+        metric.WithDescription("Duration of outbound HTTP client requests."),
+    )
+```
+
+Histogram name and unit match OTel semconv stable HTTP client metric.
+The metric.View registered by `o11y.Init` (ADR 0009 §2 Layer A
+client-side allowlist) applies automatically to this histogram
+because it is keyed by name, not by source library.
+
+Default labels recorded by the wrapper: `http.request.method`,
+`server.address`, `server.port`, `http.response.status_code` (for
+response paths) or `error.type` (for error paths). The ADR 0009
+client-side allowlist permits exactly this set; anything beyond it
+is dropped at the View.
 
 Cardinality-sensitive concerns:
 
-- **Path / route** — by default not emitted as a metric label. The
-  metric.View from ADR 0009 covers `http.client.request.duration`
-  with the same allowlist filter and trims any high-cardinality
-  attributes that future `otelhttp` versions might add.
-- **Server address** — bounded by the set of upstream hosts the
-  service calls. Acceptable.
-- **Status code / method** — bounded by the HTTP spec. Acceptable.
+- **Path / route** — not recorded by default. See opt-in below.
+- **Server address / port** — bounded by the set of upstream hosts
+  the service calls. Acceptable.
+- **Status code / method / error.type** — bounded enums. Acceptable.
 
 Path label is opt-in via `WithMetricRouteEnabled` paired with
 `WithRouteFromContext`:
@@ -193,38 +243,44 @@ explicitly attaches enter the metric.
 
 ### 4. Span model
 
-- One span per attempt, kind `SpanKindClient`. Created by
-  `otelhttp.NewTransport`, **not** by this package's hooks.
+- One span per attempt, kind `SpanKindClient`. Created in
+  `OnBeforeRequest`, ended in `OnAfterResponse` or `OnError`. Tracer
+  name: `"github.com/flywindy/o11y/resty"`.
 - Default span name: `"{METHOD}"` (low cardinality per OTel semconv
-  for client spans). With `WithSpanNameFormatter` or
+  guidance for client spans). With `WithSpanNameFormatter` or
   `WithRouteFromContext` set, name becomes `"{METHOD} {route}"`.
-- Attributes set by `otelhttp`: `http.request.method`,
-  `server.address`, `server.port`, `http.response.status_code`,
-  `network.protocol.version`. Set by this package via the
-  intermediate RoundTripper: `http.request.resend_count` (attempts
-  ≥ 2), `http.route` (if `WithRouteFromContext` resolves).
-- Span status: set by `otelhttp` for transport errors and ≥ 4xx (per
-  OTel semconv: client treats 4xx as Error because the request was
-  malformed from the client's perspective).
-- `error.type`: set by `otelhttp` for transport errors based on Go
-  standard error types (`*net.OpError`, `*url.Error`,
-  `context.DeadlineExceeded`, `context.Canceled`). Resty's
-  `OnError`-only signals (e.g. retry budget exhausted) are added to
-  the **last** attempt's span by a hook.
+- Attributes set in `OnBeforeRequest`: `http.request.method`,
+  `server.address`, `server.port`, `url.full`,
+  `http.request.resend_count` (only on attempts ≥ 2; OTel semconv
+  omits it on the first attempt), `http.route` (if
+  `WithRouteFromContext` resolves a non-empty value).
+- Attributes set in `OnAfterResponse`: `http.response.status_code`.
+  Plus `resty.error.kind=server_timeout` for status 408 / 504.
+- Attributes set in `OnError`: `error.type` (Go type name from
+  `errors.As` / `reflect`), `resty.error.kind` (§8 taxonomy).
+  `error.type` is also recorded as a label on the histogram sample
+  for the failed attempt.
+- Span status: Error for transport errors (set in `OnError`) **or**
+  HTTP status `>= 400` (set in `OnAfterResponse`, per OTel semconv
+  client-side convention that 4xx is Error because the request was
+  malformed from the client's perspective). Unset otherwise.
+- `traceparent` injection: `prop.Inject(ctx, propagation.HeaderCarrier(req.Header))`
+  in `OnBeforeRequest` after the span is started, so the downstream
+  service receives a `traceparent` pointing at this attempt's span.
 
 ### 5. Retry semantics
 
-Each resty retry produces a fresh `OnBeforeRequest` → RoundTrip cycle,
-which means a fresh `otelhttp` span per attempt. Attempt index is
-written into `req.Context()` via a private key in `OnBeforeRequest`;
-the intermediate RoundTripper reads it post-span-creation and sets
-`http.request.resend_count` on attempts ≥ 2.
+Each resty retry produces a fresh `OnBeforeRequest` →
+`OnAfterResponse`/`OnError` cycle, which means a fresh wrapper-owned
+span per attempt. The wrapper reads `req.Attempt` (resty v2's
+attempt counter on `*resty.Request`) inside `OnBeforeRequest` and
+sets `http.request.resend_count` on attempts ≥ 2.
 
 There is no "outer logical span" across retries. Resty does not
-expose a hook that fires once before the first attempt and once after
-the last; emulating one with state would be fragile across resty
-minor versions. Callers who need a logical-request span create one
-themselves before calling `client.R().Do()`.
+expose a hook that fires once before the first attempt and once
+after the last; emulating one with state would be fragile across
+resty minor versions. Callers who need a logical-request span
+create one themselves before calling `client.R().Do()`.
 
 ### 6. `Wrap` idempotency
 
@@ -244,10 +300,13 @@ the mechanism.
 
 ### 7. Compliance with ADR 0003
 
-`go-resty/resty/v2` itself does not import OpenTelemetry.
-`otelhttp.NewTransport` reads globals as fallback only; the wrapper
-always supplies `WithTracerProvider`, `WithMeterProvider`,
-`WithPropagators`. No global is touched.
+`go-resty/resty/v2` itself does not import OpenTelemetry. The
+wrapper takes `tp`, `mp`, and `prop` as explicit parameters and
+never reads or writes any `go.opentelemetry.io/otel` global. There
+is no third-party OTel instrumentation library in this package's
+dependency graph after the pivot away from `otelhttp.NewTransport`,
+so the ADR 0003 audit surface for this integration is bounded to
+our own code.
 
 The ADR 0003 §"Approved integrations" table is updated in the same PR:
 
@@ -257,12 +316,12 @@ The ADR 0003 §"Approved integrations" table is updated in the same PR:
 
 ### 8. `resty.error.kind` taxonomy
 
-`otelhttp` sets OTel's standard `error.type` from Go error class
-names (`*net.OpError`, `*url.Error`, `context.DeadlineExceeded`,
-`context.Canceled`). That is correct for protocol/transport
-classification but hides whether the failure came from resty's
-retry policy, the user's timeout, or the network itself — which is
-what an SRE actually wants to filter dashboards by.
+`error.type` (set by this wrapper from Go error class names —
+`*net.OpError`, `*url.Error`, `context.DeadlineExceeded`,
+`context.Canceled`) is correct for protocol/transport classification
+but hides whether the failure came from resty's retry policy, the
+user's timeout, or the network itself — which is what an SRE
+actually wants to filter dashboards by.
 
 This package adds a **span-only** attribute `resty.error.kind`
 (intentionally not on metrics; see §3 cardinality logic) with a
@@ -301,20 +360,20 @@ attributes from inside the handler. This keeps the wrapper focused
 on the trace/metric pipeline and lets callers decide their own
 log volume policy.
 
-`resty.error.kind` is **not** an `otel.error.type` replacement; both
+`resty.error.kind` is **not** an `error.type` replacement; both
 attributes coexist on the span. `error.type` answers "what Go type
-was the error" (programmer view, set by `otelhttp`);
-`resty.error.kind` answers "what class of failure does an operator
-see" (SRE view, set by this package).
+was the error" (programmer view); `resty.error.kind` answers "what
+class of failure does an operator see" (SRE view). Both are set by
+this package.
 
 ### 9. Golden trace tests for retry / timeout
 
 Retry and timeout flows are the highest-value resty behaviors and the
-most likely to regress when upstream `otelhttp` changes its span
-boundaries or the resty hook ordering shifts. The implementation PR
-ships a **golden-trace** test suite that asserts the recorded span
-tree byte-for-byte against committed expected JSON (with timestamp
-and span-id fields blanked out).
+most likely to regress when resty's hook ordering shifts between
+versions or when our error classification logic drifts. The
+implementation PR ships a **golden-trace** test suite that asserts
+the recorded span tree byte-for-byte against committed expected JSON
+(with timestamp and span-id fields blanked out).
 
 Test fixtures use an in-process `httptest.Server` that can be
 configured per scenario; the trace is captured via an in-memory
@@ -357,26 +416,32 @@ users are not forced to migrate.
 **Positive**
 
 - End-to-end trace continuity: gin server (ADR 0010) → resty client
-  (this ADR) → downstream service. `traceparent` injection is
-  automatic via `otelhttp`.
-- Client metric cardinality is bounded by default; route labels are
-  opt-in.
-- Retries are observable as distinct attempts with
+  (this ADR) → downstream service. `traceparent` injection happens
+  in `OnBeforeRequest` after the span is started, so downstream
+  services see a parent that is alive and recordable.
+- Client metric cardinality is bounded by default (allowlist view
+  from ADR 0009 §2); route labels are opt-in.
+- Retries are observable as distinct sibling spans with
   `http.request.resend_count`, so dashboards can separate first-try
   latency from retry latency.
-- Network-layer correctness (DNS, connection reuse, redirects,
-  HTTP/2 stream errors) is inherited from `otelhttp`, not
-  re-implemented.
+- Span lifecycle matches resty's hook lifecycle, so every hook fires
+  on a live span. No no-op `SetAttributes` after end.
+- One package, no `otelhttp` import for resty users. Smaller
+  dependency surface.
 
 **Negative / Trade-offs**
 
-- T3 means we own the resty-specific code permanently. The §2
-  evaluation must be re-run on every resty major bump and at least
-  annually for community-lib re-evaluation; the ADR 0009 path
+- T3 means we own the resty-specific code permanently, including
+  network-layer behaviors that `otelhttp` would have given us for
+  free (e.g. handling redirect chains as separate spans, baggage
+  semantics across retries). For resty's surface this is bounded
+  because resty's redirect / retry behavior is itself bounded by
+  resty's options, but it is real maintenance.
+- The §2 evaluation must be re-run on every resty major bump and at
+  least annually for community-lib re-evaluation; the ADR 0009 path
   (T2 facade) becomes available if a maintained `otelresty` emerges.
-- `Wrap` idempotency relies on a sentinel. If a future resty release
-  changes the client value store semantics, the sentinel may need to
-  move to a `sync.Map` keyed by client pointer.
+- `Wrap` idempotency mechanism is an implementation choice (§6),
+  not pinned by this ADR.
 - No outer logical span across retries (§5). Callers needing that
   signal create it themselves.
 - `WithRouteFromContext` requires the caller to construct a context
@@ -388,16 +453,13 @@ users are not forced to migrate.
 
 ## Open questions
 
-- **Wrap idempotency mechanism.** Resty v2's client value store is
-  fine for now. If we move to a process-global `sync.Map` keyed by
-  `*resty.Client`, we need to ensure entries are evicted when clients
-  are GC'd (use `runtime.SetFinalizer` or a weak map). Lean: keep
-  client-local sentinel for v2; revisit for v3.
-- **`error.type` granularity.** `otelhttp` sets it from Go error
-  types. Should the resty hook overwrite with resty's own classification
-  (e.g. distinguish "retry budget exhausted" from "single-attempt
-  transport error")? Lean: do not overwrite; add `resty.error.kind`
-  as a span-only attribute when resty has classification information.
+- **Wrap idempotency mechanism.** Three candidates listed in §6:
+  transport-chain check, package-level `sync.Map` with weak refs,
+  or a marker hook in `OnBeforeRequest`. The implementation PR picks
+  one based on a small benchmark and documents the choice in godoc.
+  If `sync.Map` wins, it must use `runtime.SetFinalizer` or
+  Go 1.24's experimental weak references to avoid leaking entries
+  for collected clients.
 - **Per-host cap configuration.** Currently `server.address` cardinality
   is implicitly bounded by the number of distinct upstream hosts. If
   a future use case calls dynamic hosts (URL shorteners, multi-tenant

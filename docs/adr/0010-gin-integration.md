@@ -49,7 +49,7 @@ Relevant existing files / context:
 
 Package layout:
 
-```
+```text
 gin/
 ├── middleware.go       // Middleware: otelgin.Middleware + ErrorRecorder
 ├── errors.go           // ErrorRecorder gin.HandlerFunc
