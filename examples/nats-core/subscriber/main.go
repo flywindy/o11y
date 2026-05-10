@@ -20,6 +20,14 @@ const (
 	natsURL = nats.DefaultURL
 )
 
+func metricsAddr(ctx context.Context) string {
+	_ = ctx
+	if v := os.Getenv("METRICS_ADDR"); v != "" {
+		return v
+	}
+	return ":2113"
+}
+
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -30,6 +38,7 @@ func main() {
 		o11y.WithServiceVersion("0.1.0"),
 		o11y.WithEnvironment("development"),
 		o11y.WithServiceNamespace("platform"),
+		o11y.WithMetricsAddr(metricsAddr(ctx)),
 	)
 	if err != nil {
 		slog.Error("failed to initialise o11y SDK", slog.Any("error", err))

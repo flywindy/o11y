@@ -38,3 +38,7 @@ go.work.sum
 .gocache/
 bin/
 obj/
+
+# Frontend (nats-ws-browser example)
+examples/nats-ws-browser/node_modules/
+examples/nats-ws-browser/dist/
