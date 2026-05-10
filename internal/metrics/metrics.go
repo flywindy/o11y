@@ -189,8 +189,17 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 		return nil, nil, fmt.Errorf("metrics: listen on %s: %w", cfg.MetricsAddr, err)
 	}
 
+	gatherer := prometheus.Gatherer(reg)
+	if cfg.MaxUniqueRoutes > 0 {
+		gatherer = metricscap.NewGatherer(reg, metricscap.PrometheusRule{
+			MetricName: "http_server_request_duration_seconds",
+			LabelName:  "http_route",
+			Max:        cfg.MaxUniqueRoutes,
+		})
+	}
+
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	mux.Handle("/metrics", promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{}))
 	server := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,

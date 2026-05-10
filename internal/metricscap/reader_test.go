@@ -106,7 +106,56 @@ func TestLimiter_RehashesAndMergesCollapsedDatapoints(t *testing.T) {
 	assert.InDelta(t, 0.02, overflow.Sum, 0.000001)
 }
 
-func TestLimiter_IsConcurrentSafe(t *testing.T) {
+func TestLimiter_DoesNotMutateInputDatapointSlices(t *testing.T) {
+	limiter := metricscap.NewLimiter(metricscap.Rule{
+		InstrumentName: durationName,
+		Key:            "http.route",
+		Max:            1,
+	})
+	rm := histogram("/keep", "/overflow-a", "/overflow-b")
+	data := rm.ScopeMetrics[0].Metrics[0].Data.(metricdata.Histogram[float64])
+	originalPoints := data.DataPoints
+
+	limiter.Rewrite(&rm)
+
+	route, ok := originalPoints[1].Attributes.Value("http.route")
+	require.True(t, ok)
+	assert.Equal(t, "/overflow-a", route.AsString())
+	assert.Equal(t, []uint64{1, 0, 0}, originalPoints[1].BucketCounts)
+}
+
+func TestLimiter_MergesCollapsedGaugeDatapoints(t *testing.T) {
+	limiter := metricscap.NewLimiter(metricscap.Rule{
+		InstrumentName: durationName,
+		Key:            "http.route",
+		Max:            1,
+	})
+	rm := metricdata.ResourceMetrics{
+		ScopeMetrics: []metricdata.ScopeMetrics{{
+			Metrics: []metricdata.Metrics{{
+				Name: durationName,
+				Data: metricdata.Gauge[int64]{DataPoints: []metricdata.DataPoint[int64]{
+					{Attributes: routeSet("/keep"), Value: 1},
+					{Attributes: routeSet("/overflow-a"), Value: 2},
+					{Attributes: routeSet("/overflow-b"), Value: 3},
+				}},
+			}},
+		}},
+	}
+
+	limiter.Rewrite(&rm)
+
+	data := rm.ScopeMetrics[0].Metrics[0].Data.(metricdata.Gauge[int64])
+	require.Len(t, data.DataPoints, 2)
+	for _, dp := range data.DataPoints {
+		value, _ := dp.Attributes.Value("http.route")
+		if value.AsString() == metricscap.OverflowValue {
+			assert.Equal(t, int64(3), dp.Value)
+		}
+	}
+}
+
+func TestLimiter_IsConcurrentSafe(_ *testing.T) {
 	limiter := metricscap.NewLimiter(metricscap.Rule{
 		InstrumentName: durationName,
 		Key:            attribute.Key("http.route"),
@@ -123,4 +172,8 @@ func TestLimiter_IsConcurrentSafe(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+func routeSet(route string) attribute.Set {
+	return attribute.NewSet(attribute.String("http.route", route))
 }
