@@ -80,6 +80,9 @@ func Connect(
 	prop propagation.TextMapPropagator,
 	opts ...Option,
 ) (*Client, error) {
+	if ctx == nil {
+		return nil, errors.New("mongo connect: context must not be nil")
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("mongo connect: context already canceled: %w", err)
 	}

@@ -25,7 +25,7 @@ const (
 
 func main() {
 	if err := run(); err != nil {
-		slog.Error("MongoDB example failed", slog.Any("error", err))
+		slog.ErrorContext(context.Background(), "MongoDB example failed", slog.Any("error", err))
 		os.Exit(1)
 	}
 }

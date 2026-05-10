@@ -68,6 +68,7 @@ func TestConnect_Validation(t *testing.T) {
 		prop    propagation.TextMapPropagator
 		wantErr string
 	}{
+		{"nil ctx", nil, "mongodb://localhost:27017", tp, prop, "context must not be nil"},
 		{"canceled ctx", canceled, "mongodb://localhost:27017", tp, prop, context.Canceled.Error()},
 		{"empty uri", context.Background(), "", tp, prop, "uri must not be empty"},
 		{"nil tracer provider", context.Background(), "mongodb://localhost:27017", nil, prop, "tracer provider must not be nil"},
