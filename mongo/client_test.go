@@ -156,10 +156,23 @@ func TestConnect_UsesProvidedTracerProvider(t *testing.T) {
 	_, _ = client.Database("o11y_test").Collection("events").InsertOne(opCtx, bson.M{"name": "provided-tracer"})
 
 	require.NotEmpty(t, sr.Ended(), "MongoDB operation should emit a span through the supplied provider")
-	attrs := sr.Ended()[0].Attributes()
+	insertSpan := findSpanWithAttribute(sr.Ended(), attribute.String("db.operation.name", "insert"))
+	require.NotNil(t, insertSpan, "MongoDB insert span should be recorded")
+	attrs := insertSpan.Attributes()
 	assert.Contains(t, attrs, attribute.String("db.system.name", "mongodb"))
 	assert.Contains(t, attrs, attribute.String("db.namespace", "o11y_test"))
 	assert.Contains(t, attrs, attribute.String("db.collection.name", "events"))
 	assert.Contains(t, attrs, attribute.String("db.operation.name", "insert"))
 	assert.NotContains(t, attrs, attribute.String("db.system", "mongodb"))
+}
+
+func findSpanWithAttribute(spans []sdktrace.ReadOnlySpan, want attribute.KeyValue) sdktrace.ReadOnlySpan {
+	for _, span := range spans {
+		for _, attr := range span.Attributes() {
+			if attr == want {
+				return span
+			}
+		}
+	}
+	return nil
 }

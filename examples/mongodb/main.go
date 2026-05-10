@@ -147,10 +147,10 @@ func upstreamEnvEnabled(key string) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "0", "false", "no", "off":
-		return false
-	default:
+	case "1", "true", "yes", "on":
 		return true
+	default:
+		return false
 	}
 }
 
