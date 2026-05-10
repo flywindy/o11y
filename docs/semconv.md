@@ -126,8 +126,10 @@ payload.
 
 ## Database - MongoDB
 
-**Status**: integration pending; `otel-mongo/v2` v0.2.11 is now an adoption
-candidate after the SDK semconv pin moved to v1.39.0. See ADR 0005.
+Spans are emitted by
+`github.com/Marz32onE/instrumentation-go/otel-mongo/v2`, wrapped by
+`github.com/flywindy/o11y/mongo`. The upstream module is pinned to the
+`otel-mongo/v2/v0.2.11` tag commit through a Go pseudo-version. See ADR 0005.
 
 ### Expected Attributes
 
@@ -154,7 +156,8 @@ candidate after the SDK semconv pin moved to v1.39.0. See ADR 0005.
 
 `otel-mongo/v2` supports `_oteltrace` document injection through
 `WithTracePropagationEnabled(bool)` and `OTEL_MONGO_PROPAGATION_ENABLED`.
-The o11y wrapper must default this off unless an application explicitly opts in.
+The o11y wrapper defaults this off unless an application explicitly opts in
+through `mongo.WithDocumentTracePropagation(true)`.
 
 ---
 

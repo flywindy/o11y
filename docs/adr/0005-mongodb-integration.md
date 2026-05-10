@@ -1,6 +1,6 @@
 # ADR 0005 - MongoDB Integration
 
-**Status**: Accepted (implementation pending; upstream adoption candidate)
+**Status**: Accepted (implemented through local wrapper)
 **Date**: 2026-04-22
 **Updated**: 2026-05-03
 
@@ -8,10 +8,10 @@
 
 ## Context
 
-The SDK currently has no MongoDB integration, even though `AGENTS.md` lists
-MongoDB as the canonical database choice for services built on this SDK.
-Services integrate their own `go.mongodb.org/mongo-driver/v2` client today,
-which means:
+The SDK provides MongoDB integration through the local
+`github.com/flywindy/o11y/mongo` wrapper package. Before this decision,
+services integrated their own `go.mongodb.org/mongo-driver/v2` client, which
+meant:
 
 - MongoDB calls are not standardized as Tempo spans.
 - Trace/log/metric correlation for DB operations requires ad-hoc code per
@@ -54,6 +54,10 @@ The SDK should adopt `github.com/Marz32onE/instrumentation-go/otel-mongo/v2`
 v0.2.11 through a local `mongo/` wrapper package, instead of writing and
 maintaining a native `event.CommandMonitor`.
 
+Because the upstream repository tags the module as `otel-mongo/v2/v0.2.11`
+instead of a Go module semver tag, `go.mod` pins the corresponding commit with
+the pseudo-version `v2.0.0-20260501090829-1aa6610b53de`.
+
 Future upstream version changes require a separate ADR/PR decision with a fresh
 global-state, semconv, document-propagation, and synthetic-delivery-tracer audit.
 
@@ -77,7 +81,7 @@ func Connect(
     tp trace.TracerProvider,
     prop propagation.TextMapPropagator,
     opts ...Option,
-) (*otelmongo.Client, error)
+) (*Client, error)
 
 type Option func(*config)
 

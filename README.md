@@ -247,6 +247,48 @@ if err != nil {
 defer func() { _ = sub.Drain() }() // gracefully drain on shutdown
 ```
 
+### MongoDB
+
+Use the `mongo` sub-package to wire MongoDB tracing to the SDK-owned
+TracerProvider and Propagator. Do not import the upstream `otel-mongo/v2`
+package directly from application code.
+
+```go
+import o11ymongo "github.com/flywindy/o11y/mongo"
+
+client, err := o11ymongo.Connect(ctx, mongoURI, obs.TracerProvider(), obs.Propagator)
+if err != nil {
+    obs.Logger.ErrorContext(ctx, "MongoDB connect failed", slog.Any("error", err))
+    return
+}
+defer func() {
+    shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    _ = client.Disconnect(shutdownCtx)
+}()
+
+collection := client.Database("app").Collection("orders")
+_, err = collection.InsertOne(ctx, bson.M{"_id": "order-123", "status": "created"})
+```
+
+MongoDB command spans are gated by the upstream instrumentation flags:
+
+```bash
+export OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true
+export OTEL_MONGO_TRACING_ENABLED=true
+```
+
+Document trace propagation is disabled by default because it writes an
+`_oteltrace` field into persisted documents. Enable it only for asynchronous
+patterns such as change streams or outbox processors that need to restore trace
+context from MongoDB documents:
+
+```go
+client, err := o11ymongo.Connect(ctx, mongoURI, obs.TracerProvider(), obs.Propagator,
+    o11ymongo.WithDocumentTracePropagation(true),
+)
+```
+
 ### Prometheus Metrics
 
 By default the SDK exposes a `/metrics` endpoint on `:2112` for Prometheus to scrape. Every series carries `service_namespace`, `service_name`, `service_version`, and `deployment_environment_name` as constant labels.
@@ -334,6 +376,25 @@ Open Grafana at `http://localhost:3000` and navigate to:
 - **Explore → Prometheus** — `http_server_request_duration_seconds`; click an exemplar dot to jump to the linked trace in Tempo
 - **Dashboards → Observability → Metrics Correlation** — HTTP latency metrics with a data link that opens the matching `metrics-example` logs in Loki
 
+### MongoDB
+
+Run a local MongoDB instance or port-forward one to `localhost:27017`, then
+enable the upstream tracing gates before running the example:
+
+```bash
+export MONGODB_URI=mongodb://localhost:27017
+export OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true
+export OTEL_MONGO_TRACING_ENABLED=true
+go run examples/mongodb/main.go
+```
+
+To demonstrate `_oteltrace` document propagation, opt in explicitly:
+
+```bash
+export O11Y_MONGO_DOCUMENT_TRACE_PROPAGATION=true
+go run examples/mongodb/main.go
+```
+
 ## Core Principles
 
 1. **Context-First**: Always propagate `context.Context` — trace information flows through context only.
@@ -345,6 +406,7 @@ Open Grafana at `http://localhost:3000` and navigate to:
 ## Acknowledgements
 
 - [`github.com/Marz32onE/instrumentation-go/otel-nats`](https://github.com/Marz32onE/instrumentation-go) — provides the underlying NATS Core + JetStream tracing semantics used by the `nats/` wrapper. Verified at v0.2.11 not to mutate OTel globals and to import semconv v1.39.0. See [ADR 0004](docs/adr/0004-nats-integration.md) for the integration decision and audit discipline.
+- [`github.com/Marz32onE/instrumentation-go/otel-mongo/v2`](https://github.com/Marz32onE/instrumentation-go) — provides the underlying MongoDB driver v2 tracing semantics used by the `mongo/` wrapper. Verified at the `otel-mongo/v2/v0.2.11` tag not to mutate OTel globals, with `_oteltrace` document propagation disabled by default through the o11y wrapper. See [ADR 0005](docs/adr/0005-mongodb-integration.md).
 
 ## AI Collaboration
 
