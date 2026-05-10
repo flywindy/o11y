@@ -170,6 +170,8 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		MetricsAddr:         cfg.metricsAddr,
 		RuntimeMetrics:      cfg.runtimeMetrics,
 		HistogramBuckets:    cfg.histogramBuckets,
+		DisableDefaultViews: cfg.disableDefaultViews,
+		MaxUniqueRoutes:     cfg.maxUniqueRoutes,
 	})
 	if err != nil {
 		_ = tp.Shutdown(ctx)

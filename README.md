@@ -133,6 +133,8 @@ func main() {
 | `WithMetricsAddr(addr)` | `:2112` | Prometheus `/metrics` scrape address |
 | `WithLogLevel(level)` | `slog.LevelInfo` | Minimum log level |
 | `WithRuntimeMetrics(bool)` | `true` | Collect Go runtime metrics (goroutines, GC, memory) |
+| `WithDisableDefaultViews()` | off | Disable SDK-managed HTTP metric label allowlists and bucket views |
+| `WithMaxUniqueRoutes(n)` | `1000` | Cap distinct `http.route` values for supported exporters |
 
 > **Migration note (pre-1.0 API change)** — `DefaultLatencyBuckets` is now a
 > function (`o11y.DefaultLatencyBuckets()` returning a fresh copy) rather
@@ -303,16 +305,23 @@ HTTP handler instrumentation is provided by the `github.com/flywindy/o11y/http` 
 import o11yhttp "github.com/flywindy/o11y/http"
 
 mux := http.NewServeMux()
-mux.HandleFunc("/api/orders", handleOrders)
+mux.HandleFunc("GET /api/orders/{id}", handleOrder)
 
-// Wrap the mux — emits http_server_request_duration_seconds histogram.
-handler := o11yhttp.New(ctx, obs.Meter("my-service"),
-    o11yhttp.WithPathNormalizer(func(r *http.Request) string {
-        // Collapse /orders/123 → /orders/:id to avoid high cardinality.
-        return pathToTemplate(r.URL.Path)
-    }),
-)(mux)
+// Wrap the mux. The SDK passes TracerProvider, MeterProvider, and Propagator
+// explicitly, so otelhttp never reads OpenTelemetry globals.
+handler := o11yhttp.NewServerHandler(
+    mux,
+    obs.TracerProvider(),
+    obs.MeterProvider(),
+    obs.Propagator,
+    "http.server",
+)
 ```
+
+For Go 1.22+ `http.ServeMux`, route patterns become bounded span names such
+as `GET /api/orders/{id}` and bounded `http.route` metric labels. For routers
+such as chi or echo, use their route pattern as an otelhttp label or span-name
+formatter at the router edge; keep raw URL paths out of metric labels.
 
 **Exemplars** are enabled automatically (OTel SDK default trace-based filter). When Prometheus is deployed with `--enable-feature=exemplar-storage` (included in `k8s/infrastructure/base/prometheus.yaml`), Grafana can navigate from a histogram bucket directly to the correlated trace in Tempo. The measurement context must contain an active sampled span; exemplar trace IDs are stored as exemplar metadata (`trace_id` / `span_id`), not as metric labels, so they do not create high-cardinality time series.
 
@@ -407,6 +416,7 @@ go run examples/mongodb/main.go
 
 - [`github.com/Marz32onE/instrumentation-go/otel-nats`](https://github.com/Marz32onE/instrumentation-go) — provides the underlying NATS Core + JetStream tracing semantics used by the `nats/` wrapper. Verified at v0.2.11 not to mutate OTel globals and to import semconv v1.39.0. See [ADR 0004](docs/adr/0004-nats-integration.md) for the integration decision and audit discipline.
 - [`github.com/Marz32onE/instrumentation-go/otel-mongo/v2`](https://github.com/Marz32onE/instrumentation-go) — provides the underlying MongoDB driver v2 tracing semantics used by the `mongo/` wrapper. Verified at the `otel-mongo/v2/v0.2.11` tag not to mutate OTel globals, with `_oteltrace` document propagation disabled by default through the o11y wrapper. See [ADR 0005](docs/adr/0005-mongodb-integration.md).
+- [`go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp`](https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp) — provides the underlying HTTP server/client instrumentation used by the `http/` facade. See [ADR 0009](docs/adr/0009-replace-http-with-otelhttp.md).
 
 ## AI Collaboration
 

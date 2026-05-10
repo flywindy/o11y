@@ -136,6 +136,8 @@ Before introducing any `github.com/<vendor>/otel-<thing>` library, verify:
 |---|---|---|---|---|
 | `Marz32onE/instrumentation-go/otel-nats` | v0.2.11 | ✅ | Reads globals as fallback only; never sets. Safe when `WithTracerProvider` / `WithPropagators` options are supplied. | See ADR 0004 |
 | `Marz32onE/instrumentation-go/otel-mongo/v2` | v0.2.11 | ✅ | Reads globals as fallback only; never sets. Supports disabling document trace propagation independently with `WithTracePropagationEnabled(false)`. | Adoption candidate after the semconv v1.39.0 upgrade; see ADR 0005 |
+| `go.opentelemetry.io/contrib/instrumentation/runtime` | v0.68.0 | ✅ | Runtime metrics are started with an explicit MeterProvider. No OTel provider globals are set. | Used by `internal/metrics` |
+| `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` | v0.68.0 | ✅ | Reads globals as fallback only; safe when `WithTracerProvider`, `WithMeterProvider`, and `WithPropagators` are supplied. | See ADR 0009 |
 
 When a new library is added or an existing one bumped, update this table
 in the same PR as the version change.
@@ -145,6 +147,9 @@ in the same PR as the version change.
 > Reviewer confirms: no new call path causes
 > `otel.SetTracerProvider` / `otel.SetTextMapPropagator` to execute,
 > directly or through any imported dependency.
+
+> Reviewer confirms: new instrumentation packages are T2 by default, or their
+> originating ADR enumerates which ADR 0008 checklist items failed to justify T3.
 
 ---
 

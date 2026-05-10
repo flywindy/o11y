@@ -1,4 +1,4 @@
-.PHONY: all test lint vuln examples bench cover fmt tidy clean help
+.PHONY: all test lint adr-check vuln examples bench cover fmt tidy clean help
 
 # Force bash so the examples target can use process substitution / read -d ''.
 # The default /bin/sh on Debian / Ubuntu is dash, which lacks both features.
@@ -16,8 +16,11 @@ help: ## List available targets
 test: ## Run unit tests with the race detector and coverage
 	$(GO) test -race -covermode=atomic -coverprofile=$(COVERAGE) $(PKGS)
 
-lint: ## Run golangci-lint (must be installed)
+lint: adr-check ## Run ADR integration gate and golangci-lint (must be installed)
 	golangci-lint run --timeout=5m $(PKGS)
+
+adr-check: ## Run ADR 0008 integration policy gate
+	$(GO) run ./scripts/check_integrations.go
 
 vuln: ## Scan dependencies for known vulnerabilities
 	govulncheck $(PKGS)

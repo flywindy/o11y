@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/flywindy/o11y/internal/metricscap"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/contrib/instrumentation/runtime"
@@ -64,9 +65,11 @@ type Config struct {
 	// ownership governance.
 	Namespace string
 
-	MetricsAddr      string
-	RuntimeMetrics   bool
-	HistogramBuckets []float64
+	MetricsAddr         string
+	RuntimeMetrics      bool
+	HistogramBuckets    []float64
+	DisableDefaultViews bool
+	MaxUniqueRoutes     int
 }
 
 // Closer is a function that shuts down a component. For the Prometheus path it
@@ -90,23 +93,50 @@ func InitMeter(ctx context.Context, cfg Config) (*sdkmetric.MeterProvider, Close
 		return nil, nil, err
 	}
 
-	httpView := sdkmetric.NewView(
-		sdkmetric.Instrument{Name: "http.server.*"},
-		sdkmetric.Stream{
-			Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
-				Boundaries: cfg.HistogramBuckets,
-			},
-		},
-	)
+	views := defaultViews(cfg)
 
 	if cfg.MetricsOTLPEndpoint != "" {
-		return initOTLP(ctx, cfg, res, httpView)
+		return initOTLP(ctx, cfg, res, views)
 	}
-	return initPrometheus(ctx, cfg, res, httpView)
+	return initPrometheus(ctx, cfg, res, views)
+}
+
+func defaultViews(cfg Config) []sdkmetric.View {
+	if cfg.DisableDefaultViews {
+		return nil
+	}
+	histogram := sdkmetric.AggregationExplicitBucketHistogram{
+		Boundaries: cfg.HistogramBuckets,
+	}
+	return []sdkmetric.View{
+		sdkmetric.NewView(
+			sdkmetric.Instrument{Name: "http.server.request.duration"},
+			sdkmetric.Stream{
+				Aggregation: histogram,
+				AttributeFilter: attribute.NewAllowKeysFilter(
+					semconv.HTTPRequestMethodKey,
+					semconv.HTTPRouteKey,
+					semconv.HTTPResponseStatusCodeKey,
+				),
+			},
+		),
+		sdkmetric.NewView(
+			sdkmetric.Instrument{Name: "http.client.request.duration"},
+			sdkmetric.Stream{
+				Aggregation: histogram,
+				AttributeFilter: attribute.NewAllowKeysFilter(
+					semconv.HTTPRequestMethodKey,
+					semconv.HTTPResponseStatusCodeKey,
+					semconv.ServerAddressKey,
+					semconv.ServerPortKey,
+				),
+			},
+		),
+	}
 }
 
 // initPrometheus sets up the Prometheus pull path.
-func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, view sdkmetric.View) (*sdkmetric.MeterProvider, Closer, error) {
+func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, views []sdkmetric.View) (*sdkmetric.MeterProvider, Closer, error) {
 	reg := prometheus.NewRegistry()
 
 	// Resource attributes in the allow filter become constant labels on every
@@ -145,7 +175,7 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 	provider = sdkmetric.NewMeterProvider(
 		sdkmetric.WithReader(exporter),
 		sdkmetric.WithResource(res),
-		sdkmetric.WithView(view),
+		sdkmetric.WithView(views...),
 	)
 
 	if cfg.RuntimeMetrics {
@@ -172,7 +202,7 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 }
 
 // initOTLP sets up the OTLP push path.
-func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, view sdkmetric.View) (*sdkmetric.MeterProvider, Closer, error) {
+func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []sdkmetric.View) (*sdkmetric.MeterProvider, Closer, error) {
 	expOpts := []otlpmetrichttp.Option{
 		otlpmetrichttp.WithEndpointURL(cfg.MetricsOTLPEndpoint),
 	}
@@ -183,6 +213,14 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, view sdkm
 	if err != nil {
 		return nil, nil, fmt.Errorf("metrics: create OTLP exporter: %w", err)
 	}
+	cappedExporter := sdkmetric.Exporter(exporter)
+	if cfg.MaxUniqueRoutes > 0 {
+		cappedExporter = metricscap.NewExporter(exporter, metricscap.Rule{
+			InstrumentName: "http.server.request.duration",
+			Key:            semconv.HTTPRouteKey,
+			Max:            cfg.MaxUniqueRoutes,
+		})
+	}
 
 	var initSucceeded bool
 	defer func() {
@@ -192,9 +230,9 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, view sdkm
 	}()
 
 	provider := sdkmetric.NewMeterProvider(
-		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exporter)),
+		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(cappedExporter)),
 		sdkmetric.WithResource(res),
-		sdkmetric.WithView(view),
+		sdkmetric.WithView(views...),
 	)
 
 	if cfg.RuntimeMetrics {

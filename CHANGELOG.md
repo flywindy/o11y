@@ -17,24 +17,21 @@ adopters can plan their upgrades.
 
 - `WithOTLPHeaders(map[string]string)` attaches arbitrary headers to every
   OTLP/HTTP request the SDK emits across traces, logs, and OTLP-push metrics.
-  Use it to authenticate against managed observability backends — Grafana
-  Cloud (`Authorization: Basic …`), Honeycomb (`X-Honeycomb-Team`), New Relic
-  (`Api-Key`), Datadog (`DD-API-KEY`) — or to route through a multi-tenant
+  Use it to authenticate against managed observability backends like Grafana
+  Cloud (`Authorization: Basic ...`), Honeycomb (`X-Honeycomb-Team`), New Relic
+  (`Api-Key`), Datadog (`DD-API-KEY`), or to route through a multi-tenant
   Collector (`X-Scope-OrgID`).
 - `SDK.Shutdown` is idempotent: a `sync.Once` gates the closer loop and the
   cached error is returned on subsequent calls. Safe to register both in a
   `defer` and inside a signal handler without double-flushing exporters.
-- HTTP middleware recovers from handler panics, records the metric with
-  `status_code=500` (or the previously committed status, if any), and
-  re-raises the original panic value so `http.ErrAbortHandler` semantics and
-  `http.Server`'s default panic logging still run.
-- HTTP middleware now wraps `ResponseWriter` with one of eight variants based
-  on which optional interfaces the underlying writer implements
-  (`http.Flusher` × `http.Hijacker` × `io.ReaderFrom`). Legacy
-  type-assertion feature detection (`w.(http.Flusher)`) once again returns
-  the truth, fixing the previously silent SSE / chunked-stream flush no-op.
-  `io.ReaderFrom` is now exposed when supported, restoring zero-copy
-  `http.ServeFile`.
+- `http.NewServerHandler` and `http.NewTransport` wrap `otelhttp` while
+  threading the SDK TracerProvider, MeterProvider, and Propagator explicitly.
+- `WithDisableDefaultViews()` and `WithMaxUniqueRoutes(int)` configure the
+  SDK-owned HTTP metric label governance added during the `otelhttp`
+  migration.
+- ADR 0008 CI gate (`make adr-check` and `.github/workflows/adr-check.yml`)
+  validates approved instrumentation imports, package tier annotations, and
+  absence of direct OTel global setter calls.
 - `nats.Conn.Subscribe` and `QueueSubscribe` reject empty `subject` (and
   empty `queue` for the queue variant) up front. An empty NATS subject
   silently matches no messages and was almost always a programming error.
@@ -52,12 +49,14 @@ adopters can plan their upgrades.
 
 ### Changed
 
-- HTTP middleware emits a `status_code=500` metric sample even when the
-  handler panics (previously the request was not recorded at all).
+- `http/` is now a Tier-2 facade over `otelhttp`; inbound HTTP requests create
+  server spans, extract `traceparent`, and emit standard OTel HTTP metrics.
+- `o11y.Init` registers default HTTP metric views that keep
+  `http.server.request.duration` labels to method, route, and status code.
 
 ### Validated
 
-- `Init` rejects empty / non-positive / NaN / `±Inf` / unsorted histogram
+- `Init` rejects empty / non-positive / NaN / `+Inf` / unsorted histogram
   bucket lists at start-up rather than allowing the OTel SDK to emit
   silently broken histograms.
 
@@ -69,18 +68,18 @@ adopters should be aware:
 #### `DefaultLatencyBuckets` is now a function
 
 ```go
-// Before — package-level []float64 variable
+// Before: package-level []float64 variable
 buckets := o11y.DefaultLatencyBuckets
 n      := len(o11y.DefaultLatencyBuckets)
 o11y.WithHistogramBuckets(o11y.DefaultLatencyBuckets)
 
-// After — function returning a defensive copy on each call
+// After: function returning a defensive copy on each call
 buckets := o11y.DefaultLatencyBuckets()
 n      := len(o11y.DefaultLatencyBuckets())
 o11y.WithHistogramBuckets(o11y.DefaultLatencyBuckets())
 ```
 
-The motivation: the old exported slice could be mutated by any caller —
+The motivation: the old exported slice could be mutated by any caller:
 `o11y.DefaultLatencyBuckets[0] = 0.999` would silently corrupt every later
 SDK initialization in the process. The function returns a fresh copy each
 time, so callers can safely modify the returned slice.
@@ -89,8 +88,8 @@ time, so callers can safely modify the returned slice.
 
 ```go
 // Before
-addr := &o11y.DefaultMetricsAddr // legal — taking address of a var
-o11y.DefaultMetricsAddr = ":9090" // legal — mutation
+addr := &o11y.DefaultMetricsAddr // legal: taking address of a var
+o11y.DefaultMetricsAddr = ":9090" // legal: mutation
 
 // After
 addr := o11y.DefaultMetricsAddr   // copy the const value
@@ -99,6 +98,25 @@ addr := o11y.DefaultMetricsAddr   // copy the const value
 
 If you need to override the listen address, use `o11y.WithMetricsAddr(":9090")`
 which has been the supported path since the option was added.
+
+#### `http.New` was replaced by `http.NewServerHandler`
+
+```go
+// Before
+handler := o11yhttp.New(ctx, obs.Meter("svc"))(mux)
+
+// After
+handler := o11yhttp.NewServerHandler(
+    mux,
+    obs.TracerProvider(),
+    obs.MeterProvider(),
+    obs.Propagator,
+    "http.server",
+)
+```
+
+Use Go 1.22+ `http.ServeMux` patterns or router-native route patterns to keep
+`http.route` bounded. The old `WithPathNormalizer` callback was removed.
 
 ### Fixed
 
@@ -110,7 +128,7 @@ which has been the supported path since the option was added.
 
 ---
 
-## [0.x] — historical
+## [0.x] - historical
 
 The project does not maintain release tags prior to this changelog. See
 `git log` for earlier history.

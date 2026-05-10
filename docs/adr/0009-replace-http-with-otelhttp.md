@@ -1,6 +1,6 @@
 # ADR 0009 — Replace `http/` with `otelhttp` Facade
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-05-08
 
 **Supersedes parts of** `http/middleware.go` (commit history); **applies** ADR 0008.
@@ -36,7 +36,7 @@ justification. Re-evaluating `http/middleware.go` against the ADR 0008
 |---|---|
 | ADR 0003 compliance | ✅ Reads globals as fallback only; `WithTracerProvider` / `WithMeterProvider` / `WithPropagators` options bypass the fallback. |
 | Maintenance signal | ✅ Maintained by OpenTelemetry contrib. |
-| Semconv alignment | ✅ Emits v1.39.0 stable HTTP attributes. |
+| Semconv alignment | ✅ Emits stable HTTP attributes through the pinned contrib version. |
 | Configurability | ✅ Span name formatter, attribute filters, and metric attribute filter all overridable. |
 | Framework signal access | ✅ At handler level there is no extra signal beyond what `otelhttp` exposes. Route extraction for stdlib is via `r.Pattern` (Go 1.22+) or a router-supplied normalizer. |
 
@@ -210,6 +210,7 @@ return otelhttp.NewHandler(next, operation,
     otelhttp.WithTracerProvider(tp),
     otelhttp.WithMeterProvider(mp),
     otelhttp.WithPropagators(prop),
+    otelhttp.WithSpanNameFormatter(defaultServerSpanName),
     // user-supplied opts last so they can override SDK defaults
     convertedOpts...,
 )
@@ -219,7 +220,7 @@ The ADR 0003 §"Approved integrations" table is updated in the same PR:
 
 | Library | Version | Verified | Behavior | Notes |
 |---|---|---|---|---|
-| `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` | (pinned) | ✅ | Reads globals as fallback only; never sets. | See ADR 0009 |
+| `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` | v0.68.0 | ✅ | Reads globals as fallback only; never sets. | See ADR 0009 |
 
 ### 5. Migration checklist (ship in the implementation PR)
 

@@ -84,9 +84,7 @@ func main() {
 	})
 
 	tracer := obs.Tracer("metrics-example")
-	metricsHandler := o11yhttp.New(ctx, obs.Meter("metrics-example"),
-		o11yhttp.WithPathNormalizer(normalizeMetricsPath),
-	)(mux)
+	metricsHandler := o11yhttp.NewServerHandler(mux, obs.TracerProvider(), obs.MeterProvider(), obs.Propagator, "http.server")
 	handler := traceServerRequests(obs.Propagator, tracer, normalizeMetricsPath, metricsHandler)
 
 	// Start the app server on :8080.
@@ -180,7 +178,7 @@ func (r *traceStatusRecorder) Write(body []byte) (int, error) {
 	return r.ResponseWriter.Write(body)
 }
 
-func traceServerRequests(propagator propagation.TextMapPropagator, tracer trace.Tracer, normalize o11yhttp.PathNormalizer, next http.Handler) http.Handler {
+func traceServerRequests(propagator propagation.TextMapPropagator, tracer trace.Tracer, normalize func(*http.Request) string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		parentCtx := propagator.Extract(r.Context(), propagation.HeaderCarrier(r.Header))
 		ctx, span := tracer.Start(parentCtx, r.Method+" "+normalize(r), trace.WithSpanKind(trace.SpanKindServer))

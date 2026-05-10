@@ -1,6 +1,6 @@
 # ADR 0008 — Instrumentation Sourcing Policy
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-05-08
 
 ---
@@ -234,7 +234,7 @@ but the contract is fixed here:
    `go/analysis` pass) is open future work.
 
 The gate runs on every PR via GitHub Actions, plus locally via
-`make lint` (the existing `Makefile` target).
+`make adr-check` and `make lint` (the existing `Makefile` target).
 
 When the gate fails, the PR description must either fix the import
 graph or reference the ADR PR that adds the missing row. The two-PR
@@ -329,22 +329,12 @@ designs. The three-tier model stays.
 
 ---
 
-## Open questions
+## Accepted clarifications
 
-- **Vendor pinning policy.** Go modules use Minimum Version Selection
-  (MVS) and `go.mod` `require` directives accept exact versions or
-  pseudo-versions only — npm-style `^` ranges do not exist in this
-  ecosystem. The policy choice is therefore: (a) **strict pinning**,
-  where every minor / patch bump requires an ADR refresh and a fresh
-  §2 audit; or (b) **MVS-driven floor**, where minor / patch bumps
-  flow through `go get` automatically and audits run at major bumps
-  only. Lean: (a) for instrumentation libs (the ADR 0003 audit
-  burden makes it cheap to also re-confirm at every bump), (b) for
-  non-instrumentation deps. To be confirmed before this ADR moves
-  to Accepted.
-- **Test coverage expectation per tier.** T1 must have full unit +
-  integration coverage. T2 typically needs only "we wired the
-  options correctly" tests because the upstream library carries its
-  own coverage. T3 must reproduce the full test matrix the upstream
-  alternatives would have had. To be formalized in `AGENTS.md` once
-  this ADR lands.
+- **Vendor pinning policy.** Instrumentation libraries are intentionally
+  pinned in `go.mod`. Every bump refreshes ADR 0003's verification row
+  and reruns the ADR 0008 gate.
+- **Test coverage expectation per tier.** T1 code carries direct unit or
+  integration coverage. T2 facades test provider / propagator wiring and
+  any SDK-owned defaults. T3 packages must test the full instrumentation
+  behavior they own.

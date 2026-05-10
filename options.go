@@ -6,6 +6,11 @@ import "log/slog"
 // Prometheus /metrics HTTP server.
 const DefaultMetricsAddr = ":2112"
 
+// DefaultMaxUniqueRoutes is the default cap for distinct http.route values
+// before overflow routes are reported as "other" where exporter support
+// allows rewriting before export.
+const DefaultMaxUniqueRoutes = 1000
+
 // defaultLatencyBuckets is the SLO-friendly histogram boundary set applied
 // to all http.server.* histograms when the caller does not override it.
 // Standardizing these boundaries across the company keeps P99 calculations
@@ -37,6 +42,8 @@ type Config struct {
 	runtimeMetrics      bool
 	histogramBuckets    []float64
 	namespace           string
+	disableDefaultViews bool
+	maxUniqueRoutes     int
 }
 
 // Option is a functional option for configuring the o11y SDK.
@@ -171,6 +178,25 @@ func WithHistogramBuckets(buckets []float64) Option {
 	}
 }
 
+// WithDisableDefaultViews disables SDK-managed HTTP metric views.
+func WithDisableDefaultViews() Option {
+	return func(c *Config) {
+		c.disableDefaultViews = true
+	}
+}
+
+// WithMaxUniqueRoutes sets the distinct http.route cap. Values <= 0 use
+// DefaultMaxUniqueRoutes.
+func WithMaxUniqueRoutes(n int) Option {
+	return func(c *Config) {
+		if n <= 0 {
+			c.maxUniqueRoutes = DefaultMaxUniqueRoutes
+			return
+		}
+		c.maxUniqueRoutes = n
+	}
+}
+
 // defaultConfig returns a *Config initialized with the package's built-in defaults.
 // It sets otlpEndpoint to "http://localhost:4318", logLevel to slog.LevelInfo, metricsAddr to DefaultMetricsAddr, runtimeMetrics to true, and histogramBuckets to DefaultLatencyBuckets.
 func defaultConfig() *Config {
@@ -180,6 +206,7 @@ func defaultConfig() *Config {
 		metricsAddr:      DefaultMetricsAddr,
 		runtimeMetrics:   true,
 		histogramBuckets: cloneFloat64s(defaultLatencyBuckets),
+		maxUniqueRoutes:  DefaultMaxUniqueRoutes,
 	}
 }
 
