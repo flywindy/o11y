@@ -81,7 +81,7 @@ func Connect(
     tp trace.TracerProvider,
     prop propagation.TextMapPropagator,
     opts ...Option,
-) (*otelmongo.Client, error)
+) (*Client, error)
 
 type Option func(*config)
 
