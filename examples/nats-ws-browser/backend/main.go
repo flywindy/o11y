@@ -49,7 +49,8 @@ func (c natsHeaderCarrier) Keys() []string {
 }
 
 // metricsAddr returns the Prometheus scrape address, overridable via METRICS_ADDR.
-func metricsAddr() string {
+func metricsAddr(ctx context.Context) string {
+	_ = ctx
 	if v := os.Getenv("METRICS_ADDR"); v != "" {
 		return v
 	}
@@ -65,7 +66,7 @@ func main() {
 		o11y.WithServiceVersion("0.1.0"),
 		o11y.WithEnvironment("development"),
 		o11y.WithServiceNamespace("platform"),
-		o11y.WithMetricsAddr(metricsAddr()),
+		o11y.WithMetricsAddr(metricsAddr(ctx)),
 	)
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to initialise o11y SDK", slog.Any("error", err))
