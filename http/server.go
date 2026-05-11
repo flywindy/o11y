@@ -27,7 +27,7 @@ func NewServerHandler(next http.Handler, tp trace.TracerProvider, mp metric.Mete
 	return otelhttp.NewHandler(next, operation, base...)
 }
 
-func defaultServerSpanName(operation string, r *http.Request) string {
+func defaultServerSpanName(_ string, r *http.Request) string {
 	if r.Pattern == "" {
 		return r.Method
 	}
