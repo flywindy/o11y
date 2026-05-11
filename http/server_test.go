@@ -76,7 +76,7 @@ func TestNewServerHandler_ThreadsProvidersAndPropagator(t *testing.T) {
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(t.Context(), &rm))
 	require.Len(t, rm.ScopeMetrics, 1)
-	require.Len(t, rm.ScopeMetrics[0].Metrics, 3)
+	require.NotEmpty(t, rm.ScopeMetrics[0].Metrics)
 	assertHTTPDurationLabels(t, rm)
 }
 

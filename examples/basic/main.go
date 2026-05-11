@@ -10,7 +10,7 @@ import (
 	o11yhttp "github.com/flywindy/o11y/http"
 )
 
-// main initializes the observability SDK with service metadata and team labels, creates a root span and a nested child span to demonstrate tracing, and starts an HTTP server whose handlers are wrapped with httpmw to emit Prometheus metrics.
+// main initializes the observability SDK with service metadata, creates a root span and a nested child span to demonstrate tracing, and starts an HTTP server wrapped with the o11y otelhttp facade.
 // The program registers a deferred SDK shutdown that flushes in-flight spans and metrics with a 5-second timeout before exit.
 func main() {
 	ctx := context.Background()
@@ -54,10 +54,10 @@ func main() {
 	rootSpan.End()
 	obs.Logger.InfoContext(ctx, "example completed")
 
-	// 5. Demonstrate the HTTP middleware. Any handler wrapped with
-	//    o11yhttp.New will emit http_server_request_duration_seconds on
+	// 5. Demonstrate the HTTP facade. Any handler wrapped with
+	//    o11yhttp.NewServerHandler will emit http_server_request_duration_seconds on
 	//    the Prometheus scrape endpoint (default :2112/metrics) with a
-	//    team="platform" label pre-populated by the SDK.
+	//    service_namespace="platform" resource label pre-populated by the SDK.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("hello\n"))

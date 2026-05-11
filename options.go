@@ -168,8 +168,8 @@ func WithRuntimeMetrics(enabled bool) Option {
 }
 
 // WithHistogramBuckets overrides the histogram boundaries applied to HTTP
-// server latency histograms. Defaults to DefaultLatencyBuckets; override
-// only when your service has a genuinely different latency profile.
+// server and client latency histograms. Defaults to DefaultLatencyBuckets;
+// override only when your service has a genuinely different latency profile.
 // Changing these from the package default makes cross-service P99
 // comparisons inconsistent.
 func WithHistogramBuckets(buckets []float64) Option {

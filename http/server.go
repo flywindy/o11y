@@ -29,7 +29,7 @@ func NewServerHandler(next http.Handler, tp trace.TracerProvider, mp metric.Mete
 
 func defaultServerSpanName(operation string, r *http.Request) string {
 	if r.Pattern == "" {
-		return operation
+		return r.Method
 	}
 	if strings.Contains(r.Pattern, " ") {
 		return r.Pattern

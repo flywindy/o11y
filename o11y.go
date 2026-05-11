@@ -76,9 +76,10 @@ func (s *SDK) MeterProvider() *sdkmetric.MeterProvider {
 	return s.meterProvider
 }
 
-// Meter returns a named meter from the SDK's MeterProvider, mirroring the
-// shape of Tracer. Pass the returned meter to http.New or to your own
-// instrumentation code.
+// Meter returns a named meter from the SDK's MeterProvider for custom
+// instrumentation. HTTP server and client instrumentation are provided by the
+// http.NewServerHandler and http.NewTransport facades, which accept the SDK's
+// MeterProvider directly.
 func (s *SDK) Meter(name string) metric.Meter {
 	return s.meterProvider.Meter(name)
 }

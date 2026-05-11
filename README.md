@@ -371,7 +371,7 @@ go run examples/jetstream/publisher/main.go
 go run examples/jetstream/subscriber/main.go
 ```
 
-### Metrics (HTTP middleware + Prometheus scraping)
+### Metrics (otelhttp facade + Prometheus scraping)
 
 ```bash
 go run examples/metrics/main.go

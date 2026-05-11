@@ -129,6 +129,7 @@ func defaultViews(cfg Config) []sdkmetric.View {
 					semconv.HTTPResponseStatusCodeKey,
 					semconv.ServerAddressKey,
 					semconv.ServerPortKey,
+					semconv.ErrorTypeKey,
 				),
 			},
 		),
