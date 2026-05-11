@@ -10,16 +10,18 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
 var integrationDirs = []string{"http", "nats", "mongo", "gin", "resty"}
 
 var setterNames = map[string]struct{}{
-	"SetTracerProvider":     {},
+	"SetTracerProvider":    {},
 	"SetTextMapPropagator": {},
-	"SetMeterProvider":      {},
-	"SetLoggerProvider":     {},
+	"SetMeterProvider":     {},
+	"SetLoggerProvider":    {},
 }
 
 func main() {
@@ -118,9 +120,10 @@ func adrMentionsPackage(dir string) bool {
 	if err != nil {
 		return false
 	}
+	pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(dir) + "(?:/|[\\s\"'`)\\]]|$)")
 	for _, match := range matches {
 		body, err := os.ReadFile(match)
-		if err == nil && bytes.Contains(body, []byte(dir+"/")) {
+		if err == nil && pattern.Match(body) {
 			return true
 		}
 	}
@@ -146,13 +149,26 @@ func checkNoGlobalSetters() []error {
 			errs = append(errs, fmt.Errorf("parse %s: %w", path, err))
 			return nil
 		}
+		otelAliases, dotImportedOtel := otelImportNames(file)
 		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if ok && dotImportedOtel {
+				if ident, ok := call.Fun.(*ast.Ident); ok {
+					if _, forbidden := setterNames[ident.Name]; forbidden {
+						errs = append(errs, fmt.Errorf("%s: forbidden otel.%s call", fset.Position(ident.Pos()), ident.Name))
+					}
+				}
+			}
+
 			sel, ok := n.(*ast.SelectorExpr)
 			if !ok {
 				return true
 			}
 			ident, ok := sel.X.(*ast.Ident)
-			if !ok || ident.Name != "otel" {
+			if !ok {
+				return true
+			}
+			if _, importedOtel := otelAliases[ident.Name]; !importedOtel {
 				return true
 			}
 			if _, forbidden := setterNames[sel.Sel.Name]; forbidden {
@@ -166,6 +182,30 @@ func checkNoGlobalSetters() []error {
 		errs = append(errs, err)
 	}
 	return errs
+}
+
+func otelImportNames(file *ast.File) (map[string]struct{}, bool) {
+	names := make(map[string]struct{})
+	var dotImported bool
+	for _, spec := range file.Imports {
+		path, err := strconv.Unquote(spec.Path.Value)
+		if err != nil || path != "go.opentelemetry.io/otel" {
+			continue
+		}
+		if spec.Name == nil {
+			names["otel"] = struct{}{}
+			continue
+		}
+		switch spec.Name.Name {
+		case "_":
+			continue
+		case ".":
+			dotImported = true
+		default:
+			names[spec.Name.Name] = struct{}{}
+		}
+	}
+	return names, dotImported
 }
 
 func shouldSkipDir(name string) bool {
