@@ -134,7 +134,7 @@ func main() {
 | `WithLogLevel(level)` | `slog.LevelInfo` | Minimum log level |
 | `WithRuntimeMetrics(bool)` | `true` | Collect Go runtime metrics (goroutines, GC, memory) |
 | `WithDisableDefaultViews()` | off | Disable SDK-managed HTTP metric label allowlists and bucket views |
-| `WithMaxUniqueRoutes(n)` | `1000` | Cap distinct `http.route` values for supported exporters |
+| `WithMaxUniqueRoutes(n)` | `1000` | Cap exported distinct `http.route` values and derive the SDK aggregation cardinality budget |
 
 > **Migration note (pre-1.0 API change)** — `DefaultLatencyBuckets` is now a
 > function (`o11y.DefaultLatencyBuckets()` returning a fresh copy) rather
@@ -322,6 +322,11 @@ For Go 1.22+ `http.ServeMux`, route patterns become bounded span names such
 as `GET /api/orders/{id}` and bounded `http.route` metric labels. For routers
 such as chi or echo, use their route pattern as an otelhttp label or span-name
 formatter at the router edge; keep raw URL paths out of metric labels.
+`WithMaxUniqueRoutes` rewrites excess exported server routes to
+`http_route="other"` while the OTel SDK's own cardinality limit protects
+in-process aggregators from attacker-controlled attribute sets. If that lower
+SDK guard trips first, metrics are preserved under `otel_metric_overflow="true"`
+with route detail intentionally dropped.
 
 **Exemplars** are enabled automatically (OTel SDK default trace-based filter). When Prometheus is deployed with `--enable-feature=exemplar-storage` (included in `k8s/infrastructure/base/prometheus.yaml`), Grafana can navigate from a histogram bucket directly to the correlated trace in Tempo. The measurement context must contain an active sampled span; exemplar trace IDs are stored as exemplar metadata (`trace_id` / `span_id`), not as metric labels, so they do not create high-cardinality time series.
 

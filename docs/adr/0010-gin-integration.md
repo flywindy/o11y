@@ -163,9 +163,10 @@ on this package's side.
 ### 4. Cardinality at `http.route` is bounded by gin's route table
 
 `otelgin` populates `http.route` from `c.FullPath()`, which is the
-matched route template. The cap reader from ADR 0009 §2 still applies
-as defense in depth (in particular, gin's `NoRoute` handler can write
-arbitrary paths if user code abuses `c.Request.URL.Path`).
+matched route template. The metrics-pipeline cardinality controls from
+ADR 0009 §2 still apply as defense in depth (in particular, gin's
+`NoRoute` handler can write arbitrary paths if user code abuses
+`c.Request.URL.Path`).
 
 ### 5. Recovery interaction and middleware ordering
 

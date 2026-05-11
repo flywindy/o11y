@@ -91,8 +91,9 @@ Under this policy the constraint is reframed:
   finite route table, not from the raw URL path.
 - **Pathological cases (404 handlers writing arbitrary paths,
   redirect handlers) and label-explosion defense in depth move to the
-  MeterProvider layer** as a `metric.View` registered once at SDK
-  init. A single view limits the attribute keyspace for every
+  metrics pipeline** as SDK-managed views, an OTel SDK cardinality
+  limit, and export-boundary presentation caps registered once at SDK
+  init. The shared pipeline limits the attribute keyspace for every
   instrumentation library at once, instead of each middleware carrying
   its own limiter.
 
@@ -108,10 +109,12 @@ sdkmetric.NewView(
 )
 ```
 
-A separate hard cap on distinct `http.route` values (replacing
-`pathLimiter`) is implemented as a custom view or a custom `Reader`
-wrapper, not duplicated per middleware. Design detail is deferred to
-ADR 0009.
+A separate hard cap on exported distinct `http.route` values
+(replacing `pathLimiter`) is implemented at the export boundary, not
+duplicated per middleware. In-process memory protection uses the OTel
+SDK's supported cardinality limit because public views cannot mutate
+attribute values and external `Reader` wrappers cannot implement the
+SDK's unexported reader methods. Design detail lives in ADR 0009.
 
 ### 4. Approved-integrations registry stays in ADR 0003
 
@@ -139,7 +142,7 @@ ADR:
 | `o11y.Init` & co. | T1 self-written | T1 — keep | (no ADR needed) |
 | `nats/` | T2 facade over corp lib | T2 — keep | ADR 0004 (already accepted) |
 | `mongo/` | T2 facade over corp lib | T2 — keep | ADR 0005 (already accepted) |
-| `http/` | T3 self-written by accident | **Replace with otelhttp facade**; cardinality moves to View | ADR 0009 (forthcoming) |
+| `http/` | T3 self-written by accident | **Replace with otelhttp facade**; cardinality moves to the metrics pipeline | ADR 0009 (forthcoming) |
 | `gin/` | (planned T3) | **T2 facade over otelgin + ErrorRecorder** | ADR 0010 (forthcoming) |
 | `resty/` | (planned T3) | **Justified T3** (no maintained otelresty passes §2) | ADR 0011 (forthcoming) |
 | Future: gRPC | n/a | T2 over `otelgrpc` | future ADR |
@@ -308,8 +311,8 @@ designs. The three-tier model stays.
   but its self-maintained code grows much more slowly. Most new
   integrations are <100 LOC of glue.
 - Cardinality discipline becomes a property of the SDK as a whole
-  (one `metric.View`) rather than something each instrumentation
-  package re-implements.
+  (views, SDK cardinality limits, and export-boundary caps) rather
+  than something each instrumentation package re-implements.
 - The SDK is more recognizable to external Go engineers consuming it,
   because it composes standard OTel contrib packages they have likely
   used before.

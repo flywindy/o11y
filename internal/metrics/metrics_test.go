@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -132,6 +133,35 @@ func TestInitMeter_MaxUniqueRoutesCapsPrometheusRoutes(t *testing.T) {
 		}
 	}
 	assert.True(t, foundOtherCount, "overflow route count should merge to 2")
+}
+
+func TestInitMeter_MaxUniqueRoutesAppliesSDKOverflow(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.MaxUniqueRoutes = 1
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	hist, err := mp.Meter("test").Float64Histogram("http.server.request.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	for i := 0; i < 20; i++ {
+		hist.Record(context.Background(), 0.01, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String("GET"),
+			semconv.HTTPRoute("/route-"+strconv.Itoa(i)),
+			semconv.HTTPResponseStatusCode(http.StatusOK),
+		))
+	}
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	assert.Contains(t, body, `otel_metric_overflow="true"`)
 }
 
 // TestInitMeter_HappyPath verifies that InitMeter stands up a working

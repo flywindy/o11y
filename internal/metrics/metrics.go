@@ -77,6 +77,11 @@ type Config struct {
 // It is always safe to call even if the component was never started.
 type Closer func(context.Context) error
 
+// cardinalityLimitBudgetFactor leaves room for the bounded dimensions that
+// share a stream with http.route (method/status and future low-cardinality
+// labels) while still putting a hard ceiling on in-process SDK aggregation.
+const cardinalityLimitBudgetFactor = 10
+
 // InitMeter initializes an OTel MeterProvider and returns it together with a
 // Closer that must be called during SDK shutdown.
 //
@@ -174,9 +179,7 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 	}()
 
 	provider = sdkmetric.NewMeterProvider(
-		sdkmetric.WithReader(exporter),
-		sdkmetric.WithResource(res),
-		sdkmetric.WithView(views...),
+		meterProviderOptions(exporter, res, views, cfg.MaxUniqueRoutes)...,
 	)
 
 	if cfg.RuntimeMetrics {
@@ -240,9 +243,7 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []s
 	}()
 
 	provider := sdkmetric.NewMeterProvider(
-		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(cappedExporter)),
-		sdkmetric.WithResource(res),
-		sdkmetric.WithView(views...),
+		meterProviderOptions(sdkmetric.NewPeriodicReader(cappedExporter), res, views, cfg.MaxUniqueRoutes)...,
 	)
 
 	if cfg.RuntimeMetrics {
@@ -257,6 +258,26 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []s
 	// second shutdown when o11y.go also calls mp.Shutdown, so we return a
 	// no-op: the MeterProvider shutdown path handles everything.
 	return provider, func(_ context.Context) error { return nil }, nil
+}
+
+func meterProviderOptions(reader sdkmetric.Reader, res *resource.Resource, views []sdkmetric.View, maxUniqueRoutes int) []sdkmetric.Option {
+	opts := []sdkmetric.Option{
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithResource(res),
+		sdkmetric.WithView(views...),
+	}
+	if maxUniqueRoutes > 0 {
+		opts = append(opts, sdkmetric.WithCardinalityLimit(cardinalityLimitBudget(maxUniqueRoutes)))
+	}
+	return opts
+}
+
+func cardinalityLimitBudget(maxUniqueRoutes int) int {
+	const maxInt = int(^uint(0) >> 1)
+	if maxUniqueRoutes > maxInt/cardinalityLimitBudgetFactor {
+		return maxInt
+	}
+	return maxUniqueRoutes * cardinalityLimitBudgetFactor
 }
 
 // resolveResource returns the Resource to attach to the MeterProvider.

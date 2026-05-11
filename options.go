@@ -6,9 +6,9 @@ import "log/slog"
 // Prometheus /metrics HTTP server.
 const DefaultMetricsAddr = ":2112"
 
-// DefaultMaxUniqueRoutes is the default cap for distinct http.route values
-// before overflow routes are reported as "other" where exporter support
-// allows rewriting before export.
+// DefaultMaxUniqueRoutes is the default export-boundary cap for distinct
+// http.route values. Additional SDK cardinality limits protect in-process
+// aggregation memory before export.
 const DefaultMaxUniqueRoutes = 1000
 
 // defaultLatencyBuckets is the SLO-friendly histogram boundary set applied
@@ -185,8 +185,9 @@ func WithDisableDefaultViews() Option {
 	}
 }
 
-// WithMaxUniqueRoutes sets the distinct http.route cap. Values <= 0 use
-// DefaultMaxUniqueRoutes.
+// WithMaxUniqueRoutes sets the distinct http.route export cap. Values <= 0
+// use DefaultMaxUniqueRoutes. The SDK also derives an in-process aggregation
+// cardinality budget from this value to guard against unbounded attribute sets.
 func WithMaxUniqueRoutes(n int) Option {
 	return func(c *Config) {
 		if n <= 0 {

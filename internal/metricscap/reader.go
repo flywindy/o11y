@@ -1,5 +1,5 @@
-// Package metricscap rewrites high-cardinality metric attribute values before
-// export.
+// Package metricscap rewrites high-cardinality metric attribute values at
+// export boundaries.
 package metricscap
 
 import (
@@ -32,7 +32,8 @@ type PrometheusRule struct {
 	Max        int
 }
 
-// Limiter rewrites capped attributes in metricdata.ResourceMetrics.
+// Limiter rewrites capped attributes in metricdata.ResourceMetrics before
+// they are exported.
 type Limiter struct {
 	buckets sync.Map
 	rules   []Rule
@@ -106,27 +107,6 @@ func (b *bucket) observe(value string) string {
 	}
 	b.seen[value] = struct{}{}
 	return value
-}
-
-// Reader wraps an OTel metric Reader and rewrites capped attributes after
-// collection.
-type Reader struct {
-	sdkmetric.Reader
-	limiter *Limiter
-}
-
-// NewReader returns a Reader wrapper for inner.
-func NewReader(inner sdkmetric.Reader, rules ...Rule) *Reader {
-	return &Reader{Reader: inner, limiter: NewLimiter(rules...)}
-}
-
-// Collect delegates to the wrapped reader and rewrites capped attributes in rm.
-func (r *Reader) Collect(ctx context.Context, rm *metricdata.ResourceMetrics) error {
-	if err := r.Reader.Collect(ctx, rm); err != nil {
-		return err
-	}
-	r.limiter.Rewrite(rm)
-	return nil
 }
 
 // Exporter wraps an OTel metric Exporter and rewrites capped attributes before
