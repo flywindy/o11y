@@ -40,20 +40,20 @@ client SDK collects pprof samples from the Go runtime
 Pyroscope-compatible `/ingest` endpoint. Production-ready, stable v1.
 Default delta encoding to bound bandwidth.
 
-**Path B — OTLP Profiles signal (the OTel fourth signal).** The
-OpenTelemetry Profiles signal specification moved to stable in late
-2025, but as of this ADR's date:
+**Path B — OTLP Profiles signal.** As of 2026-05, OpenTelemetry
+Profiles is still experimental / public Alpha, not stable. The OTel
+Go SDK does not yet provide a stable profiles exporter, and
+Collector / backend support should be treated as emerging:
 
-- The OTel Go SDK does not yet ship a stable profiles exporter.
-- The OTel Collector has profiles receiver / exporter components only
-  in `contrib`, not in the base distribution.
-- Backend support for OTLP profiles is in early days; Pyroscope
-  accepts it through Grafana Alloy's bridge, but the on-wire schema
-  is still moving between minor versions.
+- No stable v1 profiles exporter in the OTel Go SDK line.
+- Collector profiles receiver / exporter live in `contrib` only.
+- Backend ingestion via OTLP profiles is transitional; on-wire
+  schema is still shifting between minor spec revisions.
 
 Path A is what production Go services run today. Path B is the
-strategic destination once the spec settles and the Go SDK exporter
-ships a stable line.
+strategic destination once the spec stabilizes, the Go exporter
+ships a stable line, and backend support matures (see §12 for the
+explicit migration trigger set).
 
 ### Routing implications
 
@@ -228,26 +228,38 @@ The shape of `o11y.Init` becomes:
      pyroscope.Start(pyroscope.Config{
          ApplicationName: cfg.serviceName,
          ServerAddress:   cfg.profilingEndpoint,
-         AuthToken / BasicAuth: encoded from cfg.profilingAuthHeaders,
-         Tags: §6 mapping from resource attrs,
-         ProfileTypes: [CPU, alloc_objects, alloc_space,
-                       inuse_objects, inuse_space],
-         Logger: slogAdapter(s.Logger),
+         HTTPHeaders:     cfg.profilingAuthHeaders,
+         Tags:            profileTagsFromResource(res),
+         ProfileTypes: []pyroscope.ProfileType{
+             pyroscope.ProfileCPU,
+             pyroscope.ProfileAllocObjects,
+             pyroscope.ProfileAllocSpace,
+             pyroscope.ProfileInuseObjects,
+             pyroscope.ProfileInuseSpace,
+         },
+         Logger: slogAdapter{s.Logger},
      })
-   Push the returned profiler.Stop into s.shutdowns (see §7 for order).
+   Insert profiler.Stop into the final shutdown slice immediately
+   before sdkTP.Shutdown (see ordering below).
 ```
 
-Shutdown order (LIFO of important resources):
+`WithProfilingAuthHeaders` values are copied defensively into the
+config map; callers can pass `Authorization`, `X-Scope-OrgID`, or any
+other header directly without SDK-side encoding. A
+`WithProfilingBasicAuth(user, pwd)` convenience helper stays
+deferred (see §3) — there is no need to special-case BasicAuth in
+v1 when the raw header pass-through covers it.
+
+Shutdowns run in **registration order** (matching `SDK.Shutdown`'s
+existing contract, which iterates `s.shutdowns` head-to-tail). When
+profiling is enabled, construct the final shutdown slice explicitly
+in this order:
 
 ```text
 1. metricsCloser (drain /metrics scrape traffic)
 2. mp.Shutdown
 3. lp.Shutdown
-4. profiler.Stop                  (NEW — stops the profiler before
-                                   the tp is shut down, because the
-                                   span processor on the wrapped tp
-                                   still emits spans during
-                                   shutdown of upstream resources)
+4. profiler.Stop                  (NEW — must run before sdkTP.Shutdown)
 5. sdkTP.Shutdown                 (always the original concrete tp;
                                    the otelpyroscope wrapper does not
                                    own a Shutdown method)
@@ -255,8 +267,9 @@ Shutdown order (LIFO of important resources):
 
 The profiler must stop **before** the tracer provider, because
 otelpyroscope's per-span `pprof.SetGoroutineLabels` calls assume
-the profiler is still running. Stopping the profiler last would
-race with goroutine label cleanup.
+the profiler is still running. Stopping the profiler after the
+tracer would race with goroutine label cleanup on in-flight spans
+that the tracer is draining during its own shutdown.
 
 ### 5. Init failure semantics — log and continue
 
@@ -321,11 +334,10 @@ The integration relies on three mechanisms working in concert:
 1. **Per-goroutine pprof labels.** The `otelpyroscope` wrapper, on
    span start, calls `pprof.SetGoroutineLabels(pprof.WithLabels(ctx,
    pprof.Labels("span_id", traceContext.SpanID().String(),
-   "span_name", spanName, "profile_id", generatedID)))`. Every pprof
-   sample taken on that goroutine for the duration of the span
-   carries those labels. Pyroscope's storage indexes by label, so a
-   query like `service_name="foo" AND profile_id="<id>"` returns
-   exactly the samples taken during that span.
+   "span_name", spanName, "profile_id", generatedID)))`. Pyroscope's
+   storage indexes by label, so a query like
+   `service_name="foo" AND profile_id="<id>"` returns the samples
+   taken while that goroutine carried the label.
 2. **`pyroscope.profile.id` span attribute.** The same generated
    `profile_id` is set as a span attribute via
    `span.SetAttributes(attribute.String("pyroscope.profile.id",
@@ -334,6 +346,26 @@ The integration relies on three mechanisms working in concert:
 3. **Tempo → Pyroscope datasource link.** Configured at the Grafana
    datasource level (`tempo.yaml` `tracesToProfiles` block, set in
    the infrastructure PR). Not in the Go SDK's responsibility.
+
+**Scope of the span ↔ profile link — what is and is not promised.**
+Trace-to-profile linking is **CPU-profile-only** for now.
+Service-level profiles may include any of the configured Pyroscope
+profile types (CPU + alloc + inuse per §3), but Tempo span-profile
+navigation should only be promised against CPU samples. Allocation
+and in-use profiles aggregate over different sampling boundaries and
+do not respect per-goroutine pprof labels with the same fidelity as
+the CPU sampler. README and godoc must say so explicitly so
+operators do not chase "missing memory profile" on a span that the
+SDK never claimed to support.
+
+By default, `otel-profiling-go` labels **root spans only**. A span
+carrying `pyroscope.profile.id` is a necessary condition for "View
+Profile" to fire, not a sufficient one: spans shorter than the CPU
+sampling interval (10 ms at the Go default 100 Hz) may have **zero**
+captured samples and therefore an empty profile view. This is a
+property of statistical sampling, not a bug. Operators should
+interpret "View Profile" on a sub-10 ms span as "no signal," not as
+"profiling broken."
 
 **Cross-goroutine caveat — must be documented.** `pprof.SetGoroutineLabels`
 binds labels to the calling goroutine only. When span-instrumented
@@ -410,13 +442,21 @@ ADR 0003 was written to address:
 
 The exception is therefore narrow and named:
 
-- The SDK calls `pyroscope.Start` at most once per process, gated by
-  `sync.Once` on a package-level guard. A second `o11y.Init` call
-  with a non-empty profiling endpoint returns an error from Init
-  if the first Init already started the profiler. (This is stricter
-  than the SDK's general "Init is idempotent" stance because
-  `pyroscope.Start` is not idempotent — calling it twice produces
-  undefined behavior in pyroscope-go.)
+- The SDK calls `pyroscope.Start` at most once **successfully** per
+  process, gated by a package-level `sync.Mutex` + `started bool`
+  pair. The `started` flag is set to `true` **only after**
+  `pyroscope.Start` returns without error. A `sync.Once` is
+  deliberately **not** used here: combined with §5's "log and
+  continue on Start failure" policy, `sync.Once` would consume its
+  one-shot slot on the first (failed) attempt, leaving subsequent
+  `o11y.Init` calls — including retries after a transient endpoint
+  outage or a test re-Init — permanently unable to start the
+  profiler. The `mutex + started bool` shape preserves the
+  process-singleton guarantee on success while keeping the failure
+  path retryable.
+- A second `o11y.Init` that finds `started == true` returns an
+  error from Init, because `pyroscope.Start` is not idempotent and
+  calling it twice produces undefined behavior in pyroscope-go.
 - The exception is recorded explicitly in the ADR 0003 "Approved
   integrations" table when this ADR moves to Accepted.
 
