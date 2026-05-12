@@ -62,7 +62,7 @@ func main() {
 	mux.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("hello\n"))
 	})
-	wrapped := o11yhttp.NewServerHandler(mux, obs.TracerProvider(), obs.MeterProvider(), obs.Propagator, "http.server")
+	wrapped := o11yhttp.NewServerHandler(mux, obs.TracerProvider(), obs.MeterProvider(), obs.Propagator)
 
 	obs.Logger.Info("serving demo handler on :8080 — curl http://localhost:2112/metrics to scrape")
 	srv := &http.Server{

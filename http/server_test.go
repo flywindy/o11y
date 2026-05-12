@@ -47,7 +47,7 @@ func TestNewServerHandler_ThreadsProvidersAndPropagator(t *testing.T) {
 		handlerSpanID = sc.SpanID()
 		w.WriteHeader(http.StatusAccepted)
 	})
-	handler := o11yhttp.NewServerHandler(mux, tp, mp, prop, "http.server")
+	handler := o11yhttp.NewServerHandler(mux, tp, mp, prop)
 
 	upstreamTraceID := trace.TraceID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	upstreamSpanID := trace.SpanID{1, 2, 3, 4, 5, 6, 7, 8}
@@ -78,6 +78,45 @@ func TestNewServerHandler_ThreadsProvidersAndPropagator(t *testing.T) {
 	require.Len(t, rm.ScopeMetrics, 1)
 	require.NotEmpty(t, rm.ScopeMetrics[0].Metrics)
 	assertHTTPDurationLabels(t, rm)
+}
+
+func TestNewServerHandler_DefaultSpanNameWithoutServeMuxPattern(t *testing.T) {
+	spanRecorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spanRecorder))
+	mp := sdkmetric.NewMeterProvider()
+	prop := propagation.TraceContext{}
+
+	handler := o11yhttp.NewServerHandler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}), tp, mp, prop)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/raw/path", nil))
+
+	require.Equal(t, http.StatusNoContent, rec.Code)
+	spans := spanRecorder.Ended()
+	require.Len(t, spans, 1)
+	assert.Equal(t, http.MethodPost, spans[0].Name())
+}
+
+func TestNewServerHandler_DefaultSpanNamePrefixesPatternWithoutMethod(t *testing.T) {
+	spanRecorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spanRecorder))
+	mp := sdkmetric.NewMeterProvider()
+	prop := propagation.TraceContext{}
+
+	handler := o11yhttp.NewServerHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Pattern = "/custom/{id}"
+		w.WriteHeader(http.StatusNoContent)
+	}), tp, mp, prop)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPatch, "/custom/123", nil))
+
+	require.Equal(t, http.StatusNoContent, rec.Code)
+	spans := spanRecorder.Ended()
+	require.Len(t, spans, 1)
+	assert.Equal(t, "PATCH /custom/{id}", spans[0].Name())
 }
 
 func assertHTTPDurationLabels(t *testing.T, rm metricdata.ResourceMetrics) {

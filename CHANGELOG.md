@@ -111,7 +111,6 @@ handler := o11yhttp.NewServerHandler(
     obs.TracerProvider(),
     obs.MeterProvider(),
     obs.Propagator,
-    "http.server",
 )
 ```
 

@@ -142,7 +142,7 @@ ADR:
 | `o11y.Init` & co. | T1 self-written | T1 — keep | (no ADR needed) |
 | `nats/` | T2 facade over corp lib | T2 — keep | ADR 0004 (already accepted) |
 | `mongo/` | T2 facade over corp lib | T2 — keep | ADR 0005 (already accepted) |
-| `http/` | T3 self-written by accident | **Replace with otelhttp facade**; cardinality moves to the metrics pipeline | ADR 0009 (forthcoming) |
+| `http/` | T3 self-written by accident | **Replace with otelhttp facade**; cardinality moves to the metrics pipeline | ADR 0009 |
 | `gin/` | (planned T3) | **T2 facade over otelgin + ErrorRecorder** | ADR 0010 (forthcoming) |
 | `resty/` | (planned T3) | **Justified T3** (no maintained otelresty passes §2) | ADR 0011 (forthcoming) |
 | Future: gRPC | n/a | T2 over `otelgrpc` | future ADR |

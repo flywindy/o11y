@@ -75,15 +75,13 @@ The new package shape:
 package http
 
 // NewServerHandler wraps next with otelhttp.NewHandler and the SDK's
-// providers. operation is the span name root used by otelhttp for
-// requests where no route is known; passing the empty string disables
-// the prefix.
+// providers. The facade supplies its own stable otelhttp operation name;
+// callers customize emitted span names with WithSpanNameFormatter.
 func NewServerHandler(
     next http.Handler,
     tp trace.TracerProvider,
     mp metric.MeterProvider,
     prop propagation.TextMapPropagator,
-    operation string,
     opts ...Option,
 ) http.Handler
 
@@ -298,11 +296,13 @@ boundaries can differ:
       must equal `{method, route, status_code}` exactly. No
       `url_full`, `client_address`, `network_protocol_version`, or
       similar high-cardinality leaks.
-- [ ] Route cap behavior. Force the export route cap by issuing
-      requests against `MaxUniqueRoutes + 5` distinct synthetic paths;
-      verify that the first N appear with their own labels and the
-      rest collapse to `route="other"` without dropping samples. Also
-      force the lower SDK cardinality budget and verify excess
+- [ ] Route cap behavior. Force the export route cap with distinct
+      synthetic `http.route` attributes or an intentionally unbounded
+      handler that preserves raw paths; do not rely on Go 1.22+
+      `ServeMux` raw paths, because they collapse to route templates.
+      Verify that the first N routes appear with their own labels and
+      the rest collapse to `route="other"` without dropping samples.
+      Also force the separate SDK cardinality budget and verify excess
       datapoints aggregate under `otel.metric.overflow=true`.
 
 **Queryability and dashboards** — the migration must not silently

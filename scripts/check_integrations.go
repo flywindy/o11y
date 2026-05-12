@@ -8,14 +8,16 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 )
 
 var integrationDirs = []string{"http", "nats", "mongo", "gin", "resty"}
+
+const otelModulePath = "go.opentelemetry.io/otel"
 
 var setterNames = map[string]struct{}{
 	"SetTracerProvider":    {},
@@ -149,13 +151,15 @@ func checkNoGlobalSetters() []error {
 			errs = append(errs, fmt.Errorf("parse %s: %w", path, err))
 			return nil
 		}
-		otelAliases, dotImportedOtel := otelImportNames(file)
+		info := typeInfoForFile(fset, file)
 		ast.Inspect(file, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
-			if ok && dotImportedOtel {
+			if ok {
 				if ident, ok := call.Fun.(*ast.Ident); ok {
 					if _, forbidden := setterNames[ident.Name]; forbidden {
-						errs = append(errs, fmt.Errorf("%s: forbidden otel.%s call", fset.Position(ident.Pos()), ident.Name))
+						if isOTelObject(info.Uses[ident]) {
+							errs = append(errs, fmt.Errorf("%s: forbidden otel.%s call", fset.Position(ident.Pos()), ident.Name))
+						}
 					}
 				}
 			}
@@ -168,7 +172,7 @@ func checkNoGlobalSetters() []error {
 			if !ok {
 				return true
 			}
-			if _, importedOtel := otelAliases[ident.Name]; !importedOtel {
+			if !isOTelPackageRoot(info.Uses[ident]) {
 				return true
 			}
 			if _, forbidden := setterNames[sel.Sel.Name]; forbidden {
@@ -184,28 +188,67 @@ func checkNoGlobalSetters() []error {
 	return errs
 }
 
-func otelImportNames(file *ast.File) (map[string]struct{}, bool) {
-	names := make(map[string]struct{})
-	var dotImported bool
-	for _, spec := range file.Imports {
-		path, err := strconv.Unquote(spec.Path.Value)
-		if err != nil || path != "go.opentelemetry.io/otel" {
-			continue
-		}
-		if spec.Name == nil {
-			names["otel"] = struct{}{}
-			continue
-		}
-		switch spec.Name.Name {
-		case "_":
-			continue
-		case ".":
-			dotImported = true
-		default:
-			names[spec.Name.Name] = struct{}{}
+func typeInfoForFile(fset *token.FileSet, file *ast.File) *types.Info {
+	info := &types.Info{
+		Uses: make(map[*ast.Ident]types.Object),
+	}
+	conf := types.Config{
+		Importer: policyImporter{},
+		Error:    func(error) {},
+	}
+	_, _ = conf.Check(file.Name.Name, fset, []*ast.File{file}, info)
+	return info
+}
+
+func isOTelPackageRoot(obj types.Object) bool {
+	pkgName, ok := obj.(*types.PkgName)
+	if !ok || pkgName.Imported() == nil {
+		return false
+	}
+	return pkgName.Imported().Path() == otelModulePath
+}
+
+func isOTelObject(obj types.Object) bool {
+	if obj == nil {
+		return false
+	}
+	if isOTelPackageRoot(obj) {
+		return true
+	}
+	pkg := obj.Pkg()
+	return pkg != nil && pkg.Path() == otelModulePath
+}
+
+type policyImporter struct{}
+
+func (policyImporter) Import(path string) (*types.Package, error) {
+	pkg := types.NewPackage(path, packageName(path))
+	if path == otelModulePath {
+		empty := types.NewTuple()
+		sig := types.NewSignatureType(nil, nil, nil, empty, empty, false)
+		for name := range setterNames {
+			pkg.Scope().Insert(types.NewFunc(token.NoPos, pkg, name, sig))
 		}
 	}
-	return names, dotImported
+	pkg.MarkComplete()
+	return pkg, nil
+}
+
+func packageName(importPath string) string {
+	name := importPath
+	if idx := strings.LastIndex(importPath, "/"); idx >= 0 {
+		name = importPath[idx+1:]
+	}
+	if name == "" {
+		return "pkg"
+	}
+	for _, r := range name {
+		if r == '_' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			continue
+		}
+		return "pkg"
+	}
+	return name
 }
 
 func shouldSkipDir(name string) bool {

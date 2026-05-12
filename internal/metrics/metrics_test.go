@@ -152,7 +152,7 @@ func TestInitMeter_MaxUniqueRoutesAppliesSDKOverflow(t *testing.T) {
 
 	hist, err := mp.Meter("test").Float64Histogram("http.server.request.duration", metric.WithUnit("s"))
 	require.NoError(t, err)
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 1100; i++ {
 		hist.Record(context.Background(), 0.01, metric.WithAttributes(
 			semconv.HTTPRequestMethodKey.String("GET"),
 			semconv.HTTPRoute("/route-"+strconv.Itoa(i)),

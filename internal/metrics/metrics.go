@@ -77,10 +77,14 @@ type Config struct {
 // It is always safe to call even if the component was never started.
 type Closer func(context.Context) error
 
-// cardinalityLimitBudgetFactor leaves room for the bounded dimensions that
-// share a stream with http.route (method/status and future low-cardinality
-// labels) while still putting a hard ceiling on in-process SDK aggregation.
-const cardinalityLimitBudgetFactor = 10
+// The SDK cardinality limit is an in-process memory guard, not the exported
+// route presentation cap. Derive it from the bounded HTTP keyspace so
+// WithMaxUniqueRoutes(n) can preserve route detail across normal method/status
+// combinations before the SDK overflow guard intentionally drops labels.
+const (
+	sdkCardinalityMethodBudget = 16
+	sdkCardinalityStatusBudget = 64
+)
 
 // InitMeter initializes an OTel MeterProvider and returns it together with a
 // Closer that must be called during SDK shutdown.
@@ -274,10 +278,11 @@ func meterProviderOptions(reader sdkmetric.Reader, res *resource.Resource, views
 
 func cardinalityLimitBudget(maxUniqueRoutes int) int {
 	const maxInt = int(^uint(0) >> 1)
-	if maxUniqueRoutes > maxInt/cardinalityLimitBudgetFactor {
+	perRouteBudget := sdkCardinalityMethodBudget * sdkCardinalityStatusBudget
+	if maxUniqueRoutes > maxInt/perRouteBudget {
 		return maxInt
 	}
-	return maxUniqueRoutes * cardinalityLimitBudgetFactor
+	return maxUniqueRoutes * perRouteBudget
 }
 
 // resolveResource returns the Resource to attach to the MeterProvider.

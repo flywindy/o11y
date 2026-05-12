@@ -1,6 +1,6 @@
 // Package main demonstrates metrics with the o11y SDK using OTLP push.
 //
-// The example starts an HTTP server wrapped with o11yhttp middleware, then
+// The example starts an HTTP server wrapped with the o11yhttp facade, then
 // generates periodic synthetic traffic. Metrics flow:
 //
 //	App ──OTLP/HTTP──► OTel Collector ──prometheusremotewrite──► Prometheus ──► Grafana
@@ -87,7 +87,6 @@ func main() {
 		obs.TracerProvider(),
 		obs.MeterProvider(),
 		obs.Propagator,
-		"http.server",
 		o11yhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
 			return r.Method + " " + normalizeMetricsPath(r)
 		}),
