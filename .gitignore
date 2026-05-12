@@ -36,6 +36,10 @@ go.work.sum
 
 # Build cache and temporary files
 .gocache/
+.golangci-cache/
+.gomodcache/
+.gopath/
+.gotmp/
 bin/
 obj/
 

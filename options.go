@@ -6,6 +6,11 @@ import "log/slog"
 // Prometheus /metrics HTTP server.
 const DefaultMetricsAddr = ":2112"
 
+// DefaultMaxUniqueRoutes is the default export-boundary cap for distinct
+// http.route values. Additional SDK cardinality limits protect in-process
+// aggregation memory before export.
+const DefaultMaxUniqueRoutes = 1000
+
 // defaultLatencyBuckets is the SLO-friendly histogram boundary set applied
 // to all http.server.* histograms when the caller does not override it.
 // Standardizing these boundaries across the company keeps P99 calculations
@@ -37,6 +42,8 @@ type Config struct {
 	runtimeMetrics      bool
 	histogramBuckets    []float64
 	namespace           string
+	disableDefaultViews bool
+	maxUniqueRoutes     int
 }
 
 // Option is a functional option for configuring the o11y SDK.
@@ -161,13 +168,33 @@ func WithRuntimeMetrics(enabled bool) Option {
 }
 
 // WithHistogramBuckets overrides the histogram boundaries applied to HTTP
-// server latency histograms. Defaults to DefaultLatencyBuckets; override
-// only when your service has a genuinely different latency profile.
+// server and client latency histograms. Defaults to DefaultLatencyBuckets;
+// override only when your service has a genuinely different latency profile.
 // Changing these from the package default makes cross-service P99
 // comparisons inconsistent.
 func WithHistogramBuckets(buckets []float64) Option {
 	return func(c *Config) {
 		c.histogramBuckets = cloneFloat64s(buckets)
+	}
+}
+
+// WithDisableDefaultViews disables SDK-managed HTTP metric views.
+func WithDisableDefaultViews() Option {
+	return func(c *Config) {
+		c.disableDefaultViews = true
+	}
+}
+
+// WithMaxUniqueRoutes sets the distinct http.route export cap. Values <= 0
+// use DefaultMaxUniqueRoutes. The SDK also derives an in-process aggregation
+// cardinality budget from this value to guard against unbounded attribute sets.
+func WithMaxUniqueRoutes(n int) Option {
+	return func(c *Config) {
+		if n <= 0 {
+			c.maxUniqueRoutes = DefaultMaxUniqueRoutes
+			return
+		}
+		c.maxUniqueRoutes = n
 	}
 }
 
@@ -180,6 +207,7 @@ func defaultConfig() *Config {
 		metricsAddr:      DefaultMetricsAddr,
 		runtimeMetrics:   true,
 		histogramBuckets: cloneFloat64s(defaultLatencyBuckets),
+		maxUniqueRoutes:  DefaultMaxUniqueRoutes,
 	}
 }
 

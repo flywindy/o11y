@@ -181,6 +181,7 @@ Full ADR documents live in [`docs/adr/`](docs/adr/).
 | NATS integration | `github.com/Marz32onE/instrumentation-go/otel-nats` — verified at v0.2.11 not to mutate globals; wrapped by the `nats/` package | Covers NATS Core + all JetStream consumer patterns with OTel semconv v1.39.0. See [ADR 0004](docs/adr/0004-nats-integration.md) |
 | MongoDB integration | `github.com/Marz32onE/instrumentation-go/otel-mongo/v2` — wrapped by the `mongo/` package | Uses the upstream `otel-mongo/v2/v0.2.11` tag commit through a Go pseudo-version. The wrapper wires SDK providers explicitly and keeps `_oteltrace` document injection off by default. See [ADR 0005](docs/adr/0005-mongodb-integration.md) |
 | Semconv version policy | Pin v1.39.0; upgrade only when concrete triggers fire | Single SDK-owned pin avoids cognitive cost and dashboard breakage. Upgrade triggers and process documented to keep version moves deliberate. See [ADR 0006](docs/adr/0006-semconv-upgrade-strategy.md) |
+| HTTP integration | `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` — wrapped by the `http/` package | Provides `NewServerHandler` and `NewTransport` with SDK providers and propagator wired explicitly. See [ADR 0009](docs/adr/0009-replace-http-with-otelhttp.md) |
 
 ---
 

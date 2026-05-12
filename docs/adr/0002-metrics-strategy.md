@@ -92,12 +92,15 @@ matches the OTel HTTP server semantic conventions' "Golden Signal" recommendatio
 ### 7. Cardinality protection is mandatory for all label dimensions with unbounded input
 
 `http.route` is the canonical example: without normalization, every unique URL path becomes
-a distinct series. The middleware enforces two layers:
+a distinct series. The SDK enforces layered protection:
 
-1. A caller-supplied `WithPathNormalizer` collapses dynamic segments to route templates
-   (e.g. `/users/123` → `/users/:id`).
-2. A hard cap (`DefaultMaxUniquePaths = 1000`, overridable via `WithMaxUniquePaths`) collapses
-   any additional unseen route to the literal label `"other"`.
+1. Framework-aware instrumentation must emit route templates rather than raw URL paths.
+2. SDK-managed views drop high-cardinality HTTP metric labels before aggregation.
+3. A hard export cap (`DefaultMaxUniqueRoutes = 1000`, overridable via
+   `WithMaxUniqueRoutes`) collapses additional unseen routes to the literal label
+   `"other"` where route labels still reach export.
+4. The OTel SDK cardinality limit protects in-process aggregation memory when an
+   instrument still records too many distinct attribute sets.
 
 **Any new label dimension that can grow without bound must apply equivalent protection.**
 User IDs, request IDs, trace IDs, and similar high-cardinality values must never appear as

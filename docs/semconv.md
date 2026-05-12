@@ -70,8 +70,9 @@ Histogram boundaries pinned via an OTel View to
 | Key | Type | Notes |
 |---|---|---|
 | `http.request.method` | string | e.g. `GET`, `POST`. |
-| `http.route` | string | Normalized route template (e.g. `/users/:id`), never the raw URL path. Cardinality-capped via `WithPathNormalizer` + `WithMaxUniquePaths` (default 1000); overflow collapses to `"other"`. |
+| `http.route` | string | Normalized route template (e.g. `/users/:id`), never the raw URL path. Export cardinality is capped via `WithMaxUniqueRoutes` (default 1000); ordinary overflow collapses to `"other"`, while SDK aggregation overflow uses `otel.metric.overflow=true`. |
 | `http.response.status_code` | int | Must be `attribute.Int`, not `attribute.String`. |
+| `otel.metric.overflow` | bool | Emitted by the OTel SDK when the aggregation cardinality limit is reached. This is an SDK safety valve, not a semconv HTTP label. |
 
 ---
 

@@ -1,6 +1,6 @@
 # ADR 0009 — Replace `http/` with `otelhttp` Facade
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-05-08
 
 **Supersedes parts of** `http/middleware.go` (commit history); **applies** ADR 0008.
@@ -36,7 +36,7 @@ justification. Re-evaluating `http/middleware.go` against the ADR 0008
 |---|---|
 | ADR 0003 compliance | ✅ Reads globals as fallback only; `WithTracerProvider` / `WithMeterProvider` / `WithPropagators` options bypass the fallback. |
 | Maintenance signal | ✅ Maintained by OpenTelemetry contrib. |
-| Semconv alignment | ✅ Emits v1.39.0 stable HTTP attributes. |
+| Semconv alignment | ✅ Emits stable HTTP attributes through the pinned contrib version. |
 | Configurability | ✅ Span name formatter, attribute filters, and metric attribute filter all overridable. |
 | Framework signal access | ✅ At handler level there is no extra signal beyond what `otelhttp` exposes. Route extraction for stdlib is via `r.Pattern` (Go 1.22+) or a router-supplied normalizer. |
 
@@ -75,15 +75,13 @@ The new package shape:
 package http
 
 // NewServerHandler wraps next with otelhttp.NewHandler and the SDK's
-// providers. operation is the span name root used by otelhttp for
-// requests where no route is known; passing the empty string disables
-// the prefix.
+// providers. The facade supplies its own stable otelhttp operation name;
+// callers customize emitted span names with WithSpanNameFormatter.
 func NewServerHandler(
     next http.Handler,
     tp trace.TracerProvider,
     mp metric.MeterProvider,
     prop propagation.TextMapPropagator,
-    operation string,
     opts ...Option,
 ) http.Handler
 
@@ -109,13 +107,13 @@ status capture. `otelhttp` already does these correctly and has more
 test coverage for edge cases (Hijacker, Flusher, Pusher, ReaderFrom,
 trailers) than we can reasonably maintain.
 
-### 2. Cardinality control moves to the MeterProvider via `metric.View`
+### 2. Cardinality control moves to the metrics pipeline
 
 The `pathLimiter` is removed. Cardinality discipline is implemented
 once at SDK init and applies to every instrumentation library that
 emits `http.route`-shaped attributes (`http`, `gin`, future `chi`).
 
-Two layers, both registered **automatically by `o11y.Init`** (not
+Three layers are registered **automatically by `o11y.Init`** (not
 caller opt-in). The `o11y.WithDisableDefaultViews()` and
 `o11y.WithMaxUniqueRoutes(int)` options exist for callers who need to
 override; the defaults assume callers want cardinality protection.
@@ -165,18 +163,43 @@ keys the SDK considers cardinality-safe. `url.full`, `client.address`,
 low-signal attributes that some upstream libs emit on metrics by
 default get filtered before they reach the exporter.
 
-**Layer B — distinct-value cap on `http.route`** (default on, with
-`o11y.WithMaxUniqueRoutes(int)` to override):
+**Layer B - SDK aggregation cardinality budget** (default on, derived
+from `o11y.WithMaxUniqueRoutes(int)`):
 
-A custom `metric.Reader` wrapper interposes between the SDK and the
-exporter. For each `http.route` value seen, after the configured cap
-the reader rewrites the attribute to the literal `"other"` before
-forwarding the data point. The cap is per `(instrument name, attribute
-key)` pair so different histograms do not share a budget.
+The OTel Go SDK does not expose a public hook that can mutate an
+attribute value after the view filter and before aggregation:
 
-The reader implementation lives at `internal/metricscap/reader.go`.
+- `sdkmetric.Reader` has unexported methods, so external wrappers
+  cannot be registered with `sdkmetric.WithReader`.
+- `sdkmetric.Stream.AttributeFilter` can keep or drop keys, but cannot
+  rewrite `http.route` to another value.
+- The SDK does not expose a custom aggregator plugin point.
+
+Therefore in-process memory protection uses the supported
+`sdkmetric.WithCardinalityLimit` hook. The SDK derives a per-instrument
+datapoint budget from `WithMaxUniqueRoutes` and applies it to the
+MeterProvider. If a service records more distinct attribute sets than
+that budget, OTel aggregates the excess into the SDK-defined overflow
+series `otel.metric.overflow=true`. This is intentionally lower-level
+than `http.route`: it protects the aggregator map even for future
+misconfigured instruments, at the cost of losing label detail once the
+overflow guard trips.
+
+**Layer C - export-boundary `http.route` presentation cap** (default
+on, with `o11y.WithMaxUniqueRoutes(int)` to override):
+
+For Prometheus pull and OTLP push, the SDK wraps the export boundary.
+For each `http.route` value that still reaches export, after the
+configured cap the wrapper rewrites the attribute to the literal
+`"other"` before forwarding the data point. The cap is per
+`(instrument name, attribute key)` pair so different histograms do not
+share a budget.
+
+The export-boundary implementation lives in `internal/metricscap`.
 Tests cover: under-cap pass-through, at-cap collapse, attribute set
-re-hashing on collapse, concurrency.
+re-hashing on collapse, Prometheus histogram merge, and concurrency.
+This layer keeps Prometheus/Grafana queryability stable. It is not the
+memory defense; the SDK aggregation cardinality budget above is.
 
 The cap's existence is **defense in depth**. Framework-aware
 instrumentation already keeps `http.route` bounded by the route table.
@@ -210,6 +233,7 @@ return otelhttp.NewHandler(next, operation,
     otelhttp.WithTracerProvider(tp),
     otelhttp.WithMeterProvider(mp),
     otelhttp.WithPropagators(prop),
+    otelhttp.WithSpanNameFormatter(defaultServerSpanName),
     // user-supplied opts last so they can override SDK defaults
     convertedOpts...,
 )
@@ -219,7 +243,7 @@ The ADR 0003 §"Approved integrations" table is updated in the same PR:
 
 | Library | Version | Verified | Behavior | Notes |
 |---|---|---|---|---|
-| `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` | (pinned) | ✅ | Reads globals as fallback only; never sets. | See ADR 0009 |
+| `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` | v0.68.0 | ✅ | Reads globals as fallback only; never sets. | See ADR 0009 |
 
 ### 5. Migration checklist (ship in the implementation PR)
 
@@ -272,10 +296,14 @@ boundaries can differ:
       must equal `{method, route, status_code}` exactly. No
       `url_full`, `client_address`, `network_protocol_version`, or
       similar high-cardinality leaks.
-- [ ] Cap reader behavior. Force the route cap by issuing requests
-      against `MaxUniqueRoutes + 5` distinct synthetic paths; verify
-      that the first N appear with their own labels and the rest
-      collapse to `route="other"` without dropping samples.
+- [ ] Route cap behavior. Force the export route cap with distinct
+      synthetic `http.route` attributes or an intentionally unbounded
+      handler that preserves raw paths; do not rely on Go 1.22+
+      `ServeMux` raw paths, because they collapse to route templates.
+      Verify that the first N routes appear with their own labels and
+      the rest collapse to `route="other"` without dropping samples.
+      Also force the separate SDK cardinality budget and verify excess
+      datapoints aggregate under `otel.metric.overflow=true`.
 
 **Queryability and dashboards** — the migration must not silently
 break downstream queries:
@@ -350,22 +378,24 @@ them is better done by giving them the final API now than by giving
 them a transitional one. Future SDK consumers benefit from finding
 exactly one HTTP API on first read.
 
-### Why move cardinality control to the MeterProvider
+### Why move cardinality control to the metrics pipeline
 
 Three reasons:
 
-1. **DRY across instrumentation packages.** A cap implemented in the
-   `http/` package would not protect metrics emitted by `gin/`,
-   `chi/`, or future router integrations. A cap at the MeterProvider
-   protects all of them at once.
+1. **DRY across instrumentation packages.** A cap implemented only in
+   the `http/` package would not protect metrics emitted by `gin/`,
+   `chi/`, or future router integrations. A MeterProvider cardinality
+   budget protects every instrument before aggregation.
 2. **Cap independence from instrumentation.** The cap is a property
-   of the metrics pipeline (Prometheus cannot afford >N series), not
-   of any one HTTP middleware. Co-locating it with the pipeline
-   reflects the actual ownership.
+   of the metrics pipeline (the SDK cannot afford unbounded
+   in-process datapoints, and Prometheus cannot afford >N route
+   series), not of any one HTTP middleware. Co-locating both guards
+   with the pipeline reflects the actual ownership.
 3. **Reuse for non-HTTP integrations.** `messaging.destination.name`
    in NATS subjects, `db.collection.name` in MongoDB — the same
-   keyspace-explosion failure mode applies. The reader-level cap
-   generalizes.
+   keyspace-explosion failure mode applies. The SDK cardinality budget
+   generalizes; export-boundary presentation caps can then be added
+   where the backend has a stable label to rewrite.
 
 ---
 
@@ -374,8 +404,8 @@ Three reasons:
 **Positive**
 
 - ~320 lines of self-maintained HTTP middleware deleted, replaced by
-  ~50 lines of facade plus ~100 lines of MeterProvider-level cap
-  reader (the cap is reused beyond HTTP).
+  ~50 lines of facade plus a metrics-pipeline cardinality budget and
+  export-boundary route presentation cap.
 - HTTP server tracing works for the first time — inbound
   `traceparent` is extracted, server spans are created and propagated
   to handlers, slog ↔ trace correlation works at the entry point.
@@ -384,8 +414,10 @@ Three reasons:
 - Consumer services already running `otelhttp` align naturally with
   the SDK; they configure providers via `o11y.Init` and stop their
   own `otel.SetX` setup.
-- Cardinality control becomes uniform and applies to every future
-  HTTP-shaped integration without per-package reimplementation.
+- In-process cardinality control becomes uniform and applies to every
+  future integration without per-package reimplementation.
+- Exported HTTP server metrics keep the queryable `http.route="other"`
+  bucket for ordinary route overflow on both Prometheus and OTLP paths.
 
 **Negative / Trade-offs**
 
@@ -395,24 +427,27 @@ Three reasons:
   non-stdlib, non-popular routers must supply route extraction
   themselves via `otelhttp` options. We will document the chi and
   echo recipes in the README to reduce friction.
-- The MeterProvider-level cap is a new piece of code we own. Its
-  surface area is small (~100 LOC) and it is testable in isolation.
-  It is still self-written code — but it is cross-cutting
-  infrastructure, not instrumentation, and properly belongs to T1
-  (Core SDK) under ADR 0008's tier model.
+- The export-boundary route presentation cap is a new piece of code we
+  own. Its surface area is small and it is testable in isolation. It
+  is still self-written code, but it is cross-cutting infrastructure,
+  not instrumentation, and properly belongs to T1 (Core SDK) under
+  ADR 0008's tier model.
+- If the SDK cardinality guard trips before the export-boundary route
+  cap, OTel preserves totals under `otel.metric.overflow=true` and
+  route detail is intentionally lost for the overflowed datapoints.
 
 ---
 
 ## Open questions
 
-- **Default cap value.** `DefaultMaxUniquePaths = 1000` was the
+- **Default cap value.** `DefaultMaxUniqueRoutes = 1000` is the
   current value. Keep it, or revisit based on production label
   budgets? Lean: keep 1000 until concrete evidence demands change.
-- **Per-attribute cap configuration.** The cap reader supports a
-  per-attribute budget. Should we expose `WithAttributeCap(string, int)`
-  or a single `WithDefaultAttributeCap(int)` for simplicity? Lean:
-  start with the global default and add per-attribute as concrete
-  needs arise.
+- **Per-attribute cap configuration.** The export-boundary cap supports a
+  per-attribute export budget. Should we expose
+  `WithAttributeCap(string, int)` or a single
+  `WithDefaultAttributeCap(int)` for simplicity? Lean: start with the
+  global default and add per-attribute as concrete needs arise.
 - **Eviction policy when cap is hit.** "First N unique values stick,
   the rest collapse to 'other'" is the simplest. An alternative is
   LRU. Lean: stick with first-N (matches current `pathLimiter`

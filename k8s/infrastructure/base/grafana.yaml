@@ -46,6 +46,7 @@ data:
         exemplarTraceIdDestinations:
           - name: trace_id
             datasourceUid: tempo
+            urlDisplayLabel: "Open trace in Tempo"
 
     - name: Loki
       type: loki
@@ -112,7 +113,19 @@ data:
       "fiscalYearStartMonth": 0,
       "graphTooltip": 0,
       "id": null,
-      "links": [],
+      "links": [
+        {
+          "asDropdown": false,
+          "icon": "external link",
+          "includeVars": false,
+          "keepTime": true,
+          "targetBlank": false,
+          "title": "Open Tempo Explore",
+          "tooltip": "Open Tempo Explore with the current dashboard time range",
+          "type": "link",
+          "url": "/explore?schemaVersion=1&orgId=1&panes=%7B%22tempoExplore%22%3A%7B%22datasource%22%3A%22tempo%22%2C%22queries%22%3A%5B%7B%22refId%22%3A%22A%22%2C%22datasource%22%3A%7B%22type%22%3A%22tempo%22%2C%22uid%22%3A%22tempo%22%7D%2C%22queryType%22%3A%22traceql%22%2C%22query%22%3A%22%7Bresource.service.name%3D%5C%22metrics-example%5C%22%7D%22%7D%5D%2C%22range%22%3A%7B%22from%22%3A%22${__from}%22%2C%22to%22%3A%22${__to}%22%7D%7D%7D"
+        }
+      ],
       "panels": [
         {
           "datasource": {
@@ -167,6 +180,7 @@ data:
                 "uid": "prometheus"
               },
               "editorMode": "code",
+              "exemplar": true,
               "expr": "histogram_quantile(0.95, sum by (le, job, http_route, http_response_status_code) (rate(http_server_request_duration_seconds_bucket{job=\"platform/metrics-example\"}[5m])))",
               "legendFormat": "{{http_route}} {{http_response_status_code}}",
               "range": true,

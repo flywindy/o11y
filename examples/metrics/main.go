@@ -1,6 +1,6 @@
 // Package main demonstrates metrics with the o11y SDK using OTLP push.
 //
-// The example starts an HTTP server wrapped with o11yhttp middleware, then
+// The example starts an HTTP server wrapped with the o11yhttp facade, then
 // generates periodic synthetic traffic. Metrics flow:
 //
 //	App ──OTLP/HTTP──► OTel Collector ──prometheusremotewrite──► Prometheus ──► Grafana
@@ -33,9 +33,7 @@ import (
 
 	"github.com/flywindy/o11y"
 	o11yhttp "github.com/flywindy/o11y/http"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
-	"go.opentelemetry.io/otel/trace"
 )
 
 func main() {
@@ -65,8 +63,8 @@ func main() {
 		}
 	}()
 
-	// Build an HTTP handler wrapped with the o11y middleware.
-	// The middleware emits http_server_request_duration_seconds histogram with
+	// Build an HTTP handler wrapped with the o11y otelhttp facade.
+	// The facade emits http_server_request_duration_seconds histogram with
 	// service_namespace, service_name, service_version, and
 	// deployment_environment_name as constant labels on every series.
 	mux := http.NewServeMux()
@@ -84,10 +82,15 @@ func main() {
 	})
 
 	tracer := obs.Tracer("metrics-example")
-	metricsHandler := o11yhttp.New(ctx, obs.Meter("metrics-example"),
-		o11yhttp.WithPathNormalizer(normalizeMetricsPath),
-	)(mux)
-	handler := traceServerRequests(obs.Propagator, tracer, normalizeMetricsPath, metricsHandler)
+	handler := o11yhttp.NewServerHandler(
+		mux,
+		obs.TracerProvider(),
+		obs.MeterProvider(),
+		obs.Propagator,
+		o11yhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+			return r.Method + " " + normalizeMetricsPath(r)
+		}),
+	)
 
 	// Start the app server on :8080.
 	ln, err := net.Listen("tcp", ":8080")
@@ -161,35 +164,4 @@ func normalizeMetricsPath(r *http.Request) string {
 	default:
 		return "/unknown"
 	}
-}
-
-type traceStatusRecorder struct {
-	http.ResponseWriter
-	status int
-}
-
-func (r *traceStatusRecorder) WriteHeader(status int) {
-	r.status = status
-	r.ResponseWriter.WriteHeader(status)
-}
-
-func (r *traceStatusRecorder) Write(body []byte) (int, error) {
-	if r.status == 0 {
-		r.status = http.StatusOK
-	}
-	return r.ResponseWriter.Write(body)
-}
-
-func traceServerRequests(propagator propagation.TextMapPropagator, tracer trace.Tracer, normalize o11yhttp.PathNormalizer, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		parentCtx := propagator.Extract(r.Context(), propagation.HeaderCarrier(r.Header))
-		ctx, span := tracer.Start(parentCtx, r.Method+" "+normalize(r), trace.WithSpanKind(trace.SpanKindServer))
-		defer span.End()
-
-		recorder := &traceStatusRecorder{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(recorder, r.WithContext(ctx))
-		if recorder.status >= http.StatusInternalServerError {
-			span.SetStatus(codes.Error, http.StatusText(recorder.status))
-		}
-	})
 }

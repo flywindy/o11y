@@ -166,6 +166,18 @@ func TestInit_AcceptsExtremeValidBuckets(t *testing.T) {
 	testutil.MustShutdown(t.Context(), t, sdk)
 }
 
+func TestInit_AcceptsHTTPMetricGovernanceOptions(t *testing.T) {
+	srv := testutil.FakeOTLPServer(t)
+
+	opts := append(commonOpts(srv.URL),
+		o11y.WithDisableDefaultViews(),
+		o11y.WithMaxUniqueRoutes(7),
+	)
+	sdk, err := o11y.Init(context.Background(), opts...)
+	require.NoError(t, err)
+	testutil.MustShutdown(t.Context(), t, sdk)
+}
+
 // TestInit_OTLPHeadersForwarded confirms WithOTLPHeaders reaches the
 // outbound HTTP request. We use a capturing fake server in place of a real
 // OTel Collector and trigger a forced flush so the trace exporter sends at

@@ -3,12 +3,16 @@ package metrics_test
 import (
 	"context"
 	"net"
+	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/metric"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 
 	"github.com/flywindy/o11y/internal/metrics"
 	"github.com/flywindy/o11y/internal/testutil"
@@ -24,6 +28,140 @@ func baseConfig(addr string) metrics.Config {
 		RuntimeMetrics:   true,
 		HistogramBuckets: []float64{0.1, 1, 10},
 	}
+}
+
+func TestInitMeter_DefaultHTTPViewsFilterServerAttributes(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	mp, closer, err := metrics.InitMeter(context.Background(), baseConfig(addr))
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	hist, err := mp.Meter("test").Float64Histogram("http.server.request.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	hist.Record(context.Background(), 0.01, metric.WithAttributes(
+		semconv.HTTPRequestMethodKey.String("GET"),
+		semconv.HTTPRoute("/orders/{id}"),
+		semconv.HTTPResponseStatusCode(http.StatusOK),
+		semconv.URLFull("https://example.test/orders/123?token=secret"),
+		semconv.ClientAddress("203.0.113.10"),
+	))
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "http_server_request_duration_seconds_count{") {
+			continue
+		}
+		assert.Contains(t, line, `http_request_method="GET"`)
+		assert.Contains(t, line, `http_route="/orders/{id}"`)
+		assert.Contains(t, line, `http_response_status_code="200"`)
+		assert.NotContains(t, line, "url_full")
+		assert.NotContains(t, line, "client_address")
+		return
+	}
+	t.Fatal("http_server_request_duration_seconds_count not found")
+}
+
+func TestInitMeter_DisableDefaultViewsKeepsHTTPAttributes(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.DisableDefaultViews = true
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	hist, err := mp.Meter("test").Float64Histogram("http.server.request.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	hist.Record(context.Background(), 0.01, metric.WithAttributes(
+		semconv.HTTPRequestMethodKey.String("GET"),
+		semconv.HTTPRoute("/orders/{id}"),
+		semconv.HTTPResponseStatusCode(http.StatusOK),
+		semconv.URLFull("https://example.test/orders/123"),
+	))
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	assert.Contains(t, body, "url_full")
+}
+
+func TestInitMeter_MaxUniqueRoutesCapsPrometheusRoutes(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.MaxUniqueRoutes = 1
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	hist, err := mp.Meter("test").Float64Histogram("http.server.request.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	for _, route := range []string{"/keep", "/overflow-a", "/overflow-b"} {
+		hist.Record(context.Background(), 0.01, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String("GET"),
+			semconv.HTTPRoute(route),
+			semconv.HTTPResponseStatusCode(http.StatusOK),
+		))
+	}
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	assert.Contains(t, body, `http_route="other"`)
+	assert.Contains(t, body, `http_route="/keep"`)
+	assert.NotContains(t, body, `http_route="/overflow-a"`)
+	assert.NotContains(t, body, `http_route="/overflow-b"`)
+	var foundOtherCount bool
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "http_server_request_duration_seconds_count{") &&
+			strings.Contains(line, `http_route="other"`) &&
+			strings.HasSuffix(line, "} 2") {
+			foundOtherCount = true
+			break
+		}
+	}
+	assert.True(t, foundOtherCount, "overflow route count should merge to 2")
+}
+
+func TestInitMeter_MaxUniqueRoutesAppliesSDKOverflow(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.MaxUniqueRoutes = 1
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	hist, err := mp.Meter("test").Float64Histogram("http.server.request.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	for i := 0; i < 1100; i++ {
+		hist.Record(context.Background(), 0.01, metric.WithAttributes(
+			semconv.HTTPRequestMethodKey.String("GET"),
+			semconv.HTTPRoute("/route-"+strconv.Itoa(i)),
+			semconv.HTTPResponseStatusCode(http.StatusOK),
+		))
+	}
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	assert.Contains(t, body, `otel_metric_overflow="true"`)
 }
 
 // TestInitMeter_HappyPath verifies that InitMeter stands up a working
