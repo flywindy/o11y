@@ -23,6 +23,7 @@ so that every log entry is automatically enriched with `traceId` and `spanId`.
 | Tracing | OpenTelemetry Go SDK (OTLP/HTTP) | Not gRPC — keep it simple for local dev |
 | Logging | `log/slog` + `otelslog` bridge | Dual output: OTLP/HTTP → Loki (full OTel Log Data Model) and JSON stdout; `OtelSlogHandler` injects traceId / spanId on stdout path |
 | Metrics | Prometheus pull (`:2112`) or OTLP push | Pull: k8s pods scraped by Prometheus; Push: `WithMetricsOTLPEndpoint` for local dev / serverless |
+| Web framework | gin v1 | `gin/` wraps `otelgin` with SDK providers and typed `c.Errors` recording |
 | Messaging | NATS | High-performance pub/sub |
 | Database | MongoDB | NoSQL persistence |
 | Tracing backend | Grafana Tempo | |
@@ -31,6 +32,20 @@ so that every log entry is automatically enriched with `traceId` and `spanId`.
 | Visualization | Grafana | Unified traces, logs, and metrics; exemplars link histograms → Tempo traces |
 | Collector | OTel Collector | Centralized telemetry pipeline for traces, logs, and OTLP metrics |
 | Local cluster | kind (Kubernetes in Docker) | Port 4318 mapped for OTLP/HTTP (traces, logs, and metrics push) |
+
+---
+
+## Package Layout
+
+| Path | Purpose |
+|---|---|
+| `/` | Core SDK initialization, options, resources, and provider lifecycle |
+| `http/` | T2 facade over `otelhttp` for server and client HTTP instrumentation |
+| `gin/` | T2 facade over `otelgin` plus typed gin error recording |
+| `nats/` | T2 facade over NATS Core and JetStream instrumentation |
+| `mongo/` | T2 facade over MongoDB driver instrumentation |
+| `internal/` | SDK-owned logging, tracing, metrics, and test utilities |
+| `examples/` | Runnable examples for supported integrations |
 
 ---
 
@@ -182,6 +197,7 @@ Full ADR documents live in [`docs/adr/`](docs/adr/).
 | MongoDB integration | `github.com/Marz32onE/instrumentation-go/otel-mongo/v2` — wrapped by the `mongo/` package | Uses the upstream `otel-mongo/v2/v0.2.11` tag commit through a Go pseudo-version. The wrapper wires SDK providers explicitly and keeps `_oteltrace` document injection off by default. See [ADR 0005](docs/adr/0005-mongodb-integration.md) |
 | Semconv version policy | Pin v1.39.0; upgrade only when concrete triggers fire | Single SDK-owned pin avoids cognitive cost and dashboard breakage. Upgrade triggers and process documented to keep version moves deliberate. See [ADR 0006](docs/adr/0006-semconv-upgrade-strategy.md) |
 | HTTP integration | `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` — wrapped by the `http/` package | Provides `NewServerHandler` and `NewTransport` with SDK providers and propagator wired explicitly. See [ADR 0009](docs/adr/0009-replace-http-with-otelhttp.md) |
+| Gin integration | `go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin` — wrapped by the `gin/` package | Provides canonical middleware ordering and typed `gin.error.type` events for `c.Errors`. See [ADR 0010](docs/adr/0010-gin-integration.md) |
 
 ---
 
@@ -271,6 +287,7 @@ client, err := o11ymongo.Connect(ctx, mongoURI, sdk.TracerProvider(), sdk.Propag
 - ❌ Add Kubernetes manifests that send traces or logs directly to backends (Tempo, Loki) — traces and logs must go through the OTel Collector; Prometheus scraping `:2112` directly is intentional and correct
 - ❌ Call `otelnats.Connect` or `otelnats.ConnectWithOptions` directly — always go through `o11ynats.Connect` so the SDK providers are wired correctly
 - ❌ Import `github.com/Marz32onE/instrumentation-go/otel-mongo/v2` directly from services — always go through `o11ymongo.Connect` so the SDK providers are wired correctly and `_oteltrace` defaults stay enforced
+- ❌ Import `go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin` directly from services — always go through `o11ygin.Middleware` so SDK providers, propagator, and typed gin error events are wired consistently
 - ❌ Enable MongoDB `_oteltrace` document injection by default — only use `o11ymongo.WithDocumentTracePropagation(true)` when an application explicitly opts in and accepts the schema/cardinality trade-offs
 - ❌ Use `msg.Respond(data)` inside a Subscribe handler when trace context must be preserved in the reply — use `conn.Publish(ctx, msg.Reply, data)` instead
 - ❌ Use `WithTeam` — it no longer exists; use `WithServiceNamespace` instead
