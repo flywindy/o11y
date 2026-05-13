@@ -383,6 +383,44 @@ in-process aggregators from attacker-controlled attribute sets. If the separate
 SDK guard trips, metrics are preserved under `otel_metric_overflow="true"`
 with route detail intentionally dropped.
 
+### Using with gin
+
+Use the `gin` sub-package to wire gin's OTel middleware to the SDK-owned
+TracerProvider, MeterProvider, and Propagator. Register the returned chain
+before `gin.Recovery()` so panics recovered by gin still produce complete HTTP
+status attributes and metrics.
+
+```go
+import (
+    "errors"
+    "net/http"
+
+    o11ygin "github.com/flywindy/o11y/gin"
+    "github.com/gin-gonic/gin"
+)
+
+router := gin.New()
+router.Use(o11ygin.Middleware(
+    "orders-api",
+    obs.TracerProvider(),
+    obs.MeterProvider(),
+    obs.Propagator,
+)...)
+router.Use(gin.Recovery())
+
+router.GET("/orders/:id", func(c *gin.Context) {
+    c.JSON(http.StatusOK, gin.H{"status": "ok"})
+})
+router.GET("/fail", func(c *gin.Context) {
+    err := errors.New("simulated failure")
+    c.AbortWithError(http.StatusInternalServerError, err).SetType(gin.ErrorTypePublic)
+})
+```
+
+`ErrorRecorder` adds typed `gin.error.type` span events for errors pushed via
+`c.Error` / `c.AbortWithError`. The metric label set remains governed by the
+SDK's HTTP metric views and does not include gin error types.
+
 **Exemplars** are enabled automatically (OTel SDK default trace-based filter). When Prometheus is deployed with `--enable-feature=exemplar-storage` (included in `k8s/infrastructure/base/prometheus.yaml`), Grafana can navigate from a histogram bucket directly to the correlated trace in Tempo. The measurement context must contain an active sampled span; exemplar trace IDs are stored as exemplar metadata (`trace_id` / `span_id`), not as metric labels, so they do not create high-cardinality time series.
 
 **Kubernetes pods** must opt in to scraping with the annotation:
@@ -446,6 +484,17 @@ Open Grafana at `http://localhost:3000` and navigate to:
 - **Explore → Prometheus** — `http_server_request_duration_seconds`; click an exemplar dot to jump to the linked trace in Tempo
 - **Dashboards → Observability → Metrics Correlation** — HTTP latency metrics with a data link that opens the matching `metrics-example` logs in Loki
 
+### Gin
+
+```bash
+go run examples/gin/main.go
+curl http://localhost:8080/ok
+curl http://localhost:8080/fail
+```
+
+The example registers `o11ygin.Middleware(...)` before `gin.Recovery()` and
+demonstrates typed `gin.error.type` span events from `c.AbortWithError`.
+
 ### MongoDB
 
 Run a local MongoDB instance or port-forward one to `localhost:27017`, then
@@ -478,8 +527,8 @@ go run examples/mongodb/main.go
 - [`github.com/Marz32onE/instrumentation-go/otel-nats`](https://github.com/Marz32onE/instrumentation-go) — provides the underlying NATS Core + JetStream tracing semantics used by the `nats/` wrapper. Verified at v0.2.11 not to mutate OTel globals and to import semconv v1.39.0. See [ADR 0004](docs/adr/0004-nats-integration.md) for the integration decision and audit discipline.
 - [`github.com/Marz32onE/instrumentation-go/otel-mongo/v2`](https://github.com/Marz32onE/instrumentation-go) — provides the underlying MongoDB driver v2 tracing semantics used by the `mongo/` wrapper. Verified at the `otel-mongo/v2/v0.2.11` tag not to mutate OTel globals, with `_oteltrace` document propagation disabled by default through the o11y wrapper. See [ADR 0005](docs/adr/0005-mongodb-integration.md).
 - [`go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp`](https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp) — provides the underlying HTTP server/client instrumentation used by the `http/` facade. See [ADR 0009](docs/adr/0009-replace-http-with-otelhttp.md).
-
 - [`github.com/grafana/pyroscope-go`](https://github.com/grafana/pyroscope-go) and [`github.com/grafana/otel-profiling-go`](https://github.com/grafana/otel-profiling-go) provide the Pyroscope profiler and trace-to-profile bridge. See [ADR 0012](docs/adr/0012-profiling-integration.md).
+- [`go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin`](https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin) — provides the underlying gin instrumentation used by the `gin/` facade. See [ADR 0010](docs/adr/0010-gin-integration.md).
 
 ## AI Collaboration
 
