@@ -107,9 +107,9 @@ func ErrorRecorder() gin.HandlerFunc
 span-name formatter receives `*gin.Context`, so the concrete facade
 signature is `WithSpanNameFormatter(func(*gin.Context) string)`.
 
-- `WithSpanNameFormatter(func(*http.Request) string)` — passes through to otelgin
-- `WithFilter(func(*http.Request) bool)` — passes through to otelgin
-- `WithMetricAttributesFn(...)` — passes through
+- `WithSpanNameFormatter(func(*gin.Context) string)` passes through to otelgin
+- `WithFilter(func(*http.Request) bool)` passes through to otelgin
+- `WithMetricAttributesFn(...)` passes through to otelgin
 
 ### 2. ErrorRecorder semantics
 

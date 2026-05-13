@@ -6,6 +6,7 @@
 //	go run examples/gin/main.go
 //	curl http://localhost:8080/ok
 //	curl http://localhost:8080/fail
+//	curl http://localhost:8080/panic
 package main
 
 import (

@@ -16,7 +16,9 @@ const ginErrorTypeKey = "gin.error.type"
 //
 // It must run after otelgin.Middleware in the gin chain so that
 // c.Request.Context contains the server span. If no valid span is active,
-// ErrorRecorder is a no-op.
+// ErrorRecorder is a no-op. In the canonical Middleware chain, otelgin owns
+// the final HTTP-derived span status during unwind; ErrorRecorder's SetStatus
+// path preserves useful behavior when ErrorRecorder is used separately.
 func ErrorRecorder() ginframework.HandlerFunc {
 	return func(c *ginframework.Context) {
 		c.Next()
@@ -32,6 +34,8 @@ func ErrorRecorder() ginframework.HandlerFunc {
 				trace.WithAttributes(attribute.String(ginErrorTypeKey, ginErrorTypeString(ge.Type))),
 			)
 		}
+		// This is mainly for standalone ErrorRecorder use. In the canonical
+		// chain, otelgin runs after this during unwind and sets final status.
 		if c.Writer.Status() >= 500 {
 			span.SetStatus(codes.Error, c.Errors.Last().Error())
 		}
@@ -39,6 +43,8 @@ func ErrorRecorder() ginframework.HandlerFunc {
 }
 
 func ginErrorTypeString(errorType ginframework.ErrorType) string {
+	// ErrorTypeAny is an exact sentinel. A bitmask check would match every
+	// non-zero gin error type because ErrorTypeAny contains all bits.
 	if errorType == ginframework.ErrorTypeAny {
 		return "any"
 	}

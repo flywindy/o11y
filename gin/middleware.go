@@ -16,14 +16,15 @@ import (
 //
 // The SDK's tracer provider, meter provider, and propagator are passed
 // explicitly so otelgin never falls back to process-wide OpenTelemetry globals.
-// User options are appended last so callers can override otelgin behavior.
+// User options are appended last for behavior customizations; provider and
+// propagator overrides are intentionally not exposed by this facade.
 func Middleware(service string, tp trace.TracerProvider, mp metric.MeterProvider, prop propagation.TextMapPropagator, opts ...Option) []ginframework.HandlerFunc {
 	base := []otelgin.Option{
 		otelgin.WithTracerProvider(tp),
 		otelgin.WithMeterProvider(mp),
 		otelgin.WithPropagators(prop),
 	}
-	base = append(base, opts...)
+	base = append(base, applyOptions(opts)...)
 	return []ginframework.HandlerFunc{
 		otelgin.Middleware(service, base...),
 		ErrorRecorder(),
