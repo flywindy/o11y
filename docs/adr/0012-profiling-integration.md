@@ -152,11 +152,15 @@ Rationale:
 - Every OTel instrumentation library accepts `trace.TracerProvider`
   (the interface); the concrete type is never required at the
   boundary.
-- The same `SDK` field can hold the original `*sdktrace.TracerProvider`
-  internally for shutdown (`s.shutdowns = append(..., tp.Shutdown)`)
-  while exposing only the interface externally — including the
-  `otelpyroscope.NewTracerProvider(tp)` wrapper when profiling is
-  enabled.
+- The `SDK` struct stores two distinct fields: a private
+  `tracerProviderInternal *sdktrace.TracerProvider` used only for
+  registering `tp.Shutdown` into `s.shutdowns`, and a public
+  `tracerProviderPublic trace.TracerProvider` returned by
+  `SDK.TracerProvider()`. When profiling is enabled,
+  `tracerProviderPublic = otelpyroscope.NewTracerProvider(
+  tracerProviderInternal, ...)`; otherwise `tracerProviderPublic =
+  tracerProviderInternal`. The pseudocode in §4 uses these names
+  verbatim so the implementation PR has no ambiguity.
 - Future wraps (rate-limiting sampler injection, multi-tenant
   routing) become non-breaking because the public type is already
   an interface.
@@ -470,8 +474,12 @@ The exception is therefore narrow and named:
   path: if `Stop` errored, the profiler may be in a partially-torn-
   down state and pprof globals may still be claimed, so a second
   `Init` must still be rejected. The reset is a property of the
-  `Stop` closure itself, not of `SDK.Shutdown`, so the ordering with
-  other shutdown steps is irrelevant.
+  `Stop` closure itself, not of `SDK.Shutdown`; the flag is reset
+  atomically inside the closure under the package-level
+  `sync.Mutex`, so the timing of the reset relative to other
+  shutdown steps does not affect correctness. The `profiler.Stop`
+  call itself, however, must still precede `sdkTP.Shutdown` per the
+  §4 ordering requirement.
 - The exception is recorded explicitly in the ADR 0003 "Approved
   integrations" table when this ADR moves to Accepted.
 
@@ -562,6 +570,16 @@ migration. Until then, this ADR is the contract.
   consumer, so the cost is paid at the cheapest possible moment.
 - The integration is opt-in (empty endpoint = no profiler started),
   so services not yet ready for profiling pay no overhead.
+- **README update obligation for the implementation PR.** Per
+  `AGENTS.md`'s "README is the first point of contact" rule, the
+  follow-up implementation PR must update `README.md` to cover:
+  the new `WithProfilingEndpoint` and `WithProfilingAuthHeaders`
+  options, the breaking return-type changes on
+  `SDK.TracerProvider()` and `SDK.MeterProvider()`, end-to-end
+  usage examples for profiling, and the §7 caveats
+  (CPU-profile-only linking, root-span-only default labeling,
+  cross-goroutine pprof-label scope). Reviewers verify the README
+  diff covers each of these explicitly before approval.
 
 **Negative / Trade-offs**
 
