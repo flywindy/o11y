@@ -535,9 +535,11 @@ migration. Until then, this ADR is the contract.
   `WithProfilingAuthHeaders`) and zero changes to existing required
   options.
 - Trace-to-profile cross-navigation works in Tempo UI without
-  per-service configuration: every span on a goroutine that ran
-  during a profile carries `pyroscope.profile.id`, and Tempo's
-  `tracesToProfiles` datasource link does the rest.
+  per-service configuration. By default, `otel-profiling-go` labels
+  root spans only; those spans carry `pyroscope.profile.id`, and
+  Tempo's `tracesToProfiles` datasource link does the rest. Operators
+  navigating from sub-sampling-interval spans see an empty profile,
+  not a broken link (see §7 for the precise semantics).
 - Resource attribute mapping is centralized; services cannot drift
   in how they label profiles (no `application_name` overrides).
 - The breaking change to `SDK.TracerProvider()` / `SDK.MeterProvider()`
@@ -559,10 +561,13 @@ migration. Until then, this ADR is the contract.
   profiles go via Alloy, the other three signals via OTel Collector.
   This is an honest reflection of the ecosystem state today, but it
   is one more concept for operators to hold.
-- A `sync.Once` on the profiler global means a second `Init` call
-  with profiling enabled in the same process returns an error
-  (§9). This is stricter than the SDK's general posture on multiple
-  Inits but is forced by pyroscope-go's non-idempotent start.
+- A package-level `sync.Mutex` + `started bool` (§9) means a second
+  `Init` call after a successful first start returns an error. This
+  is stricter than the SDK's general posture on multiple Inits but
+  is forced by pyroscope-go's non-idempotent start. The mutex shape
+  (vs. `sync.Once`) keeps the failure path retryable so that a
+  transient endpoint outage on the first Init does not lock the
+  process out of profiling forever.
 - Mutex / block profiling is off by default and not exposable as an
   option in v1 (§3). Services that genuinely need them have to wait
   for a follow-up option. Acceptable because their absence is
