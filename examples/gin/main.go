@@ -1,4 +1,5 @@
-// Package main demonstrates gin instrumentation with the o11y SDK.
+// Package main demonstrates gin instrumentation with the o11y SDK using OTLP
+// metrics push.
 //
 // Run with:
 //
@@ -7,6 +8,9 @@
 //	curl http://localhost:8080/ok
 //	curl http://localhost:8080/fail
 //	curl http://localhost:8080/panic
+//
+// In Grafana: Explore -> Prometheus -> query
+// http_server_request_duration_seconds_bucket.
 package main
 
 import (
@@ -34,6 +38,10 @@ func main() {
 		o11y.WithEnvironment("development"),
 		o11y.WithServiceNamespace("platform"),
 		o11y.WithOTLPEndpoint("http://localhost:4318"),
+		// Push metrics via OTLP instead of exposing only the local Prometheus
+		// scrape endpoint. The OTel Collector forwards them to Prometheus via
+		// remote write, matching examples/metrics.
+		o11y.WithMetricsOTLPEndpoint("http://localhost:4318"),
 		o11y.WithLogLevel(slog.LevelInfo),
 	)
 	if err != nil {
