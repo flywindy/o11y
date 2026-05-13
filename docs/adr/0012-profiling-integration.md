@@ -220,12 +220,17 @@ The shape of `o11y.Init` becomes:
 
 ```text
 1. Resource construction (unchanged)
-2. TracerProvider build (sdktrace.NewTracerProvider, unchanged)
+2. TracerProvider build:
+     sdkTP := sdktrace.NewTracerProvider(...)  // unchanged
+     s.tracerProviderInternal = sdkTP          // bound here; used
+                                               // only for shutdown
+                                               // registration below
 3. If WithProfilingEndpoint != "":
-     a. Build the otelpyroscope wrapper around the sdk tp.
-        s.tracerProviderPublic = otelpyroscope.NewTracerProvider(sdkTP,
+     a. Build the otelpyroscope wrapper around the concrete tp.
+        s.tracerProviderPublic = otelpyroscope.NewTracerProvider(
+            s.tracerProviderInternal,
             otelpyroscope.WithAppName(cfg.serviceName))
-     b. Otherwise: s.tracerProviderPublic = sdkTP
+     b. Otherwise: s.tracerProviderPublic = s.tracerProviderInternal
 4. MeterProvider build (unchanged)
 5. LoggerProvider build (unchanged)
 6. If WithProfilingEndpoint != "":
@@ -244,7 +249,7 @@ The shape of `o11y.Init` becomes:
          Logger: slogAdapter{logger},
      })
    Insert profiler.Stop into the final shutdown slice immediately
-   before sdkTP.Shutdown (see ordering below).
+   before s.tracerProviderInternal.Shutdown (see ordering below).
 ```
 
 `logger` in step 6 refers to the local dual-output `*slog.Logger` built
@@ -269,10 +274,13 @@ in this order:
 1. metricsCloser (drain /metrics scrape traffic)
 2. mp.Shutdown
 3. lp.Shutdown
-4. profiler.Stop                  (NEW — must run before sdkTP.Shutdown)
-5. sdkTP.Shutdown                 (always the original concrete tp;
-                                   the otelpyroscope wrapper does not
-                                   own a Shutdown method)
+4. profiler.Stop                            (NEW — must run before
+                                             s.tracerProviderInternal.Shutdown)
+5. s.tracerProviderInternal.Shutdown        (always the original
+                                             concrete tp; the
+                                             otelpyroscope wrapper
+                                             does not own a Shutdown
+                                             method)
 ```
 
 The profiler must stop **before** the tracer provider, because
@@ -478,8 +486,8 @@ The exception is therefore narrow and named:
   atomically inside the closure under the package-level
   `sync.Mutex`, so the timing of the reset relative to other
   shutdown steps does not affect correctness. The `profiler.Stop`
-  call itself, however, must still precede `sdkTP.Shutdown` per the
-  §4 ordering requirement.
+  call itself, however, must still precede
+  `s.tracerProviderInternal.Shutdown` per the §4 ordering requirement.
 - The exception is recorded explicitly in the ADR 0003 "Approved
   integrations" table when this ADR moves to Accepted.
 
