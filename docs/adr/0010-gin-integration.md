@@ -1,6 +1,6 @@
 # ADR 0010 — Gin Integration
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-05-08
 
 **Applies** ADR 0008 (sourcing policy); **builds on** ADR 0009
@@ -31,6 +31,12 @@ ADR 0008 §2 checklist applied to
 | Semconv alignment | ✅ Recent versions emit v1.30+ stable HTTP attributes; we pin to a release that emits v1.39.0 to match ADR 0006. If no such release exists at adoption time, we either wait or pin one minor version behind and document the gap. |
 | Configurability | ✅ Span name formatter, attribute injector, and filter all overridable. |
 | Framework signal access | ⚠️ Modern `otelgin` writes `c.Errors.String()` as a single concatenated `gin.errors` string attribute, but does **not** call `span.RecordError` per-error nor classify by `gin.ErrorType`. ErrorRecorder (§2) **enhances** rather than replaces this: it adds typed `RecordError` calls with `gin.error.type` so each error becomes a span event queryable in TraceQL. |
+
+Adoption-time verification pinned `otelgin` v0.68.0, which already emits
+`http.server.request.duration` and already records `c.Errors` as span error
+events. The remaining SDK-owned gap is typed classification: upstream does
+not add `gin.error.type`, so ErrorRecorder adds typed error events while
+leaving upstream span and metric ownership intact.
 
 Four full passes plus one gap closable in <30 lines of facade code.
 T2 adoption is justified.
@@ -91,17 +97,19 @@ func Middleware(
 
 // ErrorRecorder returns a gin.HandlerFunc that records any errors
 // pushed via c.Error / c.AbortWithError onto the active OTel server
-// span using span.RecordError, and sets the span status to Error
-// when len(c.Errors) > 0. It must run after the otelgin middleware
+// span using span.RecordError with a gin.error.type attribute, and sets
+// the span status to Error for 5xx responses. It must run after the otelgin middleware
 // in the chain so that a server span exists in c.Request.Context().
 func ErrorRecorder() gin.HandlerFunc
 ```
 
-`Option` exposes a curated subset:
+`Option` exposes a curated subset. Adoption note: `otelgin` v0.68.0's
+span-name formatter receives `*gin.Context`, so the concrete facade
+signature is `WithSpanNameFormatter(func(*gin.Context) string)`.
 
-- `WithSpanNameFormatter(func(*http.Request) string)` — passes through to otelgin
-- `WithFilter(func(*http.Request) bool)` — passes through to otelgin
-- `WithMetricAttributesFn(...)` — passes through
+- `WithSpanNameFormatter(func(*gin.Context) string)` passes through to otelgin
+- `WithFilter(func(*http.Request) bool)` passes through to otelgin
+- `WithMetricAttributesFn(...)` passes through to otelgin
 
 ### 2. ErrorRecorder semantics
 
@@ -121,13 +129,13 @@ func ErrorRecorder() gin.HandlerFunc {
         for _, ge := range c.Errors {
             span.RecordError(ge.Err,
                 trace.WithAttributes(
-                    attribute.String("gin.error.type", ge.Type.String()),
+                    attribute.String("gin.error.type", ginErrorTypeString(ge.Type)),
                 ),
             )
         }
-        // OTel semconv: server-side 5xx is Error; for 4xx we still
-        // record the errors above but leave status Unset to match
-        // ADR 0009 / otelgin convention.
+        // OTel semconv: server-side 5xx is Error. Note that otelgin
+        // v0.68.0 also sets Error when c.Errors is non-empty, including
+        // 4xx responses produced with AbortWithError.
         if c.Writer.Status() >= 500 {
             span.SetStatus(codes.Error, c.Errors.Last().Error())
         }
@@ -137,7 +145,8 @@ func ErrorRecorder() gin.HandlerFunc {
 
 `gin.ErrorType` values (`ErrorTypeBind`, `ErrorTypeRender`,
 `ErrorTypePublic`, `ErrorTypePrivate`, `ErrorTypeAny`) map to the
-`gin.error.type` attribute as the type's string form. This is gin-
+`gin.error.type` attribute as `bind`, `render`, `public`, `private`,
+and `any`; combined bitmasks are joined with `|`. This is gin-
 specific; it is intentionally **not** mapped to OTel's `error.type`
 attribute because OTel's `error.type` is for transport / protocol
 class names (e.g. `*net.OpError`), not framework-level error tags.
@@ -222,18 +231,22 @@ inversion requires manual effort.
 #### Middleware-ordering test matrix (ship in the implementation PR)
 
 The PR adds tests covering each row. Each test asserts the recorded
-span attributes, span status, recorded errors, and the
-`http.server.request.duration` sample for the request.
+span attributes, span status, typed gin error events added by ErrorRecorder,
+and the `http.server.request.duration` sample for the request.
+
+Because `otelgin` v0.68.0 sets span status to Error whenever `c.Errors`
+is non-empty, `AbortWithError(400, err)` produces an Error span even though
+plain 4xx responses remain Unset.
 
 | # | Scenario | Recovery present | Custom recovery | Handler outcome | Expected span status | Expected `c.Errors` surfaced | Expected metric `status_code` |
 |---|---|---|---|---|---|---|---|
 | 1 | Happy path | `gin.Recovery()` | n/a | 200 OK | Unset | none | 200 |
 | 2 | 4xx via `c.JSON(400, ...)` | `gin.Recovery()` | n/a | 400 | Unset | none | 400 |
-| 3 | 4xx via `c.AbortWithError(400, err)` | `gin.Recovery()` | n/a | 400 | Unset (4xx is not server error per OTel) | one error recorded with `gin.error.type` | 400 |
-| 4 | 5xx via `c.AbortWithError(500, err)` | `gin.Recovery()` | n/a | 500 | Error, message = err.Error() | one error recorded | 500 |
-| 5 | Multiple `c.Error(err1)` + `c.AbortWithError(500, err2)` | `gin.Recovery()` | n/a | 500 | Error, message = err2.Error() | both errors recorded in order | 500 |
+| 3 | 4xx via `c.AbortWithError(400, err)` | `gin.Recovery()` | n/a | 400 | Error, message = `c.Errors.String()` from otelgin v0.68.0 | one typed error event with `gin.error.type` | 400 |
+| 4 | 5xx via `c.AbortWithError(500, err)` | `gin.Recovery()` | n/a | 500 | Error, message = `c.Errors.String()` | one typed error event | 500 |
+| 5 | Multiple `c.Error(err1)` + `c.AbortWithError(500, err2)` | `gin.Recovery()` | n/a | 500 | Error, message = `c.Errors.String()` | both typed error events recorded in order | 500 |
 | 6 | Handler panics, default Recovery | `gin.Recovery()` | n/a | 500 | Error (from status code), description **empty** — panic was swallowed by inner Recovery before any tracing layer saw it | none (`gin.Recovery` does not push panic into `c.Errors`) | 500 |
-| 7 | Handler panics, custom Recovery that **does** push into `c.Errors` | none | custom that calls `c.Error(panicErr); c.AbortWithStatus(500)` | 500 | Error | one error recorded with the panic value | 500 |
+| 7 | Handler panics, custom Recovery that **does** push into `c.Errors` | none | custom that calls `c.Error(panicErr); c.AbortWithStatus(500)` | 500 | Error | one typed error event with the panic value | 500 |
 | 8 | Handler panics, custom Recovery that swallows the panic and writes 200 | none | custom that recovers and `c.JSON(200, fallback)` | 200 | Unset | none | 200 |
 | 9 | `c.Abort()` without error, status 204 | `gin.Recovery()` | n/a | 204 | Unset | none | 204 |
 | 10 | Inverted order: `gin.Recovery()` outermost, then `Middleware(...)` (handler panics) | `gin.Recovery()` | n/a | 500 (panic, recovered by outer Recovery) | **Span exists but is incomplete**: opened by otelgin's pre-`c.Next()` code, ended by its `defer span.End()`, but `status_code` attribute and span status are **not set** because otelgin's post-`c.Next()` code was skipped by the propagating panic. ErrorRecorder is also skipped. | none | **not recorded** (otelgin's metric is also written post-`c.Next()`, which never ran) |
@@ -309,16 +322,14 @@ but not on the `http/` facade itself.
 
 ---
 
-## Open questions
+## Resolved questions
 
-- **otelgin metric registration.** Some `otelgin` versions emit
-  `http.server.duration` (old name) and some emit
-  `http.server.request.duration` (current). The version we pin must
-  be the one that emits the current name, or the metric.View must
-  rename it. To verify and document at PR time.
-- **`gin.error.type` attribute key.** Use exactly that string, or
-  follow OTel-style `gin.error_type`? Lean: dot-form `gin.error.type`
-  to mirror OTel conventions.
+- **otelgin metric registration.** Verified at adoption time:
+  `otelgin` v0.68.0 emits `http.server.request.duration`, so no
+  transitional rename view is required.
+- **`gin.error.type` attribute key.** Chosen exactly as
+  `gin.error.type`, using dot-form to mirror OTel attribute naming.
 - **Convenience overload `MiddlewareFromSDK(obs *o11y.SDK, ...)`.**
-  Adds a back-edge from `gin/` to the root package. Lean: defer until
-  user feedback shows the four-arg form is friction.
+  Deferred. The gin package must not import the root
+  `github.com/flywindy/o11y` package until user feedback shows the
+  four-argument provider form is too much friction.

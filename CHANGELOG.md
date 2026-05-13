@@ -26,6 +26,9 @@ adopters can plan their upgrades.
   `defer` and inside a signal handler without double-flushing exporters.
 - `http.NewServerHandler` and `http.NewTransport` wrap `otelhttp` while
   threading the SDK TracerProvider, MeterProvider, and Propagator explicitly.
+- `gin.Middleware` wraps `otelgin` while threading the SDK TracerProvider,
+  MeterProvider, and Propagator explicitly, and records typed `gin.error.type`
+  span events for errors pushed through `c.Error` / `c.AbortWithError`.
 - `WithDisableDefaultViews()` and `WithMaxUniqueRoutes(int)` configure the
   SDK-owned HTTP metric label governance added during the `otelhttp`
   migration.

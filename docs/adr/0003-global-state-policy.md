@@ -139,6 +139,9 @@ Before introducing any `github.com/<vendor>/otel-<thing>` library, verify:
 | `go.opentelemetry.io/contrib/instrumentation/runtime` | v0.68.0 | ✅ | Runtime metrics are started with an explicit MeterProvider. No OTel provider globals are set. | Used by `internal/metrics` |
 | `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` | v0.68.0 | ✅ | Reads globals as fallback only; safe when `WithTracerProvider`, `WithMeterProvider`, and `WithPropagators` are supplied. | See ADR 0009 |
 
+| `go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin` | v0.68.0 | yes | Reads globals as fallback only; safe when `WithTracerProvider`, `WithMeterProvider`, and `WithPropagators` are supplied. | See ADR 0010 |
+| `github.com/gin-gonic/gin` | v1.12.0 | yes | Pure HTTP framework; no OpenTelemetry provider globals. | See ADR 0010 |
+
 When a new library is added or an existing one bumped, update this table
 in the same PR as the version change.
 
