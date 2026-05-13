@@ -7,6 +7,7 @@ resources:
   - mongodb.yaml
   - tempo.yaml
   - loki.yaml
+  - pyroscope.yaml
   - alloy.yaml
   - otel-collector.yaml
   - prometheus.yaml

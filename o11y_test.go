@@ -195,11 +195,10 @@ func TestInit_OTLPHeadersForwarded(t *testing.T) {
 	sdk, err := o11y.Init(context.Background(), opts...)
 	require.NoError(t, err)
 
-	// Emit at least one span so the exporter has something to send, then
-	// force a flush before shutdown to make the assertion deterministic.
+	// Emit at least one span so the exporter has something to send; Shutdown
+	// drains the batch processor and makes the assertion deterministic.
 	_, span := sdk.Tracer("hdr-test").Start(context.Background(), "probe")
 	span.End()
-	require.NoError(t, sdk.TracerProvider().ForceFlush(context.Background()))
 	testutil.MustShutdown(t.Context(), t, sdk)
 
 	requests := srv.Requests()

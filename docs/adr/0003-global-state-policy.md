@@ -139,6 +139,9 @@ Before introducing any `github.com/<vendor>/otel-<thing>` library, verify:
 | `go.opentelemetry.io/contrib/instrumentation/runtime` | v0.68.0 | ✅ | Runtime metrics are started with an explicit MeterProvider. No OTel provider globals are set. | Used by `internal/metrics` |
 | `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` | v0.68.0 | ✅ | Reads globals as fallback only; safe when `WithTracerProvider`, `WithMeterProvider`, and `WithPropagators` are supplied. | See ADR 0009 |
 
+| `github.com/grafana/pyroscope-go` | v1.3.0 | yes | Does not import OTel or mutate OTel globals. It does claim Go `runtime/pprof` process-wide profiler state; ADR 0012 records the narrow exception and singleton guard. | See ADR 0012 |
+| `github.com/grafana/otel-profiling-go` | v0.5.1 | yes | Wraps an explicit `trace.TracerProvider`; does not set OTel globals. It labels pprof samples and annotates root spans with `pyroscope.profile.id`. | See ADR 0012 |
+
 When a new library is added or an existing one bumped, update this table
 in the same PR as the version change.
 

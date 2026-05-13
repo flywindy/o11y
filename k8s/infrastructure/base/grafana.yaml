@@ -34,6 +34,20 @@ data:
               value: service_name
           customQuery: true
           query: '{service_name=~"(.*/|)$${__span.tags["service.name"]}"} |= "$${__trace.traceId}"'
+        tracesToProfiles:
+          datasourceUid: pyroscope
+          profileTypeId: process_cpu:cpu:nanoseconds:cpu:nanoseconds
+          tags:
+            - key: service.name
+              value: service_name
+            - key: service.namespace
+              value: service_namespace
+            - key: deployment.environment.name
+              value: service_env
+            - key: k8s.pod.name
+              value: pod
+            - key: k8s.namespace.name
+              value: k8s_namespace
 
     - name: Prometheus
       type: prometheus
@@ -66,6 +80,14 @@ data:
             name: TraceID
             url: "$${__value.raw}"
             internal: true
+
+    - name: Pyroscope
+      type: grafana-pyroscope-datasource
+      uid: pyroscope
+      access: proxy
+      url: http://pyroscope.infra.svc.cluster.local:4040
+      jsonData:
+        minStep: 15s
 ---
 apiVersion: v1
 kind: ConfigMap
