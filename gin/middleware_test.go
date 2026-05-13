@@ -24,9 +24,10 @@ import (
 )
 
 const (
-	testService = "gin-test"
-	testRoute   = "/items/:id"
-	testPath    = "/items/123"
+	testService     = "gin-test"
+	testRoute       = "/items/:id"
+	testPath        = "/items/123"
+	customMetricKey = attribute.Key("custom.metric")
 )
 
 func TestMiddleware_MatrixRow01_HappyPath(t *testing.T) {
@@ -165,7 +166,7 @@ func TestMiddleware_MatrixRow10_InvertedRecoveryOrderProducesIncompleteSpan(t *t
 }
 
 func TestMiddleware_OptionPassThroughs(t *testing.T) {
-	env := newTestEnv(t)
+	env := newTestEnv(t, customMetricKey)
 	router := ginframework.New()
 	router.Use(o11ygin.Middleware(
 		testService,
@@ -179,7 +180,7 @@ func TestMiddleware_OptionPassThroughs(t *testing.T) {
 			return r.URL.Path != "/skip"
 		}),
 		o11ygin.WithMetricAttributesFn(func(*http.Request) []attribute.KeyValue {
-			return []attribute.KeyValue{attribute.String("custom.metric", "kept")}
+			return []attribute.KeyValue{customMetricKey.String("kept")}
 		}),
 	)...)
 	router.GET(testRoute, func(c *ginframework.Context) {
@@ -200,6 +201,7 @@ func TestMiddleware_OptionPassThroughs(t *testing.T) {
 	require.Equal(t, http.StatusAccepted, result.statusCode)
 	assert.Equal(t, "custom "+testRoute, result.span.Name())
 	assertMetricStatusCodes(t, result.metrics, "202")
+	assertMetricAttr(t, result.metrics, customMetricKey, "kept")
 }
 
 type testEnv struct {
@@ -235,20 +237,21 @@ func runCanonicalRequest(t *testing.T, recovery ginframework.HandlerFunc, handle
 	return env.finish(t, rec)
 }
 
-func newTestEnv(t *testing.T) *testEnv {
+func newTestEnv(t *testing.T, extraMetricKeys ...attribute.Key) *testEnv {
 	t.Helper()
 	ginframework.SetMode(ginframework.TestMode)
 	reader := sdkmetric.NewManualReader()
+	metricKeys := append([]attribute.Key{
+		semconv.HTTPRequestMethodKey,
+		semconv.HTTPRouteKey,
+		semconv.HTTPResponseStatusCodeKey,
+	}, extraMetricKeys...)
 	meterProvider := sdkmetric.NewMeterProvider(
 		sdkmetric.WithReader(reader),
 		sdkmetric.WithView(sdkmetric.NewView(
 			sdkmetric.Instrument{Name: "http.server.request.duration"},
 			sdkmetric.Stream{
-				AttributeFilter: attribute.NewAllowKeysFilter(
-					semconv.HTTPRequestMethodKey,
-					semconv.HTTPRouteKey,
-					semconv.HTTPResponseStatusCodeKey,
-				),
+				AttributeFilter: attribute.NewAllowKeysFilter(metricKeys...),
 			},
 		)),
 	)
@@ -375,4 +378,25 @@ func assertMetricStatusCodes(t *testing.T, rm metricdata.ResourceMetrics, want .
 		}
 	}
 	assert.ElementsMatch(t, want, got)
+}
+
+func assertMetricAttr(t *testing.T, rm metricdata.ResourceMetrics, key attribute.Key, want string) {
+	t.Helper()
+	for _, scope := range rm.ScopeMetrics {
+		for _, metric := range scope.Metrics {
+			if metric.Name != "http.server.request.duration" {
+				continue
+			}
+			histogram, ok := metric.Data.(metricdata.Histogram[float64])
+			require.True(t, ok)
+			for _, point := range histogram.DataPoints {
+				value, ok := point.Attributes.Value(key)
+				if ok {
+					assert.Equal(t, want, value.Emit())
+					return
+				}
+			}
+		}
+	}
+	t.Fatalf("missing metric attribute %s", key)
 }
