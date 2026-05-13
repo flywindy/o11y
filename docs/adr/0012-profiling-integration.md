@@ -237,11 +237,17 @@ The shape of `o11y.Init` becomes:
              pyroscope.ProfileInuseObjects,
              pyroscope.ProfileInuseSpace,
          },
-         Logger: slogAdapter{s.Logger},
+         Logger: slogAdapter{logger},
      })
    Insert profiler.Stop into the final shutdown slice immediately
    before sdkTP.Shutdown (see ordering below).
 ```
+
+`logger` in step 6 refers to the local dual-output `*slog.Logger` built
+in step 5 — the same value that is later assigned to `s.Logger` when
+the `SDK` struct is constructed at the end of `Init`. It is not
+`s.Logger`, because `s` does not exist yet at this point in the
+function. The implementation PR closes over the local variable.
 
 `WithProfilingAuthHeaders` values are copied defensively into the
 config map; callers can pass `Authorization`, `X-Scope-OrgID`, or any
@@ -457,6 +463,15 @@ The exception is therefore narrow and named:
 - A second `o11y.Init` that finds `started == true` returns an
   error from Init, because `pyroscope.Start` is not idempotent and
   calling it twice produces undefined behavior in pyroscope-go.
+- The `profiler.Stop` closure registered in the shutdown slice
+  resets `started = false` **only when `Stop` returns nil**. This
+  enables `Init → Shutdown → Init` cycles in integration test suites
+  while preserving the process-singleton guarantee in the failure
+  path: if `Stop` errored, the profiler may be in a partially-torn-
+  down state and pprof globals may still be claimed, so a second
+  `Init` must still be rejected. The reset is a property of the
+  `Stop` closure itself, not of `SDK.Shutdown`, so the ordering with
+  other shutdown steps is irrelevant.
 - The exception is recorded explicitly in the ADR 0003 "Approved
   integrations" table when this ADR moves to Accepted.
 
