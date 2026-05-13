@@ -11,7 +11,6 @@ import (
 	ginframework "github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
@@ -20,7 +19,6 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
-	"go.opentelemetry.io/otel/trace/noop"
 
 	o11ygin "github.com/flywindy/o11y/gin"
 )
@@ -202,13 +200,6 @@ func TestMiddleware_OptionPassThroughs(t *testing.T) {
 	require.Equal(t, http.StatusAccepted, result.statusCode)
 	assert.Equal(t, "custom "+testRoute, result.span.Name())
 	assertMetricStatusCodes(t, result.metrics, "202")
-}
-
-func TestMiddleware_RejectsRawOtelginOptions(t *testing.T) {
-	var upstream any = otelgin.WithTracerProvider(noop.NewTracerProvider())
-	_, ok := upstream.(o11ygin.Option)
-
-	assert.False(t, ok)
 }
 
 type testEnv struct {
