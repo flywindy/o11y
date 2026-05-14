@@ -51,6 +51,9 @@ type SDK struct {
 	// Pass it to nats.Inject / nats.Extract for distributed tracing over NATS.
 	Propagator propagation.TextMapPropagator
 
+	// Internal providers are the concrete SDK-owned providers we shut down.
+	// Public providers are what callers see and may be wrapped by integrations
+	// such as otel-profiling-go. See ADR 0012 §2.
 	tracerProviderInternal *sdktrace.TracerProvider
 	tracerProviderPublic   oteltrace.TracerProvider
 	meterProviderInternal  *sdkmetric.MeterProvider
