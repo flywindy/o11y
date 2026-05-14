@@ -1,10 +1,13 @@
 package profiling
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/grafana/pyroscope-go"
 	"github.com/stretchr/testify/assert"
@@ -124,4 +127,26 @@ func TestStart_RejectsSecondActiveProfiler(t *testing.T) {
 	assert.Nil(t, second)
 
 	require.NoError(t, first(context.Background()))
+}
+
+func TestTruncatePyroscopeTagValue_PreservesUTF8(t *testing.T) {
+	value := strings.Repeat("a", maxPyroscopeTagValueBytes-1) + "界"
+
+	truncated := truncatePyroscopeTagValue("service_name", value, slog.Default())
+
+	assert.True(t, utf8.ValidString(truncated))
+	assert.Equal(t, maxPyroscopeTagValueBytes-1, len(truncated))
+	assert.Equal(t, strings.Repeat("a", maxPyroscopeTagValueBytes-1), truncated)
+}
+
+func TestPyroscopeSlogAdapter_InfofUsesInfoLevel(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	adapter := pyroscopeSlogAdapter{logger: logger}
+
+	adapter.Infof("upload %s", "started")
+
+	output := buf.String()
+	assert.Contains(t, output, `"level":"INFO"`)
+	assert.Contains(t, output, `"msg":"upload started"`)
 }

@@ -136,7 +136,7 @@ func truncatePyroscopeTagValue(tag, value string, logger *slog.Logger) string {
 		}
 		lastBoundary = i
 	}
-	return value[:maxPyroscopeTagValueBytes]
+	return value[:lastBoundary]
 }
 
 func cloneStringMap(in map[string]string) map[string]string {
@@ -156,7 +156,7 @@ type pyroscopeSlogAdapter struct {
 
 func (a pyroscopeSlogAdapter) Infof(format string, args ...interface{}) {
 	if a.logger != nil {
-		a.logger.Debug(fmt.Sprintf(format, args...))
+		a.logger.Info(fmt.Sprintf(format, args...))
 	}
 }
 

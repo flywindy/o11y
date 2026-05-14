@@ -36,6 +36,7 @@ spec:
           mountPath: /var/lib/pyroscope
       volumes:
       - name: pyroscope-data
+        # Local kind storage only; production overlays should replace this with a PVC.
         emptyDir: {}
 ---
 apiVersion: v1

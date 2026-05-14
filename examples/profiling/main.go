@@ -92,7 +92,7 @@ func burnCPU(duration time.Duration) float64 {
 		}
 	}
 	cpuSink = total
-	return total
+	return cpuSink
 }
 
 func envOrDefault(key, fallback string) string {

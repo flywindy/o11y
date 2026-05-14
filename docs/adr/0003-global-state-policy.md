@@ -138,10 +138,10 @@ Before introducing any `github.com/<vendor>/otel-<thing>` library, verify:
 | `Marz32onE/instrumentation-go/otel-mongo/v2` | v0.2.11 | ✅ | Reads globals as fallback only; never sets. Supports disabling document trace propagation independently with `WithTracePropagationEnabled(false)`. | Adoption candidate after the semconv v1.39.0 upgrade; see ADR 0005 |
 | `go.opentelemetry.io/contrib/instrumentation/runtime` | v0.68.0 | ✅ | Runtime metrics are started with an explicit MeterProvider. No OTel provider globals are set. | Used by `internal/metrics` |
 | `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` | v0.68.0 | ✅ | Reads globals as fallback only; safe when `WithTracerProvider`, `WithMeterProvider`, and `WithPropagators` are supplied. | See ADR 0009 |
-| `github.com/grafana/pyroscope-go` | v1.3.0 | yes | Does not import OTel or mutate OTel globals. It does claim Go `runtime/pprof` process-wide profiler state; ADR 0012 records the narrow exception and singleton guard. | See ADR 0012 |
-| `github.com/grafana/otel-profiling-go` | v0.5.1 | yes | Wraps an explicit `trace.TracerProvider`; does not set OTel globals. It labels pprof samples and annotates root spans with `pyroscope.profile.id`. | See ADR 0012 |
-| `go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin` | v0.68.0 | yes | Reads globals as fallback only; safe when `WithTracerProvider`, `WithMeterProvider`, and `WithPropagators` are supplied. | See ADR 0010 |
-| `github.com/gin-gonic/gin` | v1.12.0 | yes | Pure HTTP framework; no OpenTelemetry provider globals. | See ADR 0010 |
+| `github.com/grafana/pyroscope-go` | v1.3.0 | ✅ | Does not import OTel or mutate OTel globals. It does claim Go `runtime/pprof` process-wide profiler state; ADR 0012 records the narrow exception and singleton guard. | See ADR 0012 |
+| `github.com/grafana/otel-profiling-go` | v0.5.1 | ✅ | Wraps an explicit `trace.TracerProvider`; does not set OTel globals. It labels pprof samples and annotates root spans with `pyroscope.profile.id`. | See ADR 0012 |
+| `go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin` | v0.68.0 | ✅ | Reads globals as fallback only; safe when `WithTracerProvider`, `WithMeterProvider`, and `WithPropagators` are supplied. | See ADR 0010 |
+| `github.com/gin-gonic/gin` | v1.12.0 | ✅ | Pure HTTP framework; no OpenTelemetry provider globals. | See ADR 0010 |
 
 When a new library is added or an existing one bumped, update this table
 in the same PR as the version change.
