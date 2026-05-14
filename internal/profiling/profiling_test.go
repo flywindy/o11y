@@ -1,16 +1,16 @@
-package o11y
+package profiling
 
 import (
 	"context"
 	"errors"
-	"net/http"
-	"net/http/httptest"
-	"reflect"
+	"log/slog"
 	"testing"
 
 	"github.com/grafana/pyroscope-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/sdk/resource"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 )
 
 type fakeProfiler struct {
@@ -36,30 +36,21 @@ func withFakePyroscopeStart(t *testing.T, fn func(pyroscope.Config) (profilerHan
 	})
 }
 
-func newFakeOTLPServer(t *testing.T) *httptest.Server {
+func testResource(t *testing.T) *resource.Resource {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	t.Cleanup(srv.Close)
-	return srv
+	res, err := resource.New(context.Background(),
+		resource.WithAttributes(
+			semconv.ServiceNameKey.String("profiled-svc"),
+			semconv.ServiceNamespaceKey.String("platform"),
+			semconv.ServiceVersionKey.String("1.2.3"),
+			semconv.DeploymentEnvironmentNameKey.String("production"),
+		),
+	)
+	require.NoError(t, err)
+	return res
 }
 
-func profilingOpts(srvURL string, extra ...Option) []Option {
-	opts := []Option{
-		WithServiceName("profiled-svc"),
-		WithServiceVersion("1.2.3"),
-		WithEnvironment("production"),
-		WithServiceNamespace("platform"),
-		WithMetricsAddr("127.0.0.1:0"),
-		WithOTLPEndpoint(srvURL),
-		WithProfilingEndpoint("http://alloy.infra.svc.cluster.local:4040"),
-	}
-	return append(opts, extra...)
-}
-
-func TestInit_ProfilingStartsPyroscopeWithResourceTagsAndHeaders(t *testing.T) {
-	srv := newFakeOTLPServer(t)
+func TestStart_ConfiguresPyroscopeWithResourceTagsAndHeaders(t *testing.T) {
 	headers := map[string]string{
 		"Authorization": "Bearer original",
 		"X-Scope-OrgID": "tenant-a",
@@ -72,14 +63,18 @@ func TestInit_ProfilingStartsPyroscopeWithResourceTagsAndHeaders(t *testing.T) {
 		return profiler, nil
 	})
 
-	opts := profilingOpts(srv.URL, WithProfilingAuthHeaders(headers))
-
-	sdk, err := Init(context.Background(), opts...)
+	closer, err := Start(Config{
+		ServiceName: "profiled-svc",
+		Endpoint:    "http://alloy.infra.svc.cluster.local:4040",
+		AuthHeaders: headers,
+		Resource:    testResource(t),
+		Logger:      slog.Default(),
+	})
 	require.NoError(t, err)
 	headers["Authorization"] = "Bearer mutated"
-	require.NoError(t, sdk.Shutdown(context.Background()))
+	require.NoError(t, closer(context.Background()))
 
-	assert.True(t, profiler.stopped, "SDK shutdown should stop the profiler")
+	assert.True(t, profiler.stopped, "shutdown should stop the profiler")
 	assert.Equal(t, "profiled-svc", captured.ApplicationName)
 	assert.Equal(t, "http://alloy.infra.svc.cluster.local:4040", captured.ServerAddress)
 	assert.Equal(t, "Bearer original", captured.HTTPHeaders["Authorization"])
@@ -97,33 +92,36 @@ func TestInit_ProfilingStartsPyroscopeWithResourceTagsAndHeaders(t *testing.T) {
 	}, captured.ProfileTypes)
 }
 
-func TestInit_ProfilingStartFailureLogsAndContinues(t *testing.T) {
-	srv := newFakeOTLPServer(t)
+func TestStart_ReturnsErrorWithoutConsumingSingletonSlot(t *testing.T) {
+	startErr := errors.New("start failed")
+	var calls int
 	withFakePyroscopeStart(t, func(pyroscope.Config) (profilerHandle, error) {
-		return nil, errors.New("start failed")
+		calls++
+		if calls == 1 {
+			return nil, startErr
+		}
+		return &fakeProfiler{}, nil
 	})
 
-	sdk, err := Init(context.Background(), profilingOpts(srv.URL)...)
-	require.NoError(t, err)
-	defer func() { require.NoError(t, sdk.Shutdown(context.Background())) }()
+	_, err := Start(Config{ServiceName: "profiled-svc", Endpoint: "http://alloy:4040"})
+	require.ErrorIs(t, err, startErr)
 
-	assert.Contains(t, reflect.TypeOf(sdk.TracerProvider()).String(), "otelpyroscope",
-		"the trace-to-profile wrapper should stay installed even if profiler start fails")
+	closer, err := Start(Config{ServiceName: "profiled-svc", Endpoint: "http://alloy:4040"})
+	require.NoError(t, err)
+	require.NoError(t, closer(context.Background()))
 }
 
-func TestInit_ProfilingRejectsSecondActiveProfiler(t *testing.T) {
-	srv := newFakeOTLPServer(t)
+func TestStart_RejectsSecondActiveProfiler(t *testing.T) {
 	withFakePyroscopeStart(t, func(pyroscope.Config) (profilerHandle, error) {
 		return &fakeProfiler{}, nil
 	})
 
-	first, err := Init(context.Background(), profilingOpts(srv.URL)...)
+	first, err := Start(Config{ServiceName: "profiled-svc", Endpoint: "http://alloy:4040"})
 	require.NoError(t, err)
 
-	second, err := Init(context.Background(), profilingOpts(srv.URL)...)
-	require.Error(t, err)
+	second, err := Start(Config{ServiceName: "profiled-svc", Endpoint: "http://alloy:4040"})
+	require.ErrorIs(t, err, ErrAlreadyStarted)
 	assert.Nil(t, second)
-	assert.ErrorIs(t, err, errProfilerAlreadyStarted)
 
-	require.NoError(t, first.Shutdown(context.Background()))
+	require.NoError(t, first(context.Background()))
 }

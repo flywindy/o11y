@@ -19,7 +19,8 @@ adopters can plan their upgrades.
   `WithProfilingEndpoint(url)` enables Pyroscope-compatible profile pushes,
   `WithProfilingAuthHeaders(map[string]string)` forwards auth / tenant headers,
   Grafana Alloy receives profiles on `:4040`, and the infrastructure stack now
-  provisions Pyroscope plus Grafana trace-to-profile links.
+  provisions Pyroscope plus Grafana trace-to-profile links. Includes
+  `examples/profiling` for end-to-end local validation.
 - `WithOTLPHeaders(map[string]string)` attaches arbitrary headers to every
   OTLP/HTTP request the SDK emits across traces, logs, and OTLP-push metrics.
   Use it to authenticate against managed observability backends like Grafana

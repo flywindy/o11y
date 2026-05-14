@@ -21,6 +21,7 @@ import (
 
 	o11ylog "github.com/flywindy/o11y/internal/log"
 	"github.com/flywindy/o11y/internal/metrics"
+	"github.com/flywindy/o11y/internal/profiling"
 	"github.com/flywindy/o11y/internal/trace"
 	otelpyroscope "github.com/grafana/otel-profiling-go"
 	"go.opentelemetry.io/contrib/bridges/otelslog"
@@ -237,9 +238,15 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 
 	var profilerCloser func(context.Context) error
 	if cfg.profilingEndpoint != "" {
-		closer, err := startProfiler(cfg, res, logger)
+		closer, err := profiling.Start(profiling.Config{
+			ServiceName: cfg.serviceName,
+			Endpoint:    cfg.profilingEndpoint,
+			AuthHeaders: cfg.profilingAuthHeaders,
+			Resource:    res,
+			Logger:      logger,
+		})
 		if err != nil {
-			if errors.Is(err, errProfilerAlreadyStarted) {
+			if errors.Is(err, profiling.ErrAlreadyStarted) {
 				_ = metricsCloser(ctx)
 				_ = mp.Shutdown(ctx)
 				_ = lp.Shutdown(ctx)

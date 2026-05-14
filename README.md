@@ -301,10 +301,6 @@ if err != nil {
 defer func() { _ = sub.Drain() }() // gracefully drain on shutdown
 ```
 
-When profiling is enabled for a service, use **Explore / Pyroscope** for
-service-level CPU and memory profiles. Tempo root spans carrying
-`pyroscope.profile.id` expose profile links back into Pyroscope.
-
 ### MongoDB
 
 Use the `mongo` sub-package to wire MongoDB tracing to the SDK-owned
@@ -494,6 +490,18 @@ curl http://localhost:8080/fail
 
 The example registers `o11ygin.Middleware(...)` before `gin.Recovery()` and
 demonstrates typed `gin.error.type` span events from `c.AbortWithError`.
+
+### Profiling
+
+```bash
+go run examples/profiling/main.go
+```
+
+The example starts a sampled root span every two seconds and burns CPU long
+enough for Pyroscope to capture useful samples. It sends profiles to
+`PYROSCOPE_ENDPOINT` (default `http://localhost:4040`) and traces/logs/OTLP
+metrics to `OTLP_ENDPOINT` (default `http://localhost:4318`). Keep the Alloy
+and Grafana port-forwards from the setup block running while the example runs.
 
 ### MongoDB
 

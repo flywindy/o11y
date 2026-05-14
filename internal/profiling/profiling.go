@@ -1,4 +1,5 @@
-package o11y
+// Package profiling encapsulates the SDK's Pyroscope profiler lifecycle.
+package profiling
 
 import (
 	"context"
@@ -16,9 +17,12 @@ import (
 
 const maxPyroscopeTagValueBytes = 1024
 
-var (
-	errProfilerAlreadyStarted = errors.New("profiling is already active in this process")
+// ErrAlreadyStarted is returned when profiling is already active in the
+// current process. Go's pprof profiler is process-wide, so the SDK allows only
+// one successful Pyroscope profiler session at a time.
+var ErrAlreadyStarted = errors.New("profiling is already active in this process")
 
+var (
 	profilerMu      sync.Mutex
 	profilerStarted bool
 	tagWarnOnce     sync.Once
@@ -32,19 +36,30 @@ var pyroscopeStart = func(cfg pyroscope.Config) (profilerHandle, error) {
 	return pyroscope.Start(cfg)
 }
 
-func startProfiler(cfg *Config, res *resource.Resource, logger *slog.Logger) (func(context.Context) error, error) {
+// Config is the subset of SDK configuration needed by the profiling
+// subsystem.
+type Config struct {
+	ServiceName string
+	Endpoint    string
+	AuthHeaders map[string]string
+	Resource    *resource.Resource
+	Logger      *slog.Logger
+}
+
+// Start starts the Pyroscope profiler and returns a shutdown function.
+func Start(cfg Config) (func(context.Context) error, error) {
 	profilerMu.Lock()
 	defer profilerMu.Unlock()
 
 	if profilerStarted {
-		return nil, errProfilerAlreadyStarted
+		return nil, ErrAlreadyStarted
 	}
 
 	profiler, err := pyroscopeStart(pyroscope.Config{
-		ApplicationName: cfg.serviceName,
-		ServerAddress:   cfg.profilingEndpoint,
-		HTTPHeaders:     cloneStringMap(cfg.profilingAuthHeaders),
-		Tags:            profileTagsFromResource(res, logger),
+		ApplicationName: cfg.ServiceName,
+		ServerAddress:   cfg.Endpoint,
+		HTTPHeaders:     cloneStringMap(cfg.AuthHeaders),
+		Tags:            profileTagsFromResource(cfg.Resource, cfg.Logger),
 		ProfileTypes: []pyroscope.ProfileType{
 			pyroscope.ProfileCPU,
 			pyroscope.ProfileAllocObjects,
@@ -52,7 +67,7 @@ func startProfiler(cfg *Config, res *resource.Resource, logger *slog.Logger) (fu
 			pyroscope.ProfileInuseObjects,
 			pyroscope.ProfileInuseSpace,
 		},
-		Logger: pyroscopeSlogAdapter{logger: logger},
+		Logger: pyroscopeSlogAdapter{logger: cfg.Logger},
 	})
 	if err != nil {
 		return nil, err
