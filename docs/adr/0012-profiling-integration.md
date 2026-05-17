@@ -1,6 +1,6 @@
 # ADR 0012 — Continuous Profiling Integration (Pyroscope)
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-05-12
 
 **Applies** ADR 0003 (global state policy), ADR 0006 (semconv upgrade

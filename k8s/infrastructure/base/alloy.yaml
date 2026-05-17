@@ -100,6 +100,20 @@ data:
       }
     }
 
+    pyroscope.receive_http "ingest" {
+      http {
+        listen_address = "0.0.0.0"
+        listen_port    = 4040
+      }
+      forward_to = [pyroscope.write.default.receiver]
+    }
+
+    pyroscope.write "default" {
+      endpoint {
+        url = "http://pyroscope.infra.svc.cluster.local:4040"
+      }
+    }
+
     otelcol.exporter.otlphttp "default" {
       client {
         endpoint = "http://otel-collector.infra.svc.cluster.local:4318"
@@ -139,6 +153,8 @@ spec:
           ports:
             - containerPort: 12345
               name: http
+            - containerPort: 4040
+              name: profiles
           volumeMounts:
             - name: config
               mountPath: /etc/alloy
@@ -152,3 +168,19 @@ spec:
         - name: logs
           hostPath:
             path: /var/log/pods
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alloy
+  namespace: infra
+spec:
+  selector:
+    app: alloy
+  ports:
+  - name: profiles
+    port: 4040
+    targetPort: profiles
+  - name: http
+    port: 12345
+    targetPort: http

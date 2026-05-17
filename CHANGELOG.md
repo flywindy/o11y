@@ -15,6 +15,12 @@ adopters can plan their upgrades.
 
 ### Added
 
+- Continuous profiling integration via Pyroscope:
+  `WithProfilingEndpoint(url)` enables Pyroscope-compatible profile pushes,
+  `WithProfilingAuthHeaders(map[string]string)` forwards auth / tenant headers,
+  Grafana Alloy receives profiles on `:4040`, and the infrastructure stack now
+  provisions Pyroscope plus Grafana trace-to-profile links. Includes
+  `examples/profiling` for end-to-end local validation.
 - `WithOTLPHeaders(map[string]string)` attaches arbitrary headers to every
   OTLP/HTTP request the SDK emits across traces, logs, and OTLP-push metrics.
   Use it to authenticate against managed observability backends like Grafana
@@ -56,6 +62,9 @@ adopters can plan their upgrades.
   server spans, extract `traceparent`, and emit standard OTel HTTP metrics.
 - `o11y.Init` registers default HTTP metric views that keep
   `http.server.request.duration` labels to method, route, and status code.
+- `SDK.TracerProvider()` now returns the `trace.TracerProvider` interface and
+  `SDK.MeterProvider()` now returns the `metric.MeterProvider` interface, so
+  profiling and future provider wrappers can stay internal to the SDK.
 
 ### Validated
 
@@ -119,6 +128,22 @@ handler := o11yhttp.NewServerHandler(
 
 Use Go 1.22+ `http.ServeMux` patterns or router-native route patterns to keep
 `http.route` bounded. The old `WithPathNormalizer` callback was removed.
+
+#### Provider accessors now return interfaces
+
+```go
+// Before
+var tp *sdktrace.TracerProvider = obs.TracerProvider()
+var mp *sdkmetric.MeterProvider = obs.MeterProvider()
+
+// After
+var tp trace.TracerProvider = obs.TracerProvider()
+var mp metric.MeterProvider = obs.MeterProvider()
+```
+
+Instrumentation libraries already accept these interfaces. Lifecycle methods
+such as `Shutdown` and concrete-only mutation hooks remain owned by
+`SDK.Shutdown` and SDK initialization.
 
 ### Fixed
 

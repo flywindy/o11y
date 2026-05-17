@@ -12,15 +12,20 @@ This project provides a "Context-First" observability layer for Go applications,
 - **Tracing**: OpenTelemetry Go SDK (OTLP/HTTP)
 - **Logging**: Go `slog` with dual output — OTLP/HTTP via `otelslog` bridge (→ Loki) and JSON stdout (→ Alloy)
 - **Metrics**: Prometheus pull (default `:2112`) or OTLP push (`WithMetricsOTLPEndpoint`)
+- **Profiling**: Opt-in continuous profiling via Pyroscope (`WithProfilingEndpoint`)
 - **Infrastructure**:
   - **NATS**: High-performance messaging
   - **MongoDB**: NoSQL database for persistence
   - **Tempo**: Distributed tracing backend
   - **Loki**: Log aggregation system
+  - **Pyroscope**: Continuous profiling backend
   - **Prometheus**: Metrics storage and scraping
-  - **Grafana**: Unified visualization for traces, logs, and metrics
+  - **Grafana**: Unified visualization for traces, logs, metrics, and profiles
   - **OTel Collector**: Centralized pipeline — all telemetry (traces and logs) flows through it
-  - **Alloy**: Log collection agent (DaemonSet), forwards logs to OTel Collector via OTLP
+  - **Alloy**: Log collection agent and Pyroscope ingest proxy
+
+Profiles are the one signal that bypasses the OTel Collector: applications
+push Pyroscope-format profiles to Alloy, which forwards them to Pyroscope.
 
 ### Telemetry Flow
 
@@ -33,6 +38,8 @@ Metrics: App :2112/metrics ◄──scrape── Prometheus ──► Grafana  (
 
 Both log paths are active simultaneously. When running `go run` locally (outside the cluster),
 only the OTLP path reaches Loki; Alloy scrapes pods exclusively inside kind.
+Profiles flow through Alloy's Pyroscope receiver to the Pyroscope backend; they
+do not go through the OTel Collector because Pyroscope ingest is not OTLP.
 Prometheus scraping also only works inside the cluster; locally, scrape `:2112/metrics` directly.
 
 ## Prerequisites
@@ -101,6 +108,9 @@ func main() {
         o11y.WithEnvironment("production"),        // required; see canonical values below
         o11y.WithServiceNamespace("platform"),     // required; maps to k8s namespace / team
         o11y.WithOTLPEndpoint("http://localhost:4318"),
+        // Optional: enable continuous profiling. In-cluster, prefer
+        // "http://alloy.infra.svc.cluster.local:4040".
+        // o11y.WithProfilingEndpoint("http://localhost:4040"),
         o11y.WithLogLevel(slog.LevelInfo),
     )
     if err != nil {
@@ -129,6 +139,8 @@ func main() {
 | `WithServiceNamespace(ns)` | — **required** | OTel `service.namespace`; identifies the owning team/product, maps to k8s namespace |
 | `WithOTLPEndpoint(url)` | `http://localhost:4318` | OTLP/HTTP collector endpoint for traces and logs |
 | `WithOTLPHeaders(map[string]string)` | `nil` | Headers attached to every OTLP/HTTP request (auth tokens, multi-tenant routing) |
+| `WithProfilingEndpoint(url)` | `""` | Enable Pyroscope-compatible continuous profiling; empty means fully disabled |
+| `WithProfilingAuthHeaders(map[string]string)` | `nil` | Headers attached to every profile push (Grafana Cloud Profiles auth, `X-Scope-OrgID`, etc.) |
 | `WithMetricsOTLPEndpoint(url)` | `""` | Switch metrics to OTLP push (serverless); when unset, Prometheus pull on `:2112` is used |
 | `WithMetricsAddr(addr)` | `:2112` | Prometheus `/metrics` scrape address |
 | `WithLogLevel(level)` | `slog.LevelInfo` | Minimum log level |
@@ -140,8 +152,10 @@ func main() {
 > function (`o11y.DefaultLatencyBuckets()` returning a fresh copy) rather
 > than a package-level slice variable, so callers cannot accidentally mutate
 > the package defaults. `DefaultMetricsAddr` is now a `const` (was `var`);
-> use `WithMetricsAddr(":9090")` to override. See `CHANGELOG.md` for the
-> migration recipe.
+> `SDK.TracerProvider()` now returns `trace.TracerProvider`, and
+> `SDK.MeterProvider()` now returns `metric.MeterProvider`. Use
+> `WithMetricsAddr(":9090")` to override the metrics listener. See
+> `CHANGELOG.md` for the migration recipe.
 
 ### Structured Logging with Trace Correlation
 
@@ -215,6 +229,44 @@ import "go.opentelemetry.io/otel"
 otel.SetTracerProvider(obs.TracerProvider())
 otel.SetTextMapPropagator(obs.Propagator)
 ```
+
+### Continuous Profiling
+
+Profiling is opt-in. Set `WithProfilingEndpoint` to an HTTP endpoint that
+speaks the Pyroscope ingest protocol. In the provided Kubernetes stack,
+applications should send profiles to Alloy:
+
+```go
+obs, err := o11y.Init(ctx,
+    o11y.WithServiceName("orders-api"),
+    o11y.WithServiceVersion("1.0.0"),
+    o11y.WithEnvironment("production"),
+    o11y.WithServiceNamespace("platform"),
+    o11y.WithOTLPEndpoint("http://otel-collector.infra.svc.cluster.local:4318"),
+    o11y.WithProfilingEndpoint("http://alloy.infra.svc.cluster.local:4040"),
+)
+```
+
+For local development, port-forward Alloy and use
+`WithProfilingEndpoint("http://localhost:4040")`. Use
+`WithProfilingAuthHeaders` when the Pyroscope endpoint requires auth or
+tenant routing headers. Header values are copied defensively and are not
+logged.
+
+When profiling is enabled, the SDK wraps its tracer provider with the Grafana
+span profiling bridge. Root spans receive a `pyroscope.profile.id` attribute,
+and Pyroscope samples are labeled so Grafana can open CPU profiles from Tempo.
+The link is statistical: short spans, especially below the CPU sampling
+interval, can legitimately show an empty profile.
+
+Important caveats:
+
+- Trace-to-profile navigation is CPU-profile-only. Service-level profiles also
+  include allocation and in-use memory profiles.
+- By default, only local root spans are labeled by the bridge.
+- Go `pprof` labels apply to the current goroutine. Work started in a new
+  goroutine is captured in the service-level profile, but it is not linked to
+  the span unless the application propagates pprof labels explicitly.
 
 ### Distributed Tracing over NATS
 
@@ -385,6 +437,7 @@ kubectl port-forward -n infra svc/otel-collector 4318:4318  # OTel traces and lo
 kubectl port-forward -n infra svc/nats           4222:4222  # NATS connection
 kubectl port-forward -n infra svc/grafana        3000:3000  # Grafana UI
 kubectl port-forward -n infra svc/prometheus     9090:9090  # Prometheus UI
+kubectl port-forward -n infra svc/alloy          4040:4040  # Pyroscope ingest for local app profiling
 ```
 
 ### Basic (spans + logs)
@@ -438,6 +491,18 @@ curl http://localhost:8080/fail
 The example registers `o11ygin.Middleware(...)` before `gin.Recovery()` and
 demonstrates typed `gin.error.type` span events from `c.AbortWithError`.
 
+### Profiling
+
+```bash
+go run examples/profiling/main.go
+```
+
+The example starts a sampled root span every two seconds and burns CPU long
+enough for Pyroscope to capture useful samples. It sends profiles to
+`PYROSCOPE_ENDPOINT` (default `http://localhost:4040`) and traces/logs/OTLP
+metrics to `OTLP_ENDPOINT` (default `http://localhost:4318`). Keep the Alloy
+and Grafana port-forwards from the setup block running while the example runs.
+
 ### MongoDB
 
 Run a local MongoDB instance or port-forward one to `localhost:27017`, then
@@ -470,7 +535,7 @@ go run examples/mongodb/main.go
 - [`github.com/Marz32onE/instrumentation-go/otel-nats`](https://github.com/Marz32onE/instrumentation-go) — provides the underlying NATS Core + JetStream tracing semantics used by the `nats/` wrapper. Verified at v0.2.11 not to mutate OTel globals and to import semconv v1.39.0. See [ADR 0004](docs/adr/0004-nats-integration.md) for the integration decision and audit discipline.
 - [`github.com/Marz32onE/instrumentation-go/otel-mongo/v2`](https://github.com/Marz32onE/instrumentation-go) — provides the underlying MongoDB driver v2 tracing semantics used by the `mongo/` wrapper. Verified at the `otel-mongo/v2/v0.2.11` tag not to mutate OTel globals, with `_oteltrace` document propagation disabled by default through the o11y wrapper. See [ADR 0005](docs/adr/0005-mongodb-integration.md).
 - [`go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp`](https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp) — provides the underlying HTTP server/client instrumentation used by the `http/` facade. See [ADR 0009](docs/adr/0009-replace-http-with-otelhttp.md).
-
+- [`github.com/grafana/pyroscope-go`](https://github.com/grafana/pyroscope-go) and [`github.com/grafana/otel-profiling-go`](https://github.com/grafana/otel-profiling-go) provide the Pyroscope profiler and trace-to-profile bridge. See [ADR 0012](docs/adr/0012-profiling-integration.md).
 - [`go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin`](https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin) — provides the underlying gin instrumentation used by the `gin/` facade. See [ADR 0010](docs/adr/0010-gin-integration.md).
 
 ## AI Collaboration

@@ -36,6 +36,10 @@ type Config struct {
 	otlpHeaders    map[string]string
 	logLevel       slog.Level
 
+	// Profiling
+	profilingEndpoint    string
+	profilingAuthHeaders map[string]string
+
 	// Metrics
 	metricsAddr         string
 	metricsOTLPEndpoint string // non-empty → OTLP push instead of Prometheus pull
@@ -115,6 +119,41 @@ func WithOTLPHeaders(headers map[string]string) Option {
 		}
 		for k, v := range headers {
 			c.otlpHeaders[k] = v
+		}
+	}
+}
+
+// WithProfilingEndpoint sets the Pyroscope-compatible ingest endpoint.
+// Examples:
+//   - "http://alloy.infra.svc.cluster.local:4040" for Grafana Alloy
+//   - "http://pyroscope.infra.svc.cluster.local:4040" for direct Pyroscope ingest
+//
+// When empty, profiling is fully disabled: no profiler goroutines are started,
+// no pprof globals are touched, and trace spans are not annotated with
+// pyroscope.profile.id. Default: empty.
+func WithProfilingEndpoint(endpoint string) Option {
+	return func(c *Config) {
+		c.profilingEndpoint = endpoint
+	}
+}
+
+// WithProfilingAuthHeaders attaches custom HTTP headers to every Pyroscope
+// profile push. Use this for Grafana Cloud Profiles, Basic auth via an
+// Authorization header, or multi-tenant routing such as X-Scope-OrgID.
+//
+// Calling WithProfilingAuthHeaders multiple times merges into the same map;
+// later calls overwrite earlier values for the same header key. Header values
+// are not logged.
+func WithProfilingAuthHeaders(headers map[string]string) Option {
+	return func(c *Config) {
+		if len(headers) == 0 {
+			return
+		}
+		if c.profilingAuthHeaders == nil {
+			c.profilingAuthHeaders = make(map[string]string, len(headers))
+		}
+		for k, v := range headers {
+			c.profilingAuthHeaders[k] = v
 		}
 	}
 }

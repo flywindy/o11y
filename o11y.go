@@ -1,7 +1,7 @@
 // Package o11y is the top-level entry point for the SDK. It exposes Init for
-// constructing a configured *SDK that bundles trace, metric, and log
-// providers together with the W3C TraceContext+Baggage propagator and a
-// dual-output slog logger.
+// constructing a configured *SDK that bundles trace, metric, log, and optional
+// profiling providers together with the W3C TraceContext+Baggage propagator
+// and a dual-output slog logger.
 //
 // The SDK never mutates global OpenTelemetry state; callers wire the returned
 // providers into their application explicitly (e.g. otel.SetTracerProvider).
@@ -21,7 +21,9 @@ import (
 
 	o11ylog "github.com/flywindy/o11y/internal/log"
 	"github.com/flywindy/o11y/internal/metrics"
+	"github.com/flywindy/o11y/internal/profiling"
 	"github.com/flywindy/o11y/internal/trace"
+	otelpyroscope "github.com/grafana/otel-profiling-go"
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
@@ -49,31 +51,36 @@ type SDK struct {
 	// Pass it to nats.Inject / nats.Extract for distributed tracing over NATS.
 	Propagator propagation.TextMapPropagator
 
-	provider      *sdktrace.TracerProvider
-	meterProvider *sdkmetric.MeterProvider
-	shutdowns     []func(context.Context) error
+	// Internal providers are the concrete SDK-owned providers we shut down.
+	// Public providers are what callers see and may be wrapped by integrations
+	// such as otel-profiling-go. See ADR 0012 §2.
+	tracerProviderInternal *sdktrace.TracerProvider
+	tracerProviderPublic   oteltrace.TracerProvider
+	meterProviderInternal  *sdkmetric.MeterProvider
+	meterProviderPublic    metric.MeterProvider
+	shutdowns              []func(context.Context) error
 
 	shutdownOnce sync.Once
 	shutdownErr  error
 }
 
-// TracerProvider returns the underlying sdktrace.TracerProvider.
+// TracerProvider returns the SDK's tracer provider interface.
 // Use this to wire the SDK's provider as the global OTel tracer provider
 // if needed, e.g. otel.SetTracerProvider(sdk.TracerProvider()).
-func (s *SDK) TracerProvider() *sdktrace.TracerProvider {
-	return s.provider
+func (s *SDK) TracerProvider() oteltrace.TracerProvider {
+	return s.tracerProviderPublic
 }
 
 // Tracer returns a named tracer from the SDK's TracerProvider.
 func (s *SDK) Tracer(name string) oteltrace.Tracer {
-	return s.provider.Tracer(name)
+	return s.tracerProviderPublic.Tracer(name)
 }
 
-// MeterProvider returns the underlying sdkmetric.MeterProvider. Use this
+// MeterProvider returns the SDK's meter provider interface. Use this
 // when wiring SDK-produced metrics into instrumentation libraries that
 // accept an OTel MeterProvider directly.
-func (s *SDK) MeterProvider() *sdkmetric.MeterProvider {
-	return s.meterProvider
+func (s *SDK) MeterProvider() metric.MeterProvider {
+	return s.meterProviderPublic
 }
 
 // Meter returns a named meter from the SDK's MeterProvider for custom
@@ -81,7 +88,7 @@ func (s *SDK) MeterProvider() *sdkmetric.MeterProvider {
 // http.NewServerHandler and http.NewTransport facades, which accept the SDK's
 // MeterProvider directly.
 func (s *SDK) Meter(name string) metric.Meter {
-	return s.meterProvider.Meter(name)
+	return s.meterProviderPublic.Meter(name)
 }
 
 // Shutdown gracefully flushes and shuts down all registered SDK components.
@@ -159,6 +166,10 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	if err != nil {
 		return nil, err
 	}
+	tracerProviderPublic := oteltrace.TracerProvider(tp)
+	if cfg.profilingEndpoint != "" {
+		tracerProviderPublic = otelpyroscope.NewTracerProvider(tp)
+	}
 
 	// 3. Initialize MeterProvider + Prometheus scrape endpoint. On failure,
 	//    shut down the already-initialized tracer to avoid leaking its
@@ -228,19 +239,53 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 
 	logger := slog.New(o11ylog.NewMultiHandler(otelHandler, stdoutHandler))
 
+	var profilerCloser func(context.Context) error
+	if cfg.profilingEndpoint != "" {
+		closer, err := profiling.Start(ctx, profiling.Config{
+			ServiceName: cfg.serviceName,
+			Endpoint:    cfg.profilingEndpoint,
+			AuthHeaders: cfg.profilingAuthHeaders,
+			Resource:    res,
+			Logger:      logger,
+		})
+		if err != nil {
+			if errors.Is(err, profiling.ErrAlreadyStarted) {
+				_ = metricsCloser(ctx)
+				_ = mp.Shutdown(ctx)
+				_ = lp.Shutdown(ctx)
+				_ = tp.Shutdown(ctx)
+				return nil, err
+			}
+			logger.WarnContext(ctx, "profiling disabled after Pyroscope start failure",
+				slog.String("endpoint", cfg.profilingEndpoint),
+				slog.Any("error", err),
+			)
+		} else {
+			profilerCloser = closer
+		}
+	}
+
+	shutdowns := []func(context.Context) error{
+		metricsCloser,
+		mp.Shutdown,
+		lp.Shutdown,
+	}
+	if profilerCloser != nil {
+		shutdowns = append(shutdowns, profilerCloser)
+	}
+	shutdowns = append(shutdowns, tp.Shutdown)
+
 	// Shutdowns run in registration order: drain scrape traffic first
-	// (metricsServer), then flush the meter provider, then logs, then traces.
+	// (metricsServer), then flush the meter provider, logs, optional profiling,
+	// then traces.
 	return &SDK{
-		Logger:        logger,
-		Propagator:    prop,
-		provider:      tp,
-		meterProvider: mp,
-		shutdowns: []func(context.Context) error{
-			metricsCloser,
-			mp.Shutdown,
-			lp.Shutdown,
-			tp.Shutdown,
-		},
+		Logger:                 logger,
+		Propagator:             prop,
+		tracerProviderInternal: tp,
+		tracerProviderPublic:   tracerProviderPublic,
+		meterProviderInternal:  mp,
+		meterProviderPublic:    mp,
+		shutdowns:              shutdowns,
 	}, nil
 }
 

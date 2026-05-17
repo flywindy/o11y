@@ -78,7 +78,9 @@ func instrumentationModules(path string) ([]string, error) {
 		}
 		module := fields[0]
 		if strings.HasPrefix(module, "go.opentelemetry.io/contrib/instrumentation/") ||
-			strings.HasPrefix(module, "github.com/Marz32onE/instrumentation-go/") {
+			strings.HasPrefix(module, "github.com/Marz32onE/instrumentation-go/") ||
+			module == "github.com/grafana/pyroscope-go" ||
+			module == "github.com/grafana/otel-profiling-go" {
 			modules = append(modules, module)
 		}
 	}
