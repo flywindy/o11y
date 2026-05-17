@@ -241,7 +241,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 
 	var profilerCloser func(context.Context) error
 	if cfg.profilingEndpoint != "" {
-		closer, err := profiling.Start(profiling.Config{
+		closer, err := profiling.Start(ctx, profiling.Config{
 			ServiceName: cfg.serviceName,
 			Endpoint:    cfg.profilingEndpoint,
 			AuthHeaders: cfg.profilingAuthHeaders,

@@ -13,9 +13,24 @@ spec:
       labels:
         app: pyroscope
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: pyroscope
         image: grafana/pyroscope:2.0.2
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
         ports:
         - containerPort: 4040
           name: http
@@ -34,9 +49,13 @@ spec:
         volumeMounts:
         - name: pyroscope-data
           mountPath: /var/lib/pyroscope
+        - name: pyroscope-tmp
+          mountPath: /tmp
       volumes:
       - name: pyroscope-data
         # Local kind storage only; production overlays should replace this with a PVC.
+        emptyDir: {}
+      - name: pyroscope-tmp
         emptyDir: {}
 ---
 apiVersion: v1

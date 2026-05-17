@@ -72,7 +72,7 @@ func main() {
 			return
 		case <-ticker.C:
 			workCtx, span := tracer.Start(ctx, "cpu-bound-root-work")
-			result := burnCPU(1500 * time.Millisecond)
+			result := burnCPU(workCtx, 1500*time.Millisecond)
 			span.End()
 
 			obs.Logger.InfoContext(workCtx, "completed profiled work",
@@ -83,10 +83,13 @@ func main() {
 	}
 }
 
-func burnCPU(duration time.Duration) float64 {
+func burnCPU(ctx context.Context, duration time.Duration) float64 {
 	deadline := time.Now().Add(duration)
 	var total float64
 	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			break
+		}
 		for i := 1; i < 10000; i++ {
 			total += math.Sqrt(float64(i)) * math.Sin(float64(i))
 		}

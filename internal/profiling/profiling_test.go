@@ -66,7 +66,7 @@ func TestStart_ConfiguresPyroscopeWithResourceTagsAndHeaders(t *testing.T) {
 		return profiler, nil
 	})
 
-	closer, err := Start(Config{
+	closer, err := Start(context.Background(), Config{
 		ServiceName: "profiled-svc",
 		Endpoint:    "http://alloy.infra.svc.cluster.local:4040",
 		AuthHeaders: headers,
@@ -106,10 +106,10 @@ func TestStart_ReturnsErrorWithoutConsumingSingletonSlot(t *testing.T) {
 		return &fakeProfiler{}, nil
 	})
 
-	_, err := Start(Config{ServiceName: "profiled-svc", Endpoint: "http://alloy:4040"})
+	_, err := Start(context.Background(), Config{ServiceName: "profiled-svc", Endpoint: "http://alloy:4040"})
 	require.ErrorIs(t, err, startErr)
 
-	closer, err := Start(Config{ServiceName: "profiled-svc", Endpoint: "http://alloy:4040"})
+	closer, err := Start(context.Background(), Config{ServiceName: "profiled-svc", Endpoint: "http://alloy:4040"})
 	require.NoError(t, err)
 	require.NoError(t, closer(context.Background()))
 }
@@ -119,18 +119,28 @@ func TestStart_RejectsSecondActiveProfiler(t *testing.T) {
 		return &fakeProfiler{}, nil
 	})
 
-	first, err := Start(Config{ServiceName: "profiled-svc", Endpoint: "http://alloy:4040"})
+	first, err := Start(context.Background(), Config{ServiceName: "profiled-svc", Endpoint: "http://alloy:4040"})
 	require.NoError(t, err)
 
-	second, err := Start(Config{ServiceName: "profiled-svc", Endpoint: "http://alloy:4040"})
+	second, err := Start(context.Background(), Config{ServiceName: "profiled-svc", Endpoint: "http://alloy:4040"})
 	require.ErrorIs(t, err, ErrAlreadyStarted)
 	assert.Nil(t, second)
 
 	require.NoError(t, first(context.Background()))
 }
 
+func TestStart_ReturnsCanceledContextError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	closer, err := Start(ctx, Config{ServiceName: "profiled-svc", Endpoint: "http://alloy:4040"})
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, closer)
+}
+
 func TestTruncatePyroscopeTagValue_PreservesUTF8(t *testing.T) {
-	value := strings.Repeat("a", maxPyroscopeTagValueBytes-1) + "界"
+	value := strings.Repeat("a", maxPyroscopeTagValueBytes-1) + "\u754c"
 
 	truncated := truncatePyroscopeTagValue("service_name", value, slog.Default())
 

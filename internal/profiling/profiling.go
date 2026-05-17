@@ -37,7 +37,8 @@ var pyroscopeStart = func(cfg pyroscope.Config) (profilerHandle, error) {
 }
 
 // Config is the subset of SDK configuration needed by the profiling
-// subsystem.
+// subsystem. It specifies the Pyroscope endpoint, authentication headers,
+// resource-derived tags, and logger used by the profiler integration.
 type Config struct {
 	ServiceName string
 	Endpoint    string
@@ -47,10 +48,17 @@ type Config struct {
 }
 
 // Start starts the Pyroscope profiler and returns a shutdown function.
-func Start(cfg Config) (func(context.Context) error, error) {
+func Start(ctx context.Context, cfg Config) (func(context.Context) error, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	profilerMu.Lock()
 	defer profilerMu.Unlock()
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if profilerStarted {
 		return nil, ErrAlreadyStarted
 	}
