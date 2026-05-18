@@ -1,0 +1,1032 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": true,
+      "title": "Tempo: traces for this service",
+      "tooltip": "Open Tempo Explore filtered by service.name",
+      "type": "link",
+      "url": "/explore?schemaVersion=1&orgId=1&panes=%7B%22tempo%22%3A%7B%22datasource%22%3A%22tempo%22%2C%22queries%22%3A%5B%7B%22refId%22%3A%22A%22%2C%22datasource%22%3A%7B%22type%22%3A%22tempo%22%2C%22uid%22%3A%22tempo%22%7D%2C%22queryType%22%3A%22traceql%22%2C%22query%22%3A%22%7Bresource.service.name%3D%5C%22$service_name%5C%22%7D%22%7D%5D%2C%22range%22%3A%7B%22from%22%3A%22${__from}%22%2C%22to%22%3A%22${__to}%22%7D%7D%7D"
+    },
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": true,
+      "title": "Loki: logs for this service",
+      "tooltip": "Open Loki Explore filtered by service",
+      "type": "link",
+      "url": "/explore?schemaVersion=1&orgId=1&panes=%7B%22loki%22%3A%7B%22datasource%22%3A%22loki%22%2C%22queries%22%3A%5B%7B%22refId%22%3A%22A%22%2C%22datasource%22%3A%7B%22type%22%3A%22loki%22%2C%22uid%22%3A%22loki%22%7D%2C%22expr%22%3A%22%7Bservice_name%3D%5C%22$service_namespace%2F$service_name%5C%22%7D%22%7D%5D%2C%22range%22%3A%7B%22from%22%3A%22${__from}%22%2C%22to%22%3A%22${__to}%22%7D%7D%7D"
+    }
+  ],
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Service Up",
+      "id": 1,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"options": {"0": {"text": "DOWN", "color": "red"}}, "type": "value"}
+          ],
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "red", "value": null},
+            {"color": "green", "value": 1}
+          ]},
+          "color": {"mode": "thresholds"},
+          "unit": "none"
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "horizontal",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "expr": "max(target_info{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"})",
+          "legendFormat": "up",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Request rate",
+      "id": 2,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "blue", "value": null}
+          ]},
+          "color": {"mode": "thresholds"},
+          "unit": "reqps"
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "expr": "sum(rate(http_server_request_duration_seconds_count{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\",http_route=~\"$http_route\"}[$__rate_interval]))",
+          "legendFormat": "rps",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Error rate (5xx)",
+      "id": 3,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "green", "value": null},
+            {"color": "yellow", "value": 1},
+            {"color": "red", "value": 5}
+          ]},
+          "color": {"mode": "thresholds"},
+          "unit": "percent",
+          "decimals": 2
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "expr": "100 * sum(rate(http_server_request_duration_seconds_count{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\",http_route=~\"$http_route\",http_response_status_code=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(http_server_request_duration_seconds_count{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\",http_route=~\"$http_route\"}[$__rate_interval])), 0.0001)",
+          "legendFormat": "err %",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "P95 latency",
+      "id": 4,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "green", "value": null},
+            {"color": "yellow", "value": 0.25},
+            {"color": "red", "value": 1}
+          ]},
+          "color": {"mode": "thresholds"},
+          "unit": "s"
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_server_request_duration_seconds_bucket{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\",http_route=~\"$http_route\"}[$__rate_interval])))",
+          "legendFormat": "p95",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Goroutines",
+      "id": 5,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "blue", "value": null},
+            {"color": "yellow", "value": 1000},
+            {"color": "red", "value": 10000}
+          ]},
+          "color": {"mode": "thresholds"},
+          "unit": "short"
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "expr": "sum(process_runtime_go_goroutines{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"})",
+          "legendFormat": "goroutines",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Heap in use",
+      "id": 6,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "blue", "value": null}
+          ]},
+          "color": {"mode": "thresholds"},
+          "unit": "bytes"
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "expr": "sum(process_runtime_go_mem_heap_inuse_bytes{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"})",
+          "legendFormat": "heap",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 100,
+      "title": "HTTP Server  (RED: Rate / Errors / Duration)",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 4},
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Request rate by route / status",
+      "id": 10,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 5},
+      "description": "Server-side request throughput, broken down by http.route and HTTP status code. Each route's count is the histogram _count derived from http.server.request.duration.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {"mode": "normal", "group": "A"}
+          },
+          "color": {"mode": "palette-classic"},
+          "unit": "reqps"
+        }
+      },
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "expr": "sum by (http_route, http_response_status_code) (rate(http_server_request_duration_seconds_count{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\",http_route=~\"$http_route\"}[$__rate_interval]))",
+          "legendFormat": "{{http_route}} {{http_response_status_code}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Status code distribution",
+      "id": 11,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 5},
+      "description": "Aggregated traffic by HTTP status code family.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 70,
+            "lineWidth": 0,
+            "showPoints": "never",
+            "stacking": {"mode": "normal", "group": "A"}
+          },
+          "color": {"mode": "palette-classic"},
+          "unit": "reqps"
+        },
+        "overrides": [
+          {"matcher": {"id": "byRegexp", "options": "/^5..*/"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]},
+          {"matcher": {"id": "byRegexp", "options": "/^4..*/"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]},
+          {"matcher": {"id": "byRegexp", "options": "/^2..*/"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]},
+          {"matcher": {"id": "byRegexp", "options": "/^3..*/"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]}
+        ]
+      },
+      "options": {
+        "legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "expr": "sum by (http_response_status_code) (rate(http_server_request_duration_seconds_count{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\",http_route=~\"$http_route\"}[$__rate_interval]))",
+          "legendFormat": "{{http_response_status_code}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Latency p50 / p95 / p99 (with exemplars)",
+      "id": 12,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 5},
+      "description": "Server latency percentiles. Exemplar dots link to the matching Tempo trace.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 5,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          },
+          "color": {"mode": "palette-classic"},
+          "unit": "s"
+        }
+      },
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "refId": "P50",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "exemplar": true,
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(http_server_request_duration_seconds_bucket{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\",http_route=~\"$http_route\"}[$__rate_interval])))",
+          "legendFormat": "p50",
+          "range": true
+        },
+        {
+          "refId": "P95",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "exemplar": true,
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_server_request_duration_seconds_bucket{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\",http_route=~\"$http_route\"}[$__rate_interval])))",
+          "legendFormat": "p95",
+          "range": true
+        },
+        {
+          "refId": "P99",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "exemplar": true,
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(http_server_request_duration_seconds_bucket{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\",http_route=~\"$http_route\"}[$__rate_interval])))",
+          "legendFormat": "p99",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "heatmap",
+      "title": "Latency heatmap (all routes)",
+      "id": 13,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 13},
+      "description": "Full distribution of request latency. Use this when percentiles are misleading (multimodal traffic, slow tail).",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "scaleDistribution": {"type": "linear"},
+            "hideFrom": {"tooltip": false, "viz": false, "legend": false}
+          }
+        }
+      },
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "color": {
+          "exponent": 0.5,
+          "fill": "dark-orange",
+          "mode": "scheme",
+          "reverse": false,
+          "scale": "exponential",
+          "scheme": "Spectral",
+          "steps": 64
+        },
+        "exemplars": {"color": "rgba(255,0,255,0.7)"},
+        "filterValues": {"le": 1e-9},
+        "legend": {"show": true},
+        "rowsFrame": {"layout": "auto"},
+        "showValue": "never",
+        "tooltip": {"mode": "single", "yHistogram": true},
+        "yAxis": {"axisPlacement": "left", "reverse": false, "unit": "s"}
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "exemplar": true,
+          "expr": "sum by (le) (rate(http_server_request_duration_seconds_bucket{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\",http_route=~\"$http_route\"}[$__rate_interval]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Top routes by traffic",
+      "id": 14,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 13},
+      "description": "Top 10 routes by request rate over the dashboard time range.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"align": "auto", "cellOptions": {"type": "auto"}},
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Value"}, "properties": [
+            {"id": "unit", "value": "reqps"},
+            {"id": "custom.cellOptions", "value": {"mode": "gradient", "type": "gauge"}}
+          ]}
+        ]
+      },
+      "options": {
+        "cellHeight": "sm",
+        "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false},
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "expr": "topk(10, sum by (http_route, http_request_method) (rate(http_server_request_duration_seconds_count{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"}[$__range])))",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {"id": "organize", "options": {"excludeByName": {"Time": true}, "renameByName": {"Value": "rps", "http_route": "route", "http_request_method": "method"}}}
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Slowest routes (P95)",
+      "id": 15,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 21},
+      "description": "Top 10 slowest routes by P95 latency over the dashboard time range.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"align": "auto"},
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "green", "value": null},
+            {"color": "yellow", "value": 0.25},
+            {"color": "red", "value": 1}
+          ]}
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Value"}, "properties": [
+            {"id": "unit", "value": "s"},
+            {"id": "custom.cellOptions", "value": {"mode": "gradient", "type": "color-background"}}
+          ]}
+        ]
+      },
+      "options": {
+        "cellHeight": "sm",
+        "footer": {"show": false},
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "expr": "topk(10, histogram_quantile(0.95, sum by (le, http_route) (rate(http_server_request_duration_seconds_bucket{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"}[$__range]))))",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {"id": "organize", "options": {"excludeByName": {"Time": true}, "renameByName": {"Value": "p95", "http_route": "route"}}}
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Top error routes (4xx + 5xx)",
+      "id": 16,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 21},
+      "description": "Top error-emitting (route, status) pairs over the dashboard time range.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"align": "auto"},
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "green", "value": null},
+            {"color": "orange", "value": 0.1},
+            {"color": "red", "value": 1}
+          ]}
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "Value"}, "properties": [
+            {"id": "unit", "value": "reqps"},
+            {"id": "custom.cellOptions", "value": {"mode": "gradient", "type": "color-background"}}
+          ]}
+        ]
+      },
+      "options": {
+        "cellHeight": "sm",
+        "footer": {"show": false},
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "expr": "topk(10, sum by (http_route, http_response_status_code) (rate(http_server_request_duration_seconds_count{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\",http_response_status_code=~\"[45]..\"}[$__range])))",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {"id": "organize", "options": {"excludeByName": {"Time": true}, "renameByName": {"Value": "rps", "http_route": "route", "http_response_status_code": "status"}}}
+      ]
+    },
+    {
+      "type": "row",
+      "id": 200,
+      "title": "HTTP Client  (outbound)",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 29},
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbound request rate by upstream",
+      "id": 20,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 30},
+      "description": "Outbound HTTP calls made by this service, grouped by server.address.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "stacking": {"mode": "normal", "group": "A"}
+          },
+          "color": {"mode": "palette-classic"},
+          "unit": "reqps"
+        }
+      },
+      "options": {
+        "legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "expr": "sum by (server_address, http_request_method) (rate(http_client_request_duration_seconds_count{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"}[$__rate_interval]))",
+          "legendFormat": "{{http_request_method}} {{server_address}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbound P95 by upstream",
+      "id": 21,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 30},
+      "description": "Outbound HTTP latency P95 per upstream.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "color": {"mode": "palette-classic"},
+          "unit": "s"
+        }
+      },
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "exemplar": true,
+          "expr": "histogram_quantile(0.95, sum by (le, server_address) (rate(http_client_request_duration_seconds_bucket{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"}[$__rate_interval])))",
+          "legendFormat": "{{server_address}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 300,
+      "title": "Go Runtime  (USE)",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 38},
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Goroutines",
+      "id": 30,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 6, "x": 0, "y": 39},
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"},
+          "color": {"mode": "palette-classic"},
+          "unit": "short"
+        }
+      },
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "expr": "sum(process_runtime_go_goroutines{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"})",
+          "legendFormat": "goroutines",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Heap memory",
+      "id": 31,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 6, "x": 6, "y": 39},
+      "description": "Bytes in use vs bytes obtained from the OS. The gap is reclaimable headroom.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never"},
+          "color": {"mode": "palette-classic"},
+          "unit": "bytes"
+        }
+      },
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "expr": "sum(process_runtime_go_mem_heap_inuse_bytes{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"})",
+          "legendFormat": "in_use",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "expr": "sum(process_runtime_go_mem_heap_sys_bytes{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"})",
+          "legendFormat": "sys",
+          "range": true
+        },
+        {
+          "refId": "C",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "expr": "sum(process_runtime_go_mem_heap_released_bytes{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"})",
+          "legendFormat": "released",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "heatmap",
+      "title": "GC pause distribution",
+      "id": 32,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 39},
+      "description": "Distribution of GC pause durations. Bright bands at the top mean stop-the-world events are creeping into the tail.",
+      "fieldConfig": {"defaults": {"custom": {"scaleDistribution": {"type": "linear"}}}},
+      "options": {
+        "calculate": false,
+        "cellGap": 1,
+        "color": {"exponent": 0.5, "fill": "dark-orange", "mode": "scheme", "scheme": "Oranges", "scale": "exponential", "steps": 64},
+        "filterValues": {"le": 1e-9},
+        "legend": {"show": true},
+        "rowsFrame": {"layout": "auto"},
+        "showValue": "never",
+        "tooltip": {"mode": "single", "yHistogram": true},
+        "yAxis": {"axisPlacement": "left", "unit": "ns"}
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "expr": "sum by (le) (rate(process_runtime_go_gc_pause_ns_bucket{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"}[$__rate_interval]))",
+          "format": "heatmap",
+          "legendFormat": "{{le}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "GC frequency",
+      "id": 33,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 39},
+      "description": "GC completions per second (rate of process.runtime.go.gc.count).",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"drawStyle": "line", "fillOpacity": 20, "lineWidth": 1, "showPoints": "never"},
+          "color": {"mode": "palette-classic"},
+          "unit": "ops"
+        }
+      },
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "expr": "sum(rate(process_runtime_go_gc_count_total{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"}[$__rate_interval]))",
+          "legendFormat": "gc/s",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 400,
+      "title": "Logs  (Loki) — service-scoped, trace-correlated",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 47},
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Log volume by level",
+      "id": 40,
+      "datasource": {"type": "loki", "uid": "loki"},
+      "gridPos": {"h": 10, "w": 8, "x": 0, "y": 48},
+      "description": "Per-second log rate, stacked by severity. WARN+ should be a small fraction of traffic.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "lineWidth": 0,
+            "showPoints": "never",
+            "stacking": {"mode": "normal", "group": "A"}
+          },
+          "color": {"mode": "palette-classic"},
+          "unit": "logs"
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "error"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]},
+          {"matcher": {"id": "byName", "options": "warn"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}]},
+          {"matcher": {"id": "byName", "options": "info"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
+          {"matcher": {"id": "byName", "options": "debug"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "gray"}}]}
+        ]
+      },
+      "options": {
+        "legend": {"calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "loki"},
+          "editorMode": "code",
+          "expr": "sum by (level) (rate({service_name=~\"($service_namespace)/($service_name)\"}[$__auto]))",
+          "legendFormat": "{{level}}",
+          "queryType": "range"
+        }
+      ]
+    },
+    {
+      "type": "logs",
+      "title": "Live logs (click traceId to open trace)",
+      "id": 41,
+      "datasource": {"type": "loki", "uid": "loki"},
+      "gridPos": {"h": 10, "w": 16, "x": 8, "y": 48},
+      "description": "Most recent log lines for this service. The Loki datasource is wired with derivedFields → Tempo, so traceId values render as links.",
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": false,
+        "showCommonLabels": false,
+        "showLabels": false,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": false
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "loki", "uid": "loki"},
+          "editorMode": "code",
+          "expr": "{service_name=~\"($service_namespace)/($service_name)\"} | json",
+          "queryType": "range",
+          "maxLines": 200
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 500,
+      "title": "Traces  (Tempo)",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 58},
+      "panels": []
+    },
+    {
+      "type": "traces",
+      "title": "Recent traces for this service",
+      "id": 50,
+      "datasource": {"type": "tempo", "uid": "tempo"},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 59},
+      "description": "TraceQL search filtered by resource.service.name. Click a row to open the span timeline; spans link to logs and CPU profiles via the Tempo datasource configuration.",
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "tempo", "uid": "tempo"},
+          "queryType": "traceql",
+          "query": "{resource.service.name=\"$service_name\" && resource.service.namespace=\"$service_namespace\"}",
+          "tableType": "traces",
+          "limit": 20
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 600,
+      "title": "Profiles  (Pyroscope) — requires WithProfilingEndpoint",
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 69},
+      "panels": []
+    },
+    {
+      "type": "flamegraph",
+      "title": "CPU flame graph",
+      "id": 60,
+      "datasource": {"type": "grafana-pyroscope-datasource", "uid": "pyroscope"},
+      "gridPos": {"h": 12, "w": 12, "x": 0, "y": 70},
+      "description": "Aggregated CPU samples for this service over the dashboard time range. Open a span in the Traces panel above to focus on a single request's CPU profile.",
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "grafana-pyroscope-datasource", "uid": "pyroscope"},
+          "labelSelector": "{service_name=\"$service_name\"}",
+          "groupBy": [],
+          "profileTypeId": "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+          "queryType": "profile"
+        }
+      ]
+    },
+    {
+      "type": "flamegraph",
+      "title": "Alloc flame graph (memory)",
+      "id": 61,
+      "datasource": {"type": "grafana-pyroscope-datasource", "uid": "pyroscope"},
+      "gridPos": {"h": 12, "w": 12, "x": 12, "y": 70},
+      "description": "Allocated heap bytes per call site. Use this to find allocation hot paths driving GC pressure.",
+      "options": {},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "grafana-pyroscope-datasource", "uid": "pyroscope"},
+          "labelSelector": "{service_name=\"$service_name\"}",
+          "groupBy": [],
+          "profileTypeId": "memory:alloc_space:bytes:space:bytes",
+          "queryType": "profile"
+        }
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["o11y", "sdk", "overview", "firepower"],
+  "templating": {
+    "list": [
+      {
+        "name": "service_namespace",
+        "label": "service.namespace",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "definition": "label_values(target_info, service_namespace)",
+        "query": {"query": "label_values(target_info, service_namespace)", "refId": "service_namespace"},
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".+",
+        "current": {"selected": false, "text": "All", "value": "$__all"}
+      },
+      {
+        "name": "service_name",
+        "label": "service.name",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "definition": "label_values(target_info{service_namespace=~\"$service_namespace\"}, service_name)",
+        "query": {"query": "label_values(target_info{service_namespace=~\"$service_namespace\"}, service_name)", "refId": "service_name"},
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "includeAll": true,
+        "multi": false,
+        "allValue": ".+",
+        "current": {"selected": false, "text": "All", "value": "$__all"}
+      },
+      {
+        "name": "environment",
+        "label": "environment",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "definition": "label_values(target_info{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\"}, deployment_environment_name)",
+        "query": {"query": "label_values(target_info{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\"}, deployment_environment_name)", "refId": "environment"},
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".+",
+        "current": {"selected": false, "text": "All", "value": "$__all"}
+      },
+      {
+        "name": "service_version",
+        "label": "service.version",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "definition": "label_values(target_info{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\"}, service_version)",
+        "query": {"query": "label_values(target_info{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\"}, service_version)", "refId": "service_version"},
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".+",
+        "current": {"selected": false, "text": "All", "value": "$__all"}
+      },
+      {
+        "name": "http_route",
+        "label": "http.route",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "definition": "label_values(http_server_request_duration_seconds_count{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"}, http_route)",
+        "query": {"query": "label_values(http_server_request_duration_seconds_count{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"}, http_route)", "refId": "http_route"},
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".+",
+        "current": {"selected": false, "text": "All", "value": "$__all"}
+      }
+    ]
+  },
+  "time": {"from": "now-30m", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "o11y SDK Overview",
+  "uid": "o11y-overview",
+  "version": 1,
+  "weekStart": ""
+}

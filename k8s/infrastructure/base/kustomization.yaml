@@ -12,3 +12,18 @@ resources:
   - otel-collector.yaml
   - prometheus.yaml
   - grafana.yaml
+
+# Generate the grafana-dashboards ConfigMap from standalone JSON files so
+# dashboard definitions live as proper files (no YAML escaping, easy diffs)
+# while still being delivered to the cluster as a single mountable ConfigMap.
+configMapGenerator:
+  - name: grafana-dashboards
+    namespace: infra
+    files:
+      - dashboards/o11y-overview.json
+      - dashboards/metrics-correlation.json
+
+# Pin the generated ConfigMap's name so the grafana Deployment's volume
+# reference (name: grafana-dashboards) keeps resolving after edits.
+generatorOptions:
+  disableNameSuffixHash: true

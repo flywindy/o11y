@@ -475,10 +475,29 @@ go run examples/metrics/main.go
 The example starts an HTTP server on `:8080` and generates synthetic traffic every 500 ms. Metrics flow via OTLP/HTTP to the OTel Collector, which forwards them to Prometheus via remote write. It uses the same `localhost:4318` NodePort as traces and logs, so no extra metrics scrape port is needed for this example. Histogram buckets include exemplars linking each measurement to its trace.
 
 Open Grafana at `http://localhost:3000` and navigate to:
+- **Dashboards → Observability → o11y SDK Overview** — the flagship dashboard. Pick `service.namespace` / `service.name` from the variable picker at the top and it auto-populates RED metrics, runtime stats, logs, traces, and CPU profiles for any service that uses the SDK. See [Flagship Dashboard](#flagship-dashboard) below.
+- **Dashboards → Observability → Metrics Correlation** — HTTP latency metrics with a data link that opens the matching `metrics-example` logs in Loki
 - **Explore → Tempo** — producer and consumer spans linked across services
 - **Explore → Loki** — structured log entries with correlated `traceId` and `spanId`
 - **Explore → Prometheus** — `http_server_request_duration_seconds`; click an exemplar dot to jump to the linked trace in Tempo
-- **Dashboards → Observability → Metrics Correlation** — HTTP latency metrics with a data link that opens the matching `metrics-example` logs in Loki
+
+### Flagship Dashboard
+
+The provisioned `o11y SDK Overview` dashboard (`k8s/infrastructure/base/dashboards/o11y-overview.json`)
+is the default surface for any service that wires up the SDK. It uses
+`target_info` resource attributes for service discovery, so dropdowns are
+populated automatically as soon as a service starts emitting metrics — no
+per-service dashboard authoring needed.
+
+Sections, top to bottom:
+
+- **Header stats** — service health (`target_info`), request rate, error rate, P95 latency, goroutines, heap in use.
+- **HTTP Server (RED)** — throughput by route/status, status-code distribution, P50/P95/P99 with Tempo exemplars, latency heatmap, top routes by traffic / by P95 / by error rate.
+- **HTTP Client** — outbound RPS and P95 by `server.address`.
+- **Go Runtime (USE)** — goroutines, heap memory (in_use / sys / released), GC pause heatmap, GC frequency.
+- **Logs (Loki)** — log volume stacked by level + live tail filtered by `service_name`. `traceId` values in log bodies render as links into Tempo via the Loki datasource's `derivedFields`.
+- **Traces (Tempo)** — recent traces for the selected service. Spans link out to logs (`tracesToLogsV2`) and CPU profiles (`tracesToProfiles`) via the Tempo datasource configuration.
+- **Profiles (Pyroscope)** — CPU and allocation flame graphs. Populates only when the service was started with `WithProfilingEndpoint`; otherwise the panels stay empty.
 
 ### Gin
 
