@@ -146,6 +146,8 @@ revisit the choice if upstream semconv adds one.
 //
 // Wrap returns a non-nil error when:
 //   - rdb is nil;
+//   - tp (trace.TracerProvider) is nil;
+//   - mp (metric.MeterProvider) is nil;
 //   - the underlying concrete type is not supported (single /
 //     cluster / ring / sentinel-failover are all supported in
 //     v9.9.0; *redis.SentinelClient is not);
@@ -156,10 +158,17 @@ revisit the choice if upstream semconv adds one.
 //   - the per-node redisotel.InstrumentMetrics phase returns an
 //     error (gathered via errors.Join over all failing nodes).
 //
-// The first three error classes (nil / unsupported /
-// instrument-creation) preserve the strict unmodified-on-error
-// contract: the original client is returned with no callbacks
-// installed and the dedup-map entry stays open for retry.
+// Wrap does NOT fall back to otel.GetTracerProvider() /
+// otel.GetMeterProvider() when the arguments are nil — the
+// no-OTel-globals discipline (ADR 0008) requires that
+// providers be passed explicitly. Nil providers are a
+// configuration bug, surfaced as a strict error.
+//
+// The first five error classes (nil rdb / nil tp / nil mp /
+// unsupported type / instrument-creation) preserve the strict
+// unmodified-on-error contract: the original client is
+// returned with no callbacks installed and the dedup-map entry
+// stays open for retry.
 //
 // The remaining two — ForEachShard failure on a warmed
 // Cluster/Ring, and metrics-phase failure — are best-effort.
@@ -659,9 +668,10 @@ Cluster-specific concerns:
       err := doCommitSequence(rdb, e)   // §10 / §7
       switch classify(err) {
       case errStrictPreCommit:
-          // nil rdb, unsupported type, wrapper-owned instrument
-          // creation. Nothing was mutated: remove the placeholder
-          // so a retry can re-enter cleanly.
+          // nil rdb / nil tp / nil mp / unsupported type /
+          // wrapper-owned instrument creation. Nothing was
+          // mutated: remove the placeholder so a retry can
+          // re-enter cleanly.
           m.CompareAndDelete(key, e)
           e.mu.Unlock()
           return rdb, err
@@ -1015,11 +1025,15 @@ Cluster-specific concerns:
 
   **Failure paths.** The wrapper has three classes:
 
-  - **Strict pre-commit failure** (nil `rdb`, unsupported type,
-    wrapper-owned instrument creation): nothing has been mutated.
-    The wrapper returns the original client, runs the
-    `CompareAndDelete` placeholder cleanup from the idempotency
-    section, and `done = false`. Retry is safe.
+  - **Strict pre-commit failure** (nil `rdb`, nil `tp`, nil
+    `mp`, unsupported type, wrapper-owned instrument creation):
+    nothing has been mutated. The wrapper returns the original
+    client, runs the `CompareAndDelete` placeholder cleanup
+    from the idempotency section, and `done = false`. Retry is
+    safe. Provider-nil checks run **first** in step 1 — before
+    any allocation, lock acquisition, or `LoadOrStore` — so a
+    nil-provider call doesn't even create a dedup-map entry to
+    clean up.
 
   - **Warmed Cluster/Ring `ForEachShard` failure** (step 4
     iteration error): this is the awkward case created by
@@ -1262,16 +1276,24 @@ On every `go-redis` / `redisotel` version change:
     the canonicity-check loop in §10 is removed (waiter commits
     on the orphaned entry, then a third `Wrap` call inserts a
     second placeholder and double-hooks) would fail this test.
-  - `Wrap` returns a non-nil error for a nil client, for
-    `*redis.SentinelClient`, and when wrapper-owned instrument
-    creation fails — the three strict unmodified-on-error paths
-    per §10. The contract is asserted by issuing a command on
-    the returned client after a forced failure and confirming
-    the in-memory exporter records **no** spans and **no**
-    `db.client.operation.duration` samples — no `OnNewNode`
-    callback and no partial per-shard hook installation survives
-    these error paths. (`ForEachShard` mid-traversal failures on
-    warmed Cluster/Ring are best-effort per §10's carve-out, not
+  - `Wrap` returns a non-nil error for a nil client, for a nil
+    `trace.TracerProvider`, for a nil `metric.MeterProvider`,
+    for `*redis.SentinelClient`, and when wrapper-owned
+    instrument creation fails — the five strict
+    unmodified-on-error paths per §10. The nil-provider cases
+    are asserted explicitly: pass `Wrap(redis.NewClient(...),
+    nil, mp)` and `Wrap(redis.NewClient(...), tp, nil)`,
+    confirm each returns a non-nil error with no panic and
+    that the package's dedup map is unchanged (no placeholder
+    created for either call — provider-nil checks short-circuit
+    before `LoadOrStore`). The broader contract is asserted by
+    issuing a command on the returned client after a forced
+    failure and confirming the in-memory exporter records
+    **no** spans and **no** `db.client.operation.duration`
+    samples — no `OnNewNode` callback and no partial
+    per-shard hook installation survives these error paths.
+    (`ForEachShard` mid-traversal failures on warmed
+    Cluster/Ring are best-effort per §10's carve-out, not
     strict; that path is covered by the warmed-Cluster
     `ForEachShard`-failure carve-out test below.)
   - **Metrics-phase carve-out (§7 group B).** Forcing
