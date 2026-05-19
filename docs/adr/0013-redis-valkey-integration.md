@@ -136,7 +136,10 @@ revisit the choice if upstream semconv adds one.
 // go-redis configuration. Returns the same client for chaining.
 //
 // Wrap accepts any redis.UniversalClient, so single-node,
-// ClusterClient, FailoverClient (Sentinel), and Ring all work.
+// *redis.Client (including the Sentinel-failover variant returned
+// by NewFailoverClient — go-redis v9.9.0 returns a regular
+// *redis.Client there, distinguishable only by its Options().Addr
+// placeholder), *redis.ClusterClient, and *redis.Ring all work.
 //
 // Wrap is idempotent: calling it twice on the same client is a no-op
 // after the first call.
@@ -314,25 +317,40 @@ names that pass through unchanged from v1.24 to v1.39:
 - `db.client.connections.misses`
 - `db.client.connections.create_time` (histogram, unit `ms`)
 
-`Wrap` calls
+For a single-node `*redis.Client` (including the Sentinel-failover
+variant) `Wrap` calls
 `redisotel.InstrumentMetrics(rdb, redisotel.WithMeterProvider(mp))`
-to register these. The wrapper does not duplicate them.
+once and is done.
 
-**Warmed-cluster / ring metric coverage.** In go-redis/redisotel
-v9.9.0, the `*redis.ClusterClient` and `*redis.Ring` branches of
-`InstrumentMetrics` install only an `OnNewNode` callback and
-return; they do **not** iterate pre-existing node clients. A
-warmed cluster passed to `Wrap` would therefore receive no
-`db.client.connections.*` samples for its already-created shards
-until topology refresh, even though §10's `ForEachShard` pass
-gives those shards spans. `Wrap` mirrors §10's dual mechanism for
-metrics: during the same transactional iteration over shards (see
-§10's ordering rules), it calls
-`redisotel.InstrumentMetrics(perNodeClient, redisotel.WithMeterProvider(mp))`
-on each per-node `*redis.Client` it collects. Double-registration
-on a second `Wrap` call is prevented by §10's top-level
-`sync.Map` dedup (which short-circuits before any per-node work
-runs), not by per-node bookkeeping.
+**Cluster / Ring: bypass the top-level cluster path.** In
+go-redis/redisotel v9.9.0, calling `InstrumentMetrics` directly on
+a `*redis.ClusterClient` or `*redis.Ring` installs an `OnNewNode`
+callback that closes over **one shared `conf` struct**: after the
+first per-node invocation, redisotel mutates `conf.poolName` to
+that node's address and appends node-specific attrs to
+`conf.attrs`, and **subsequent** new-node invocations re-use the
+mutated state — they keep the first node's `pool.name` label and
+keep appending duplicate attributes. The wrapper therefore must
+**not** rely on the top-level `InstrumentMetrics(clusterClient)`
+call for ongoing node coverage; using it would produce wrong /
+duplicated labels on every node created after the first.
+
+`Wrap` instead drives `InstrumentMetrics` itself, **per node**,
+using a fresh call site (and therefore a fresh internal `conf`)
+each time:
+
+1. During the §10 `ForEachShard` pass, call
+   `redisotel.InstrumentMetrics(perNodeClient, redisotel.WithMeterProvider(mp))`
+   on each already-materialised per-node `*redis.Client`.
+2. In the wrapper's own `OnNewNode` callback (which is per-`Wrap`-
+   call and so has its own closure, **not** redisotel's shared
+   one), the same per-node `InstrumentMetrics` call fires for each
+   freshly-created node — picking up post-`Wrap` topology
+   refreshes without inheriting any sibling's pool.name.
+
+Double-registration on a second `Wrap` call is prevented by §10's
+top-level `sync.Map` dedup (which short-circuits before any
+per-node work runs), not by per-node bookkeeping.
 
 **Carve-out: partial per-node `InstrumentMetrics` failure.** In
 go-redis/redisotel v9.9.0, `InstrumentMetrics` registers its
@@ -408,10 +426,11 @@ The wrapper's `ProcessPipelineHook` emits one flat span per
   `db.client.operation.duration` with
   `db.operation.name="pipeline"`.
 
-**Single-node / Sentinel-failover** (`*redis.Client`,
-`*redis.FailoverClient`): one hook invocation per `Pipeline()` /
-`TxPipeline()` call, so one span and one sample per caller batch.
-`db.operation.batch.size` matches the caller-issued command count.
+**Single-node / Sentinel-failover** (both are `*redis.Client`,
+differentiated only by `Options().Addr`): one hook invocation per
+`Pipeline()` / `TxPipeline()` call, so one span and one sample per
+caller batch. `db.operation.batch.size` matches the caller-issued
+command count.
 
 **Cluster / Ring** (`*redis.ClusterClient`, `*redis.Ring`): go-redis
 v9.9.0 splits the caller batch by destination shard and invokes
@@ -499,9 +518,16 @@ it does not contribute to histogram cardinality.
 
 ### 10. Topology modes
 
-The wrapper accepts `redis.UniversalClient`, so single-node
-`*redis.Client`, `*redis.ClusterClient`, `*redis.FailoverClient`
-(Sentinel), and `*redis.Ring` all flow through one entry point.
+The wrapper accepts `redis.UniversalClient`. The three supported
+concrete types are `*redis.Client` (which includes the Sentinel-
+failover variant returned by `NewFailoverClient` — go-redis v9.9.0
+does not expose a distinct `*redis.FailoverClient` type, only a
+`*redis.Client` whose `Options().Addr == "FailoverClient"`),
+`*redis.ClusterClient`, and `*redis.Ring`. `*redis.SentinelClient`
+(the raw sentinel-monitor RPC client returned by
+`NewSentinelClient`) is **not** supported and is rejected with an
+error by `Wrap`. The Sentinel-failover sub-case is detected via
+`rdb.Options().Addr == "FailoverClient"`, not via a type switch.
 
 Cluster-specific concerns:
 
@@ -529,9 +555,9 @@ Cluster-specific concerns:
   Idempotency is therefore enforced at the wrapper layer using a
   package-private `sync.Map[redis.UniversalClient]*entry` keyed by
   the interface value (interface equality compares dynamic type
-  plus pointer, which is well-defined for the four supported
-  concrete types `*redis.Client`, `*redis.ClusterClient`,
-  `*redis.Ring`, `*redis.FailoverClient`). Each `entry` holds a
+  plus pointer, which is well-defined for the three supported
+  concrete types `*redis.Client`, `*redis.ClusterClient`, and
+  `*redis.Ring`). Each `entry` holds a
   `sync.Mutex` plus a `done bool`. The flow on every `Wrap` call:
 
   1. `LoadOrStore` an `*entry` for the client. This creates a
@@ -575,12 +601,18 @@ Cluster-specific concerns:
   no mutation of `rdb` yet; (2) run `ForEachShard` (Cluster/Ring)
   collecting the per-node `*redis.Client` references but **not**
   calling `AddHook` during traversal; (3) once traversal completes
-  cleanly, install `OnNewNode` and then `AddHook` on each
-  collected node, in that order, treating the combined step as
-  the **tracing commit point**; (4) call
-  `redisotel.InstrumentMetrics` on the top-level `rdb` and on each
-  collected per-node client (the **best-effort metrics phase** —
-  see §7 group B carve-out).
+  cleanly, install the wrapper's own `OnNewNode` (which on every
+  future node-creation will call `AddHook` and then
+  `redisotel.InstrumentMetrics(newNode, …)` against a **fresh**
+  closure-local config — sidestepping redisotel's shared-`conf`
+  bug from §7 group B) and then `AddHook` on each collected node,
+  in that order, treating the combined step as the **tracing
+  commit point**; (4) call `redisotel.InstrumentMetrics` on each
+  collected per-node client (for single-node, on the top-level
+  `rdb` itself) — the **best-effort metrics phase**, see §7 group
+  B carve-out. Note that for Cluster / Ring there is no top-level
+  `InstrumentMetrics(rdb)` call at all; the per-node iteration is
+  the entire metrics path.
 
   If any step **at or before the tracing commit point** fails —
   nil `rdb`, unsupported type, wrapper-owned instrument creation,
@@ -760,6 +792,16 @@ On every `go-redis` / `redisotel` version change:
     shard's pool. This asserts the dual-mechanism contract from
     both §7 (metrics) and §10 (tracing); a regression where only
     `OnNewNode` is installed for either path would fail this test.
+  - **No shared-config label pollution (§7 group B regression
+    test).** Integration test with a 3-shard cluster: after
+    `Wrap`, force a topology refresh that materialises two new
+    nodes back-to-back through the wrapper's `OnNewNode`. Assert
+    that each new node's `db.client.connections.usage` samples
+    carry that node's own `pool.name` (its address), **not** the
+    first new node's address. A regression that re-introduced the
+    top-level `redisotel.InstrumentMetrics(clusterClient)` call
+    would fail this assertion because of the shared-`conf` bug
+    described in §7 group B.
   - `Wrap` returns a non-nil error for a nil client, for
     `*redis.SentinelClient`, when wrapper-owned instrument
     creation fails, and when `ForEachShard` returns an error
