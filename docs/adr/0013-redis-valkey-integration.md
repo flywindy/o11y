@@ -148,9 +148,14 @@ revisit the choice if upstream semconv adds one.
 //   - rdb is nil;
 //   - tp (trace.TracerProvider) is nil;
 //   - mp (metric.MeterProvider) is nil;
-//   - the underlying concrete type is not supported (single /
-//     cluster / ring / sentinel-failover are all supported in
-//     v9.9.0; *redis.SentinelClient is not);
+//   - the underlying concrete type is not one of the three
+//     supported variants of redis.UniversalClient (single /
+//     cluster / ring — Sentinel-failover is a *redis.Client, so
+//     it falls under "single"). Note: *redis.SentinelClient (the
+//     raw sentinel-monitor RPC client from NewSentinelClient)
+//     does NOT implement redis.UniversalClient at all in go-redis
+//     v9.9.0, so passing it to Wrap is a compile-time error, not
+//     a runtime one — no error class is needed for it;
 //   - creation of the wrapper's own metric instruments against
 //     the supplied MeterProvider fails;
 //   - the initial ForEachShard iteration over an already-warmed
@@ -564,11 +569,24 @@ concrete types are `*redis.Client` (which includes the Sentinel-
 failover variant returned by `NewFailoverClient` — go-redis v9.9.0
 does not expose a distinct `*redis.FailoverClient` type, only a
 `*redis.Client` whose `Options().Addr == "FailoverClient"`),
-`*redis.ClusterClient`, and `*redis.Ring`. `*redis.SentinelClient`
-(the raw sentinel-monitor RPC client returned by
-`NewSentinelClient`) is **not** supported and is rejected with an
-error by `Wrap`. The Sentinel-failover sub-case is detected via
-`rdb.Options().Addr == "FailoverClient"`, not via a type switch.
+`*redis.ClusterClient`, and `*redis.Ring`. The Sentinel-failover
+sub-case is detected via `rdb.Options().Addr == "FailoverClient"`,
+not via a type switch.
+
+`*redis.SentinelClient` — the raw sentinel-monitor RPC client
+returned by `NewSentinelClient` — does **not** implement
+`redis.UniversalClient` in go-redis v9.9.0 (it lacks `Watch`,
+`Pipeline`, etc.). It therefore cannot reach `Wrap` at all; a
+call like `Wrap(redis.NewSentinelClient(...), tp, mp)` is a
+compile-time type error, not a runtime one. No runtime rejection
+path is needed.
+
+The wrapper still uses a type switch on the supported concretes
+to drive topology-specific behaviour (cluster/ring iterate
+shards, single-node `*redis.Client` does not), and the type
+switch's default case returns an error to defend against any
+hypothetical future `redis.UniversalClient` implementation that
+the wrapper does not know how to walk.
 
 Cluster-specific concerns:
 
@@ -576,9 +594,24 @@ Cluster-specific concerns:
   `redis.Hook` on `*redis.ClusterClient` / `*redis.Ring` through
   **both** an `OnNewNode` callback (covers future nodes created
   after `Wrap` returns) **and** an immediate iteration over the
-  already-materialised shards via `ForEachShard` (Cluster: via
-  `ForEachMaster` + `ForEachSlave`; Ring: `ForEachShard`) calling
-  `AddHook` on each per-node `*redis.Client`. The dual approach
+  already-materialised shards. The iteration API differs by
+  topology:
+  - **Cluster** uses `ForEachMaster` followed by `ForEachSlave`;
+    both walk the cluster's current topology view.
+  - **Ring** uses `GetShardClients()`, **not** `ForEachShard`.
+    `Ring.ForEachShard` in go-redis v9.9.0 silently skips any
+    shard whose `shard.IsDown()` reports true — but the
+    underlying per-shard `*redis.Client` is already materialised
+    inside the Ring and continues to live there. If the shard
+    later recovers (`IsDown` flips back), no `OnNewNode`
+    callback fires because the shard client was never re-created,
+    leaving that shard's commands forever un-hooked. The
+    `GetShardClients()` getter returns every shard regardless of
+    health, so each can be hooked + metric-instrumented during
+    the initial pass.
+
+  `AddHook` is then called on each per-node `*redis.Client`
+  yielded by the chosen iteration API. The dual approach
   is required because in go-redis v9.9.0 `OnNewNode` only appends
   the callback to a slice that runs from the cluster pool's
   `GetOrCreate`, so a warmed `ClusterClient` passed to `Wrap`
@@ -1219,9 +1252,9 @@ On every `go-redis` / `redisotel` version change:
     `done` gate described in §10 (after the second `Wrap`, each
     per-node `*redis.Client` still has exactly one tracing hook
     in its chain).
-  - On a warmed `*redis.ClusterClient` / `*redis.Ring` (one whose
-    `ForEachShard` already yields ≥1 node before `Wrap` is
-    called), every existing shard's per-node `*redis.Client`
+  - On a warmed `*redis.ClusterClient` / `*redis.Ring` (one
+    whose shard iteration already yields ≥1 node before `Wrap`
+    is called), every existing shard's per-node `*redis.Client`
     receives **both** the tracing hook and a
     `redisotel.InstrumentMetrics` registration before `Wrap`
     returns. A subsequent command routed to a pre-existing shard
@@ -1229,7 +1262,20 @@ On every `go-redis` / `redisotel` version change:
     least one `db.client.connections.usage` sample for that
     shard's pool. This asserts the dual-mechanism contract from
     both §7 (metrics) and §10 (tracing); a regression where only
-    `OnNewNode` is installed for either path would fail this test.
+    `OnNewNode` is installed for either path would fail this
+    test.
+  - **Down Ring shard is still instrumented (§10 regression).**
+    Construct a `*redis.Ring` whose shard-down probe reports
+    `IsDown() == true` for one shard at `Wrap` time, while the
+    underlying per-shard `*redis.Client` is already
+    materialised. `Wrap` succeeds; the down shard is then
+    flipped to healthy via the test fixture (no `OnNewNode`
+    fires because the shard client was never re-created), and
+    a command routed to that shard must emit a span and a
+    `db.client.operation.duration` sample. A regression that
+    iterates Ring shards via `Ring.ForEachShard` instead of
+    `GetShardClients()` would skip the down shard during the
+    initial pass and fail this test.
   - **No shared-config label pollution (§7 group B regression
     test).** Integration test with a 3-shard cluster: after
     `Wrap`, force a topology refresh that materialises two new
@@ -1278,24 +1324,29 @@ On every `go-redis` / `redisotel` version change:
     second placeholder and double-hooks) would fail this test.
   - `Wrap` returns a non-nil error for a nil client, for a nil
     `trace.TracerProvider`, for a nil `metric.MeterProvider`,
-    for `*redis.SentinelClient`, and when wrapper-owned
-    instrument creation fails — the five strict
-    unmodified-on-error paths per §10. The nil-provider cases
-    are asserted explicitly: pass `Wrap(redis.NewClient(...),
-    nil, mp)` and `Wrap(redis.NewClient(...), tp, nil)`,
-    confirm each returns a non-nil error with no panic and
-    that the package's dedup map is unchanged (no placeholder
-    created for either call — provider-nil checks short-circuit
-    before `LoadOrStore`). The broader contract is asserted by
-    issuing a command on the returned client after a forced
-    failure and confirming the in-memory exporter records
-    **no** spans and **no** `db.client.operation.duration`
-    samples — no `OnNewNode` callback and no partial
-    per-shard hook installation survives these error paths.
+    and when wrapper-owned instrument creation fails — the
+    four strict unmodified-on-error paths per §10. The
+    nil-provider cases are asserted explicitly: pass
+    `Wrap(redis.NewClient(...), nil, mp)` and
+    `Wrap(redis.NewClient(...), tp, nil)`, confirm each
+    returns a non-nil error with no panic and that the
+    package's dedup map is unchanged (no placeholder created
+    for either call — provider-nil checks short-circuit
+    before `LoadOrStore`). The broader contract is asserted
+    by issuing a command on the returned client after a
+    forced failure and confirming the in-memory exporter
+    records **no** spans and **no**
+    `db.client.operation.duration` samples — no `OnNewNode`
+    callback and no partial per-shard hook installation
+    survives these error paths.
     (`ForEachShard` mid-traversal failures on warmed
     Cluster/Ring are best-effort per §10's carve-out, not
     strict; that path is covered by the warmed-Cluster
-    `ForEachShard`-failure carve-out test below.)
+    `ForEachShard`-failure carve-out test below.
+    `*redis.SentinelClient` is not tested here because it does
+    not implement `redis.UniversalClient` in v9.9.0 and
+    therefore fails to compile at the call site — there is no
+    runtime rejection path to exercise.)
   - **Metrics-phase carve-out (§7 group B).** Forcing
     `redisotel.InstrumentMetrics` to fail on a subset of the
     per-node iteration (e.g. by injecting a MeterProvider that
