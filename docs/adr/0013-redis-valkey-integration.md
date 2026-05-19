@@ -321,10 +321,10 @@ metric labels cannot). `server.port` is included so services
 running multiple Redis processes on the same host (sidecars, dev
 environments) can distinguish them, per Gemini's allowlist note.
 
-**B. Connection-pool metrics — passed through from `redisotel.InstrumentMetrics`.**
+**B. Connection-pool metrics — passed through from `redisotel.InstrumentMetrics`, with views to bring them to v1.39.**
 
-These instruments already use stable `db.client.connections.*`
-names that pass through unchanged from v1.24 to v1.39:
+redisotel v9.9.0 emits the **v1.24-era** pool instruments —
+plural-form names and millisecond histograms:
 
 - `db.client.connections.idle.max`
 - `db.client.connections.idle.min`
@@ -334,6 +334,55 @@ names that pass through unchanged from v1.24 to v1.39:
 - `db.client.connections.hits`
 - `db.client.connections.misses`
 - `db.client.connections.create_time` (histogram, unit `ms`)
+- `db.client.connections.use_time` (histogram, unit `ms`) —
+  dropped by the view in group C since group A replaces it.
+
+The OTel semantic-conventions v1.33 database migration renamed
+this family from `db.client.connections.*` (plural) to
+`db.client.connection.*` (singular) and switched
+`create_time` / `use_time` from `ms` to `s`. ADR 0011 pins this
+repo to semconv v1.39, so an unmodified pass-through would
+leave the pool metrics non-compliant — dashboards keyed on the
+v1.39 names would miss Redis pool telemetry entirely.
+
+The wrapper closes the gap with two complementary fixes:
+
+- **Name normalisation via views.** The package exports a
+  view set that renames each redisotel instrument to its
+  v1.39 singular equivalent (`db.client.connections.usage`
+  → `db.client.connection.count`, etc.) using
+  `sdkmetric.NewView(sdkmetric.Instrument{Name: ...},
+  sdkmetric.Stream{Name: ...})`. `o11y.Init` registers these
+  alongside the group A allowlist views and the group C drop
+  view (§7 enumerates the registration site).
+- **Unit conversion for `create_time`.** OTel Go views do not
+  support unit conversion on histograms, so a Stream-rename of
+  `create_time` would carry the wrong unit (`ms` instead of
+  `s`). The wrapper therefore **drops** the redisotel
+  `db.client.connections.create_time` histogram via a second
+  view and re-emits its own `db.client.connection.create_time`
+  histogram in `s` from inside the SDK-owned hook (the dialer
+  start/end timestamps are available there). The drop view is
+  the same shape as the group C drop and is composed into the
+  same `MetricViews()` export.
+
+After these views the visible pool metric set is fully v1.39:
+
+- `db.client.connection.idle.max`
+- `db.client.connection.idle.min`
+- `db.client.connection.max`
+- `db.client.connection.count` (with `state` attribute)
+- `db.client.connection.timeouts`
+- `db.client.connection.create_time` (re-emitted by the wrapper
+  in `s`).
+- Hits / misses are dropped — they have no v1.39 stable name
+  and are derivable from `count{state="used"}` and pool
+  timeouts.
+
+Labels emitted by redisotel (`pool.name`, legacy `db.system`)
+are attribute-filtered down to the §7 group A allowlist via the
+same view set so the pool metrics carry the same low-cardinality
+label set as the operation-duration histogram.
 
 For a single-node `*redis.Client` (including the Sentinel-failover
 variant) `Wrap` calls
@@ -414,31 +463,46 @@ readiness exactly which nodes are partial. The corresponding test
 in §12 forces this partial-failure mode and asserts the
 documented behaviour.
 
-**C. Drop upstream `db.client.connections.use_time` via view.**
+**C. Drop / rename upstream `db.client.connections.*` via views.**
 
-`redisotel.InstrumentMetrics` also registers a duration histogram
-named `db.client.connections.use_time` (unit `ms`), which group A
-replaces. This view drops it:
+`redisotel.InstrumentMetrics` registers the v1.24-era pool
+instrument family enumerated in group B. The wrapper's view set
+performs three operations on that family:
 
-```go
-sdkmetric.NewView(
-    sdkmetric.Instrument{Name: "db.client.connections.use_time"},
-    sdkmetric.Stream{Aggregation: sdkmetric.AggregationDrop{}},
-)
-```
+1. **Drop** `db.client.connections.use_time` (the per-command
+   duration histogram redisotel emits in `ms`): group A
+   replaces it with `db.client.operation.duration` in `s`, so
+   the upstream histogram is shape-incompatible and is dropped
+   wholesale.
+2. **Drop** `db.client.connections.create_time` (the dial
+   histogram in `ms`): the wrapper re-emits this as
+   `db.client.connection.create_time` in `s` from inside the
+   SDK-owned hook (group B above). OTel Go views cannot convert
+   units on histograms, so drop-and-re-emit is the only path.
+3. **Rename** every remaining `db.client.connections.<rest>`
+   instrument to its v1.39 singular `db.client.connection.<rest>`
+   form by setting `Stream.Name`. The hits/misses gauges are
+   dropped because v1.39 has no stable name for them (see
+   group B).
 
-(This matches the OTel Go `sdk/metric` v1.43.0 API the repo already
-uses in `internal/metrics.defaultViews`; the old
-`view.New` / `aggregation.Drop` types were removed before stabilization.)
+Each operation is a `sdkmetric.NewView(sdkmetric.Instrument{Name: ...},
+sdkmetric.Stream{Name: ..., Aggregation: ...})` (the Drop variant
+uses `Aggregation: sdkmetric.AggregationDrop{}`; the rename variant
+uses `Name:` only). The full set lives in the redis package's
+`MetricViews()` export and matches the OTel Go `sdk/metric`
+v1.43.0 API the repo already uses in
+`internal/metrics.defaultViews`.
 
-**View registration site.** The view in group C must be registered
-at `sdkmetric.NewMeterProvider` construction time — OTel Go fixes
-views when the MeterProvider is built, so `Wrap` cannot add views
-after the fact (Codex reviewer note). This ADR therefore requires
-that `o11y.Init` include the drop view in its default view set
-(adjacent to the ADR 0009 §2 allowlist views). The redis package
-exports the view constructor so `o11y.Init` can compose it without
-the redis package needing to know about `o11y.Init`.
+**View registration site.** All of these views (the group A
+allowlist views from §5, and the group C drops + renames here)
+must be registered at `sdkmetric.NewMeterProvider` construction
+time — OTel Go fixes views when the MeterProvider is built, so
+`Wrap` cannot add views after the fact. This ADR therefore
+requires that `o11y.Init` include the redis view set in its
+default view set (adjacent to the ADR 0009 §2 allowlist views).
+The redis package exports `MetricViews()` so `o11y.Init` can
+compose it without the redis package needing to know about
+`o11y.Init`.
 
 The operation-duration histogram in group A falls under the
 metric.View allowlist registered at `o11y.Init` per ADR 0009 §2;
@@ -1532,6 +1596,22 @@ On every `go-redis` / `redisotel` version change:
     "s") and the label set matches §7 group A.
   - `db.client.connections.use_time` is dropped by the view (no
     instrument under that name appears in collected metrics).
+  - **Pool metrics are v1.39-named (§7 group C).** With the
+    package's `MetricViews()` registered, the exporter sees the
+    singular-form, second-based instruments
+    (`db.client.connection.count` with `state` attribute,
+    `db.client.connection.timeouts`,
+    `db.client.connection.idle.max` / `idle.min`,
+    `db.client.connection.max`,
+    `db.client.connection.create_time` in `s`) and **no**
+    plural-form `db.client.connections.*` instrument appears in
+    the exporter snapshot. A regression that fails to register
+    the rename views would leave the redisotel v1.24 names
+    visible and fail this assertion. The drop+re-emit of
+    `create_time` is asserted by confirming exactly one
+    `db.client.connection.create_time` histogram (unit `s`)
+    appears and the redisotel `db.client.connections.create_time`
+    (unit `ms`) does not.
   - Pipeline span (single-node): name is exactly `redis.pipeline`,
     `db.operation.batch.size` equals the caller-issued command
     count, exactly one such span per `Pipeline()` call, no
