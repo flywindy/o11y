@@ -557,13 +557,20 @@ Cluster-specific concerns:
   exposes no public accessor for already-registered hooks, so the
   wrapper cannot ask "is my marker already in this client's chain?"
   Idempotency is therefore enforced at the wrapper layer using a
-  package-private `sync.Map[uintptr]*entry`, keyed by the concrete
-  pointer of the client (extracted via a `switch v := rdb.(type)`
-  over the three supported concretes `*redis.Client`,
-  `*redis.ClusterClient`, `*redis.Ring`, then `uintptr(unsafe.Pointer(v))`).
-  Keying by `uintptr` rather than by the interface value keeps the
-  map from retaining a Go reference to the client — see the
-  lifetime discussion below. But `uintptr` alone is not a safe
+  package-private `sync.Map` (Go's standard `sync.Map` is the
+  non-generic `type Map struct` even in Go 1.25 — the ADR's
+  bracketed notation below should be read as "logically
+  `map[uintptr]*entry`, accessed via type-asserted `Load` /
+  `LoadOrStore` / `Store` / `CompareAndDelete` calls on the
+  untyped `sync.Map`"; an implementation may wrap it in a small
+  typed helper like `type entryMap struct{ m sync.Map }` with
+  typed methods to keep call sites tidy). The map is keyed by
+  the concrete pointer of the client (extracted via a
+  `switch v := rdb.(type)` over the three supported concretes
+  `*redis.Client`, `*redis.ClusterClient`, `*redis.Ring`, then
+  `uintptr(unsafe.Pointer(v))`). Keying by `uintptr` rather than
+  by the interface value keeps the map from retaining a Go
+  reference to the client — see the lifetime discussion below. But `uintptr` alone is not a safe
   long-term identity, because Go's allocator can reuse the
   underlying memory once the original client is unreachable and
   before the `runtime.AddCleanup` callback has had a chance to
@@ -597,7 +604,7 @@ Cluster-specific concerns:
   redirected through a fresh `LoadOrStore` rather than continue
   on the orphaned entry.
 
-  ```
+  ```go
   for {
       e, _ := m.LoadOrStore(key, newEntry(currentClient))
       e.mu.Lock()
@@ -705,7 +712,8 @@ Cluster-specific concerns:
   the global propagator).
 
   **The dedup map does not keep clients alive.** A naive
-  `sync.Map[redis.UniversalClient]*entry` would hold the interface
+  `sync.Map` keyed by `redis.UniversalClient` (logically
+  `map[redis.UniversalClient]*entry`) would hold the interface
   value (and therefore the underlying `*redis.Client` /
   `*redis.ClusterClient` / `*redis.Ring` pointer) for the lifetime
   of the process, blocking GC of any client the caller has dropped
@@ -751,11 +759,13 @@ Cluster-specific concerns:
 
   1. Construct the wrapper's own metric instruments and the hook
      value in local variables — no mutation of `rdb` yet.
-  2. Allocate a `seenNodes sync.Map[uintptr]*nodeState` captured
-     by both the upcoming `OnNewNode` closure and the
-     `ForEachShard` loop, where:
+  2. Allocate a `seenNodes` `sync.Map` (logically keyed by
+     `uintptr` to `*nodeState` — same untyped-`sync.Map` caveat
+     as the idempotency map above), captured by both the
+     upcoming `OnNewNode` closure and the `ForEachShard` loop,
+     where:
 
-     ```
+     ```go
      type nodeState struct {
          client           *redis.Client
          hookInstalled    atomic.Bool   // CAS gate for AddHook
@@ -777,7 +787,7 @@ Cluster-specific concerns:
      `OnNewNode(newNode *redis.Client)` callback. On each
      invocation it does:
 
-     ```
+     ```go
      ns := &nodeState{client: newNode}
      actual, _ := seenNodes.LoadOrStore(addr(newNode), ns)
      state := actual.(*nodeState)
@@ -1082,15 +1092,17 @@ On every `go-redis` / `redisotel` version change:
     on the orphaned entry, then a third `Wrap` call inserts a
     second placeholder and double-hooks) would fail this test.
   - `Wrap` returns a non-nil error for a nil client, for
-    `*redis.SentinelClient`, when wrapper-owned instrument
-    creation fails, and when `ForEachShard` returns an error
-    mid-traversal — these are the strict unmodified-on-error
-    paths. The contract is asserted by issuing a command on the
-    returned client after a forced failure and confirming the
-    in-memory exporter records **no** spans and **no**
+    `*redis.SentinelClient`, and when wrapper-owned instrument
+    creation fails — the three strict unmodified-on-error paths
+    per §10. The contract is asserted by issuing a command on
+    the returned client after a forced failure and confirming
+    the in-memory exporter records **no** spans and **no**
     `db.client.operation.duration` samples — no `OnNewNode`
     callback and no partial per-shard hook installation survives
-    these error paths.
+    these error paths. (`ForEachShard` mid-traversal failures on
+    warmed Cluster/Ring are best-effort per §10's carve-out, not
+    strict; that path is covered by the warmed-Cluster
+    `ForEachShard`-failure carve-out test below.)
   - **Metrics-phase carve-out (§7 group B).** Forcing
     `redisotel.InstrumentMetrics` to fail on a subset of the
     per-node iteration (e.g. by injecting a MeterProvider that
