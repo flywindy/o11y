@@ -1328,14 +1328,19 @@ On every `go-redis` / `redisotel` version change:
     the per-shard callback goroutines (v9.9.0's `ForEachShard`
     fans out one goroutine per shard) must not trigger the race
     detector.
-  - **Pre-commit failure cleans up the dedup placeholder.**
-    Force an instrument-creation or `ForEachShard` error on a
-    fresh client; after `Wrap` returns the error, assert the
-    package dedup map does not contain an entry for that client
-    pointer (via the test affordance from the lifecycle test
-    above). Without the `CompareAndDelete` cleanup, the
-    placeholder would leak permanently, and this assertion would
-    fail.
+  - **Strict pre-commit failure cleans up the dedup placeholder.**
+    Force a wrapper-owned instrument-creation error (e.g. a
+    MeterProvider whose first instrument registration returns
+    an error) on a fresh client; after `Wrap` returns the error,
+    assert the package dedup map does not contain an entry for
+    that client pointer (via the test affordance from the
+    lifecycle test above). Without the `CompareAndDelete`
+    cleanup, the placeholder would leak permanently. Note that
+    `ForEachShard` mid-traversal failure is **not** tested here
+    because §10 classifies it as best-effort once `OnNewNode` is
+    installed (the entry stays committed with `done=true`); that
+    behaviour is asserted by the warmed-Cluster carve-out test
+    below.
   - **Concurrent `Wrap` with a failing first call (orphan-entry
     safety).** Two goroutines `Wrap` the same client. The first
     one is wired to fail pre-commit (e.g. instrument creation
@@ -1421,15 +1426,18 @@ On every `go-redis` / `redisotel` version change:
     failed to take the steady-state branch in the callback,
     would keep at least K `*redis.Client` references reachable
     and fail this test.
-  - **`Unwrap` + re-`Wrap` does not double-emit spans.** On a
-    warmed cluster: `Wrap`, run a `GET` (one span recorded),
-    `Unwrap`, `Wrap` again with the same MeterProvider, run
-    another `GET`. Assert exactly **one new span** appears in
-    the exporter — not two — proving the disabled-flag gate on
-    the old hook closure no-ops correctly. (The corresponding
-    pool-stat double-emission for Cluster/Ring is the documented
-    `Unwrap` limitation in §10 and is not asserted by this
-    test.)
+  - **`Unwrap` + re-`Wrap` does not double-emit spans or pool
+    metrics.** On a warmed cluster: `Wrap`, run a `GET` (one
+    span recorded), `Unwrap`, `Wrap` again with the same
+    MeterProvider, run another `GET`. Assert exactly **one new
+    span** appears in the exporter — not two — proving the
+    disabled-flag gate on the old hook closure no-ops
+    correctly. On the next pool-metric observation cycle,
+    assert exactly **one** `db.client.connection.count` time
+    series per shard — not two — proving §10's
+    `Registration.Unregister()` step in `Unwrap` correctly
+    detached the prior observable before the second `Wrap`
+    registered its own.
   - **Dedup map does not pin clients.** Create K short-lived
     `*redis.Client` instances, `Wrap` each, then drop all
     references. After `runtime.GC` + a brief settle (or after an
