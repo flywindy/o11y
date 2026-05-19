@@ -156,19 +156,23 @@ revisit the choice if upstream semconv adds one.
 //   - the per-node redisotel.InstrumentMetrics phase returns an
 //     error (gathered via errors.Join over all failing nodes).
 //
-// The first four error classes preserve the unmodified-on-error
+// The first three error classes (nil / unsupported /
+// instrument-creation) preserve the strict unmodified-on-error
 // contract: the original client is returned with no callbacks
 // installed and the dedup-map entry stays open for retry.
 //
-// The fifth class — metrics-phase errors — does NOT roll back.
-// By the time that phase starts, the tracing hooks are already
-// installed (and §10's idempotency rules prevent uninstalling
-// them); some per-node pool-stat callbacks may also have
-// registered before the failure point. In this case Wrap returns
-// (rdb, joinedErr), records dedup-map done = true, and the
-// returned client is a fully-traced but partially metric'd
-// client. See §7 group B for why per-node InstrumentMetrics is
-// not atomic under v9.9.0.
+// The remaining two — ForEachShard failure on a warmed
+// Cluster/Ring, and metrics-phase failure — are best-effort.
+// By the time either is reached, the wrapper has already
+// installed OnNewNode (which closes the v9.9.0 race window for
+// nodes created mid-iteration; see §10) and may have hooked
+// some per-node *redis.Clients via the callback. go-redis
+// v9.9.0 exposes no public hook-remove API, so the wrapper
+// cannot unwind. Wrap therefore returns (rdb, err), sets the
+// dedup-map done=true, registers runtime.AddCleanup, and the
+// caller observes a partially-instrumented client. Retries are
+// silent no-ops to avoid double-hooking the nodes already
+// covered.
 //
 // Callers MUST NOT ignore Wrap's error silently — log it and
 // surface it to startup readiness so missing Redis telemetry is
@@ -559,10 +563,33 @@ Cluster-specific concerns:
   `*redis.ClusterClient`, `*redis.Ring`, then `uintptr(unsafe.Pointer(v))`).
   Keying by `uintptr` rather than by the interface value keeps the
   map from retaining a Go reference to the client — see the
-  lifetime discussion below — while still giving a stable
-  identity for the duration of the client's lifetime. Each `entry`
-  holds a
-  `sync.Mutex` plus a `done bool`. The flow on every `Wrap` call:
+  lifetime discussion below. But `uintptr` alone is not a safe
+  long-term identity, because Go's allocator can reuse the
+  underlying memory once the original client is unreachable and
+  before the `runtime.AddCleanup` callback has had a chance to
+  delete the entry. A new short-lived client allocated at the
+  same address would `LoadOrStore` the **stale** entry with
+  `done = true` and skip instrumentation entirely. Generation
+  counters (which were proposed earlier in this section) only
+  prevent an outdated cleanup from deleting a newer entry —
+  they do not stop the newer entry from inheriting the old one.
+
+  To rule this out, each entry also carries a
+  `weak.Pointer[T]` (Go 1.24's `weak` package) pointing at the
+  underlying concrete client. On every `Wrap` call, after
+  `LoadOrStore` returns the entry, the loop checks
+  `entry.weakClient.Value() == currentConcretePointer`. A
+  mismatch (or a `nil` weak `Value`, meaning the original
+  client has been GC'd but cleanup has not yet run) means the
+  entry is stale: the wrapper `CompareAndDelete`s it and
+  restarts the `LoadOrStore`. This handles the address-reuse
+  window deterministically — the stale entry is always
+  detected and replaced on the next `Wrap` call, regardless of
+  whether GC cleanup has run yet.
+
+  Each `entry` therefore holds a `sync.Mutex`, a `done bool`,
+  and a `weak.Pointer[T]` for the concrete client type. The
+  flow on every `Wrap` call:
 
   The flow is a small retry loop, not a straight sequence, because
   a pre-commit failure removes the entry from the map and any
@@ -572,14 +599,23 @@ Cluster-specific concerns:
 
   ```
   for {
-      e, _ := m.LoadOrStore(key, newEntry())
+      e, _ := m.LoadOrStore(key, newEntry(currentClient))
       e.mu.Lock()
-      // Verify e is still the canonical entry for this key.
-      // If a pre-commit failure on a sibling goroutine ran
-      // CompareAndDelete while we were blocked, e is orphaned.
-      if current, ok := m.Load(key); !ok || current != e {
+      // (a) Canonicity: a pre-commit failure on a sibling
+      //     goroutine may have CompareAndDeleted while we were
+      //     blocked, leaving us with an orphan entry.
+      current, ok := m.Load(key)
+      if !ok || current != e {
           e.mu.Unlock()
           continue            // restart at LoadOrStore
+      }
+      // (b) Identity: the entry might be a stale survivor from
+      //     a previous client whose memory was reused before
+      //     AddCleanup ran.
+      if got := e.weakClient.Value(); got == nil || got != currentClient {
+          m.CompareAndDelete(key, e)
+          e.mu.Unlock()
+          continue            // restart at LoadOrStore with fresh entry
       }
       if e.done {
           e.mu.Unlock()
@@ -600,8 +636,10 @@ Cluster-specific concerns:
 
   Step-by-step:
 
-  1. `LoadOrStore` an `*entry` for the client. This creates a
-     placeholder on first call without yet asserting "wrapped".
+  1. `LoadOrStore` an `*entry` for the client. The freshly-
+     constructed entry has `weakClient = weak.Make(currentClient)`
+     so any future reader can verify it is for this specific
+     client allocation.
   2. Lock the entry's mutex. This serialises concurrent `Wrap`
      calls on the same client (a second goroutine blocks until
      the first either commits or fails).
@@ -610,36 +648,49 @@ Cluster-specific concerns:
      pointer, the entry is **orphaned** — a prior pre-commit
      failure on another goroutine ran `CompareAndDelete` after
      we did `LoadOrStore` but before we got the lock. We unlock
-     and restart the loop, where the next `LoadOrStore` either
-     finds another goroutine's fresh placeholder or installs our
-     own. Without this check, a waiter could successfully commit
-     on an entry no longer in the dedup map, and a later `Wrap`
-     call would insert a new placeholder and double-register
-     hooks/metrics despite the idempotency contract.
-  4. Under the lock and on the canonical entry, check `done`. If
-     true, release and return `(rdb, nil)` — steady-state hit.
-  5. If false, run the §10 / §7 commit sequence (instrument
+     and restart the loop. Without this check, a waiter could
+     successfully commit on an entry no longer in the dedup
+     map, and a later `Wrap` call would insert a new placeholder
+     and double-register hooks/metrics despite the idempotency
+     contract.
+  4. **Identity check.** Compare `entry.weakClient.Value()`
+     against the current client pointer. If `nil` (original
+     client GC'd, cleanup not yet run) or mismatched (memory
+     reused for a new client allocation), the entry is stale —
+     `CompareAndDelete` it and restart the loop. The next
+     iteration's `LoadOrStore` will install a fresh entry whose
+     `weakClient` points at the current client. Without this
+     check, a new short-lived client allocated at a recycled
+     address would inherit the previous client's `done = true`
+     entry and skip instrumentation entirely.
+  5. Under the lock and on the canonical, identity-matched
+     entry, check `done`. If true, release and return
+     `(rdb, nil)` — steady-state hit.
+  6. If false, run the §10 / §7 commit sequence (instrument
      creation → `ForEachShard` collection → `OnNewNode` +
      `AddHook` + per-node `InstrumentMetrics` commit). On
      success, set `done = true`, register the
      `runtime.AddCleanup`, release, return `(rdb, nil)`.
-  6. On **any** failure before the tracing commit point, leave
-     `done = false`, **`CompareAndDelete` the map entry using the
-     `*entry` pointer as the witness value** (so the placeholder
-     is removed iff nothing else has already replaced it), unlock,
-     and return `(rdb, err)`. Removing the placeholder is required
-     because pre-commit failures never register the
-     `runtime.AddCleanup` (that happens on commit success), so a
-     stranded `done=false` entry would leak forever otherwise —
-     and a later short-lived client allocated at the same
-     concrete pointer address would inherit it and silently
-     no-op past the gate. The canonicity check in step 3 makes
-     concurrent waiters safe: any blocked-on-this-entry goroutine
-     observes the deletion on its next lock acquisition and
-     restarts the loop instead of committing on an orphan.
+  7. On **strict pre-commit failure**, leave `done = false`,
+     **`CompareAndDelete` the map entry using the `*entry`
+     pointer as the witness value** (so the placeholder is
+     removed iff nothing else has already replaced it), unlock,
+     and return `(rdb, err)`. Removing the placeholder is
+     required because strict-failure paths never register the
+     `runtime.AddCleanup`, so a stranded `done=false` entry
+     would leak forever otherwise. The canonicity check in
+     step 3 makes concurrent waiters safe: any blocked-on-this-
+     entry goroutine observes the deletion on its next lock
+     acquisition and restarts the loop. The best-effort failure
+     paths (warmed-cluster `ForEachShard` error, metrics-phase
+     error) do **not** take this path — they set `done = true`
+     and register `runtime.AddCleanup` despite the error, so
+     retries are silent no-ops; see the "Failure paths"
+     discussion in the ordering section below.
 
-  Marking the client as wrapped only at the commit point (step 4)
-  is essential: storing the marker on entry (step 1) would leave a
+  Marking the client as wrapped only at a commit point (step 6,
+  or the best-effort commit in step 7's carve-outs) is
+  essential: storing the marker on entry (step 1) would leave a
   failed-but-marked client that future retries would silently
   no-op past, and a concurrent second `Wrap` would also see the
   marker and report success before any hook is installed.
@@ -700,83 +751,135 @@ Cluster-specific concerns:
 
   1. Construct the wrapper's own metric instruments and the hook
      value in local variables — no mutation of `rdb` yet.
-  2. Allocate a `seenNodes sync.Map[uintptr]*redis.Client`
-     captured by both the upcoming `OnNewNode` closure and the
-     `ForEachShard` loop. Both code paths `LoadOrStore` the
-     per-node `uintptr` (storing the `*redis.Client` itself as
-     the value) before doing any hook installation, and skip
-     the node if it was already seen. Storing the client in the
-     map — rather than appending to a separate slice — sidesteps
+  2. Allocate a `seenNodes sync.Map[uintptr]*nodeState` captured
+     by both the upcoming `OnNewNode` closure and the
+     `ForEachShard` loop, where:
+
+     ```
+     type nodeState struct {
+         client           *redis.Client
+         hookInstalled    atomic.Bool   // CAS gate for AddHook
+         metricsInstalled atomic.Bool   // CAS gate for InstrumentMetrics
+     }
+     ```
+
+     Both code paths `LoadOrStore` a `*nodeState` keyed by the
+     node's `uintptr`. The `atomic.Bool` CAS gates make hook and
+     metric installation single-shot per node regardless of which
+     code path (callback vs iterator vs step 6) reaches it first;
+     this is what eliminates the double-instrument bug a naive
+     "both callback and step 6 call `InstrumentMetrics`" would
+     have. Storing in the map rather than a slice also handles
      the v9.9.0 fact that `ForEachShard` invokes its callback
-     **concurrently** per shard: `sync.Map` writes from N
-     goroutines are safe, while a naive `to-instrument := append(...)`
-     would race and could drop nodes before the metrics phase
-     ran (caught by `go test -race`).
-  3. Install the wrapper's own `OnNewNode(newNode *redis.Client)`
-     callback. On each invocation it does:
-     `seenNodes.LoadOrStore(addr(newNode), {})`; if already
-     present, return without touching the node. Otherwise
-     `AddHook(newNode, traceHook)` followed by
-     `redisotel.InstrumentMetrics(newNode, redisotel.WithMeterProvider(mp))`
-     in this same closure (whose `conf` is per-Wrap-call, not
-     shared with sibling callbacks — sidesteps redisotel's
-     shared-`conf` bug from §7 group B). The callback is now in
-     place to catch any node created from this moment on.
-  4. Run `ForEachShard`. For each visited per-node
-     `*redis.Client`, do the same `seenNodes.LoadOrStore` dance:
-     if already present (because step 3's callback hooked it
-     during the gap), skip; otherwise `AddHook` — the
-     `*redis.Client` is already in `seenNodes` from the
-     `LoadOrStore`, so no separate slice append is needed.
-     Iteration errors fail `Wrap` here (still pre-commit; the
-     placeholder is cleaned up per the idempotency section's
-     step 5).
+     **concurrently** per shard — `sync.Map` writes from N
+     goroutines are safe.
+  3. Install the wrapper's own
+     `OnNewNode(newNode *redis.Client)` callback. On each
+     invocation it does:
+
+     ```
+     ns := &nodeState{client: newNode}
+     actual, _ := seenNodes.LoadOrStore(addr(newNode), ns)
+     state := actual.(*nodeState)
+     if state.hookInstalled.CompareAndSwap(false, true) {
+         AddHook(newNode, traceHook)
+     }
+     if state.metricsInstalled.CompareAndSwap(false, true) {
+         InstrumentMetrics(newNode, WithMeterProvider(mp))
+     }
+     ```
+
+     The callback's closure carries its own redisotel `conf`, so
+     it sidesteps the shared-`conf` bug (§7 group B). The
+     callback is now in place to catch any node created from
+     this moment on.
+  4. Run `ForEachShard`. The per-shard callback executes the
+     same CAS dance on `hookInstalled` (so a node race-caught
+     by step 3's callback during the iteration window is not
+     re-hooked). `InstrumentMetrics` is **not** called in this
+     pass — it is deferred to step 6, which also uses the same
+     CAS gate so any node already metric-installed by step 3's
+     callback during the race window is skipped. `ForEachShard`
+     iteration errors are handled per the failure-path discussion
+     below — note that by this point step 3 may have already
+     installed hooks/metrics on nodes created during the
+     iteration window, and there is no public API to remove
+     them.
   5. Once `ForEachShard` returns cleanly, the **tracing commit
      point** has been reached: every node that exists now is
      hooked, every node created from this moment on will be
-     hooked. Set `done = true` only after step 6 completes.
-  6. **Best-effort metrics phase**: iterate `seenNodes` (using
-     `sync.Map.Range`, which is safe to call after concurrent
-     writers have finished) and call
-     `redisotel.InstrumentMetrics(perNodeClient, …)` on each
-     stored client. For single-node, call it on the top-level
-     `rdb` itself instead — `seenNodes` is empty in that branch.
-     Errors are gathered via `errors.Join` per the §7 group B
-     carve-out. Note that for Cluster / Ring there is no
-     top-level `InstrumentMetrics(rdb)` call at all; the per-node
-     iteration is the entire metrics path.
+     hooked. `done = true` is set after step 6.
+  6. **Best-effort metrics phase**: iterate `seenNodes` via
+     `sync.Map.Range` (safe after concurrent writers have
+     finished). For each entry, CAS-claim
+     `state.metricsInstalled.CompareAndSwap(false, true)`; on
+     success call `InstrumentMetrics(state.client, …)`. Nodes
+     that step 3's callback already CAS-claimed during the race
+     window are correctly skipped — no double-registration. For
+     single-node, `seenNodes` is empty and `InstrumentMetrics`
+     is called on the top-level `rdb` instead. Errors gather
+     via `errors.Join` per the §7 group B carve-out. For Cluster
+     / Ring there is no top-level `InstrumentMetrics(rdb)` call;
+     the per-node iteration is the entire metrics path.
 
   The race-closing property: because `OnNewNode` is registered
   **before** `ForEachShard` runs, any node materialised during
   iteration is guaranteed to fire the callback. The `seenNodes`
-  dedup makes the order of "callback fires" vs "iterator visits"
-  on the same node irrelevant — whichever wins, the node is
-  hooked exactly once, and the loser skips. There is no remaining
-  window where a new node can sneak in unhooked.
+  dedup + per-node CAS gates make the order of "callback fires"
+  vs "iterator visits" vs "step 6 runs" on the same node
+  irrelevant — whichever wins each CAS does the work, the rest
+  skip. There is no remaining window where a new node can sneak
+  in unhooked, and no node is hooked or metric-installed more
+  than once.
 
-  If any step **at or before the tracing commit point** fails —
-  nil `rdb`, unsupported type, wrapper-owned instrument creation,
-  or `ForEachShard` returning an error — the wrapper returns the
-  original client with no callbacks installed, no shards hooked,
-  and `done = false` so retries can re-run. This is the strict
-  unmodified-on-error contract surfaced in §3.
+  **Failure paths.** The wrapper has three classes:
 
-  Failures **in the metrics phase (step 4)** are reported via
-  `errors.Join` on the return value but **do not** roll the
-  tracing phase back: by the time the metrics phase starts, the
-  tracing hooks are already installed, and unwinding them would
-  itself require touching the unexported hook chain that §10's
-  idempotency discussion already rules out as inaccessible. The
-  dedup map is set to `done = true` despite the metrics error so
-  retries are silent no-ops rather than risk
-  double-registering pool-stat observers on the nodes that did
-  succeed (see §7 group B for why per-node `InstrumentMetrics`
-  is not atomic). This means the post-`Wrap` state under a
-  metrics-phase error is: full tracing, partial pool metrics,
-  non-nil error return. Callers who insist on all-or-nothing
-  pool metrics should treat a non-nil `Wrap` error as terminal
-  for the process; callers who can tolerate degraded metrics
-  can log and continue.
+  - **Strict pre-commit failure** (nil `rdb`, unsupported type,
+    wrapper-owned instrument creation): nothing has been mutated.
+    The wrapper returns the original client, runs the
+    `CompareAndDelete` placeholder cleanup from the idempotency
+    section, and `done = false`. Retry is safe.
+
+  - **Warmed Cluster/Ring `ForEachShard` failure** (step 4
+    iteration error): this is the awkward case created by
+    closing the race window. Because `OnNewNode` was already
+    installed in step 3, any node materialised during the
+    failed iteration may already have a tracing hook attached
+    (and possibly an `InstrumentMetrics` registration too) via
+    the callback. The wrapper cannot remove these — go-redis
+    v9.9.0 exposes no public hook-remove API. The wrapper
+    therefore treats this as a **best-effort failure**, parallel
+    to the metrics-phase carve-out: report the error via the
+    return value, leave installed hooks in place, set
+    `done = true` and register the `runtime.AddCleanup` so
+    retries are silent no-ops rather than risk double-hooking
+    the nodes the callback already touched. The post-`Wrap`
+    state is: tracing partially installed (every node that
+    fired the callback during the window is fully covered;
+    nodes the failing iteration didn't reach are not), no
+    metrics from step 6 (it never ran), non-nil error return.
+    A regression test in §12 forces this path and asserts the
+    documented behaviour.
+
+  - **Metrics-phase failure (step 6)**: reported via
+    `errors.Join` on the return value but does **not** roll
+    the tracing phase back. Tracing hooks are already installed
+    by step 5, and unwinding them would require touching the
+    unexported hook chain that §10's idempotency discussion
+    already rules out as inaccessible. `done = true` despite
+    the metrics error so retries are silent no-ops rather than
+    risk double-registering pool-stat observers on the nodes
+    that did succeed (see §7 group B for why per-node
+    `InstrumentMetrics` is not atomic). The post-`Wrap` state
+    is: full tracing, partial pool metrics, non-nil error
+    return.
+
+  Callers who insist on all-or-nothing instrumentation should
+  treat any non-nil `Wrap` error as terminal for the process;
+  callers who can tolerate degraded telemetry can log and
+  continue. The §3 doc-comment enumerates which error class
+  each return belongs to so startup readiness can decide
+  per-class.
 - **MOVED / ASK redirects.** go-redis handles redirects internally
   by re-issuing the command against the correct node. The hook
   emits **one span per attempt**, so a redirected command produces
@@ -998,13 +1101,16 @@ On every `go-redis` / `redisotel` version change:
     `done` flag is `true`, so a subsequent `Wrap` call is a
     silent no-op even with a healthy MeterProvider, asserting
     the "no retry of partially-registered observers" design.
-  - **Retry-after-failure.** After a forced first-call failure
-    (e.g. `ForEachShard` returning a fixture error), a second
-    `Wrap` call with a healthy MeterProvider succeeds, returns
-    `(rdb, nil)`, and subsequent commands emit spans. This proves
-    that the failed first call did not mark the client as
-    "wrapped" in the package-private dedup map and that retry
-    actually performs the work, per the §10 commit-point rule.
+  - **Strict pre-commit retry-after-failure.** Force a strict
+    pre-commit failure (wrapper-owned instrument-creation error
+    on a non-cluster client, where `ForEachShard` isn't called).
+    A second `Wrap` with a healthy MeterProvider must succeed,
+    return `(rdb, nil)`, and subsequent commands must emit spans.
+    This proves the strict failure path correctly removed its
+    placeholder so retry actually performs the work. (Retry for
+    the best-effort `ForEachShard`/metrics-phase classes is
+    asserted to be a no-op by the warmed-cluster carve-out test
+    above, not by this one.)
   - **Concurrent `Wrap`.** Launching N goroutines that call `Wrap`
     on the same warmed `*redis.ClusterClient` simultaneously
     results in exactly one successful commit (the per-entry
@@ -1020,6 +1126,39 @@ On every `go-redis` / `redisotel` version change:
     the interface value as the map key — or that omitted the
     `runtime.AddCleanup` registration — would leave the map at
     K and fail this assertion.
+  - **Address-reuse identity check.** A unit test using
+    `runtime.SetFinalizer` to assert reachability windows
+    constructs a `*redis.Client` C1, `Wrap`s it, drops the
+    reference, allocates a new `*redis.Client` C2 at the same
+    address (via repeatedly allocating until size-class match,
+    or via an unsafe test-only helper). `Wrap(C2)` is called
+    **before** C1's `runtime.AddCleanup` has been allowed to
+    run. Assert that C2's `Wrap` does **not** return early via
+    the stale entry's `done = true`, that C2 ends up fully
+    instrumented, and that a `GET` on C2 emits a span. A
+    regression that drops the `weak.Pointer` identity check
+    would treat C2 as already-wrapped and emit zero spans.
+  - **No double-instrument in race window.** Construct a fake
+    `*redis.ClusterClient` whose `ForEachShard` yields one
+    existing node and, mid-iteration, injects a new node via
+    `OnNewNode`. After `Wrap` returns, assert the new node has
+    exactly **one** tracing hook and exactly **one**
+    `db.client.connections.usage` series — not two of either.
+    A regression that removes the `metricsInstalled` CAS gate
+    would emit two duplicate pool-metric series for the raced
+    node.
+  - **Warmed-Cluster ForEachShard-failure carve-out.** Force
+    `ForEachShard` to error after the wrapper's `OnNewNode` has
+    already hooked one freshly-materialised node during the
+    failed iteration. Assert: (a) `Wrap` returns a non-nil
+    error of class "warmed-cluster best-effort"; (b) the
+    pre-touched node still has its tracing hook (visible via a
+    subsequent `GET` emitting a span); (c) the dedup map entry
+    has `done = true` and `runtime.AddCleanup` is registered, so
+    a second `Wrap` call is a silent no-op even with a healthy
+    `ForEachShard`. This locks in the §10 documented behaviour;
+    without it a future refactor might mistake this for the
+    strict pre-commit class and try (and fail) to roll back.
   - The hook short-circuits Pub/Sub commands (§11): asserting that
     `PUBLISH`, `SPUBLISH`, `SUBSCRIBE`, `PSUBSCRIBE`, `PUBSUB`
     produce no span and no `db.client.operation.duration` sample.
