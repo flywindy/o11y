@@ -564,20 +564,66 @@ Cluster-specific concerns:
   holds a
   `sync.Mutex` plus a `done bool`. The flow on every `Wrap` call:
 
+  The flow is a small retry loop, not a straight sequence, because
+  a pre-commit failure removes the entry from the map and any
+  goroutine that was blocked on that entry's mutex must be
+  redirected through a fresh `LoadOrStore` rather than continue
+  on the orphaned entry.
+
+  ```
+  for {
+      e, _ := m.LoadOrStore(key, newEntry())
+      e.mu.Lock()
+      // Verify e is still the canonical entry for this key.
+      // If a pre-commit failure on a sibling goroutine ran
+      // CompareAndDelete while we were blocked, e is orphaned.
+      if current, ok := m.Load(key); !ok || current != e {
+          e.mu.Unlock()
+          continue            // restart at LoadOrStore
+      }
+      if e.done {
+          e.mu.Unlock()
+          return rdb, nil     // steady-state idempotent hit
+      }
+      err := doCommitSequence(rdb, e)   // §10 / §7
+      if err != nil {
+          m.CompareAndDelete(key, e)    // remove placeholder
+          e.mu.Unlock()
+          return rdb, err
+      }
+      e.done = true
+      runtime.AddCleanup(clientObj, deleteByGen, identity)
+      e.mu.Unlock()
+      return rdb, nil
+  }
+  ```
+
+  Step-by-step:
+
   1. `LoadOrStore` an `*entry` for the client. This creates a
      placeholder on first call without yet asserting "wrapped".
   2. Lock the entry's mutex. This serialises concurrent `Wrap`
-     calls on the same client (a second goroutine blocks until the
-     first either commits or fails) and prevents a concurrent
-     caller from seeing a half-installed client and assuming it is
-     ready.
-  3. Under the lock, check `done`. If true, release and return
-     `(rdb, nil)` — this is the steady-state idempotent path.
-  4. If false, run the §10 / §7 commit sequence (instrument
+     calls on the same client (a second goroutine blocks until
+     the first either commits or fails).
+  3. **Canonicity check.** After acquiring the lock, re-`Load`
+     the key. If the value is missing or not the same `*entry`
+     pointer, the entry is **orphaned** — a prior pre-commit
+     failure on another goroutine ran `CompareAndDelete` after
+     we did `LoadOrStore` but before we got the lock. We unlock
+     and restart the loop, where the next `LoadOrStore` either
+     finds another goroutine's fresh placeholder or installs our
+     own. Without this check, a waiter could successfully commit
+     on an entry no longer in the dedup map, and a later `Wrap`
+     call would insert a new placeholder and double-register
+     hooks/metrics despite the idempotency contract.
+  4. Under the lock and on the canonical entry, check `done`. If
+     true, release and return `(rdb, nil)` — steady-state hit.
+  5. If false, run the §10 / §7 commit sequence (instrument
      creation → `ForEachShard` collection → `OnNewNode` +
      `AddHook` + per-node `InstrumentMetrics` commit). On
-     success, set `done = true`, release, return `(rdb, nil)`.
-  5. On **any** failure before the tracing commit point, leave
+     success, set `done = true`, register the
+     `runtime.AddCleanup`, release, return `(rdb, nil)`.
+  6. On **any** failure before the tracing commit point, leave
      `done = false`, **`CompareAndDelete` the map entry using the
      `*entry` pointer as the witness value** (so the placeholder
      is removed iff nothing else has already replaced it), unlock,
@@ -587,17 +633,10 @@ Cluster-specific concerns:
      stranded `done=false` entry would leak forever otherwise —
      and a later short-lived client allocated at the same
      concrete pointer address would inherit it and silently
-     no-op past the gate. `CompareAndDelete` makes the removal
-     race-safe against a concurrent `Wrap` that has already
-     stored a fresh placeholder under the same key (rare, but
-     possible if the caller has dropped the original client and
-     a new one happens to allocate at the same address before
-     we run the cleanup): the witness mismatches, the delete is
-     skipped, and the fresh placeholder survives. A subsequent
-     `Wrap` call on the original client therefore re-enters at
-     step 1, re-`LoadOrStore`s a new placeholder, and retries
-     the work — the client is still unmodified under §10's
-     unmodified-on-error contract, so retry is safe.
+     no-op past the gate. The canonicity check in step 3 makes
+     concurrent waiters safe: any blocked-on-this-entry goroutine
+     observes the deletion on its next lock acquisition and
+     restarts the loop instead of committing on an orphan.
 
   Marking the client as wrapped only at the commit point (step 4)
   is essential: storing the marker on entry (step 1) would leave a
@@ -924,6 +963,21 @@ On every `go-redis` / `redisotel` version change:
     above). Without the `CompareAndDelete` cleanup, the
     placeholder would leak permanently, and this assertion would
     fail.
+  - **Concurrent `Wrap` with a failing first call (orphan-entry
+    safety).** Two goroutines `Wrap` the same client. The first
+    one is wired to fail pre-commit (e.g. instrument creation
+    rigged to error); the second is wired to succeed. The
+    failure path's `CompareAndDelete` removes the placeholder
+    while the second goroutine is still blocked on the entry's
+    mutex. Assert: (a) the second goroutine returns `(rdb, nil)`
+    with the client fully instrumented; (b) the client has
+    exactly **one** tracing hook per node (not zero, not two);
+    (c) the dedup map contains exactly one entry for the client
+    at the end, owned by the second goroutine's fresh
+    `LoadOrStore`. Run under `go test -race`. A regression where
+    the canonicity-check loop in §10 is removed (waiter commits
+    on the orphaned entry, then a third `Wrap` call inserts a
+    second placeholder and double-hooks) would fail this test.
   - `Wrap` returns a non-nil error for a nil client, for
     `*redis.SentinelClient`, when wrapper-owned instrument
     creation fails, and when `ForEachShard` returns an error
