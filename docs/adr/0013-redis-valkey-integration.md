@@ -437,10 +437,19 @@ the resolved top-level pool-name. On each observation cycle the
 callback:
 
 1. Dereferences the weak pointer; if `nil` (the client has been
-   GC'd), unregisters the callback and returns. This is the
-   only path that removes the callback — the wrapper relies on
-   `RegisterCallback`'s returned `Registration.Unregister` plus
-   the weak pointer to avoid pinning the client.
+   GC'd between scrape cycles), the callback **returns without
+   observing and without calling `Unregister`**. Calling
+   `Registration.Unregister()` from inside the callback would
+   deadlock OTel Go `sdk/metric` v1.43.0 — `pipeline.produce`
+   holds the pipeline lock while invoking registered callbacks,
+   and `Unregister` re-takes the same lock. The actual
+   unregistration is performed from outside the callback by the
+   `runtime.AddCleanup` hook the wrapper installed on commit
+   success (which also deletes the dedup-map entry); that hook
+   runs in its own goroutine after the client is reclaimed and
+   is therefore not under the pipeline lock. Until the cleanup
+   fires, the callback simply no-ops on each scrape — cheap and
+   safe.
 2. For single-node, reads `PoolStats()` once and records the
    gauges under the pool-metric label set above, with
    `db.client.connection.pool.name` set to the top-level
@@ -739,9 +748,18 @@ Cluster-specific concerns:
   the concrete pointer of the client (extracted via a
   `switch v := rdb.(type)` over the three supported concretes
   `*redis.Client`, `*redis.ClusterClient`, `*redis.Ring`, then
-  `uintptr(unsafe.Pointer(v))`). Keying by `uintptr` rather than
-  by the interface value keeps the map from retaining a Go
-  reference to the client — see the lifetime discussion below. But `uintptr` alone is not a safe
+  `uintptr(unsafe.Pointer(v))`). Each branch of the type switch
+  **also tests `v == nil`** and returns `ErrNilClient` from the
+  strict pre-commit class before any key derivation runs —
+  catching the typed-nil case (`var c *redis.Client = nil;
+  Wrap(c, ...)`) which slips past the earlier
+  `rdb redis.UniversalClient == nil` check because the
+  interface value is non-nil even though its dynamic value is.
+  Without this check the wrapper would derive a zero `uintptr`
+  key and later panic on `v.Options()` / `v.AddHook(...)`.
+  Keying by `uintptr` rather than by the interface value keeps
+  the map from retaining a Go reference to the client — see the
+  lifetime discussion below. But `uintptr` alone is not a safe
   long-term identity, because Go's allocator can reuse the
   underlying memory once the original client is unreachable and
   before the `runtime.AddCleanup` callback has had a chance to
@@ -935,10 +953,21 @@ Cluster-specific concerns:
   as `uintptr`** extracted via type switch (one of three branches:
   `*redis.Client`, `*redis.ClusterClient`, `*redis.Ring`) and
   registers a `runtime.AddCleanup(client, deleteEntry, id)` on
-  first successful commit. The map therefore stores no reference
-  that could keep the client live; when the caller drops the
-  client and it becomes unreachable, `runtime.AddCleanup` fires
-  and the entry is removed.
+  first successful commit. The cleanup function deletes the
+  dedup-map entry **and** calls
+  `entry.poolMetricRegistration.Unregister()` on the §7 group B
+  observable so the MeterProvider drops it. Running the
+  unregister from `runtime.AddCleanup`'s goroutine (rather than
+  from inside the callback when the weak pointer is observed
+  nil) is essential: the callback runs under
+  `sdk/metric.pipeline.produce`'s pipeline lock, and
+  `Registration.Unregister()` re-takes the same lock —
+  unregistering from inside would deadlock. The cleanup
+  goroutine is not under the lock, so it is safe. The map
+  therefore stores no reference that could keep the client live;
+  when the caller drops the client and it becomes unreachable,
+  `runtime.AddCleanup` fires and the entry plus the observable
+  are removed.
 
   The address-reuse window — a new client allocated at the same
   address before the previous client's cleanup has run — is
@@ -1419,17 +1448,23 @@ On every `go-redis` / `redisotel` version change:
     the canonicity-check loop in §10 is removed (waiter commits
     on the orphaned entry, then a third `Wrap` call inserts a
     second placeholder and double-hooks) would fail this test.
-  - `Wrap` returns a non-nil error for a nil client, for a nil
-    `trace.TracerProvider`, for a nil `metric.MeterProvider`,
-    and when wrapper-owned instrument creation fails — the
-    four strict unmodified-on-error paths per §10. The
-    nil-provider cases are asserted explicitly: pass
+  - `Wrap` returns a non-nil error for a nil interface client,
+    for a typed-nil concrete client (e.g.
+    `var c *redis.Client = nil; Wrap(c, tp, mp)` — the
+    interface value is non-nil but the dynamic value is, so the
+    untyped check passes; the per-concrete check in §10 catches
+    it), for a nil `trace.TracerProvider`, for a nil
+    `metric.MeterProvider`, and when wrapper-owned instrument
+    creation fails — the strict unmodified-on-error paths per
+    §10. The nil-provider cases are asserted explicitly: pass
     `Wrap(redis.NewClient(...), nil, mp)` and
     `Wrap(redis.NewClient(...), tp, nil)`, confirm each
-    returns a non-nil error with no panic and that the
-    package's dedup map is unchanged (no placeholder created
-    for either call — provider-nil checks short-circuit
-    before `LoadOrStore`). The broader contract is asserted
+    returns a non-nil error with no panic. The typed-nil case
+    is asserted for each of the three supported concretes
+    (`*redis.Client`, `*redis.ClusterClient`, `*redis.Ring`),
+    confirming no panic in any branch and that the dedup map is
+    unchanged for all of these (no placeholder created — strict
+    checks short-circuit before `LoadOrStore`). The broader contract is asserted
     by issuing a command on the returned client after a
     forced failure and confirming the in-memory exporter
     records **no** spans and **no**
@@ -1473,6 +1508,18 @@ On every `go-redis` / `redisotel` version change:
     omitted pool-name entirely would collapse the two pools
     into a single colliding series and violate the OTel
     async-callback uniqueness contract.
+  - **Pool observable does not unregister from inside the
+    callback (§7 group B).** Wrap a short-lived `*redis.Client`,
+    drop the reference, and `runtime.GC()` to make the weak
+    pointer go nil. Trigger a `ManualReader.Collect(ctx)` on the
+    MeterProvider. Assert (a) the collect call completes within
+    a short deadline (e.g. 200ms) — not deadlocked; (b) the
+    observation cycle records nothing for the GC'd client; (c)
+    the `runtime.AddCleanup` hook subsequently fires and the
+    eventual exporter snapshot no longer lists the client's
+    callback registration. A regression that called
+    `Registration.Unregister()` from inside the callback would
+    block on the pipeline lock and time the test out.
   - **Strict pre-commit retry-after-failure.** Force a strict
     pre-commit failure (wrapper-owned instrument-creation error
     on a non-cluster client, where `ForEachShard` isn't called).
