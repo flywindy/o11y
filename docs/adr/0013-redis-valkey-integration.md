@@ -661,11 +661,18 @@ Cluster-specific concerns:
 
   1. Construct the wrapper's own metric instruments and the hook
      value in local variables — no mutation of `rdb` yet.
-  2. Allocate a `seenNodes sync.Map[uintptr]struct{}` captured by
-     both the upcoming `OnNewNode` closure and the `ForEachShard`
-     loop. Both code paths will `LoadOrStore` the per-node
-     `uintptr` before doing any hook installation on that node,
-     and skip the node if it was already seen.
+  2. Allocate a `seenNodes sync.Map[uintptr]*redis.Client`
+     captured by both the upcoming `OnNewNode` closure and the
+     `ForEachShard` loop. Both code paths `LoadOrStore` the
+     per-node `uintptr` (storing the `*redis.Client` itself as
+     the value) before doing any hook installation, and skip
+     the node if it was already seen. Storing the client in the
+     map — rather than appending to a separate slice — sidesteps
+     the v9.9.0 fact that `ForEachShard` invokes its callback
+     **concurrently** per shard: `sync.Map` writes from N
+     goroutines are safe, while a naive `to-instrument := append(...)`
+     would race and could drop nodes before the metrics phase
+     ran (caught by `go test -race`).
   3. Install the wrapper's own `OnNewNode(newNode *redis.Client)`
      callback. On each invocation it does:
      `seenNodes.LoadOrStore(addr(newNode), {})`; if already
@@ -679,21 +686,26 @@ Cluster-specific concerns:
   4. Run `ForEachShard`. For each visited per-node
      `*redis.Client`, do the same `seenNodes.LoadOrStore` dance:
      if already present (because step 3's callback hooked it
-     during the gap), skip; otherwise `AddHook` and append to a
-     local "to-instrument" list. Iteration errors fail `Wrap`
-     here (still pre-commit; the placeholder is cleaned up per
-     the idempotency section's step 5).
+     during the gap), skip; otherwise `AddHook` — the
+     `*redis.Client` is already in `seenNodes` from the
+     `LoadOrStore`, so no separate slice append is needed.
+     Iteration errors fail `Wrap` here (still pre-commit; the
+     placeholder is cleaned up per the idempotency section's
+     step 5).
   5. Once `ForEachShard` returns cleanly, the **tracing commit
      point** has been reached: every node that exists now is
      hooked, every node created from this moment on will be
      hooked. Set `done = true` only after step 6 completes.
-  6. **Best-effort metrics phase**: call
-     `redisotel.InstrumentMetrics(perNodeClient, …)` on the
-     "to-instrument" list (and for single-node, on the top-level
-     `rdb` itself). Errors are gathered via `errors.Join` per the
-     §7 group B carve-out. Note that for Cluster / Ring there is
-     no top-level `InstrumentMetrics(rdb)` call at all; the
-     per-node iteration is the entire metrics path.
+  6. **Best-effort metrics phase**: iterate `seenNodes` (using
+     `sync.Map.Range`, which is safe to call after concurrent
+     writers have finished) and call
+     `redisotel.InstrumentMetrics(perNodeClient, …)` on each
+     stored client. For single-node, call it on the top-level
+     `rdb` itself instead — `seenNodes` is empty in that branch.
+     Errors are gathered via `errors.Join` per the §7 group B
+     carve-out. Note that for Cluster / Ring there is no
+     top-level `InstrumentMetrics(rdb)` call at all; the per-node
+     iteration is the entire metrics path.
 
   The race-closing property: because `OnNewNode` is registered
   **before** `ForEachShard` runs, any node materialised during
@@ -899,7 +911,11 @@ On every `go-redis` / `redisotel` version change:
     injected node ends up with exactly one tracing hook (not
     zero, not two): zero would mean the race left it unhooked,
     two would mean `seenNodes` dedup failed. A command routed to
-    that node must emit exactly one span.
+    that node must emit exactly one span. The whole test runs
+    under `go test -race`; concurrent writes to `seenNodes` from
+    the per-shard callback goroutines (v9.9.0's `ForEachShard`
+    fans out one goroutine per shard) must not trigger the race
+    detector.
   - **Pre-commit failure cleans up the dedup placeholder.**
     Force an instrument-creation or `ForEachShard` error on a
     fresh client; after `Wrap` returns the error, assert the
