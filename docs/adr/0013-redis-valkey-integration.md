@@ -553,11 +553,15 @@ Cluster-specific concerns:
   exposes no public accessor for already-registered hooks, so the
   wrapper cannot ask "is my marker already in this client's chain?"
   Idempotency is therefore enforced at the wrapper layer using a
-  package-private `sync.Map[redis.UniversalClient]*entry` keyed by
-  the interface value (interface equality compares dynamic type
-  plus pointer, which is well-defined for the three supported
-  concrete types `*redis.Client`, `*redis.ClusterClient`, and
-  `*redis.Ring`). Each `entry` holds a
+  package-private `sync.Map[uintptr]*entry`, keyed by the concrete
+  pointer of the client (extracted via a `switch v := rdb.(type)`
+  over the three supported concretes `*redis.Client`,
+  `*redis.ClusterClient`, `*redis.Ring`, then `uintptr(unsafe.Pointer(v))`).
+  Keying by `uintptr` rather than by the interface value keeps the
+  map from retaining a Go reference to the client — see the
+  lifetime discussion below — while still giving a stable
+  identity for the duration of the client's lifetime. Each `entry`
+  holds a
   `sync.Mutex` plus a `done bool`. The flow on every `Wrap` call:
 
   1. `LoadOrStore` an `*entry` for the client. This creates a
@@ -591,9 +595,40 @@ Cluster-specific concerns:
   `sync.Map` is local state of the redis instrumentation package —
   it does **not** violate ADR 0008's no-OTel-globals policy (which
   targets `otel.SetTracerProvider` / `otel.SetMeterProvider` and
-  the global propagator). Entries are not removed; the
-  `UniversalClient` lifetime is the process lifetime in every
-  adopter today.
+  the global propagator).
+
+  **The dedup map does not keep clients alive.** A naive
+  `sync.Map[redis.UniversalClient]*entry` would hold the interface
+  value (and therefore the underlying `*redis.Client` /
+  `*redis.ClusterClient` / `*redis.Ring` pointer) for the lifetime
+  of the process, blocking GC of any client the caller has dropped
+  — turning a small idempotency aid into unbounded global state,
+  which would be especially painful in tests, multi-tenant
+  processes, and services that create short-lived clients. To
+  avoid that, the wrapper keys the map by the **concrete pointer
+  as `uintptr`** extracted via type switch (one of three branches:
+  `*redis.Client`, `*redis.ClusterClient`, `*redis.Ring`) and
+  registers a `runtime.AddCleanup(client, deleteEntry, id)` on
+  first successful commit. The map therefore stores no reference
+  that could keep the client live; when the caller drops the
+  client and it becomes unreachable, `runtime.AddCleanup` fires
+  and the entry is removed. To rule out the address-reuse window
+  between cleanup running and a new client being allocated at the
+  same address, each `entry` carries a `generation uint64`
+  assigned at `LoadOrStore` time, and the cleanup function only
+  deletes the entry when its generation still matches — a freshly
+  inserted entry for a reused address gets a new generation and
+  is not touched by the prior client's cleanup.
+
+  An explicit `Unwrap(rdb redis.UniversalClient)` helper is
+  exported for tests that need deterministic eviction without
+  waiting for GC (e.g. table-driven tests over many cluster
+  fixtures). `Unwrap` deletes the entry, attempts to remove the
+  tracing hook only via the documented `OnNewNode` mechanism for
+  future nodes (existing hooks remain attached — there is no
+  public hook-remove API in go-redis v9.9.0, see §10's
+  hook-chain-inaccessibility discussion), and is intended for
+  test fixtures rather than production client teardown.
 
   **Ordering and the unmodified-on-error contract.** The wrapper
   performs the work in this order: (1) construct the wrapper's
@@ -835,6 +870,15 @@ On every `go-redis` / `redisotel` version change:
     mutex serialises the racers) and zero double-hooked nodes:
     after the dust settles, a single command emits exactly one
     span, not N.
+  - **Dedup map does not pin clients.** Create K short-lived
+    `*redis.Client` instances, `Wrap` each, then drop all
+    references. After `runtime.GC` + a brief settle (or after an
+    explicit `Unwrap` per client), the package's dedup map size
+    drops back to 0 (asserted via an exported `testHookMapLen`
+    or equivalent test affordance). A regression that re-stored
+    the interface value as the map key — or that omitted the
+    `runtime.AddCleanup` registration — would leave the map at
+    K and fail this assertion.
   - The hook short-circuits Pub/Sub commands (§11): asserting that
     `PUBLISH`, `SPUBLISH`, `SUBSCRIBE`, `PSUBSCRIBE`, `PUBSUB`
     produce no span and no `db.client.operation.duration` sample.
