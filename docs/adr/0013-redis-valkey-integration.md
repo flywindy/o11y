@@ -534,7 +534,7 @@ On every `go-redis` / `redisotel` version change:
     server, `redis.ErrPoolTimeout` from an exhausted test pool,
     `context.DeadlineExceeded` from an expired
     `context.WithTimeout`, `context.Canceled` from an explicitly
-    cancelled `context.WithCancel`, a `*net.OpError` from a closed
+    canceled `context.WithCancel`, a `*net.OpError` from a closed
     listener).
   - `redis.Nil` does not call `RecordError`, does not set Error
     status, does not emit `error.type`, but does record a duration
@@ -611,8 +611,12 @@ On every `go-redis` / `redisotel` version change:
   interface compatibility.
 - Pub/Sub gap is real. Services that rely on `PUBLISH` /
   `SUBSCRIBE` for non-trivial workflows will see no spans for
-  those operations under this ADR (the `redis.Hook` interface
-  does not fire for them).
+  those operations under this ADR: subscription receive paths
+  (`*redis.PubSub.Receive*`) bypass `redis.Hook.ProcessHook`
+  entirely, and the publish-side commands (`PUBLISH` / `SPUBLISH`
+  / `PUBSUB*`) — which **do** travel through `ProcessHook` in
+  v9.9.0 — are intentionally short-circuited by the
+  command-name filter documented in §11.
 - `redis.error.kind` is intentionally narrower than
   `resty.error.kind`. Operators looking for `auth` / `loading` /
   `oom` distinctions must read the error message or wait for an
