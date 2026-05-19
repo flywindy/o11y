@@ -64,14 +64,20 @@ metrics.
   `db.connection_string` never appears, the `code.*` attributes
   never appear, and `db.query.text` is off unless explicitly
   enabled.
-- **Metrics.** `redisotel.InstrumentMetrics` is kept. Its
-  connection-pool instruments (`db.client.connections.idle.max` /
-  `.usage` / `.timeouts` / etc.) carry stable `db.client.*` names
-  that pass through unchanged from v1.24 to v1.39, so there is
-  nothing to rewrite. We register one metric.View at `o11y.Init`
-  time to drop the upstream `db.client.connections.use_time`
-  duration histogram (we replace it with our own seconds-unit
-  `db.client.operation.duration` recorded from the tracing hook).
+- **Metrics.** `redisotel.InstrumentMetrics` is **not** used.
+  Its connection-pool instruments carry v1.24-era plural names
+  (`db.client.connections.*`, ms histograms) and the labels it
+  emits (`pool.name`, legacy `db.system`) cannot be translated
+  to the §5 group A allowlist via OTel Go views (`AttributeFilter`
+  only retains/drops, it cannot add). The wrapper instead owns
+  the pool-metric instrument set end-to-end: it reads
+  `*redis.Client.PoolStats()` from each live shard on each
+  observation cycle and records under v1.39 singular names
+  (`db.client.connection.*`, `s` histograms) with the group A
+  label set. See §7 group B for the full instrument list and
+  §7 group C for the defensive drop views that keep the v1.39
+  contract intact if a consumer also wires up
+  `redisotel.InstrumentMetrics` for an unrelated reason.
 
 The T3-for-tracing scope is bounded by the `redis.Hook` interface
 (four methods) and the closed set of attributes in §5. ADR 0011
@@ -116,13 +122,18 @@ revisit the choice if upstream semconv adds one.
    error recording, and one `db.client.operation.duration`
    histogram in seconds. Pure SDK code; no redisotel dependency on
    this code path.
-2. **Call `redisotel.InstrumentMetrics(rdb, redisotel.WithMeterProvider(mp))`**
-   for connection-pool observability. Pool stats are valuable and
-   their stable `db.client.connections.*` names need no rewrite.
-   The one upstream instrument we do not want
-   (`db.client.connections.use_time`, the upstream duration
-   histogram) is dropped by a metric.View registered at
-   `o11y.Init` time (see §7).
+2. **Own the connection-pool metric instrument set directly.**
+   The wrapper registers a single async observable callback
+   against the supplied MeterProvider that reads
+   `*redis.Client.PoolStats()` from each live shard at scrape
+   time and records under v1.39 singular names
+   (`db.client.connection.idle.{max,min}`,
+   `db.client.connection.max`, `db.client.connection.count`
+   with `state` attribute, `db.client.connection.timeouts`)
+   plus a `db.client.connection.create_time` histogram (unit
+   `s`) populated from the SDK-owned dial hook. The redisotel
+   v1.24-era instruments are not used; §7 group B explains why,
+   and group C documents defensive drop views.
 
 `redisotel.InstrumentTracing` is **not** called.
 
@@ -156,12 +167,12 @@ revisit the choice if upstream semconv adds one.
 //     does NOT implement redis.UniversalClient at all in go-redis
 //     v9.9.0, so passing it to Wrap is a compile-time error, not
 //     a runtime one — no error class is needed for it;
-//   - creation of the wrapper's own metric instruments against
-//     the supplied MeterProvider fails;
-//   - the initial ForEachShard iteration over an already-warmed
-//     *redis.ClusterClient / *redis.Ring fails;
-//   - the per-node redisotel.InstrumentMetrics phase returns an
-//     error (gathered via errors.Join over all failing nodes).
+//   - creation of the wrapper's own metric instruments
+//     (db.client.operation.duration in §5 group A and the
+//     pool-stat instrument set in §7 group B) against the
+//     supplied MeterProvider fails;
+//   - the initial shard-collection pass over an already-warmed
+//     *redis.ClusterClient / *redis.Ring fails.
 //
 // Wrap does NOT fall back to otel.GetTracerProvider() /
 // otel.GetMeterProvider() when the arguments are nil — the
@@ -169,24 +180,26 @@ revisit the choice if upstream semconv adds one.
 // providers be passed explicitly. Nil providers are a
 // configuration bug, surfaced as a strict error.
 //
-// The first five error classes (nil rdb / nil tp / nil mp /
-// unsupported type / instrument-creation) preserve the strict
+// The first four error classes (nil rdb / nil tp / nil mp /
+// instrument-creation) preserve the strict
 // unmodified-on-error contract: the original client is
 // returned with no callbacks installed and the dedup-map entry
 // stays open for retry.
 //
-// The remaining two — ForEachShard failure on a warmed
-// Cluster/Ring, and metrics-phase failure — are best-effort.
-// By the time either is reached, the wrapper has already
-// installed OnNewNode (which closes the v9.9.0 race window for
-// nodes created mid-iteration; see §10) and may have hooked
-// some per-node *redis.Clients via the callback. go-redis
-// v9.9.0 exposes no public hook-remove API, so the wrapper
-// cannot unwind. Wrap therefore returns (rdb, err), sets the
-// dedup-map done=true, registers runtime.AddCleanup, and the
-// caller observes a partially-instrumented client. Retries are
-// silent no-ops to avoid double-hooking the nodes already
-// covered.
+// The remaining class — shard-collection failure on a warmed
+// Cluster/Ring — is best-effort. By the time it is reached,
+// the wrapper has already installed OnNewNode (which closes
+// the v9.9.0 race window for nodes created mid-iteration; see
+// §10) and may have hooked some per-node *redis.Clients via
+// the callback. go-redis v9.9.0 exposes no public hook-remove
+// API, so the wrapper cannot unwind. Wrap therefore returns
+// (rdb, err), sets the dedup-map done=true, registers
+// runtime.AddCleanup, and the caller observes a partially-
+// instrumented client. Retries are silent no-ops to avoid
+// double-hooking the nodes already covered. Pool metrics on
+// these partially-hooked nodes still emit correctly — the
+// pool-stat observer iterates the live shard set at scrape
+// time, not the in-flight collection state.
 //
 // Callers MUST NOT ignore Wrap's error silently — log it and
 // surface it to startup readiness so missing Redis telemetry is
@@ -217,10 +230,18 @@ func WithCommandTextEnabled(enabled bool) Option
 func WithAttributes(attrs ...attribute.KeyValue) Option
 
 // MetricViews returns the metric.Views this package needs registered
-// at MeterProvider construction time (specifically, the drop view
-// for the upstream db.client.connections.use_time histogram). o11y.Init
-// composes these into its default view set; consumers building their
-// own MeterProvider must include them via sdkmetric.WithView.
+// at MeterProvider construction time. The set contains:
+//   - the §5 group A allowlist views for db.client.operation.duration
+//     (label set bounded to db.system.name, db.operation.name,
+//     server.address, server.port, error.type);
+//   - defensive drop views for every v1.24-era
+//     db.client.connections.* instrument that redisotel v9.9.0
+//     would emit, in case a consumer also wires up
+//     redisotel.InstrumentMetrics — see §7 group C for why.
+//
+// o11y.Init composes these into its default view set; consumers
+// building their own MeterProvider must include them via
+// sdkmetric.WithView, or the v1.39 contract is not preserved.
 func MetricViews() []sdkmetric.View
 ```
 
@@ -321,188 +342,124 @@ metric labels cannot). `server.port` is included so services
 running multiple Redis processes on the same host (sidecars, dev
 environments) can distinguish them, per Gemini's allowlist note.
 
-**B. Connection-pool metrics — passed through from `redisotel.InstrumentMetrics`, with views to bring them to v1.39.**
+**B. Connection-pool metrics — owned by the wrapper, emitted in semconv v1.39.**
 
-redisotel v9.9.0 emits the **v1.24-era** pool instruments —
-plural-form names and millisecond histograms:
+The ADR originally planned to call
+`redisotel.InstrumentMetrics(...)` and translate its emissions
+to v1.39 via OTel Go views. That approach is **not viable**: in
+OTel Go `sdk/metric` v1.43.0, `Stream.AttributeFilter` only
+chooses which already-recorded attributes are retained — it
+cannot add `db.system.name`, `server.address`, or `server.port`
+to redisotel's `pool.name` / legacy `db.system` label set. The
+wrapper therefore does **not** call `redisotel.InstrumentMetrics`
+at all. It owns the pool-metric instrument set end-to-end,
+reads `*redis.Client.PoolStats()` from each per-node client at
+observation time, and records under v1.39 names with the §7
+group A label set.
 
+Instruments registered once per `Wrap` call (async / observable
+where appropriate):
+
+- `db.client.connection.idle.max` — Int64ObservableUpDownCounter
+- `db.client.connection.idle.min` — Int64ObservableUpDownCounter
+- `db.client.connection.max` — Int64ObservableUpDownCounter
+- `db.client.connection.count` (with `state="used"|"idle"`) —
+  Int64ObservableUpDownCounter
+- `db.client.connection.timeouts` — Int64ObservableCounter
+- `db.client.connection.create_time` (unit `s`) — Float64Histogram,
+  recorded synchronously from inside the SDK-owned dial hook
+  (the only timing point where the start/end timestamps are
+  available).
+
+All async instruments are registered with a single
+`RegisterCallback` whose closure captures a
+`weak.Pointer[T]` to the underlying concrete client (one of
+`*redis.Client` / `*redis.ClusterClient` / `*redis.Ring`). On
+each observation cycle the callback:
+
+1. Dereferences the weak pointer; if `nil` (the client has been
+   GC'd), unregisters the callback and returns. This is the
+   only path that removes the callback — the wrapper relies on
+   `RegisterCallback`'s returned `Registration.Unregister` plus
+   the weak pointer to avoid pinning the client.
+2. For single-node, reads `PoolStats()` once and records the
+   five gauges under labels `{db.system.name="redis",
+   server.address=<host>, server.port=<port if Addr splits>}`.
+3. For Cluster / Ring, iterates the current shard set —
+   `*redis.ClusterClient.ForEachMaster` + `ForEachSlave` for
+   Cluster, `*redis.Ring.GetShardClients()` for Ring (the same
+   APIs §10's setup pass uses, with the same down-shard
+   coverage caveat resolved by `GetShardClients`). For each
+   per-node `*redis.Client`, reads `PoolStats()` and records
+   under the same label set, with `server.address` /
+   `server.port` taken from that node's `Options()`.
+
+Reading pool stats at observation time rather than registering
+per-node callbacks eliminates redisotel's shared-`conf` bug
+(every observation builds its label set fresh from the current
+shard's `Options`), removes the in-flight race window entirely
+(no setup-phase per-node InstrumentMetrics call exists), and
+keeps the dedup map free of per-node `*redis.Client`
+references. The observation cost is one `PoolStats()` call per
+shard per scrape interval, which is a few atomic-counter reads
+inside go-redis — well within the metrics SDK's observation
+budget.
+
+**Implication for §10's commit sequence.** Because the wrapper
+no longer calls `redisotel.InstrumentMetrics`, §10's
+"best-effort metrics phase" no longer needs the
+`metricsInstalled` CAS gate, the `metricsErr` field, the shared-
+`conf` workaround, or the warmed-Cluster `ForEachShard`-failure
+carve-out for metrics. Instrument creation (the async
+registrations and the `create_time` histogram) is a single
+strict pre-commit step that either succeeds or fails as one
+unit, joining the existing strict error class. The detailed
+walk-through in §10 carries the simplified flow; this group B
+section is the authoritative description of what the metrics
+path actually does.
+
+**C. Defensive drop views for redisotel emissions.**
+
+The wrapper itself does not call `redisotel.InstrumentMetrics`
+(see group B), so in a default `Wrap` + `o11y.Init` deployment
+no `db.client.connections.*` instruments are registered against
+the MeterProvider. However, an end-user who composes their own
+MeterProvider and **also** wires up `redisotel.InstrumentMetrics`
+on the side (perhaps for a non-Redis-via-this-wrapper code
+path, or by accident) would re-introduce the v1.24-named
+plural family. To keep the v1.39 contract intact for any
+MeterProvider that includes `MetricViews()`, the export
+registers a defensive drop view for every redisotel pool
+instrument:
+
+- `db.client.connections.usage`
 - `db.client.connections.idle.max`
 - `db.client.connections.idle.min`
 - `db.client.connections.max`
-- `db.client.connections.usage` (with `state` attribute)
 - `db.client.connections.timeouts`
 - `db.client.connections.hits`
 - `db.client.connections.misses`
-- `db.client.connections.create_time` (histogram, unit `ms`)
-- `db.client.connections.use_time` (histogram, unit `ms`) —
-  dropped by the view in group C since group A replaces it.
+- `db.client.connections.create_time`
+- `db.client.connections.use_time`
 
-The OTel semantic-conventions v1.33 database migration renamed
-this family from `db.client.connections.*` (plural) to
-`db.client.connection.*` (singular) and switched
-`create_time` / `use_time` from `ms` to `s`. ADR 0011 pins this
-repo to semconv v1.39, so an unmodified pass-through would
-leave the pool metrics non-compliant — dashboards keyed on the
-v1.39 names would miss Redis pool telemetry entirely.
-
-The wrapper closes the gap with two complementary fixes:
-
-- **Name normalisation via views.** The package exports a
-  view set that renames each redisotel instrument to its
-  v1.39 singular equivalent (`db.client.connections.usage`
-  → `db.client.connection.count`, etc.) using
-  `sdkmetric.NewView(sdkmetric.Instrument{Name: ...},
-  sdkmetric.Stream{Name: ...})`. `o11y.Init` registers these
-  alongside the group A allowlist views and the group C drop
-  view (§7 enumerates the registration site).
-- **Unit conversion for `create_time`.** OTel Go views do not
-  support unit conversion on histograms, so a Stream-rename of
-  `create_time` would carry the wrong unit (`ms` instead of
-  `s`). The wrapper therefore **drops** the redisotel
-  `db.client.connections.create_time` histogram via a second
-  view and re-emits its own `db.client.connection.create_time`
-  histogram in `s` from inside the SDK-owned hook (the dialer
-  start/end timestamps are available there). The drop view is
-  the same shape as the group C drop and is composed into the
-  same `MetricViews()` export.
-
-After these views the visible pool metric set is fully v1.39:
-
-- `db.client.connection.idle.max`
-- `db.client.connection.idle.min`
-- `db.client.connection.max`
-- `db.client.connection.count` (with `state` attribute)
-- `db.client.connection.timeouts`
-- `db.client.connection.create_time` (re-emitted by the wrapper
-  in `s`).
-- Hits / misses are dropped — they have no v1.39 stable name
-  and are derivable from `count{state="used"}` and pool
-  timeouts.
-
-Labels emitted by redisotel (`pool.name`, legacy `db.system`)
-are attribute-filtered down to the §7 group A allowlist via the
-same view set so the pool metrics carry the same low-cardinality
-label set as the operation-duration histogram.
-
-For a single-node `*redis.Client` (including the Sentinel-failover
-variant) `Wrap` calls
-`redisotel.InstrumentMetrics(rdb, redisotel.WithMeterProvider(mp))`
-once and is done.
-
-**Cluster / Ring: bypass the top-level cluster path.** In
-go-redis/redisotel v9.9.0, calling `InstrumentMetrics` directly on
-a `*redis.ClusterClient` or `*redis.Ring` installs an `OnNewNode`
-callback that closes over **one shared `conf` struct**: after the
-first per-node invocation, redisotel mutates `conf.poolName` to
-that node's address and appends node-specific attrs to
-`conf.attrs`, and **subsequent** new-node invocations re-use the
-mutated state — they keep the first node's `pool.name` label and
-keep appending duplicate attributes. The wrapper therefore must
-**not** rely on the top-level `InstrumentMetrics(clusterClient)`
-call for ongoing node coverage; using it would produce wrong /
-duplicated labels on every node created after the first.
-
-`Wrap` instead drives `InstrumentMetrics` itself, **per node**,
-using a fresh call site (and therefore a fresh internal `conf`)
-each time. The exact orchestration lives in §10's seven-step
-flow, summarised here:
-
-- The initial `ForEachMaster + ForEachSlave` / `GetShardClients`
-  pass collects per-node `*redis.Client` references into
-  `seenNodes` but does **not** call `InstrumentMetrics` inline.
-- The wrapper's `OnNewNode` callback (per-`Wrap`-call closure,
-  so each call site has its own redisotel `conf`) hooks new
-  nodes during the in-flight race window. It claims a per-node
-  CAS gate (`metricsInstalled`) before calling
-  `InstrumentMetrics` so step 6 below doesn't repeat the work.
-- The dedicated metrics phase (§10 step 6) walks `seenNodes`,
-  consults the same `metricsInstalled` CAS gate, and calls
-  `redisotel.InstrumentMetrics(perNodeClient, redisotel.WithMeterProvider(mp))`
-  on each node the callback didn't already claim, surfacing
-  errors via `errors.Join`. Failures the callback already
-  recorded in `metricsErr` are folded into the same returned
-  error so no error class is silently swallowed (which a naive
-  "call `InstrumentMetrics` inline during the shard pass" path
-  would have).
-- The steady-state branch of `OnNewNode` (after step 7 swaps
-  `seenNodesPtr` to nil) calls `InstrumentMetrics` directly on
-  the new node without dedup — see §10 for why no race remains
-  at that point.
-
-Double-registration on a second `Wrap` call is prevented by §10's
-top-level `sync.Map` dedup (which short-circuits before any
-per-node work runs), not by per-node bookkeeping.
-
-**Carve-out: partial per-node `InstrumentMetrics` failure.** In
-go-redis/redisotel v9.9.0, `InstrumentMetrics` registers its
-pool-stat observer callbacks **before** it creates the
-metrics-hook histograms, so a per-node call that fails partway
-(typically at histogram creation against a broken MeterProvider)
-returns an error after the per-node client has **already** been
-mutated. This is a single-call atomicity gap inside redisotel
-that the wrapper cannot unwind from the outside without owning
-the entire pool-stat instrument set, which §B explicitly opts
-out of. Consequently, §10's unmodified-on-error contract has one
-exception, documented here: if a per-node `InstrumentMetrics`
-call returns an error during the warm-Cluster / warm-Ring
-iteration, nodes processed before the failure point may retain
-their pool-stat callbacks (harmless when the MeterProvider keeps
-failing — the callbacks observe but their reads produce nothing
-useful — but they accumulate if a later `Wrap` retry succeeds,
-producing double-registered observers on those specific nodes).
-`Wrap` therefore performs per-node `InstrumentMetrics` **last**
-in the commit sequence (after tracing hooks and `OnNewNode` are
-in place), collects all per-node errors into a single
-`errors.Join` return, and **does** set `done = true` if the
-tracing-hook phase succeeded — accepting that a retry would be a
-no-op rather than risk the double-observer scenario. Callers
-proceeding past such an error therefore get full tracing coverage
-plus pool metrics from the nodes that succeeded, and missing pool
-metrics from the ones that didn't; the error return tells startup
-readiness exactly which nodes are partial. The corresponding test
-in §12 forces this partial-failure mode and asserts the
-documented behaviour.
-
-**C. Drop / rename upstream `db.client.connections.*` via views.**
-
-`redisotel.InstrumentMetrics` registers the v1.24-era pool
-instrument family enumerated in group B. The wrapper's view set
-performs three operations on that family:
-
-1. **Drop** `db.client.connections.use_time` (the per-command
-   duration histogram redisotel emits in `ms`): group A
-   replaces it with `db.client.operation.duration` in `s`, so
-   the upstream histogram is shape-incompatible and is dropped
-   wholesale.
-2. **Drop** `db.client.connections.create_time` (the dial
-   histogram in `ms`): the wrapper re-emits this as
-   `db.client.connection.create_time` in `s` from inside the
-   SDK-owned hook (group B above). OTel Go views cannot convert
-   units on histograms, so drop-and-re-emit is the only path.
-3. **Rename** every remaining `db.client.connections.<rest>`
-   instrument to its v1.39 singular `db.client.connection.<rest>`
-   form by setting `Stream.Name`. The hits/misses gauges are
-   dropped because v1.39 has no stable name for them (see
-   group B).
-
-Each operation is a `sdkmetric.NewView(sdkmetric.Instrument{Name: ...},
-sdkmetric.Stream{Name: ..., Aggregation: ...})` (the Drop variant
-uses `Aggregation: sdkmetric.AggregationDrop{}`; the rename variant
-uses `Name:` only). The full set lives in the redis package's
-`MetricViews()` export and matches the OTel Go `sdk/metric`
-v1.43.0 API the repo already uses in
+Each is dropped via
+`sdkmetric.NewView(sdkmetric.Instrument{Name: <plural-name>},
+sdkmetric.Stream{Aggregation: sdkmetric.AggregationDrop{}})`.
+This is a no-op if redisotel was never registered, and prevents
+mixed v1.24/v1.39 emissions if it was. The full set lives in
+the redis package's `MetricViews()` export and matches the OTel
+Go `sdk/metric` v1.43.0 API the repo already uses in
 `internal/metrics.defaultViews`.
 
-**View registration site.** All of these views (the group A
-allowlist views from §5, and the group C drops + renames here)
-must be registered at `sdkmetric.NewMeterProvider` construction
-time — OTel Go fixes views when the MeterProvider is built, so
-`Wrap` cannot add views after the fact. This ADR therefore
-requires that `o11y.Init` include the redis view set in its
-default view set (adjacent to the ADR 0009 §2 allowlist views).
-The redis package exports `MetricViews()` so `o11y.Init` can
-compose it without the redis package needing to know about
-`o11y.Init`.
+**View registration site.** The group A allowlist views from §5
+and the group C defensive drops here must be registered at
+`sdkmetric.NewMeterProvider` construction time — OTel Go fixes
+views when the MeterProvider is built, so `Wrap` cannot add
+views after the fact. This ADR therefore requires that
+`o11y.Init` include the redis view set in its default view set
+(adjacent to the ADR 0009 §2 allowlist views). The redis
+package exports `MetricViews()` so `o11y.Init` can compose it
+without the redis package needing to know about `o11y.Init`.
 
 The operation-duration histogram in group A falls under the
 metric.View allowlist registered at `o11y.Init` per ADR 0009 §2;
@@ -790,14 +747,14 @@ Cluster-specific concerns:
           e.mu.Unlock()
           return rdb, err
       case errBestEffort:
-          // Warmed-Cluster ForEachShard failure or metrics-phase
-          // failure. OnNewNode is installed and may have hooked /
-          // instrumented some nodes already; v9.9.0 has no public
-          // hook-remove API. Commit the dedup entry so retries are
-          // silent no-ops and don't double-register on the
-          // already-touched nodes. Release the race-window map so
-          // post-return OnNewNode firings take the steady-state,
-          // no-retention branch.
+          // Warmed-Cluster/Ring shard-collection failure.
+          // OnNewNode is already installed and may have hooked
+          // some nodes during the failed iteration; v9.9.0 has
+          // no public hook-remove API. Commit the dedup entry
+          // so retries are silent no-ops and don't double-hook
+          // the already-touched nodes. Release the race-window
+          // map so post-return OnNewNode firings take the
+          // steady-state, no-retention branch.
           seenNodesPtr.Store(nil)
           e.done = true
           runtime.AddCleanup(clientObj, deleteEntry, identity)
@@ -847,9 +804,9 @@ Cluster-specific concerns:
      entry, check `done`. If true, release and return
      `(rdb, nil)` — steady-state hit.
   6. If false, run the §10 / §7 commit sequence (instrument
-     creation → `OnNewNode` install → `ForEachShard` collection
-     → per-node `AddHook` + `InstrumentMetrics`). Classify the
-     result:
+     creation including the pool-metric observable registration
+     → `OnNewNode` install → shard-collection pass with per-node
+     `AddHook` → release `seenNodesPtr`). Classify the result:
        - **Success** → set `done = true`, register
          `runtime.AddCleanup`, unlock, return `(rdb, nil)`.
        - **Strict pre-commit error** (nil rdb, unsupported type,
@@ -859,19 +816,22 @@ Cluster-specific concerns:
          removed iff nothing else replaced it; unlock; return
          `(rdb, err)`. A retry can then re-enter cleanly.
        - **Best-effort error** (warmed-Cluster/Ring
-         `ForEachShard` failure or metrics-phase failure):
-         `OnNewNode` is already installed and may have hooked /
-         instrumented some nodes during the failing iteration,
-         and v9.9.0 has no public hook-remove API. Commit the
-         dedup entry anyway: `seenNodesPtr.Store(nil)` so any
-         post-return `OnNewNode` firing takes the steady-state
-         no-retention branch (without this step the callback
-         would keep capturing every refreshed node in the map
-         and leak), then set `done = true`, register
-         `runtime.AddCleanup`, unlock, return `(rdb, err)`. A
-         retry on the same client therefore short-circuits
-         instead of double-registering on the already-touched
-         nodes, and steady-state node creations do not leak.
+         shard-collection failure): `OnNewNode` is already
+         installed and may have hooked some nodes during the
+         failing iteration, and v9.9.0 has no public hook-remove
+         API. Commit the dedup entry anyway:
+         `seenNodesPtr.Store(nil)` so any post-return
+         `OnNewNode` firing takes the steady-state no-retention
+         branch (without this step the callback would keep
+         capturing every refreshed node in the map and leak),
+         then set `done = true`, register `runtime.AddCleanup`,
+         unlock, return `(rdb, err)`. A retry on the same client
+         therefore short-circuits instead of double-hooking the
+         already-touched nodes, and steady-state node creations
+         do not leak. Pool metrics still emit correctly because
+         the §7 group B observable was registered before
+         `OnNewNode` and scrapes the live shard set regardless
+         of the collection-pass outcome.
 
   The canonicity check in step 3 makes concurrent waiters safe
   against the strict-pre-commit `CompareAndDelete` path: any
@@ -965,18 +925,16 @@ Cluster-specific concerns:
   normal, and those new (non-disabled) hooks emit spans
   correctly.
 
-  **Known limitation: `Unwrap` does not unregister
-  `redisotel.InstrumentMetrics` callbacks.** redisotel's
-  pool-stat observer callbacks are attached to the
-  MeterProvider, not to a closure we own, and redisotel exposes
-  no removal API. After `Unwrap` + `Wrap` on the same
-  Cluster/Ring node, both registrations stay live, so
-  `db.client.connections.*` series for that node will emit
-  twice. This is acceptable for test fixtures (which typically
-  use a fresh MeterProvider per test case anyway, or reset the
-  in-memory exporter), but `Unwrap` is **not** safe in
-  production teardown paths that share a MeterProvider across
-  Wraps. The doc-comment on `Unwrap` carries this warning.
+  **Unwrap cleanly handles the wrapper-owned pool observable.**
+  Each `Wrap` call's async pool-metric callback is returned
+  from `RegisterCallback` as a `Registration`. The wrapper
+  stores that `Registration` on the dedup entry; `Unwrap`
+  calls `Registration.Unregister()` before deleting the
+  entry, so a subsequent `Wrap` registers a fresh callback
+  and there is no double-emission of pool metrics. This
+  cleanly resolves the limitation earlier drafts of this
+  section called out for redisotel-based metrics (which had
+  no removal API).
 
   **Ordering and the unmodified-on-error contract.** Naively, one
   would gather shards first and install `OnNewNode` second, but
@@ -990,13 +948,18 @@ Cluster-specific concerns:
   `seenNodes` set keyed by the per-node `*redis.Client`'s
   `uintptr` to deduplicate. Steps:
 
-  1. Construct the wrapper's own metric instruments and the hook
-     value in local variables — no mutation of `rdb` yet.
+  1. Construct the wrapper's own metric instruments (the
+     `db.client.operation.duration` histogram from §5 group A
+     **and** the pool-metric instrument set from §7 group B,
+     including registering the async observable callback against
+     the supplied MeterProvider) and the hook value in local
+     variables — no mutation of `rdb` yet. Any failure here is
+     strict pre-commit per the failure-path discussion below.
   2. Allocate a `seenNodes` `sync.Map` (logically keyed by
      `uintptr` to `*nodeState` — same untyped-`sync.Map` caveat
      as the idempotency map above), and wrap it behind a
      `seenNodesPtr atomic.Pointer[sync.Map]` so the map can be
-     dropped for GC once steady-state begins (see step 7
+     dropped for GC once steady-state begins (see step 6
      below — the map's purpose is purely to dedup the in-flight
      race window, and retaining strong `*redis.Client`
      references in it for the rest of the process would leak
@@ -1007,25 +970,31 @@ Cluster-specific concerns:
 
      ```go
      type nodeState struct {
-         client           *redis.Client
-         hookInstalled    atomic.Bool   // CAS gate for AddHook
-         metricsInstalled atomic.Bool   // CAS gate for InstrumentMetrics
-         metricsErr       atomic.Pointer[error] // surfaced by step 6
+         client        *redis.Client
+         hookInstalled atomic.Bool   // CAS gate for AddHook
      }
      ```
 
+     The wrapper no longer drives `redisotel.InstrumentMetrics`
+     per-node — pool metrics are emitted by a single
+     wrapper-owned observable callback that iterates the live
+     shard set at scrape time (§7 group B). The race-window
+     dedup therefore only needs to cover hook installation;
+     there is no metrics-side CAS or error field on
+     `nodeState`.
+
      Both code paths `LoadOrStore` a `*nodeState` keyed by the
-     node's `uintptr`. The `atomic.Bool` CAS gates make hook and
-     metric installation single-shot per node regardless of which
-     code path (callback vs iterator vs step 6) reaches it first;
-     this is what eliminates the double-instrument bug a naive
-     "both callback and step 6 call `InstrumentMetrics`" would
-     have. Storing in the map rather than a slice also handles
-     the v9.9.0 fact that `ForEachShard` invokes its callback
-     **concurrently** per shard — `sync.Map` writes from N
-     goroutines are safe.
+     node's `uintptr`. The `hookInstalled` CAS gate makes hook
+     installation single-shot per node regardless of which code
+     path (callback vs iterator) reaches it first. Storing in
+     the map rather than a slice also handles the v9.9.0 fact
+     that `ForEachShard` invokes its callback **concurrently**
+     per shard — `sync.Map` writes from N goroutines are safe.
   3. Install the wrapper's own
-     `OnNewNode(newNode *redis.Client)` callback. The closure
+     `OnNewNode(newNode *redis.Client)` callback. It only
+     installs the tracing hook — pool metrics come from a single
+     wrapper-owned observable that scrapes the live shard set
+     (§7 group B), not from per-node registrations. The closure
      branches on whether the in-flight race window is still
      open (`seenNodesPtr` non-nil):
 
@@ -1033,76 +1002,45 @@ Cluster-specific concerns:
      onNewNode := func(newNode *redis.Client) {
          if disabled.Load() { return }     // Unwrap gate, §10
          if m := seenNodesPtr.Load(); m != nil {
-             // Setup phase: dedup against ForEachShard / step 6.
+             // Setup phase: dedup against ForEachShard pass.
              ns := &nodeState{client: newNode}
              actual, _ := m.LoadOrStore(addr(newNode), ns)
              state := actual.(*nodeState)
              if state.hookInstalled.CompareAndSwap(false, true) {
                  AddHook(newNode, traceHook)
              }
-             if state.metricsInstalled.CompareAndSwap(false, true) {
-                 if err := InstrumentMetrics(newNode, WithMeterProvider(mp)); err != nil {
-                     state.metricsErr.Store(&err)
-                 }
-             }
              return
          }
          // Steady state (post-Wrap-return): no dedup needed —
          // go-redis fires OnNewNode exactly once per node-pool
          // creation, and there is no concurrent ForEachShard
-         // pass to race with. Install hook and pool metrics
-         // directly without retaining a reference.
+         // pass to race with. Install hook directly without
+         // retaining a reference.
          AddHook(newNode, traceHook)
-         if err := InstrumentMetrics(newNode, WithMeterProvider(mp)); err != nil {
-             slog.Warn("redis: post-Wrap InstrumentMetrics failed",
-                 "addr", newNode.Options().Addr, "err", err)
-         }
      }
      ```
 
-     The callback's closure carries its own redisotel `conf`, so
-     it sidesteps the shared-`conf` bug (§7 group B). The
-     callback is now in place to catch any node created from
-     this moment on.
-  4. Run `ForEachShard`. The per-shard callback executes the
-     same CAS dance on `hookInstalled` (so a node race-caught
-     by step 3's callback during the iteration window is not
-     re-hooked). `InstrumentMetrics` is **not** called in this
-     pass — it is deferred to step 6, which also uses the same
-     CAS gate so any node already metric-installed by step 3's
-     callback during the race window is skipped. `ForEachShard`
-     iteration errors are handled per the failure-path discussion
-     below — note that by this point step 3 may have already
-     installed hooks/metrics on nodes created during the
-     iteration window, and there is no public API to remove
-     them.
-  5. Once `ForEachShard` returns cleanly, the **tracing commit
+     The callback is now in place to catch any node created
+     from this moment on. There is no shared-`conf` bug to
+     sidestep because the wrapper does not call
+     `redisotel.InstrumentMetrics` at all.
+  4. Run the shard-collection pass (Cluster:
+     `ForEachMaster` + `ForEachSlave`; Ring: `GetShardClients`).
+     The per-shard callback executes the same CAS dance on
+     `hookInstalled` (so a node race-caught by step 3's
+     callback during the iteration window is not re-hooked).
+     Iteration errors fail `Wrap` here on the best-effort path
+     described below — by this point step 3 may have already
+     installed hooks on nodes created during the iteration
+     window, and there is no public API to remove them.
+  5. Once the shard pass returns cleanly, the **tracing commit
      point** has been reached: every node that exists now is
      hooked, every node created from this moment on will be
-     hooked. `done = true` is set after step 7.
-  6. **Best-effort metrics phase**: iterate `seenNodes` via
-     `sync.Map.Range` on the still-non-nil map (step 7 has not
-     yet swapped it out). For each entry:
-       - First read `state.metricsErr.Load()`. If non-nil, the
-         `OnNewNode` race-window path already attempted
-         `InstrumentMetrics` for this node and it failed; join
-         the stored error into the per-node error list and move
-         on (no retry — `metricsInstalled = true` and partial
-         redisotel state, see §7 group B).
-       - Otherwise CAS-claim
-         `state.metricsInstalled.CompareAndSwap(false, true)`;
-         on success call `InstrumentMetrics(state.client, …)`
-         and join any returned error. Nodes that step 3's
-         callback already CAS-claimed during the race window
-         are correctly skipped here — no double-registration.
-
-     For single-node, `seenNodes` is empty and
-     `InstrumentMetrics` is called on the top-level `rdb`
-     instead. Errors gather via `errors.Join` per the §7
-     group B carve-out. For Cluster / Ring there is no
-     top-level `InstrumentMetrics(rdb)` call; the per-node
-     iteration is the entire metrics path.
-  7. **Release the race-window map.** `seenNodesPtr.Store(nil)`.
+     hooked. `done = true` is set after step 6. The pool-metric
+     observable registered back in step 1 (§7 group B) has been
+     emitting since the next MeterProvider scrape cycle began —
+     no separate metrics commit point exists.
+  6. **Release the race-window map.** `seenNodesPtr.Store(nil)`.
      From this point on the `OnNewNode` closure takes the
      steady-state branch shown in step 3, which does not touch
      `seenNodes` at all. The previously-allocated `sync.Map`
@@ -1116,72 +1054,66 @@ Cluster-specific concerns:
      idempotency loop's commit path.
 
   The race-closing property: because `OnNewNode` is registered
-  **before** `ForEachShard` runs, any node materialised during
-  iteration is guaranteed to fire the callback. The `seenNodes`
-  dedup + per-node CAS gates make the order of "callback fires"
-  vs "iterator visits" vs "step 6 runs" on the same node
-  irrelevant — whichever wins each CAS does the work, the rest
-  skip. There is no remaining window where a new node can sneak
-  in unhooked, and no node is hooked or metric-installed more
-  than once.
+  **before** the shard-collection pass runs, any node materialised
+  during iteration is guaranteed to fire the callback. The
+  `seenNodes` dedup + `hookInstalled` CAS gate make the order of
+  "callback fires" vs "iterator visits" on the same node
+  irrelevant — whichever wins the CAS installs the hook, the
+  loser skips. There is no remaining window where a new node
+  can sneak in unhooked, and no node is hooked more than once.
+  Pool metrics are independent of this race because the §7
+  group B observable scrapes the live shard set at observation
+  time, not from the wrapper's `seenNodes`.
 
-  **Post-return OnNewNode metric errors.** New nodes created
-  after `Wrap` has returned still fire the `OnNewNode` callback
-  installed in step 3, but now via its steady-state branch (no
-  `seenNodes` retention). `InstrumentMetrics` errors in this
-  branch are logged via the package's `slog` logger at WARN
-  level with the per-node `server.address`; they cannot be
-  surfaced through `Wrap`'s return because that call already
-  returned. This is a known limitation listed alongside the §7
-  group B metrics-phase carve-out; callers who need strict
-  alerting on post-`Wrap` per-node metric failures should
-  subscribe to the log stream.
+  **No post-return metric-error sink needed.** With the
+  wrapper owning the pool-metric observable (§7 group B) and
+  per-node `redisotel.InstrumentMetrics` removed entirely, there
+  is no longer a class of "post-return per-node metric failure"
+  to surface. The observable runs against a single set of
+  instruments registered once during `Wrap`; if those
+  registrations succeed at `Wrap` time, every subsequent
+  observation scrapes the live shard set with no further
+  failable registrations. Earlier drafts of this ADR carried a
+  `slog`-based error sink for post-`Wrap` `InstrumentMetrics`
+  failures — that path no longer exists.
 
-  **Failure paths.** The wrapper has three classes:
+  **Failure paths.** The wrapper has two classes:
 
   - **Strict pre-commit failure** (nil `rdb`, nil `tp`, nil
-    `mp`, unsupported type, wrapper-owned instrument creation):
-    nothing has been mutated. The wrapper returns the original
-    client, runs the `CompareAndDelete` placeholder cleanup
-    from the idempotency section, and `done = false`. Retry is
-    safe. Provider-nil checks run **first** in step 1 — before
-    any allocation, lock acquisition, or `LoadOrStore` — so a
+    `mp`, unsupported type, wrapper-owned instrument creation
+    — which now includes both the
+    `db.client.operation.duration` histogram from §5 group A
+    and the pool-metric instrument set from §7 group B): nothing
+    has been mutated. The wrapper returns the original client,
+    runs the `CompareAndDelete` placeholder cleanup from the
+    idempotency section, and `done = false`. Retry is safe.
+    Provider-nil checks run **first** in step 1 — before any
+    allocation, lock acquisition, or `LoadOrStore` — so a
     nil-provider call doesn't even create a dedup-map entry to
-    clean up.
+    clean up. Instrument creation runs entirely before step 3
+    (`OnNewNode` install), so a failure here also leaves the
+    callback uninstalled — no partial state.
 
-  - **Warmed Cluster/Ring `ForEachShard` failure** (step 4
-    iteration error): this is the awkward case created by
-    closing the race window. Because `OnNewNode` was already
-    installed in step 3, any node materialised during the
-    failed iteration may already have a tracing hook attached
-    (and possibly an `InstrumentMetrics` registration too) via
-    the callback. The wrapper cannot remove these — go-redis
-    v9.9.0 exposes no public hook-remove API. The wrapper
-    therefore treats this as a **best-effort failure**, parallel
-    to the metrics-phase carve-out: report the error via the
-    return value, leave installed hooks in place, set
-    `done = true` and register the `runtime.AddCleanup` so
-    retries are silent no-ops rather than risk double-hooking
-    the nodes the callback already touched. The post-`Wrap`
-    state is: tracing partially installed (every node that
-    fired the callback during the window is fully covered;
-    nodes the failing iteration didn't reach are not), no
-    metrics from step 6 (it never ran), non-nil error return.
-    A regression test in §12 forces this path and asserts the
-    documented behaviour.
-
-  - **Metrics-phase failure (step 6)**: reported via
-    `errors.Join` on the return value but does **not** roll
-    the tracing phase back. Tracing hooks are already installed
-    by step 5, and unwinding them would require touching the
-    unexported hook chain that §10's idempotency discussion
-    already rules out as inaccessible. `done = true` despite
-    the metrics error so retries are silent no-ops rather than
-    risk double-registering pool-stat observers on the nodes
-    that did succeed (see §7 group B for why per-node
-    `InstrumentMetrics` is not atomic). The post-`Wrap` state
-    is: full tracing, partial pool metrics, non-nil error
-    return.
+  - **Warmed Cluster/Ring shard-collection failure** (step 4
+    iteration error): the awkward case created by closing the
+    race window. Because `OnNewNode` was already installed in
+    step 3, any node materialised during the failed iteration
+    may already have a tracing hook attached via the callback.
+    The wrapper cannot remove these — go-redis v9.9.0 exposes
+    no public hook-remove API. The wrapper treats this as a
+    **best-effort failure**: report the error via the return
+    value, leave installed hooks in place, run step 6
+    (`seenNodesPtr.Store(nil)`) to release the race-window map
+    and switch the callback to its steady-state branch, set
+    `done = true`, and register `runtime.AddCleanup` so retries
+    are silent no-ops rather than risk double-hooking the nodes
+    the callback already touched. Pool metrics still work
+    correctly via the §7 group B observable, which scrapes
+    whatever shards the topology yields at observation time —
+    so the post-`Wrap` state is: tracing partially installed
+    (every node the callback fired on during the window is
+    covered; nodes the failing iteration didn't reach are not),
+    pool metrics fully operational, non-nil error return.
 
   Callers who insist on all-or-nothing instrumentation should
   treat any non-nil `Wrap` error as terminal for the process;
@@ -1299,11 +1231,14 @@ Findings:
   `Wrap` is called and providers are passed, command spans are
   emitted unconditionally.
 
-**Wrapper discipline.** `Wrap` calls `redisotel.InstrumentMetrics`
-with an explicit `redisotel.WithMeterProvider(mp)`. The fallback
-branch is never reached. `redisotel.InstrumentTracing` is not
-called, so the tracer-provider fallback path is moot for this
-package.
+**Wrapper discipline.** `Wrap` does not call either
+`redisotel.InstrumentMetrics` or `redisotel.InstrumentTracing`
+(see §7 group B and §2 for why), so neither
+`redisotel.WithTracerProvider` nor `redisotel.WithMeterProvider`
+fallback paths in redisotel can ever execute on this code path.
+The wrapper interacts with the SDK only via its own
+`tp.Tracer(...)` and `mp.Meter(...)` calls using the providers
+passed to `Wrap`.
 
 ### Audit discipline for upstream bumps
 
@@ -1315,13 +1250,20 @@ On every `go-redis` / `redisotel` version change:
    becomes viable and whether the SDK-owned tracing hook can be
    retired in a future ADR amendment.
 3. Re-check the set of metric instruments emitted by
-   `redisotel.InstrumentMetrics`. If new instruments appear, audit
-   their names and cardinality and update §7 group B / C as needed.
-4. Re-check the `redis.Hook` interface for additions or signature
+   `redisotel.InstrumentMetrics` (even though we no longer call
+   it). If new instruments appear, add corresponding entries to
+   §7 group C's defensive drop list so a consumer that registers
+   redisotel separately cannot leak v1.24-era names past the
+   v1.39 contract.
+4. Re-check `*redis.Client.PoolStats()`'s field set. If go-redis
+   adds or removes pool counters, mirror the change in §7 group B
+   (the wrapper-owned observable) and the corresponding §12
+   exporter assertion.
+5. Re-check the `redis.Hook` interface for additions or signature
    changes. The wrapper's hook implementation must implement the
    full current interface; CI runs the wrapper against the pinned
    go-redis version to catch this.
-5. Update the ADR 0003 approved-integrations table with the new
+6. Update the ADR 0003 approved-integrations table with the new
    version.
 
 ---
@@ -1338,15 +1280,16 @@ On every `go-redis` / `redisotel` version change:
   - On a warmed `*redis.ClusterClient` / `*redis.Ring` (one
     whose shard iteration already yields ≥1 node before `Wrap`
     is called), every existing shard's per-node `*redis.Client`
-    receives **both** the tracing hook and a
-    `redisotel.InstrumentMetrics` registration before `Wrap`
-    returns. A subsequent command routed to a pre-existing shard
-    emits a span, and the in-memory metric exporter records at
-    least one `db.client.connections.usage` sample for that
-    shard's pool. This asserts the dual-mechanism contract from
-    both §7 (metrics) and §10 (tracing); a regression where only
-    `OnNewNode` is installed for either path would fail this
-    test.
+    receives the tracing hook before `Wrap` returns. A
+    subsequent command routed to a pre-existing shard emits a
+    span, and the in-memory metric exporter records at least
+    one `db.client.connection.count` sample (with `state`
+    attribute) for that shard's pool on the next observation
+    cycle — sourced from the wrapper-owned §7 group B
+    observable, not from any per-node redisotel registration. A
+    regression where only `OnNewNode` is installed for the
+    tracing path would fail this test on the pre-existing
+    shard's spans.
   - **Down Ring shard is still instrumented (§10 regression).**
     Construct a `*redis.Ring` whose shard-down probe reports
     `IsDown() == true` for one shard at `Wrap` time, while the
@@ -1359,16 +1302,19 @@ On every `go-redis` / `redisotel` version change:
     iterates Ring shards via `Ring.ForEachShard` instead of
     `GetShardClients()` would skip the down shard during the
     initial pass and fail this test.
-  - **No shared-config label pollution (§7 group B regression
+  - **Per-shard pool-metric labelling (§7 group B regression
     test).** Integration test with a 3-shard cluster: after
     `Wrap`, force a topology refresh that materialises two new
-    nodes back-to-back through the wrapper's `OnNewNode`. Assert
-    that each new node's `db.client.connections.usage` samples
-    carry that node's own `pool.name` (its address), **not** the
-    first new node's address. A regression that re-introduced the
-    top-level `redisotel.InstrumentMetrics(clusterClient)` call
-    would fail this assertion because of the shared-`conf` bug
-    described in §7 group B.
+    nodes back-to-back. On the next scrape cycle, assert each
+    shard's `db.client.connection.count` series carries that
+    shard's own `server.address` (and `server.port` when split),
+    **not** any sibling's address — proving the wrapper-owned
+    observable iterates the live shard set per-observation and
+    builds the label set freshly from each shard's `Options`. A
+    regression that re-introduced redisotel's per-node
+    `InstrumentMetrics` (which closes over a shared `conf` in
+    v9.9.0) would fail this assertion because every post-first
+    node would inherit the first node's `pool.name`.
   - **`ForEachShard` / `OnNewNode` race window is closed.** Unit
     test using a fake `*redis.ClusterClient` (or a real one with
     a controllable topology) that injects a brand-new node
@@ -1430,16 +1376,22 @@ On every `go-redis` / `redisotel` version change:
     not implement `redis.UniversalClient` in v9.9.0 and
     therefore fails to compile at the call site — there is no
     runtime rejection path to exercise.)
-  - **Metrics-phase carve-out (§7 group B).** Forcing
-    `redisotel.InstrumentMetrics` to fail on a subset of the
-    per-node iteration (e.g. by injecting a MeterProvider that
-    returns an instrument-creation error after N successful
-    calls) yields: (a) `Wrap` returns a non-nil error joined from
-    the failing nodes; (b) the returned client has working
-    tracing — a `GET` call emits a span; (c) the dedup map's
-    `done` flag is `true`, so a subsequent `Wrap` call is a
-    silent no-op even with a healthy MeterProvider, asserting
-    the "no retry of partially-registered observers" design.
+  - **Pool-metric observable emits v1.39 instruments (§7 group B).**
+    `Wrap` a single-node `*redis.Client` against a
+    MeterProvider with a periodic in-memory reader. Force at
+    least one PoolStats observation cycle. Assert the exporter
+    sees `db.client.connection.idle.{max,min}`,
+    `db.client.connection.max`, `db.client.connection.count`
+    (with `state` attribute), `db.client.connection.timeouts`,
+    and `db.client.connection.create_time` (unit `s`) — each
+    carrying `db.system.name="redis"`, `server.address`, and
+    (when `Options.Addr` splits) `server.port`, **without**
+    `pool.name` or legacy `db.system`. Repeat for
+    `*redis.ClusterClient` with two shards, asserting each
+    shard contributes its own labelled samples. A regression
+    that re-introduced `redisotel.InstrumentMetrics` would
+    surface the plural-form `db.client.connections.*` names
+    and the `pool.name` label, failing this test.
   - **Strict pre-commit retry-after-failure.** Force a strict
     pre-commit failure (wrapper-owned instrument-creation error
     on a non-cluster client, where `ForEachShard` isn't called).
@@ -1499,42 +1451,38 @@ On every `go-redis` / `redisotel` version change:
     instrumented, and that a `GET` on C2 emits a span. A
     regression that drops the `weak.Pointer` identity check
     would treat C2 as already-wrapped and emit zero spans.
-  - **No double-instrument in race window.** Construct a fake
-    `*redis.ClusterClient` whose `ForEachShard` yields one
-    existing node and, mid-iteration, injects a new node via
-    `OnNewNode`. After `Wrap` returns, assert the new node has
-    exactly **one** tracing hook and exactly **one**
-    `db.client.connections.usage` series — not two of either.
-    A regression that removes the `metricsInstalled` CAS gate
-    would emit two duplicate pool-metric series for the raced
-    node.
-  - **`OnNewNode` metric errors surface in `Wrap`'s return.**
-    Wire a MeterProvider that fails `InstrumentMetrics` on a
-    specific node identity. Inject that node via `OnNewNode`
-    during the race window (before step 6). Assert that
-    `Wrap` returns a non-nil error joined from the per-node
-    error (so the callback-path failure is **not** silently
-    swallowed), and that step 6 sees `metricsInstalled = true`
-    and `metricsErr != nil` for that node and propagates the
-    error rather than retrying or skipping silently. A
-    regression that drops the `metricsErr` field would let
-    `Wrap` return `nil` here despite missing pool metrics.
-  - **Warmed-Cluster ForEachShard-failure carve-out.** Force
-    `ForEachShard` to error after the wrapper's `OnNewNode` has
-    already hooked one freshly-materialised node during the
-    failed iteration. Assert: (a) `Wrap` returns a non-nil
-    error of class "warmed-cluster best-effort"; (b) the
-    pre-touched node still has its tracing hook (visible via a
-    subsequent `GET` emitting a span); (c) the dedup map entry
-    has `done = true` and `runtime.AddCleanup` is registered, so
-    a second `Wrap` call is a silent no-op even with a healthy
-    `ForEachShard`; (d) `seenNodesPtr.Load() == nil` after the
-    error return — proving the best-effort failure path released
-    the race-window map and post-return `OnNewNode` firings will
-    take the steady-state branch. A regression that forgets to
-    `Store(nil)` on the best-effort path would fail (d), and
-    subsequent topology refreshes would silently accumulate
-    `*redis.Client` references in the captured map.
+  - **No double-hook in race window.** Construct a fake
+    `*redis.ClusterClient` whose shard-collection pass yields
+    one existing node and, mid-iteration, injects a new node
+    via `OnNewNode`. After `Wrap` returns, assert the new node
+    has exactly **one** tracing hook — not two. A regression
+    that removes the `hookInstalled` CAS gate would emit two
+    duplicate spans for any command routed to the raced node.
+    Pool metrics are not part of this test because they come
+    from the wrapper-owned observable (§7 group B) which
+    iterates the live shard set at scrape time, not from per-
+    node registrations — no double-registration is possible
+    from this code path.
+  - **Warmed-Cluster shard-collection-failure carve-out.**
+    Force the shard-collection pass (Cluster: `ForEachMaster`;
+    Ring: `GetShardClients` fixture) to error after the
+    wrapper's `OnNewNode` has already hooked one freshly-
+    materialised node during the failing iteration. Assert:
+    (a) `Wrap` returns a non-nil error of class
+    "warmed-cluster best-effort"; (b) the pre-touched node
+    still has its tracing hook (visible via a subsequent `GET`
+    emitting a span); (c) the dedup map entry has
+    `done = true` and `runtime.AddCleanup` is registered, so a
+    second `Wrap` call is a silent no-op even with a healthy
+    iteration; (d) `seenNodesPtr.Load() == nil` after the error
+    return — proving the best-effort failure path released the
+    race-window map and post-return `OnNewNode` firings will
+    take the steady-state branch; (e) the pool-metric
+    observable emits non-zero samples on the next scrape (the
+    §7 group B path is independent of the failed collection
+    pass). A regression that forgets to `Store(nil)` on the
+    best-effort path would fail (d); a regression that ties
+    pool metrics to the collection pass would fail (e).
   - The hook short-circuits Pub/Sub commands (§11): asserting that
     `PUBLISH`, `SPUBLISH`, `SUBSCRIBE`, `PSUBSCRIBE`, `PUBSUB`
     produce no span and no `db.client.operation.duration` sample.
@@ -1671,9 +1619,12 @@ On every `go-redis` / `redisotel` version change:
   Ring carry the hook to each node automatically via `OnNewNode`;
   single-node and Sentinel-failover use `AddHook`. (Sentinel
   spans surface a placeholder `server.address` — see §10.)
-- Pool-stats instruments come from `redisotel.InstrumentMetrics`
-  without modification — we do not reimplement what upstream gets
-  right.
+- Pool-stats instruments are emitted by a wrapper-owned async
+  observable that scrapes `*redis.Client.PoolStats()` on each
+  shard, recording under v1.39 singular names with the §7
+  group A label set. `redisotel.InstrumentMetrics` is not used
+  (its v1.24 names and `pool.name` label cannot be translated
+  to v1.39 via OTel Go views; see §7 group B).
 
 **Negative / Trade-offs**
 
