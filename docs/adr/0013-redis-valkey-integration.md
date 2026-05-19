@@ -229,6 +229,27 @@ func WithCommandTextEnabled(enabled bool) Option
 // metrics backend would treat as cardinality.
 func WithAttributes(attrs ...attribute.KeyValue) Option
 
+// WithPoolName sets the application-defined identifier emitted as
+// db.client.connection.pool.name on every pool-metric sample (§7
+// group B). The OTel database-metrics semconv marks this attribute
+// as required for db.client.connection.* instruments.
+//
+// When omitted, the wrapper synthesises a process-unique default of
+// "redis-<uintptr-hex>" derived from the concrete client pointer.
+// For Cluster / Ring topologies the per-shard label is the
+// composed value "<top-level-pool-name>/<shard-Addr>" — see §7
+// group B for why per-shard discrimination is required even when
+// shards share a base name.
+//
+// Supply WithPoolName when you want stable, human-readable labels
+// across deployments (e.g. "sessions-cache", "rate-limiter"). Two
+// Wrap calls in the same process MUST supply distinct pool-names
+// if they wrap distinct logical pools that may resolve to the same
+// host/port (sidecar deployments, multiple db numbers, fixtures),
+// otherwise the OTel async-callback uniqueness contract is
+// violated.
+func WithPoolName(name string) Option
+
 // MetricViews returns the metric.Views this package needs registered
 // at MeterProvider construction time. The set contains:
 //   - the §5 group A allowlist views for db.client.operation.duration
@@ -354,8 +375,45 @@ to redisotel's `pool.name` / legacy `db.system` label set. The
 wrapper therefore does **not** call `redisotel.InstrumentMetrics`
 at all. It owns the pool-metric instrument set end-to-end,
 reads `*redis.Client.PoolStats()` from each per-node client at
-observation time, and records under v1.39 names with the §7
-group A label set.
+observation time, and records under v1.39 names with a
+**dedicated pool-metric label set** described below — distinct
+from the §7 group A operation-duration allowlist because the
+pool metrics need pool identity but not `db.operation.name`.
+
+**Pool-metric label set.** The OTel database-metrics semconv
+marks `db.client.connection.pool.name` as **required** for
+every `db.client.connection.*` instrument, and the OTel
+async-instrument rules require each callback to produce a
+unique attribute set per observation — without a pool identity
+label, two `Wrap` calls on different clients pointing at the
+same host/port (sidecar deployments, multiple `db` numbers,
+fixtures) would collapse into one time series and violate both
+the semconv and the SDK uniqueness contract. The wrapper
+therefore emits, for every pool-metric sample:
+
+- `db.system.name = "redis"`
+- `db.client.connection.pool.name = <pool-name>` — application-
+  unique, see derivation below
+- `server.address = <host>` (taken from the per-shard
+  `Options().Addr`)
+- `server.port = <port>` when `Options().Addr` splits cleanly
+  (omitted for the Sentinel-failover placeholder, same rule as
+  §5)
+
+**Pool-name derivation.** The wrapper accepts a
+`WithPoolName(string)` option on `Wrap` carrying an
+application-defined identifier (mirroring the semconv intent —
+e.g. `"sessions-cache"`, `"rate-limiter"`). If supplied, the
+top-level pool-name is that string; otherwise the wrapper
+synthesises a default of `redis-<uintptr-hex>` using the
+concrete client pointer (the same value the §10 dedup map keys
+on), which guarantees uniqueness across `Wrap` calls in the
+same process. For Cluster / Ring, the per-shard pool-name
+appends the shard's address as a suffix:
+`<top-level-pool-name>/<shard-Addr>`. Within a single
+`*redis.ClusterClient`, distinct shards already have distinct
+addresses; the prefix discriminates between two `Wrap`s on
+different cluster clients whose topologies happen to overlap.
 
 Instruments registered once per `Wrap` call (async / observable
 where appropriate):
@@ -374,8 +432,9 @@ where appropriate):
 All async instruments are registered with a single
 `RegisterCallback` whose closure captures a
 `weak.Pointer[T]` to the underlying concrete client (one of
-`*redis.Client` / `*redis.ClusterClient` / `*redis.Ring`). On
-each observation cycle the callback:
+`*redis.Client` / `*redis.ClusterClient` / `*redis.Ring`) plus
+the resolved top-level pool-name. On each observation cycle the
+callback:
 
 1. Dereferences the weak pointer; if `nil` (the client has been
    GC'd), unregisters the callback and returns. This is the
@@ -383,16 +442,20 @@ each observation cycle the callback:
    `RegisterCallback`'s returned `Registration.Unregister` plus
    the weak pointer to avoid pinning the client.
 2. For single-node, reads `PoolStats()` once and records the
-   five gauges under labels `{db.system.name="redis",
-   server.address=<host>, server.port=<port if Addr splits>}`.
+   gauges under the pool-metric label set above, with
+   `db.client.connection.pool.name` set to the top-level
+   pool-name and `server.address` / `server.port` taken from
+   `Options()`.
 3. For Cluster / Ring, iterates the current shard set —
    `*redis.ClusterClient.ForEachMaster` + `ForEachSlave` for
    Cluster, `*redis.Ring.GetShardClients()` for Ring (the same
    APIs §10's setup pass uses, with the same down-shard
    coverage caveat resolved by `GetShardClients`). For each
    per-node `*redis.Client`, reads `PoolStats()` and records
-   under the same label set, with `server.address` /
-   `server.port` taken from that node's `Options()`.
+   under the same label set, with `db.client.connection.pool.name`
+   set to `<top-level-pool-name>/<shard.Options().Addr>` and
+   `server.address` / `server.port` taken from that node's
+   `Options()`.
 
 Reading pool stats at observation time rather than registering
 per-node callbacks eliminates redisotel's shared-`conf` bug
@@ -1382,21 +1445,34 @@ On every `go-redis` / `redisotel` version change:
     therefore fails to compile at the call site — there is no
     runtime rejection path to exercise.)
   - **Pool-metric observable emits v1.39 instruments (§7 group B).**
-    `Wrap` a single-node `*redis.Client` against a
-    MeterProvider with a periodic in-memory reader. Force at
-    least one PoolStats observation cycle. Assert the exporter
-    sees `db.client.connection.idle.{max,min}`,
+    `Wrap` a single-node `*redis.Client` with
+    `WithPoolName("test")` against a MeterProvider with a
+    periodic in-memory reader. Force at least one PoolStats
+    observation cycle. Assert the exporter sees
+    `db.client.connection.idle.{max,min}`,
     `db.client.connection.max`, `db.client.connection.count`
     (with `state` attribute), `db.client.connection.timeouts`,
     and `db.client.connection.create_time` (unit `s`) — each
-    carrying `db.system.name="redis"`, `server.address`, and
-    (when `Options.Addr` splits) `server.port`, **without**
-    `pool.name` or legacy `db.system`. Repeat for
-    `*redis.ClusterClient` with two shards, asserting each
-    shard contributes its own labelled samples. A regression
-    that re-introduced `redisotel.InstrumentMetrics` would
-    surface the plural-form `db.client.connections.*` names
-    and the `pool.name` label, failing this test.
+    carrying `db.system.name="redis"`,
+    `db.client.connection.pool.name="test"`, `server.address`,
+    and (when `Options.Addr` splits) `server.port`. The legacy
+    `db.system` attribute and any plural-form
+    `db.client.connections.*` instruments must be absent. Repeat
+    for `*redis.ClusterClient` with two shards using
+    `WithPoolName("cluster")`, asserting each shard contributes
+    its own labelled samples with
+    `db.client.connection.pool.name="cluster/<shard-Addr>"`.
+  - **Pool-name default + uniqueness (§7 group B).** Wrap two
+    distinct single-node `*redis.Client`s pointing at the same
+    `host:port` (a sidecar / dual-db scenario), neither call
+    supplying `WithPoolName`. On the next observation cycle,
+    assert that two distinct `db.client.connection.count` time
+    series exist — one per `Wrap` — each carrying its own
+    synthesised `db.client.connection.pool.name = "redis-<hex>"`
+    derived from the concrete pointer. A regression that
+    omitted pool-name entirely would collapse the two pools
+    into a single colliding series and violate the OTel
+    async-callback uniqueness contract.
   - **Strict pre-commit retry-after-failure.** Force a strict
     pre-commit failure (wrapper-owned instrument-creation error
     on a non-cluster client, where `ForEachShard` isn't called).
@@ -1629,8 +1705,10 @@ On every `go-redis` / `redisotel` version change:
   spans surface a placeholder `server.address` — see §10.)
 - Pool-stats instruments are emitted by a wrapper-owned async
   observable that scrapes `*redis.Client.PoolStats()` on each
-  shard, recording under v1.39 singular names with the §7
-  group A label set. `redisotel.InstrumentMetrics` is not used
+  shard, recording under v1.39 singular names with a dedicated
+  pool-metric label set (`db.system.name`,
+  `db.client.connection.pool.name`, `server.address`,
+  `server.port`). `redisotel.InstrumentMetrics` is not used
   (its v1.24 names and `pool.name` label cannot be translated
   to v1.39 via OTel Go views; see §7 group B).
 
