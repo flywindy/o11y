@@ -211,7 +211,7 @@ All keys come from `go.opentelemetry.io/otel/semconv/v1.39.0`.
 | `server.address` | every span | host, from `redis.Options.Addr` / cluster node |
 | `server.port` | every span | port, from `redis.Options.Addr` / cluster node |
 | `db.query.text` | only if `WithCommandTextEnabled(true)` | the command and arguments, truncated at 1 KiB |
-| `db.operation.batch.size` | pipeline spans only | count of commands in the batch |
+| `db.operation.batch.size` | pipeline spans only | command count in the hook-invocation batch — equals the caller's batch for single-node / sentinel-failover; equals the per-shard subset for cluster / ring (§8) |
 | `error.type` | error paths | Go type name from `reflect.TypeOf(err).String()` (see §9 for the `redis.Nil` exception) |
 | `redis.error.kind` | selected error paths only | one of the closed-enum values in §9 |
 
@@ -305,11 +305,12 @@ gives those shards spans. `Wrap` mirrors §10's dual mechanism for
 metrics: during the same transactional iteration over shards (see
 §10's ordering rules), it calls
 `redisotel.InstrumentMetrics(perNodeClient, redisotel.WithMeterProvider(mp))`
-on each per-node `*redis.Client` it collects, gated by the same
-sentinel marker so a second `Wrap` does not register pool
-instruments twice. `InstrumentMetrics` errors on a per-node
-invocation roll the whole `Wrap` call back under §10's
-unmodified-on-error contract.
+on each per-node `*redis.Client` it collects. Double-registration
+on a second `Wrap` call is prevented by §10's top-level
+`sync.Map` dedup (which short-circuits before any per-node work
+runs), not by per-node bookkeeping. `InstrumentMetrics` errors on
+any per-node invocation roll the whole `Wrap` call back under
+§10's unmodified-on-error contract.
 
 **C. Drop upstream `db.client.connections.use_time` via view.**
 
@@ -344,15 +345,37 @@ the label set above bounds its cardinality.
 ### 8. Pipeline / batch span model
 
 The wrapper's `ProcessPipelineHook` emits one flat span per
-`Pipeline()` / `TxPipeline()` batch:
+**hook invocation**:
 
 - Span name: `redis.pipeline`. Low cardinality; the command list is
   not appended to the name.
 - Attributes: `db.operation.name="pipeline"`,
   `db.operation.batch.size=<n>`, `db.system.name="redis"`,
   `server.address`, `server.port`.
-- One metric sample per batch on `db.client.operation.duration`
-  with `db.operation.name="pipeline"`.
+- One metric sample per hook invocation on
+  `db.client.operation.duration` with
+  `db.operation.name="pipeline"`.
+
+**Single-node / Sentinel-failover** (`*redis.Client`,
+`*redis.FailoverClient`): one hook invocation per `Pipeline()` /
+`TxPipeline()` call, so one span and one sample per caller batch.
+`db.operation.batch.size` matches the caller-issued command count.
+
+**Cluster / Ring** (`*redis.ClusterClient`, `*redis.Ring`): go-redis
+v9.9.0 splits the caller batch by destination shard and invokes
+`ProcessPipelineHook` **once per node group**, on each node's
+per-node `*redis.Client` (which §10 hooked individually). A
+caller-issued pipeline that crosses K shards therefore produces
+**K sibling `redis.pipeline` spans** (each carrying the
+node-specific `server.address`) and K duration samples; each
+span's `db.operation.batch.size` is the subset size routed to
+that shard, not the original batch length. Summing the per-node
+`batch.size` across the spans linked by the caller's trace
+reconstructs the caller-visible total. This is the honest
+description of what the hook contract surfaces in v9.9.0:
+hooking the top-level `ClusterClient` to own a single batch span
+is not supported because `ClusterClient.processPipeline` performs
+the shard split before any pipeline hook fires.
 
 Per-command sub-spans inside a pipeline are out of scope. The
 `redis.Hook` contract from go-redis surfaces only the batch
@@ -445,12 +468,30 @@ Cluster-specific concerns:
   next topology refresh. Single-node `*redis.Client` uses
   `AddHook` directly. All three code paths read `server.address`
   / `server.port` from the per-connection options at span-start
-  time. The iteration must be guarded by a per-node sentinel
-  marker so a second `Wrap` call (or a refreshed shard that
-  happens to be re-presented to `ForEachShard`) does not
-  double-hook: each `*redis.Client` is tagged with a no-op marker
-  hook on first `AddHook`, and the iteration skips clients whose
-  hook chain already contains that marker.
+  time.
+
+  **Idempotency without inspecting hook chains.** go-redis v9.9.0's
+  `AddHook` only appends to the unexported `hooksMixin.slice` and
+  exposes no public accessor for already-registered hooks, so the
+  wrapper cannot ask "is my marker already in this client's chain?"
+  Idempotency is therefore enforced at the wrapper layer using a
+  package-private `sync.Map[redis.UniversalClient]struct{}` keyed
+  by the interface value (interface equality compares dynamic
+  type plus pointer, which is well-defined for the four supported
+  concrete types `*redis.Client`, `*redis.ClusterClient`,
+  `*redis.Ring`, `*redis.FailoverClient`). On entry, `Wrap` does a
+  `LoadOrStore`; on a hit it returns `(rdb, nil)` immediately
+  without touching hooks, `InstrumentMetrics`, `OnNewNode`, or
+  `ForEachShard`. This handles both repeated `Wrap` calls and the
+  cluster-pool-refresh case where `ForEachShard` may re-present
+  the same `*redis.Client` (which carries its own already-attached
+  hook from the first iteration). The `sync.Map` is local state of
+  the redis instrumentation package — it does **not** violate
+  ADR 0008's no-OTel-globals policy (which targets
+  `otel.SetTracerProvider` / `otel.SetMeterProvider` and the
+  global propagator), and it is the standard pattern wrap-once
+  libraries use. Entries are not removed; the `UniversalClient`
+  lifetime is the process lifetime in every adopter today.
 
   **Ordering and the unmodified-on-error contract.** To honour §3's
   "on error the original client is returned unmodified" promise,
@@ -639,11 +680,15 @@ On every `go-redis` / `redisotel` version change:
   - The hook short-circuits Pub/Sub commands (§11): asserting that
     `PUBLISH`, `SPUBLISH`, `SUBSCRIBE`, `PSUBSCRIBE`, `PUBSUB`
     produce no span and no `db.client.operation.duration` sample.
-  - **Pipeline Pub/Sub filtering (§8).** A pipeline of only
+  - **Pipeline Pub/Sub filtering (§8, single-node case).** Against
+    a single-node `*redis.Client`, a pipeline of only
     `pipe.Publish(...)` calls produces no `redis.pipeline` span
     and no duration sample. A mixed pipeline (e.g. one `Publish`
     plus two `Set` calls) records exactly one `redis.pipeline`
-    span with `db.operation.batch.size=3` (full length).
+    span with `db.operation.batch.size=3` (full length). Cluster
+    pipeline semantics are covered separately by the integration
+    test below — the §8 contract there is per-node-group, not
+    single-batch.
   - **Redis Streams are covered as `db.*` (§11).** `XADD`,
     `XREAD`, `XREADGROUP`, `XGROUP CREATE`, `XACK`, and
     `XPENDING` each emit a span with `db.operation.name` set to
@@ -673,9 +718,16 @@ On every `go-redis` / `redisotel` version change:
     "s") and the label set matches §7 group A.
   - `db.client.connections.use_time` is dropped by the view (no
     instrument under that name appears in collected metrics).
-  - Pipeline span: name is exactly `redis.pipeline`, attribute
-    `db.operation.batch.size` matches the command count, no
+  - Pipeline span (single-node): name is exactly `redis.pipeline`,
+    `db.operation.batch.size` equals the caller-issued command
+    count, exactly one such span per `Pipeline()` call, no
     per-command child spans appear.
+  - Pipeline spans (cluster, integration test under
+    `testcontainers-go`): a 6-command pipeline whose keys
+    intentionally fan out across two shards produces exactly two
+    `redis.pipeline` sibling spans, each carrying its node's
+    `server.address`, and the sum of their `db.operation.batch.size`
+    equals 6. Asserts the §8 per-node-group contract.
 
 - Compatibility tests against an in-process `miniredis` instance
   cover single-node behavior end to end (cheap, no Docker).
