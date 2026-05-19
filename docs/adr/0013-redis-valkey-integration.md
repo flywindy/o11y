@@ -141,18 +141,36 @@ revisit the choice if upstream semconv adds one.
 // Wrap is idempotent: calling it twice on the same client is a no-op
 // after the first call.
 //
-// Wrap returns a non-nil error when rdb is nil, when the underlying
-// concrete type is not supported by redisotel.InstrumentMetrics
-// (single / cluster / ring / sentinel-failover are all supported in
-// v9.9.0; *redis.SentinelClient — the raw sentinel-monitor client —
-// is not), when instrument creation against the supplied
-// MeterProvider fails, or when the initial ForEachShard iteration
-// over an already-warmed *redis.ClusterClient / *redis.Ring fails
-// (see §10 for why the iteration is mandatory). On error the
-// original client is returned unmodified so callers can choose to
-// proceed without instrumentation; they MUST NOT ignore the error
-// silently — log it and surface it to startup readiness, otherwise
-// missing Redis spans/metrics become invisible at runtime.
+// Wrap returns a non-nil error when:
+//   - rdb is nil;
+//   - the underlying concrete type is not supported (single /
+//     cluster / ring / sentinel-failover are all supported in
+//     v9.9.0; *redis.SentinelClient is not);
+//   - creation of the wrapper's own metric instruments against
+//     the supplied MeterProvider fails;
+//   - the initial ForEachShard iteration over an already-warmed
+//     *redis.ClusterClient / *redis.Ring fails;
+//   - the per-node redisotel.InstrumentMetrics phase returns an
+//     error (gathered via errors.Join over all failing nodes).
+//
+// The first four error classes preserve the unmodified-on-error
+// contract: the original client is returned with no callbacks
+// installed and the dedup-map entry stays open for retry.
+//
+// The fifth class — metrics-phase errors — does NOT roll back.
+// By the time that phase starts, the tracing hooks are already
+// installed (and §10's idempotency rules prevent uninstalling
+// them); some per-node pool-stat callbacks may also have
+// registered before the failure point. In this case Wrap returns
+// (rdb, joinedErr), records dedup-map done = true, and the
+// returned client is a fully-traced but partially metric'd
+// client. See §7 group B for why per-node InstrumentMetrics is
+// not atomic under v9.9.0.
+//
+// Callers MUST NOT ignore Wrap's error silently — log it and
+// surface it to startup readiness so missing Redis telemetry is
+// observable; whether to fail open or fail closed on a metrics-
+// phase error is a deployment decision.
 func Wrap(
     rdb redis.UniversalClient,
     tp trace.TracerProvider,
@@ -167,8 +185,14 @@ type Option func(*config)
 // often contain key names and values that are sensitive.
 func WithCommandTextEnabled(enabled bool) Option
 
-// WithAttributes appends static attributes (e.g. service-level
-// labels) to every emitted span and metric sample.
+// WithAttributes appends extra attributes to every emitted **span**.
+// These never flow to metric samples, regardless of cardinality —
+// the metric label set is fixed by §7 group A and ADR 0009 §2 so
+// that per-user / per-request / per-key labels cannot inflate
+// db.client.operation.duration or the redisotel pool-stat
+// instruments. Intended for span-only enrichment such as
+// service-level tags that a tracing backend can index but a
+// metrics backend would treat as cardinality.
 func WithAttributes(attrs ...attribute.KeyValue) Option
 
 // MetricViews returns the metric.Views this package needs registered
@@ -208,8 +232,8 @@ All keys come from `go.opentelemetry.io/otel/semconv/v1.39.0`.
 | `db.system.name` | every span | `"redis"` (single string; see §1 on Valkey backends) |
 | `db.operation.name` | every span | uppercased command name (e.g. `"GET"`, `"HSET"`), or `"pipeline"` for batches |
 | `db.namespace` | every span | the selected DB number as a string, when known |
-| `server.address` | every span | host, from `redis.Options.Addr` / cluster node |
-| `server.port` | every span | port, from `redis.Options.Addr` / cluster node |
+| `server.address` | every span | host portion of `redis.Options.Addr` for single-node / cluster / ring; the literal `"FailoverClient"` placeholder for Sentinel-failover (see §10 limitation) |
+| `server.port` | when `Options.Addr` splits cleanly into `host:port` | numeric port from `redis.Options.Addr`. **Omitted** when the address has no port — specifically for Sentinel-failover (`Options.Addr == "FailoverClient"`) and for any UDS path that may surface in future. Span tests assert presence only for the topologies that can supply it. |
 | `db.query.text` | only if `WithCommandTextEnabled(true)` | the command and arguments, truncated at 1 KiB |
 | `db.operation.batch.size` | pipeline spans only | command count in the hook-invocation batch — equals the caller's batch for single-node / sentinel-failover; equals the per-shard subset for cluster / ring (§8) |
 | `error.type` | error paths | Go type name from `reflect.TypeOf(err).String()` (see §9 for the `redis.Nil` exception) |
@@ -261,7 +285,7 @@ on a single histogram instrument:
 
 | Name | Type | Unit | Labels |
 |---|---|---|---|
-| `db.client.operation.duration` | Float64Histogram | `s` | `db.system.name`, `db.operation.name`, `server.address`, `server.port`, `error.type` (on errors only) |
+| `db.client.operation.duration` | Float64Histogram | `s` | `db.system.name`, `db.operation.name`, `server.address`, `server.port` (when `Options.Addr` splits — i.e. **omitted** for Sentinel-failover whose `Addr` is the `"FailoverClient"` placeholder), `error.type` (on errors only) |
 
 This is the stable v1.39 instrument name with the canonical unit.
 Because we record it ourselves rather than rewriting an upstream
@@ -308,9 +332,37 @@ metrics: during the same transactional iteration over shards (see
 on each per-node `*redis.Client` it collects. Double-registration
 on a second `Wrap` call is prevented by §10's top-level
 `sync.Map` dedup (which short-circuits before any per-node work
-runs), not by per-node bookkeeping. `InstrumentMetrics` errors on
-any per-node invocation roll the whole `Wrap` call back under
-§10's unmodified-on-error contract.
+runs), not by per-node bookkeeping.
+
+**Carve-out: partial per-node `InstrumentMetrics` failure.** In
+go-redis/redisotel v9.9.0, `InstrumentMetrics` registers its
+pool-stat observer callbacks **before** it creates the
+metrics-hook histograms, so a per-node call that fails partway
+(typically at histogram creation against a broken MeterProvider)
+returns an error after the per-node client has **already** been
+mutated. This is a single-call atomicity gap inside redisotel
+that the wrapper cannot unwind from the outside without owning
+the entire pool-stat instrument set, which §B explicitly opts
+out of. Consequently, §10's unmodified-on-error contract has one
+exception, documented here: if a per-node `InstrumentMetrics`
+call returns an error during the warm-Cluster / warm-Ring
+iteration, nodes processed before the failure point may retain
+their pool-stat callbacks (harmless when the MeterProvider keeps
+failing — the callbacks observe but their reads produce nothing
+useful — but they accumulate if a later `Wrap` retry succeeds,
+producing double-registered observers on those specific nodes).
+`Wrap` therefore performs per-node `InstrumentMetrics` **last**
+in the commit sequence (after tracing hooks and `OnNewNode` are
+in place), collects all per-node errors into a single
+`errors.Join` return, and **does** set `done = true` if the
+tracing-hook phase succeeded — accepting that a retry would be a
+no-op rather than risk the double-observer scenario. Callers
+proceeding past such an error therefore get full tracing coverage
+plus pool metrics from the nodes that succeeded, and missing pool
+metrics from the ones that didn't; the error return tells startup
+readiness exactly which nodes are partial. The corresponding test
+in §12 forces this partial-failure mode and asserts the
+documented behaviour.
 
 **C. Drop upstream `db.client.connections.use_time` via view.**
 
@@ -517,24 +569,42 @@ Cluster-specific concerns:
   `UniversalClient` lifetime is the process lifetime in every
   adopter today.
 
-  **Ordering and the unmodified-on-error contract.** To honour §3's
-  "on error the original client is returned unmodified" promise,
-  the wrapper performs the work in this order: (1) construct the
-  metric instruments and the hook value in local variables — no
-  mutation of `rdb` yet; (2) run `ForEachShard` (Cluster/Ring)
+  **Ordering and the unmodified-on-error contract.** The wrapper
+  performs the work in this order: (1) construct the wrapper's
+  own metric instruments and the hook value in local variables —
+  no mutation of `rdb` yet; (2) run `ForEachShard` (Cluster/Ring)
   collecting the per-node `*redis.Client` references but **not**
   calling `AddHook` during traversal; (3) once traversal completes
   cleanly, install `OnNewNode` and then `AddHook` on each
   collected node, in that order, treating the combined step as
-  the single commit point. If any step before commit fails — nil
-  `rdb`, unsupported type, instrument creation, or `ForEachShard`
-  returning an error — the wrapper returns the original client
-  with no callbacks installed and no shards hooked. This means
-  callers who decide to proceed after a non-nil error from `Wrap`
-  see a uniformly uninstrumented client (no surprise spans from
-  shards that happened to be created before the failure point);
-  startup readiness can therefore key off the single error return
-  without worrying about partial telemetry.
+  the **tracing commit point**; (4) call
+  `redisotel.InstrumentMetrics` on the top-level `rdb` and on each
+  collected per-node client (the **best-effort metrics phase** —
+  see §7 group B carve-out).
+
+  If any step **at or before the tracing commit point** fails —
+  nil `rdb`, unsupported type, wrapper-owned instrument creation,
+  or `ForEachShard` returning an error — the wrapper returns the
+  original client with no callbacks installed, no shards hooked,
+  and `done = false` so retries can re-run. This is the strict
+  unmodified-on-error contract surfaced in §3.
+
+  Failures **in the metrics phase (step 4)** are reported via
+  `errors.Join` on the return value but **do not** roll the
+  tracing phase back: by the time the metrics phase starts, the
+  tracing hooks are already installed, and unwinding them would
+  itself require touching the unexported hook chain that §10's
+  idempotency discussion already rules out as inaccessible. The
+  dedup map is set to `done = true` despite the metrics error so
+  retries are silent no-ops rather than risk
+  double-registering pool-stat observers on the nodes that did
+  succeed (see §7 group B for why per-node `InstrumentMetrics`
+  is not atomic). This means the post-`Wrap` state under a
+  metrics-phase error is: full tracing, partial pool metrics,
+  non-nil error return. Callers who insist on all-or-nothing
+  pool metrics should treat a non-nil `Wrap` error as terminal
+  for the process; callers who can tolerate degraded metrics
+  can log and continue.
 - **MOVED / ASK redirects.** go-redis handles redirects internally
   by re-issuing the command against the correct node. The hook
   emits **one span per attempt**, so a redirected command produces
@@ -675,8 +745,8 @@ On every `go-redis` / `redisotel` version change:
 - Unit tests for the wrapper:
   - `Wrap` is idempotent (calling twice does not double-instrument
     and returns `(rdb, nil)` on the second call). For cluster/ring
-    clients, idempotency is asserted per node via the sentinel
-    marker described in §10 (after the second `Wrap`, each
+    clients, idempotency is asserted by the dedup-map's
+    `done` gate described in §10 (after the second `Wrap`, each
     per-node `*redis.Client` still has exactly one tracing hook
     in its chain).
   - On a warmed `*redis.ClusterClient` / `*redis.Ring` (one whose
@@ -691,16 +761,25 @@ On every `go-redis` / `redisotel` version change:
     both §7 (metrics) and §10 (tracing); a regression where only
     `OnNewNode` is installed for either path would fail this test.
   - `Wrap` returns a non-nil error for a nil client, for
-    `*redis.SentinelClient`, when given a MeterProvider whose
-    instrument creation has been forced to fail, and when
-    `ForEachShard` returns an error mid-traversal (the original
-    client is returned unmodified in each case). The
-    unmodified-on-error contract is asserted by issuing a
-    command on the returned client after a forced failure and
-    confirming the in-memory exporter records **no** spans and
-    **no** `db.client.operation.duration` samples — i.e. no
-    `OnNewNode` callback and no partial per-shard hook installation
-    survives the error path.
+    `*redis.SentinelClient`, when wrapper-owned instrument
+    creation fails, and when `ForEachShard` returns an error
+    mid-traversal — these are the strict unmodified-on-error
+    paths. The contract is asserted by issuing a command on the
+    returned client after a forced failure and confirming the
+    in-memory exporter records **no** spans and **no**
+    `db.client.operation.duration` samples — no `OnNewNode`
+    callback and no partial per-shard hook installation survives
+    these error paths.
+  - **Metrics-phase carve-out (§7 group B).** Forcing
+    `redisotel.InstrumentMetrics` to fail on a subset of the
+    per-node iteration (e.g. by injecting a MeterProvider that
+    returns an instrument-creation error after N successful
+    calls) yields: (a) `Wrap` returns a non-nil error joined from
+    the failing nodes; (b) the returned client has working
+    tracing — a `GET` call emits a span; (c) the dedup map's
+    `done` flag is `true`, so a subsequent `Wrap` call is a
+    silent no-op even with a healthy MeterProvider, asserting
+    the "no retry of partially-registered observers" design.
   - **Retry-after-failure.** After a forced first-call failure
     (e.g. `ForEachShard` returning a fixture error), a second
     `Wrap` call with a healthy MeterProvider succeeds, returns
@@ -736,8 +815,11 @@ On every `go-redis` / `redisotel` version change:
     `server.address="FailoverClient"` (placeholder), matching the
     limitation documented in §10 and the open question above.
   - Spans emit only the §5 attributes — assert presence of
-    `db.system.name`, `db.operation.name`, `server.address`,
-    `server.port` and absence of `db.connection_string`, `db.system`,
+    `db.system.name`, `db.operation.name`, `server.address`
+    (single-node fixture also asserts `server.port`; Sentinel
+    fixture asserts `server.port` is **absent** because
+    `Options.Addr == "FailoverClient"` does not split) and
+    absence of `db.connection_string`, `db.system`,
     `db.statement`, `code.function`, `code.filepath`, `code.lineno`.
   - `db.query.text` is absent by default and present (truncated to
     1 KiB) when `WithCommandTextEnabled(true)`.
