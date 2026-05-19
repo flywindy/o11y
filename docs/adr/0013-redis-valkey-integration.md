@@ -433,10 +433,26 @@ Cluster-specific concerns:
   happens to be re-presented to `ForEachShard`) does not
   double-hook: each `*redis.Client` is tagged with a no-op marker
   hook on first `AddHook`, and the iteration skips clients whose
-  hook chain already contains that marker. `ForEachShard` errors
-  bubble up as the wrapper's error return value; the new-node
-  callback is installed regardless so future shards stay
-  instrumented even when the initial iteration is partial.
+  hook chain already contains that marker.
+
+  **Ordering and the unmodified-on-error contract.** To honour §3's
+  "on error the original client is returned unmodified" promise,
+  the wrapper performs the work in this order: (1) construct the
+  metric instruments and the hook value in local variables — no
+  mutation of `rdb` yet; (2) run `ForEachShard` (Cluster/Ring)
+  collecting the per-node `*redis.Client` references but **not**
+  calling `AddHook` during traversal; (3) once traversal completes
+  cleanly, install `OnNewNode` and then `AddHook` on each
+  collected node, in that order, treating the combined step as
+  the single commit point. If any step before commit fails — nil
+  `rdb`, unsupported type, instrument creation, or `ForEachShard`
+  returning an error — the wrapper returns the original client
+  with no callbacks installed and no shards hooked. This means
+  callers who decide to proceed after a non-nil error from `Wrap`
+  see a uniformly uninstrumented client (no surprise spans from
+  shards that happened to be created before the failure point);
+  startup readiness can therefore key off the single error return
+  without worrying about partial telemetry.
 - **MOVED / ASK redirects.** go-redis handles redirects internally
   by re-issuing the command against the correct node. The hook
   emits **one span per attempt**, so a redirected command produces
@@ -501,7 +517,9 @@ candidate for a separate ADR if demand appears:
   "not instrumented" without an explicit filter. This ADR
   therefore covers them as ordinary `db.*` operations: each
   Streams command produces one `db.client.operation.duration`
-  sample and one span carrying `db.operation.name="xadd"` etc.
+  sample and one span carrying `db.operation.name="XADD"`,
+  `"XREAD"`, etc. — uppercased, matching the §5 rule that
+  applies to every command.
   The `messaging.system="redis"` model with producer/consumer
   spans, message-id linking, and consumer-group lag metrics is a
   follow-up ADR; that ADR would add a Streams-command filter to
@@ -587,9 +605,16 @@ On every `go-redis` / `redisotel` version change:
     asserts §10's "dual mechanism" contract; a regression where
     only `OnNewNode` is installed would fail this test.
   - `Wrap` returns a non-nil error for a nil client, for
-    `*redis.SentinelClient`, and when given a MeterProvider whose
-    instrument creation has been forced to fail (the original
-    client is returned unmodified in each case).
+    `*redis.SentinelClient`, when given a MeterProvider whose
+    instrument creation has been forced to fail, and when
+    `ForEachShard` returns an error mid-traversal (the original
+    client is returned unmodified in each case). The
+    unmodified-on-error contract is asserted by issuing a
+    command on the returned client after a forced failure and
+    confirming the in-memory exporter records **no** spans and
+    **no** `db.client.operation.duration` samples — i.e. no
+    `OnNewNode` callback and no partial per-shard hook installation
+    survives the error path.
   - The hook short-circuits Pub/Sub commands (§11): asserting that
     `PUBLISH`, `SPUBLISH`, `SUBSCRIBE`, `PSUBSCRIBE`, `PUBSUB`
     produce no span and no `db.client.operation.duration` sample.
@@ -601,8 +626,9 @@ On every `go-redis` / `redisotel` version change:
   - **Redis Streams are covered as `db.*` (§11).** `XADD`,
     `XREAD`, `XREADGROUP`, `XGROUP CREATE`, `XACK`, and
     `XPENDING` each emit a span with `db.operation.name` set to
-    the lowercased command name and produce a duration sample;
-    no `messaging.*` attributes are present.
+    the uppercased command name (per §5: `"XADD"`, `"XREAD"`,
+    etc.) and produce a duration sample; no `messaging.*`
+    attributes are present.
   - Sentinel-failover clients (`NewFailoverClient`) emit
     `server.address="FailoverClient"` (placeholder), matching the
     limitation documented in §10 and the open question above.
