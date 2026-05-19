@@ -782,13 +782,25 @@ Cluster-specific concerns:
   first successful commit. The map therefore stores no reference
   that could keep the client live; when the caller drops the
   client and it becomes unreachable, `runtime.AddCleanup` fires
-  and the entry is removed. To rule out the address-reuse window
-  between cleanup running and a new client being allocated at the
-  same address, each `entry` carries a `generation uint64`
-  assigned at `LoadOrStore` time, and the cleanup function only
-  deletes the entry when its generation still matches — a freshly
-  inserted entry for a reused address gets a new generation and
-  is not touched by the prior client's cleanup.
+  and the entry is removed.
+
+  The address-reuse window — a new client allocated at the same
+  address before the previous client's cleanup has run — is
+  handled by the **weak-pointer identity check** in the retry
+  loop above, not by a generation counter. The check
+  (`entry.weakClient.Value() == currentClient`) on every `Wrap`
+  call detects the mismatch before `LoadOrStore` can inherit the
+  stale `done = true` entry, `CompareAndDelete`s the stale
+  entry, and restarts the loop with a fresh placeholder. The
+  `runtime.AddCleanup` callback itself uses
+  `m.CompareAndDelete(key, *entry)` with the original `*entry`
+  pointer as the witness, so an outdated cleanup cannot wrongly
+  evict a fresh entry installed for a reused address. Earlier
+  drafts of this section proposed a `generation uint64` field
+  for the same purpose, but a generation counter only protects
+  the cleanup-side deletion — it does not stop a new client
+  from inheriting the stale entry on its own `LoadOrStore`. The
+  weak-pointer check supersedes it.
 
   An explicit `Unwrap(rdb redis.UniversalClient)` helper is
   exported for tests that need deterministic eviction without
