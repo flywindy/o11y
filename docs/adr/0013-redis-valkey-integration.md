@@ -145,12 +145,14 @@ revisit the choice if upstream semconv adds one.
 // concrete type is not supported by redisotel.InstrumentMetrics
 // (single / cluster / ring / sentinel-failover are all supported in
 // v9.9.0; *redis.SentinelClient — the raw sentinel-monitor client —
-// is not), or when instrument creation against the supplied
-// MeterProvider fails. On error the original client is returned
-// unmodified so callers can choose to proceed without instrumentation;
-// they MUST NOT ignore the error silently — log it and surface it to
-// startup readiness, otherwise missing Redis spans/metrics become
-// invisible at runtime.
+// is not), when instrument creation against the supplied
+// MeterProvider fails, or when the initial ForEachShard iteration
+// over an already-warmed *redis.ClusterClient / *redis.Ring fails
+// (see §10 for why the iteration is mandatory). On error the
+// original client is returned unmodified so callers can choose to
+// proceed without instrumentation; they MUST NOT ignore the error
+// silently — log it and surface it to startup readiness, otherwise
+// missing Redis spans/metrics become invisible at runtime.
 func Wrap(
     rdb redis.UniversalClient,
     tp trace.TracerProvider,
@@ -299,11 +301,15 @@ named `db.client.connections.use_time` (unit `ms`), which group A
 replaces. This view drops it:
 
 ```go
-view.New(
-    view.MatchInstrumentName("db.client.connections.use_time"),
-    view.WithAggregation(aggregation.Drop{}),
+sdkmetric.NewView(
+    sdkmetric.Instrument{Name: "db.client.connections.use_time"},
+    sdkmetric.Stream{Aggregation: sdkmetric.AggregationDrop{}},
 )
 ```
+
+(This matches the OTel Go `sdk/metric` v1.43.0 API the repo already
+uses in `internal/metrics.defaultViews`; the old
+`view.New` / `aggregation.Drop` types were removed before stabilization.)
 
 **View registration site.** The view in group C must be registered
 at `sdkmetric.NewMeterProvider` construction time — OTel Go fixes
@@ -389,10 +395,28 @@ Cluster-specific concerns:
 
 - **`server.address` per node.** `Wrap` registers the SDK-owned
   `redis.Hook` on `*redis.ClusterClient` / `*redis.Ring` through
-  their `OnNewNode` callback so each node receives the hook with
-  its own `Options.Addr`. Single-node `*redis.Client` uses
-  `AddHook` directly. Both code paths read `server.address` /
-  `server.port` from the per-connection options at span-start time.
+  **both** an `OnNewNode` callback (covers future nodes created
+  after `Wrap` returns) **and** an immediate iteration over the
+  already-materialised shards via `ForEachShard` (Cluster: via
+  `ForEachMaster` + `ForEachSlave`; Ring: `ForEachShard`) calling
+  `AddHook` on each per-node `*redis.Client`. The dual approach
+  is required because in go-redis v9.9.0 `OnNewNode` only appends
+  the callback to a slice that runs from the cluster pool's
+  `GetOrCreate`, so a warmed `ClusterClient` passed to `Wrap`
+  would otherwise execute commands on existing nodes without the
+  hook, silently losing spans and operation metrics until the
+  next topology refresh. Single-node `*redis.Client` uses
+  `AddHook` directly. All three code paths read `server.address`
+  / `server.port` from the per-connection options at span-start
+  time. The iteration must be guarded by a per-node sentinel
+  marker so a second `Wrap` call (or a refreshed shard that
+  happens to be re-presented to `ForEachShard`) does not
+  double-hook: each `*redis.Client` is tagged with a no-op marker
+  hook on first `AddHook`, and the iteration skips clients whose
+  hook chain already contains that marker. `ForEachShard` errors
+  bubble up as the wrapper's error return value; the new-node
+  callback is installed regardless so future shards stay
+  instrumented even when the initial iteration is partial.
 - **MOVED / ASK redirects.** go-redis handles redirects internally
   by re-issuing the command against the correct node. The hook
   emits **one span per attempt**, so a redirected command produces
@@ -512,7 +536,18 @@ On every `go-redis` / `redisotel` version change:
 
 - Unit tests for the wrapper:
   - `Wrap` is idempotent (calling twice does not double-instrument
-    and returns `(rdb, nil)` on the second call).
+    and returns `(rdb, nil)` on the second call). For cluster/ring
+    clients, idempotency is asserted per node via the sentinel
+    marker described in §10 (after the second `Wrap`, each
+    per-node `*redis.Client` still has exactly one tracing hook
+    in its chain).
+  - On a warmed `*redis.ClusterClient` / `*redis.Ring` (one whose
+    `ForEachShard` already yields ≥1 node before `Wrap` is
+    called), every existing shard's per-node `*redis.Client`
+    receives the hook before `Wrap` returns, and a subsequent
+    command routed to a pre-existing shard emits a span. This
+    asserts §10's "dual mechanism" contract; a regression where
+    only `OnNewNode` is installed would fail this test.
   - `Wrap` returns a non-nil error for a nil client, for
     `*redis.SentinelClient`, and when given a MeterProvider whose
     instrument creation has been forced to fail (the original
