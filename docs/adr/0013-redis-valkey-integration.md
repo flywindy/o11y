@@ -577,10 +577,27 @@ Cluster-specific concerns:
      creation → `ForEachShard` collection → `OnNewNode` +
      `AddHook` + per-node `InstrumentMetrics` commit). On
      success, set `done = true`, release, return `(rdb, nil)`.
-  5. On **any** failure before commit, leave `done = false`,
-     release, return `(rdb, err)`. A subsequent `Wrap` call can
-     therefore retry the work — the client is still unmodified
-     under §10's unmodified-on-error contract, so retry is safe.
+  5. On **any** failure before the tracing commit point, leave
+     `done = false`, **`CompareAndDelete` the map entry using the
+     `*entry` pointer as the witness value** (so the placeholder
+     is removed iff nothing else has already replaced it), unlock,
+     and return `(rdb, err)`. Removing the placeholder is required
+     because pre-commit failures never register the
+     `runtime.AddCleanup` (that happens on commit success), so a
+     stranded `done=false` entry would leak forever otherwise —
+     and a later short-lived client allocated at the same
+     concrete pointer address would inherit it and silently
+     no-op past the gate. `CompareAndDelete` makes the removal
+     race-safe against a concurrent `Wrap` that has already
+     stored a fresh placeholder under the same key (rare, but
+     possible if the caller has dropped the original client and
+     a new one happens to allocate at the same address before
+     we run the cleanup): the witness mismatches, the delete is
+     skipped, and the fresh placeholder survives. A subsequent
+     `Wrap` call on the original client therefore re-enters at
+     step 1, re-`LoadOrStore`s a new placeholder, and retries
+     the work — the client is still unmodified under §10's
+     unmodified-on-error contract, so retry is safe.
 
   Marking the client as wrapped only at the commit point (step 4)
   is essential: storing the marker on entry (step 1) would leave a
@@ -630,24 +647,61 @@ Cluster-specific concerns:
   hook-chain-inaccessibility discussion), and is intended for
   test fixtures rather than production client teardown.
 
-  **Ordering and the unmodified-on-error contract.** The wrapper
-  performs the work in this order: (1) construct the wrapper's
-  own metric instruments and the hook value in local variables —
-  no mutation of `rdb` yet; (2) run `ForEachShard` (Cluster/Ring)
-  collecting the per-node `*redis.Client` references but **not**
-  calling `AddHook` during traversal; (3) once traversal completes
-  cleanly, install the wrapper's own `OnNewNode` (which on every
-  future node-creation will call `AddHook` and then
-  `redisotel.InstrumentMetrics(newNode, …)` against a **fresh**
-  closure-local config — sidestepping redisotel's shared-`conf`
-  bug from §7 group B) and then `AddHook` on each collected node,
-  in that order, treating the combined step as the **tracing
-  commit point**; (4) call `redisotel.InstrumentMetrics` on each
-  collected per-node client (for single-node, on the top-level
-  `rdb` itself) — the **best-effort metrics phase**, see §7 group
-  B carve-out. Note that for Cluster / Ring there is no top-level
-  `InstrumentMetrics(rdb)` call at all; the per-node iteration is
-  the entire metrics path.
+  **Ordering and the unmodified-on-error contract.** Naively, one
+  would gather shards first and install `OnNewNode` second, but
+  that opens a race window for warmed clusters already serving
+  traffic: a topology refresh or MOVED/ASK redirect during the
+  gap can materialise a node that is neither in the gathered slice
+  (created after `ForEachShard` returned) nor caught by
+  `OnNewNode` (created before it was installed), so the node
+  stays unhooked indefinitely. The wrapper therefore installs the
+  callback **before** iterating shards and uses a per-call
+  `seenNodes` set keyed by the per-node `*redis.Client`'s
+  `uintptr` to deduplicate. Steps:
+
+  1. Construct the wrapper's own metric instruments and the hook
+     value in local variables — no mutation of `rdb` yet.
+  2. Allocate a `seenNodes sync.Map[uintptr]struct{}` captured by
+     both the upcoming `OnNewNode` closure and the `ForEachShard`
+     loop. Both code paths will `LoadOrStore` the per-node
+     `uintptr` before doing any hook installation on that node,
+     and skip the node if it was already seen.
+  3. Install the wrapper's own `OnNewNode(newNode *redis.Client)`
+     callback. On each invocation it does:
+     `seenNodes.LoadOrStore(addr(newNode), {})`; if already
+     present, return without touching the node. Otherwise
+     `AddHook(newNode, traceHook)` followed by
+     `redisotel.InstrumentMetrics(newNode, redisotel.WithMeterProvider(mp))`
+     in this same closure (whose `conf` is per-Wrap-call, not
+     shared with sibling callbacks — sidesteps redisotel's
+     shared-`conf` bug from §7 group B). The callback is now in
+     place to catch any node created from this moment on.
+  4. Run `ForEachShard`. For each visited per-node
+     `*redis.Client`, do the same `seenNodes.LoadOrStore` dance:
+     if already present (because step 3's callback hooked it
+     during the gap), skip; otherwise `AddHook` and append to a
+     local "to-instrument" list. Iteration errors fail `Wrap`
+     here (still pre-commit; the placeholder is cleaned up per
+     the idempotency section's step 5).
+  5. Once `ForEachShard` returns cleanly, the **tracing commit
+     point** has been reached: every node that exists now is
+     hooked, every node created from this moment on will be
+     hooked. Set `done = true` only after step 6 completes.
+  6. **Best-effort metrics phase**: call
+     `redisotel.InstrumentMetrics(perNodeClient, …)` on the
+     "to-instrument" list (and for single-node, on the top-level
+     `rdb` itself). Errors are gathered via `errors.Join` per the
+     §7 group B carve-out. Note that for Cluster / Ring there is
+     no top-level `InstrumentMetrics(rdb)` call at all; the
+     per-node iteration is the entire metrics path.
+
+  The race-closing property: because `OnNewNode` is registered
+  **before** `ForEachShard` runs, any node materialised during
+  iteration is guaranteed to fire the callback. The `seenNodes`
+  dedup makes the order of "callback fires" vs "iterator visits"
+  on the same node irrelevant — whichever wins, the node is
+  hooked exactly once, and the loser skips. There is no remaining
+  window where a new node can sneak in unhooked.
 
   If any step **at or before the tracing commit point** fails —
   nil `rdb`, unsupported type, wrapper-owned instrument creation,
@@ -837,6 +891,23 @@ On every `go-redis` / `redisotel` version change:
     top-level `redisotel.InstrumentMetrics(clusterClient)` call
     would fail this assertion because of the shared-`conf` bug
     described in §7 group B.
+  - **`ForEachShard` / `OnNewNode` race window is closed.** Unit
+    test using a fake `*redis.ClusterClient` (or a real one with
+    a controllable topology) that injects a brand-new node
+    creation **between** the `OnNewNode` install and the
+    `ForEachShard` iteration of a `Wrap` call. Assert that the
+    injected node ends up with exactly one tracing hook (not
+    zero, not two): zero would mean the race left it unhooked,
+    two would mean `seenNodes` dedup failed. A command routed to
+    that node must emit exactly one span.
+  - **Pre-commit failure cleans up the dedup placeholder.**
+    Force an instrument-creation or `ForEachShard` error on a
+    fresh client; after `Wrap` returns the error, assert the
+    package dedup map does not contain an entry for that client
+    pointer (via the test affordance from the lifecycle test
+    above). Without the `CompareAndDelete` cleanup, the
+    placeholder would leak permanently, and this assertion would
+    fail.
   - `Wrap` returns a non-nil error for a nil client, for
     `*redis.SentinelClient`, when wrapper-owned instrument
     creation fails, and when `ForEachShard` returns an error
