@@ -355,16 +355,30 @@ duplicated labels on every node created after the first.
 
 `Wrap` instead drives `InstrumentMetrics` itself, **per node**,
 using a fresh call site (and therefore a fresh internal `conf`)
-each time:
+each time. The exact orchestration lives in §10's seven-step
+flow, summarised here:
 
-1. During the §10 `ForEachShard` pass, call
-   `redisotel.InstrumentMetrics(perNodeClient, redisotel.WithMeterProvider(mp))`
-   on each already-materialised per-node `*redis.Client`.
-2. In the wrapper's own `OnNewNode` callback (which is per-`Wrap`-
-   call and so has its own closure, **not** redisotel's shared
-   one), the same per-node `InstrumentMetrics` call fires for each
-   freshly-created node — picking up post-`Wrap` topology
-   refreshes without inheriting any sibling's pool.name.
+- The initial `ForEachMaster + ForEachSlave` / `GetShardClients`
+  pass collects per-node `*redis.Client` references into
+  `seenNodes` but does **not** call `InstrumentMetrics` inline.
+- The wrapper's `OnNewNode` callback (per-`Wrap`-call closure,
+  so each call site has its own redisotel `conf`) hooks new
+  nodes during the in-flight race window. It claims a per-node
+  CAS gate (`metricsInstalled`) before calling
+  `InstrumentMetrics` so step 6 below doesn't repeat the work.
+- The dedicated metrics phase (§10 step 6) walks `seenNodes`,
+  consults the same `metricsInstalled` CAS gate, and calls
+  `redisotel.InstrumentMetrics(perNodeClient, redisotel.WithMeterProvider(mp))`
+  on each node the callback didn't already claim, surfacing
+  errors via `errors.Join`. Failures the callback already
+  recorded in `metricsErr` are folded into the same returned
+  error so no error class is silently swallowed (which a naive
+  "call `InstrumentMetrics` inline during the shard pass" path
+  would have).
+- The steady-state branch of `OnNewNode` (after step 7 swaps
+  `seenNodesPtr` to nil) calls `InstrumentMetrics` directly on
+  the new node without dedup — see §10 for why no race remains
+  at that point.
 
 Double-registration on a second `Wrap` call is prevented by §10's
 top-level `sync.Map` dedup (which short-circuits before any
@@ -439,7 +453,10 @@ The wrapper's `ProcessPipelineHook` emits one flat span per
   not appended to the name.
 - Attributes: `db.operation.name="pipeline"`,
   `db.operation.batch.size=<n>`, `db.system.name="redis"`,
-  `server.address`, `server.port`.
+  `server.address`, and `server.port` **when `Options.Addr`
+  splits cleanly** (omitted otherwise, per §5 / §7 — Sentinel-
+  failover pipelines whose `Addr == "FailoverClient"` carry no
+  port).
 - One metric sample per hook invocation on
   `db.client.operation.duration` with
   `db.operation.name="pipeline"`.
@@ -1125,8 +1142,10 @@ Cluster-specific concerns:
   master address; resolving to a real endpoint requires capturing
   it inside `Options.Dialer`, which is out of scope for this ADR
   and tracked under §Open questions. Sentinel-monitor RPCs (the
-  `*redis.SentinelClient` returned by `NewSentinelClient`) are not
-  instrumented at all — `Wrap` returns an error for it.
+  `*redis.SentinelClient` returned by `NewSentinelClient`) are
+  not instrumented at all — that type does not implement
+  `redis.UniversalClient` in v9.9.0, so a call to `Wrap` with it
+  is a compile-time error, not a runtime one (see §10).
 - **Replica reads (`RouteByLatency`, `RouteRandomly`,
   `ReadOnly`).** Replica node addresses appear in `server.address`
   naturally. No `redis.cluster.node.role` attribute is emitted by
