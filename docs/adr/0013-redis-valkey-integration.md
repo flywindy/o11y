@@ -129,7 +129,8 @@ revisit the choice if upstream semconv adds one.
    time and records under v1.39 singular names
    (`db.client.connection.idle.{max,min}`,
    `db.client.connection.max`, `db.client.connection.count`
-   with `state` attribute, `db.client.connection.timeouts`)
+   with `db.client.connection.state="used"|"idle"`,
+   `db.client.connection.timeouts`)
    plus a `db.client.connection.create_time` histogram (unit
    `s`) populated from the SDK-owned dial hook. The redisotel
    v1.24-era instruments are not used; §7 group B explains why,
@@ -298,7 +299,7 @@ All keys come from `go.opentelemetry.io/otel/semconv/v1.39.0`.
 | `server.address` | every span | host portion of `redis.Options.Addr` for single-node / cluster / ring; the literal `"FailoverClient"` placeholder for Sentinel-failover (see §10 limitation) |
 | `server.port` | when `Options.Addr` splits cleanly into `host:port` | numeric port from `redis.Options.Addr`. **Omitted** when the address has no port — specifically for Sentinel-failover (`Options.Addr == "FailoverClient"`) and for any UDS path that may surface in future. Span tests assert presence only for the topologies that can supply it. |
 | `db.query.text` | only if `WithCommandTextEnabled(true)` | the command and arguments, truncated at 1 KiB |
-| `db.operation.batch.size` | pipeline spans only | command count in the hook-invocation batch — equals the caller's batch for single-node / sentinel-failover; equals the per-shard subset for cluster / ring (§8) |
+| `db.operation.batch.size` | pipeline spans only, **and only when the effective user-command count is ≥ 2** | command count in the hook-invocation batch — equals the caller's batch for single-node / sentinel-failover; equals the per-shard subset for cluster / ring (§8). Omitted when the per-hook count is 0 or 1, per the semconv v1.39 rule that batch operations are batches of two or more. |
 | `error.type` | error paths | Go type name from `reflect.TypeOf(err).String()` (see §9 for the `redis.Nil` exception) |
 | `redis.error.kind` | selected error paths only | one of the closed-enum values in §9 |
 
@@ -421,7 +422,9 @@ where appropriate):
 - `db.client.connection.idle.max` — Int64ObservableUpDownCounter
 - `db.client.connection.idle.min` — Int64ObservableUpDownCounter
 - `db.client.connection.max` — Int64ObservableUpDownCounter
-- `db.client.connection.count` (with `state="used"|"idle"`) —
+- `db.client.connection.count` (carrying
+  `db.client.connection.state="used"|"idle"` — the full semconv
+  v1.39 attribute key, not the shorthand `state`) —
   Int64ObservableUpDownCounter
 - `db.client.connection.timeouts` — Int64ObservableCounter
 - `db.client.connection.create_time` (unit `s`) — Float64Histogram,
@@ -545,11 +548,16 @@ The wrapper's `ProcessPipelineHook` emits one flat span per
 - Span name: `redis.pipeline`. Low cardinality; the command list is
   not appended to the name.
 - Attributes: `db.operation.name="pipeline"`,
-  `db.operation.batch.size=<n>`, `db.system.name="redis"`,
-  `server.address`, and `server.port` **when `Options.Addr`
-  splits cleanly** (omitted otherwise, per §5 / §7 — Sentinel-
-  failover pipelines whose `Addr == "FailoverClient"` carry no
-  port).
+  `db.operation.batch.size=<n>` **when the effective user-
+  command count is ≥ 2** (semconv v1.39 reserves batch.size
+  for true batches; the attribute is omitted when a clustered
+  pipeline routes a single command to one shard, when an
+  internal split happens to yield a 1-command per-node hook
+  invocation, or any other case where the per-hook count is
+  0 or 1), `db.system.name="redis"`, `server.address`, and
+  `server.port` **when `Options.Addr` splits cleanly** (omitted
+  otherwise, per §5 / §7 — Sentinel-failover pipelines whose
+  `Addr == "FailoverClient"` carry no port).
 - One metric sample per hook invocation on
   `db.client.operation.duration` with
   `db.operation.name="pipeline"`.
@@ -593,16 +601,25 @@ per-node `*redis.Client` (which §10 hooked individually). A
 caller-issued pipeline that crosses K shards therefore produces
 **K sibling `redis.pipeline` spans** (each carrying the
 node-specific `server.address`) and K duration samples; each
-span's `db.operation.batch.size` is the subset size routed to
-that shard (with the same MULTI/EXEC compensation as the
-single-node case if the caller used `TxPipeline`), not the
-original batch length. Summing the per-node `batch.size` across
-the spans linked by the caller's trace reconstructs the
-caller-visible total. This is the honest description of what
-the hook contract surfaces in v9.9.0: hooking the top-level
-`ClusterClient` to own a single batch span is not supported
-because `ClusterClient.processPipeline` performs the shard
-split before any pipeline hook fires.
+span's `db.operation.batch.size` (when present) is the subset
+size routed to that shard (with the same MULTI/EXEC
+compensation as the single-node case if the caller used
+`TxPipeline`), not the original batch length. **When a shard's
+subset contains only one user command** — common for a small
+caller pipeline that happens to fan out one command per
+shard — the span omits `db.operation.batch.size` entirely,
+per the semconv v1.39 rule that batch.size MUST NOT be set
+when the operation is not actually a batch. The span itself
+still emits as `redis.pipeline` because the wire-level fact is
+a pipeline invocation; only the size attribute is conditional.
+Summing the per-node `batch.size` across the spans that have
+it, plus counting the spans that omitted it (each representing
+one user command), reconstructs the caller-visible total. This
+is the honest description of what the hook contract surfaces in
+v9.9.0: hooking the top-level `ClusterClient` to own a single
+batch span is not supported because
+`ClusterClient.processPipeline` performs the shard split before
+any pipeline hook fires.
 
 Per-command sub-spans inside a pipeline are out of scope. The
 `redis.Hook` contract from go-redis surfaces only the batch
@@ -1486,7 +1503,8 @@ On every `go-redis` / `redisotel` version change:
     observation cycle. Assert the exporter sees
     `db.client.connection.idle.{max,min}`,
     `db.client.connection.max`, `db.client.connection.count`
-    (with `state` attribute), `db.client.connection.timeouts`,
+    (with `db.client.connection.state="used"|"idle"`),
+    `db.client.connection.timeouts`,
     and `db.client.connection.create_time` (unit `s`) — each
     carrying `db.system.name="redis"`,
     `db.client.connection.pool.name="test"`, `server.address`,
@@ -1678,7 +1696,8 @@ On every `go-redis` / `redisotel` version change:
   - **Pool metrics are v1.39-named (§7 group C).** With the
     package's `MetricViews()` registered, the exporter sees the
     singular-form, second-based instruments
-    (`db.client.connection.count` with `state` attribute,
+    (`db.client.connection.count` with
+    `db.client.connection.state` attribute,
     `db.client.connection.timeouts`,
     `db.client.connection.idle.max` / `idle.min`,
     `db.client.connection.max`,
@@ -1697,10 +1716,21 @@ On every `go-redis` / `redisotel` version change:
     per-command child spans appear.
   - Pipeline spans (cluster, integration test under
     `testcontainers-go`): a 6-command pipeline whose keys
-    intentionally fan out across two shards produces exactly two
+    intentionally fan out across two shards (3+3) produces
+    exactly two `redis.pipeline` sibling spans, each carrying
+    its node's `server.address`, and the sum of their
+    `db.operation.batch.size` (both present, both = 3) equals
+    6. Asserts the §8 per-node-group contract.
+  - **Cluster pipeline batch.size omitted for size-1 subsets
+    (§8).** Same fixture, but with a 2-command pipeline whose
+    keys land one on each of two shards. Assert exactly two
     `redis.pipeline` sibling spans, each carrying its node's
-    `server.address`, and the sum of their `db.operation.batch.size`
-    equals 6. Asserts the §8 per-node-group contract.
+    `server.address` — and assert each span has **no**
+    `db.operation.batch.size` attribute set, per the semconv
+    v1.39 rule that batch.size MUST NOT be present when the
+    per-hook user-command count is less than 2. A regression
+    that always emitted `batch.size=1` would fail this test
+    and produce non-compliant series.
 
 - Compatibility tests against an in-process `miniredis` instance
   cover single-node behavior end to end (cheap, no Docker).
