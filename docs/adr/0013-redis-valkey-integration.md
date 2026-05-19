@@ -343,6 +343,26 @@ boundary; reconstructing per-command timing would require
 instrumenting at the protocol layer, which is below the hook
 contract.
 
+**Pub/Sub filter inside pipelines.** `pipe.Publish(...)` /
+`pipe.SPublish(...)` and pipelined `PUBSUB*` commands travel
+through `ProcessPipelineHook`, not `ProcessHook`, so the
+single-command filter from §11 is not sufficient on its own. The
+pipeline hook applies the same lowercased command-name set
+({`publish`, `spublish`, `subscribe`, `unsubscribe`, `psubscribe`,
+`punsubscribe`, `ssubscribe`, `sunsubscribe`, `pubsub`}) to each
+`cmd` in the batch:
+
+- If **every** command in the batch matches the filter, the hook
+  short-circuits — no `redis.pipeline` span, no
+  `db.client.operation.duration` sample — and calls
+  `next(ctx, cmds)` directly.
+- Otherwise the pipeline span and metric sample are recorded, and
+  `db.operation.batch.size` reflects the **full** batch length
+  (filtered commands included). This is the pragmatic compromise:
+  mixed Pub/Sub + normal pipelines are rare, and rebuilding the
+  batch-size count from a filtered subset would mislead operators
+  about how much work the pipeline actually issued.
+
 ### 9. Error handling
 
 Following the operator-friendly classification pattern from ADR 0011
@@ -466,12 +486,30 @@ candidate for a separate ADR if demand appears:
   invoke `next(ctx, cmd)` directly — when `cmd.Name()` (lowercased)
   matches the set `{publish, spublish, subscribe, unsubscribe,
   psubscribe, punsubscribe, ssubscribe, sunsubscribe, pubsub}`.
+  The same set is also applied inside `ProcessPipelineHook` so
+  that pipelined `Publish` does not leak `redis.pipeline` spans
+  — see §8 for the pipeline-level short-circuit rules.
   When Pub/Sub becomes a target the right model is `messaging.*`
   semconv (with `messaging.system="redis"`), which is structurally
   unlike the `db.*` model this ADR commits to, so the filter stays
   in place even then.
-- **Redis Streams (`XADD` / `XREAD` / consumer groups).** Same
-  reasoning: `messaging.*` semconv, separate ADR.
+- **Redis Streams as `messaging.*` semconv.** `XADD` / `XREAD` /
+  `XREADGROUP` / `XGROUP` / `XACK` / `XCLAIM` / `XAUTOCLAIM` /
+  `XPENDING` / `XRANGE` / `XREVRANGE` / `XLEN` / `XINFO` / `XDEL`
+  / `XTRIM` / `XSETID` are normal go-redis commands and **do**
+  invoke `ProcessHook`, so unlike Pub/Sub they cannot simply be
+  "not instrumented" without an explicit filter. This ADR
+  therefore covers them as ordinary `db.*` operations: each
+  Streams command produces one `db.client.operation.duration`
+  sample and one span carrying `db.operation.name="xadd"` etc.
+  The `messaging.system="redis"` model with producer/consumer
+  spans, message-id linking, and consumer-group lag metrics is a
+  follow-up ADR; that ADR would add a Streams-command filter to
+  the `db.*` hook (mirroring the Pub/Sub mechanism) and emit
+  `messaging.*` telemetry from a separate code path. Until then,
+  Streams users get duration/error coverage but no
+  Streams-specific attributes (no `messaging.message.id`, no
+  consumer-group lag).
 - **Client-side caching observability.** Tracking cache hit/miss
   rate, invalidation events, RESP3 client-tracking — out of scope
   until a consumer uses it.
@@ -555,6 +593,16 @@ On every `go-redis` / `redisotel` version change:
   - The hook short-circuits Pub/Sub commands (§11): asserting that
     `PUBLISH`, `SPUBLISH`, `SUBSCRIBE`, `PSUBSCRIBE`, `PUBSUB`
     produce no span and no `db.client.operation.duration` sample.
+  - **Pipeline Pub/Sub filtering (§8).** A pipeline of only
+    `pipe.Publish(...)` calls produces no `redis.pipeline` span
+    and no duration sample. A mixed pipeline (e.g. one `Publish`
+    plus two `Set` calls) records exactly one `redis.pipeline`
+    span with `db.operation.batch.size=3` (full length).
+  - **Redis Streams are covered as `db.*` (§11).** `XADD`,
+    `XREAD`, `XREADGROUP`, `XGROUP CREATE`, `XACK`, and
+    `XPENDING` each emit a span with `db.operation.name` set to
+    the lowercased command name and produce a duration sample;
+    no `messaging.*` attributes are present.
   - Sentinel-failover clients (`NewFailoverClient`) emit
     `server.address="FailoverClient"` (placeholder), matching the
     limitation documented in §10 and the open question above.
