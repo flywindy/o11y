@@ -41,18 +41,44 @@ same repo as `go-redis` itself.
 | 1 | ADR 0003 compliance (no global mutation) | ✅ | `extra/redisotel/config.go:57–58` reads `otel.GetTracerProvider()` / `otel.GetMeterProvider()` as fallback only; no `Set*` call anywhere in the package. |
 | 2 | Maintenance signal | ✅ | Shipped in the `go-redis` repo's main release cadence; v9.9.0 tagged 2025-05-27. |
 | 3 | Semconv alignment with SDK v1.39 pin | ❌ | Imports `semconv/v1.24.0` (15 minor versions behind). Emits legacy `db.system`, `db.statement`, `db.connection_string` instead of stable `db.system.name`, `db.query.text`, etc. |
-| 4 | Configurability of names/attributes | ✅ | `WithTracerProvider`, `WithMeterProvider`, `WithDBStatement(bool)`, `WithAttributes(...)` cover what we need; the legacy attribute keys can be rewritten via an additional hook (see §5). |
+| 4 | Configurability of names/attributes | ❌ | `WithTracerProvider`, `WithMeterProvider`, `WithDBStatement(bool)`, `WithAttributes(...)` exist, but there is no option to suppress `db.connection_string` or the `code.*` attributes, and OTel Go's `trace.Span` has no `DeleteAttribute`. A downstream hook cannot remove attributes redisotel set on span start. |
 | 5 | Framework signal access | ⚠️ | Tracing, dial, pool stats, pipeline, and cluster (via `OnNewNode`) are covered. Pub/Sub is **not instrumented** (no hook fires for `Subscribe` / `Publish`). Acceptable; see §11. |
 
-Item 3 fails strictly. Under ADR 0008 §2 that puts T3 on the table.
-A pure T3 (reimplement on top of `redis.Hook` from scratch) would be
-~300–400 LOC and would duplicate the dial/pool/cluster wiring that
-redisotel already gets right. Item 3 is fixable with a thin
-attribute-rewrite layer in front of redisotel (§5), so this ADR
-chooses a **T2-with-rewrite** path rather than T3. The rewrite layer
-is ~30 LOC and bounded to the legacy-key translation table; if
-redisotel later upgrades its semconv pin, the rewrite layer becomes a
-no-op and can be deleted.
+Item 3 fails strictly. Item 4 also fails on closer inspection: the
+OTel Go `trace.Span` API has **no DeleteAttribute** operation, and
+redisotel attaches `db.system`, `db.connection_string`, and the
+`code.*` attributes inside its own `BeforeProcess`, which runs
+before any hook we add downstream. A "post-hook attribute rewrite"
+can add or overwrite values but cannot remove the legacy keys, so
+the semconv-alignment and PII-protection guarantees this ADR needs
+are **not achievable** through a pure-T2 facade over
+`redisotel.InstrumentTracing`.
+
+This ADR therefore adopts a **hybrid**: T3 for tracing, T2 for
+metrics.
+
+- **Tracing.** We write our own `redis.Hook` (~120–150 LOC, the
+  size of the existing `mongo/` wrapper) that emits semconv v1.39
+  attributes directly. `redisotel.InstrumentTracing` is **not**
+  called. We own the span lifecycle and the attribute set, so
+  `db.connection_string` never appears, the `code.*` attributes
+  never appear, and `db.query.text` is off unless explicitly
+  enabled.
+- **Metrics.** `redisotel.InstrumentMetrics` is kept. Its
+  connection-pool instruments (`db.client.connections.idle.max` /
+  `.usage` / `.timeouts` / etc.) carry stable `db.client.*` names
+  that pass through unchanged from v1.24 to v1.39, so there is
+  nothing to rewrite. We register one metric.View at `o11y.Init`
+  time to drop the upstream `db.client.connections.use_time`
+  duration histogram (we replace it with our own seconds-unit
+  `db.client.operation.duration` recorded from the tracing hook).
+
+The T3-for-tracing scope is bounded by the `redis.Hook` interface
+(four methods) and the closed set of attributes in §5. ADR 0011
+established the same precedent for resty: §2 fails on one item, T3
+is permitted when the rewrite is bounded and the alternative (forced
+emission of wrong-version semconv) is unacceptable. This ADR follows
+the same logic.
 
 Relevant files / context:
 
@@ -79,19 +105,26 @@ recorded in `server.address`. OTel semconv v1.39 does not list a
 `"valkey"` value for `db.system.name`, and a future amendment can
 revisit the choice if upstream semconv adds one.
 
-### 2. Sourcing tier: T2 facade over redisotel/v9 + attribute rewrite
+### 2. Sourcing tier: hybrid (T3 tracing, T2 metrics)
 
-The wrapper installs `redisotel.InstrumentTracing` and
-`redisotel.InstrumentMetrics` on the user's client, then adds a small
-SDK-owned `redis.Hook` that runs **after** redisotel's hook in the
-chain. The SDK-owned hook does three things:
+`Wrap` does two distinct things to the user's client:
 
-1. Translates legacy attribute keys to stable v1.39 names (§5).
-2. Drops attributes the SDK does not want to emit (`db.connection_string`).
-3. Classifies errors (§9).
+1. **Attach an SDK-owned `redis.Hook`** that emits spans and the
+   operation-duration histogram directly. Implements
+   `redis.Hook`'s `DialHook`, `ProcessHook`, and
+   `ProcessPipelineHook`. Owns span start/end, attribute set,
+   error recording, and one `db.client.operation.duration`
+   histogram in seconds. Pure SDK code; no redisotel dependency on
+   this code path.
+2. **Call `redisotel.InstrumentMetrics(rdb, redisotel.WithMeterProvider(mp))`**
+   for connection-pool observability. Pool stats are valuable and
+   their stable `db.client.connections.*` names need no rewrite.
+   The one upstream instrument we do not want
+   (`db.client.connections.use_time`, the upstream duration
+   histogram) is dropped by a metric.View registered at
+   `o11y.Init` time (see §7).
 
-A metric.View registered at `o11y.Init` rewrites the upstream
-instrument names to stable forms (§7).
+`redisotel.InstrumentTracing` is **not** called.
 
 ### 3. Public API shape
 
@@ -124,6 +157,13 @@ func WithCommandTextEnabled(enabled bool) Option
 // WithAttributes appends static attributes (e.g. service-level
 // labels) to every emitted span and metric sample.
 func WithAttributes(attrs ...attribute.KeyValue) Option
+
+// MetricViews returns the metric.Views this package needs registered
+// at MeterProvider construction time (specifically, the drop view
+// for the upstream db.client.connections.use_time histogram). o11y.Init
+// composes these into its default view set; consumers building their
+// own MeterProvider must include them via sdkmetric.WithView.
+func MetricViews() []sdkmetric.View
 ```
 
 The wrapper does **not** accept a `propagation.TextMapPropagator`.
@@ -144,107 +184,147 @@ Caller deployment configuration is the source of truth for
 `server.address`; backend type is inferable from the address /
 hostname convention rather than from a span attribute.
 
-### 5. Attribute rewrite to semconv v1.39
+### 5. Span attributes emitted (semconv v1.39, stable)
 
-redisotel v9.9.0 emits legacy keys. The SDK-owned post-hook rewrites
-on every span:
+Because the wrapper owns the tracing hook (§2), the attribute set is
+defined here directly rather than as a translation from upstream.
+All keys come from `go.opentelemetry.io/otel/semconv/v1.39.0`.
 
-| Legacy key (redisotel @ v1.24) | Rewrite | Notes |
+| Attribute | When set | Value |
 |---|---|---|
-| `db.system` ("redis") | `db.system.name` ("redis") | Drop the legacy key after copying. |
-| `db.statement` | `db.query.text` | Only if `WithCommandTextEnabled(true)`. Otherwise drop both. |
-| `db.connection_string` | (dropped) | May contain `redis://user:password@host:port/db`. Replaced functionally by `server.address` + `server.port`, which redisotel also sets. |
-| `db.redis.num_cmd` | `db.operation.batch.size` | Stable v1.39 name. |
-| `server.address` | unchanged | Already stable. |
-| `server.port` | unchanged | Already stable. |
-| `code.function`, `code.filepath`, `code.lineno` | (dropped) | These describe the redisotel hook's call site, not the caller's; misleading. |
+| `db.system.name` | every span | `"redis"` (single string; see §1 on Valkey backends) |
+| `db.operation.name` | every span | uppercased command name (e.g. `"GET"`, `"HSET"`), or `"pipeline"` for batches |
+| `db.namespace` | every span | the selected DB number as a string, when known |
+| `server.address` | every span | host, from `redis.Options.Addr` / cluster node |
+| `server.port` | every span | port, from `redis.Options.Addr` / cluster node |
+| `db.query.text` | only if `WithCommandTextEnabled(true)` | the command and arguments, truncated at 1 KiB |
+| `db.operation.batch.size` | pipeline spans only | count of commands in the batch |
+| `error.type` | error paths | Go type name from `reflect.TypeOf(err).String()` (see §9 for the `redis.Nil` exception) |
+| `redis.error.kind` | selected error paths only | one of the closed-enum values in §9 |
 
-The rewrite happens in the wrapper hook's `AfterProcess` /
-`AfterProcessPipeline` equivalents (go-redis v9's hook model wraps
-process via context-passing `next`; the wrapper composes around the
-return). The set of legacy keys is closed and lives in a single
-table in the wrapper for easy audit on redisotel bumps.
+Keys **not** emitted (intentionally diverging from what
+`redisotel.InstrumentTracing` would have done):
+
+- `db.connection_string` — may carry `redis://user:password@host:port/db`.
+  Never set by the wrapper; credential material does not enter the
+  trace pipeline. `server.address` + `server.port` cover the
+  identification need.
+- `code.function`, `code.filepath`, `code.lineno` — describe the
+  redisotel hook's call site, not the caller's; misleading without
+  upstream changes.
+- `db.system` (legacy v1.24 key) — replaced by `db.system.name`.
+- `db.statement` (legacy v1.24 key) — replaced by `db.query.text`
+  and gated by §6.
+
+Span name: `redis.<METHOD>` for single commands (e.g.
+`redis.GET`), `redis.pipeline` for batches. Low cardinality; the
+command name is the operation, not the argument.
 
 ### 6. Command text (`db.query.text`) is opt-in, default off
 
-redisotel's `WithDBStatement(true)` is **default-on** upstream and
-emits full command text including arguments. This is unsafe as a
-default for the same reasons as `_oteltrace` document propagation in
-ADR 0005: Redis arguments routinely contain key names with embedded
-identifiers, cached values, session tokens, hashed credentials, etc.
+The wrapper does **not** emit `db.query.text` by default. Redis
+command arguments routinely carry key names with embedded
+identifiers, cached values, session tokens, hashed credentials,
+etc. — the same data-protection reasoning as ADR 0005 §4 on
+`_oteltrace` document propagation.
 
-The wrapper passes `redisotel.WithDBStatement(false)` to upstream
-unconditionally, then conditionally re-emits `db.query.text` from
-its own hook when `WithCommandTextEnabled(true)`. Re-emission, not
-pass-through, lets the wrapper apply consistent length truncation
-(implementation PR sets a 1 KiB cap to bound span size).
+`WithCommandTextEnabled(true)` turns it on. When enabled, the
+wrapper formats the command and arguments and truncates at 1 KiB
+to bound span size. The truncation is consistent across single
+commands and pipeline batches.
 
-Services that need full command text (debug environments, query
-profilers) must opt in explicitly and accept the data-protection
-consequences.
+Because the wrapper owns the tracing hook (§2), there is no
+`redisotel.WithDBStatement(false)` to pass through — the legacy
+`db.statement` key is simply never emitted.
 
-### 7. Metrics: instrument names rewritten via metric.View
+### 7. Metrics
 
-redisotel v1.24 emits `db.client.connections.use_time` (histogram,
-unit `ms`). Stable v1.39 names this metric
-`db.client.operation.duration` (unit `s`). Connection-pool gauges
-(`db.client.connections.idle.max` / `.usage` / `.timeouts` / etc.)
-are unchanged between v1.24 and v1.39 — those pass through.
+The wrapper produces three groups of metrics:
 
-The wrapper does not rename in code; it registers metric.Views at
-`Wrap` time (or composes views the host SDK injects via
-`o11y.Init`):
+**A. Operation duration histogram — SDK-owned, recorded in seconds.**
+
+The SDK's tracing hook records each command's wall-clock duration
+on a single histogram instrument:
+
+| Name | Type | Unit | Labels |
+|---|---|---|---|
+| `db.client.operation.duration` | Float64Histogram | `s` | `db.system.name`, `db.operation.name`, `server.address`, `server.port`, `error.type` (on errors only) |
+
+This is the stable v1.39 instrument name with the canonical unit.
+Because we record it ourselves rather than rewriting an upstream
+histogram, there is no unit drift; sample values are seconds end to
+end. The Gemini reviewer suggestion to "record directly within the
+SDK's hook in seconds" is what this ADR adopts.
+
+The label set above is the **allowlist** for this instrument.
+`db.query.text` and `redis.error.kind` are span-only and never
+labels on the histogram (span attributes can be high cardinality;
+metric labels cannot). `server.port` is included so services
+running multiple Redis processes on the same host (sidecars, dev
+environments) can distinguish them, per Gemini's allowlist note.
+
+**B. Connection-pool metrics — passed through from `redisotel.InstrumentMetrics`.**
+
+These instruments already use stable `db.client.connections.*`
+names that pass through unchanged from v1.24 to v1.39:
+
+- `db.client.connections.idle.max`
+- `db.client.connections.idle.min`
+- `db.client.connections.max`
+- `db.client.connections.usage` (with `state` attribute)
+- `db.client.connections.timeouts`
+- `db.client.connections.hits`
+- `db.client.connections.misses`
+- `db.client.connections.create_time` (histogram, unit `ms`)
+
+`Wrap` calls
+`redisotel.InstrumentMetrics(rdb, redisotel.WithMeterProvider(mp))`
+to register these. The wrapper does not duplicate them.
+
+**C. Drop upstream `db.client.connections.use_time` via view.**
+
+`redisotel.InstrumentMetrics` also registers a duration histogram
+named `db.client.connections.use_time` (unit `ms`), which group A
+replaces. This view drops it:
 
 ```go
 view.New(
     view.MatchInstrumentName("db.client.connections.use_time"),
-    view.WithRename("db.client.operation.duration"),
-    view.WithUnit("s"),
-    view.WithAggregation(/* divide-by-1000 not natively supported,
-                           so we accept the unit drift on this view
-                           and document it; see Open Questions */),
+    view.WithAggregation(aggregation.Drop{}),
 )
 ```
 
-Unit conversion (`ms` → `s`) is **not** done by the View — OTel's
-View API does not transform sample values. The wrapper documents
-that the rewritten histogram emits values in milliseconds with unit
-label `s`, **or** keeps the upstream `ms` unit label and forgoes the
-v1.39 unit alignment. The implementation PR picks one and documents
-the choice; this ADR's preference is to keep `ms` (Option B) and
-accept the unit drift as a known compatibility note, since rewriting
-unit labels without rewriting values is worse than admitting the
-unit. The histogram name still aligns with v1.39 so dashboard
-queries are correct; the unit label is the only point of drift.
+**View registration site.** The view in group C must be registered
+at `sdkmetric.NewMeterProvider` construction time — OTel Go fixes
+views when the MeterProvider is built, so `Wrap` cannot add views
+after the fact (Codex reviewer note). This ADR therefore requires
+that `o11y.Init` include the drop view in its default view set
+(adjacent to the ADR 0009 §2 allowlist views). The redis package
+exports the view constructor so `o11y.Init` can compose it without
+the redis package needing to know about `o11y.Init`.
 
-Once a future redisotel version upgrades its semconv pin and uses
-seconds natively, the View can be retired.
-
-The renamed `db.client.operation.duration` then falls under the
-metric.View allowlist registered at `o11y.Init` per ADR 0009 §2, so
-its label cardinality is bounded the same way HTTP duration is.
+The operation-duration histogram in group A falls under the
+metric.View allowlist registered at `o11y.Init` per ADR 0009 §2;
+the label set above bounds its cardinality.
 
 ### 8. Pipeline / batch span model
 
-redisotel produces **one span per pipeline batch** with
-`db.redis.num_cmd` recording the command count (rewritten to
-`db.operation.batch.size` per §5). The wrapper preserves this flat
-model:
+The wrapper's `ProcessPipelineHook` emits one flat span per
+`Pipeline()` / `TxPipeline()` batch:
 
-- Span name: `redis.pipeline` (renamed from upstream's
-  `redis.pipeline <summary>` to drop the summary, which has unbounded
-  cardinality from concatenated command names).
+- Span name: `redis.pipeline`. Low cardinality; the command list is
+  not appended to the name.
 - Attributes: `db.operation.name="pipeline"`,
   `db.operation.batch.size=<n>`, `db.system.name="redis"`,
   `server.address`, `server.port`.
-- One metric sample per batch on `db.client.operation.duration` with
-  `db.operation.name="pipeline"`. Per-command timing is not
-  available from redisotel and the wrapper does not reconstruct it.
+- One metric sample per batch on `db.client.operation.duration`
+  with `db.operation.name="pipeline"`.
 
-Per-command sub-spans inside a pipeline are out of scope. redisotel
-does not surface per-command timing during the batch, and emulating
-it would either require forking redisotel or instrumenting at a
-lower layer than the hook contract permits.
+Per-command sub-spans inside a pipeline are out of scope. The
+`redis.Hook` contract from go-redis surfaces only the batch
+boundary; reconstructing per-command timing would require
+instrumenting at the protocol layer, which is below the hook
+contract.
 
 ### 9. Error handling
 
@@ -254,15 +334,17 @@ operational response materially differs are pulled out into a
 closed-enum attribute. Everything else relies on stable
 `error.type`.
 
-The wrapper hook runs after redisotel and adjusts the span:
+Because the wrapper owns the tracing hook (§2), it controls
+whether `span.RecordError` and `span.SetStatus(Error)` are called at
+all. The flow on every command's return:
 
 | # | Condition | Action |
 |---|---|---|
-| 1 | `errors.Is(err, redis.Nil)` | **Unset** the Error status redisotel sets. Drop the recorded error. Do not emit `error.type`. (`redis.Nil` is the sentinel for "key does not exist"; it is a normal control-flow signal, not a failure.) |
-| 2 | `errors.Is(err, redis.ErrPoolTimeout)` | Set `error.type="*redis.PoolError"` and `redis.error.kind="pool_timeout"`. Leave Error status as set by redisotel. |
-| 3 | `errors.Is(err, context.DeadlineExceeded)` | Set `error.type="context.DeadlineExceeded"` and `redis.error.kind="client_timeout"`. |
-| 4 | `errors.Is(err, context.Canceled)` (and not row 3) | Set `error.type="context.Canceled"` and `redis.error.kind="client_canceled"`. |
-| 5 | any other non-nil err | Set `error.type` from `reflect.TypeOf(err).String()`. Do **not** set `redis.error.kind`. |
+| 1 | `errors.Is(err, redis.Nil)` | Treat as success: span status stays `Unset`, no `RecordError`, no `error.type`. (`redis.Nil` is the sentinel for "key does not exist"; it is a normal control-flow signal, not a failure.) The duration histogram still records a sample with no `error.type` label. |
+| 2 | `errors.Is(err, redis.ErrPoolTimeout)` | `span.RecordError(err)`, `SetStatus(Error)`, `error.type="*redis.PoolError"`, `redis.error.kind="pool_timeout"`. Histogram sample carries `error.type` label. |
+| 3 | `errors.Is(err, context.DeadlineExceeded)` | `RecordError`, `SetStatus(Error)`, `error.type="context.DeadlineExceeded"`, `redis.error.kind="client_timeout"`. |
+| 4 | `errors.Is(err, context.Canceled)` (and not row 3) | `RecordError`, `SetStatus(Error)`, `error.type="context.Canceled"`, `redis.error.kind="client_canceled"`. |
+| 5 | any other non-nil err | `RecordError`, `SetStatus(Error)`, `error.type` from `reflect.TypeOf(err).String()`. Do **not** set `redis.error.kind`. |
 
 Rationale for stopping at three `redis.error.kind` values:
 
@@ -294,22 +376,23 @@ The wrapper accepts `redis.UniversalClient`, so single-node
 
 Cluster-specific concerns:
 
-- **`server.address` per node.** redisotel's
-  `InstrumentTracing(rdb)` registers an `OnNewNode` callback on
-  `*redis.ClusterClient` / `*redis.Ring`, so each node's hook chain
-  carries that node's address. The wrapper relies on this directly;
-  no extra cluster-aware code is needed.
+- **`server.address` per node.** `Wrap` registers the SDK-owned
+  `redis.Hook` on `*redis.ClusterClient` / `*redis.Ring` through
+  their `OnNewNode` callback so each node receives the hook with
+  its own `Options.Addr`. Single-node `*redis.Client` uses
+  `AddHook` directly. Both code paths read `server.address` /
+  `server.port` from the per-connection options at span-start time.
 - **MOVED / ASK redirects.** go-redis handles redirects internally
-  by re-issuing the command against the correct node. redisotel
+  by re-issuing the command against the correct node. The hook
   emits **one span per attempt**, so a redirected command produces
   two sibling spans (the first with the wrong-node address, the
   second with the right one). This is documented behavior, not a
   bug; the second span carries the successful response.
 - **Failover.** When a primary fails over, go-redis refreshes the
-  topology and `OnNewNode` fires for the new primary. redisotel
-  does not cache topology state, so the new primary's spans carry
-  the correct `server.address` from the first hook invocation. The
-  wrapper relies on this and adds no failover-specific logic.
+  topology and `OnNewNode` fires for the new primary. The wrapper
+  caches no topology state, so the new primary's spans carry the
+  correct `server.address` from the first hook invocation. No
+  failover-specific logic is required.
 - **Replica reads (`RouteByLatency`, `RouteRandomly`,
   `ReadOnly`).** Replica node addresses appear in `server.address`
   naturally. No `redis.cluster.node.role` attribute is emitted by
@@ -328,11 +411,12 @@ candidate for a separate ADR if demand appears:
 - **`valkey-go` client.** RESP3-first features (client-side caching,
   pubsub via `Receive`) and auto-pipelining are valkey-go's primary
   selling points. None of the current adopters need them.
-- **Pub/Sub instrumentation.** redisotel does not instrument
-  `Subscribe` / `Publish`. The wrapper does not backfill it. When
-  Pub/Sub becomes a target, the right model is `messaging.*`
-  semconv (with `messaging.system="redis"`), which is structurally
-  unlike the `db.*` model this ADR commits to.
+- **Pub/Sub instrumentation.** `Subscribe` / `Publish` are not
+  instrumented. The `redis.Hook` interface does not fire for them
+  in the first place, and the right model when Pub/Sub becomes a
+  target is `messaging.*` semconv (with
+  `messaging.system="redis"`), which is structurally unlike the
+  `db.*` model this ADR commits to.
 - **Redis Streams (`XADD` / `XREAD` / consumer groups).** Same
   reasoning: `messaging.*` semconv, separate ADR.
 - **Client-side caching observability.** Tracking cache hit/miss
@@ -347,7 +431,9 @@ candidate for a separate ADR if demand appears:
 ## Global-state verification
 
 ### Library: `github.com/redis/go-redis/extra/redisotel/v9`
+
 ### Version: `v9.9.0`
+
 ### Result: ✅ SAFE — does not set globals
 
 **Verification method.** Source inspection of
@@ -366,23 +452,29 @@ Findings:
   `Wrap` is called and providers are passed, command spans are
   emitted unconditionally.
 
-**Wrapper discipline.** `Wrap` always passes both
-`redisotel.WithTracerProvider(tp)` and
-`redisotel.WithMeterProvider(mp)`. The fallback branch is never
-reached in practice.
+**Wrapper discipline.** `Wrap` calls `redisotel.InstrumentMetrics`
+with an explicit `redisotel.WithMeterProvider(mp)`. The fallback
+branch is never reached. `redisotel.InstrumentTracing` is not
+called, so the tracer-provider fallback path is moot for this
+package.
 
 ### Audit discipline for upstream bumps
 
 On every `go-redis` / `redisotel` version change:
 
 1. Re-grep the package for `otel.Set*` calls.
-2. Re-check the semconv import path. If it advances past v1.24, the
-   §5 rewrite table can shrink; if any new attribute is added,
-   evaluate whether it needs rewriting.
-3. Re-check `db.statement` default in `config.go` — if upstream
-   flips the default to off, §6's defensive override becomes
-   redundant but harmless.
-4. Update the ADR 0003 approved-integrations table with the new
+2. Re-check the semconv import path. If it advances past v1.24 to a
+   stable v1.x ≥ 1.39, evaluate whether `redisotel.InstrumentTracing`
+   becomes viable and whether the SDK-owned tracing hook can be
+   retired in a future ADR amendment.
+3. Re-check the set of metric instruments emitted by
+   `redisotel.InstrumentMetrics`. If new instruments appear, audit
+   their names and cardinality and update §7 group B / C as needed.
+4. Re-check the `redis.Hook` interface for additions or signature
+   changes. The wrapper's hook implementation must implement the
+   full current interface; CI runs the wrapper against the pinned
+   go-redis version to catch this.
+5. Update the ADR 0003 approved-integrations table with the new
    version.
 
 ---
@@ -392,21 +484,25 @@ On every `go-redis` / `redisotel` version change:
 - Unit tests for the wrapper:
   - `Wrap` is idempotent (calling twice does not double-instrument).
   - `Wrap` rejects a nil client.
-  - Attribute rewrite produces v1.39 keys and drops the legacy
-    originals (table-driven, one row per §5 entry).
-  - `db.connection_string` is never present on any emitted span.
-  - `db.query.text` is absent by default and present (truncated)
-    when `WithCommandTextEnabled(true)`.
+  - Spans emit only the §5 attributes — assert presence of
+    `db.system.name`, `db.operation.name`, `server.address`,
+    `server.port` and absence of `db.connection_string`, `db.system`,
+    `db.statement`, `code.function`, `code.filepath`, `code.lineno`.
+  - `db.query.text` is absent by default and present (truncated to
+    1 KiB) when `WithCommandTextEnabled(true)`.
   - Error classification table-driven tests for §9 rows 1–5, using
-    real fixture errors (`redis.Nil`, `redis.ErrPoolTimeout` from a
-    test pool, `context.DeadlineExceeded` from a canceled context,
-    a `*net.OpError` from a closed listener).
-  - `redis.Nil` does not set `error.type`, does not increment any
-    error counter, and leaves span status `Unset`.
-  - metric.View renaming
-    `db.client.connections.use_time` → `db.client.operation.duration`
-    is registered and produces a histogram under the new name.
-  - Pipeline span: name is `redis.pipeline`, attribute
+    real fixture errors (`redis.Nil` from `Get` against an empty
+    server, `redis.ErrPoolTimeout` from an exhausted test pool,
+    `context.DeadlineExceeded` from a canceled context, a
+    `*net.OpError` from a closed listener).
+  - `redis.Nil` does not call `RecordError`, does not set Error
+    status, does not emit `error.type`, but does record a duration
+    sample (asserting the histogram count increments).
+  - `db.client.operation.duration` is recorded in **seconds** (unit
+    "s") and the label set matches §7 group A.
+  - `db.client.connections.use_time` is dropped by the view (no
+    instrument under that name appears in collected metrics).
+  - Pipeline span: name is exactly `redis.pipeline`, attribute
     `db.operation.batch.size` matches the command count, no
     per-command child spans appear.
 
@@ -433,64 +529,75 @@ On every `go-redis` / `redisotel` version change:
 
 - Single client library covers both Redis and Valkey backends;
   callers do not change code when switching.
-- Less SDK-owned instrumentation code (~80–120 LOC wrapper) than a
-  T3 reimplementation would require.
-- Attribute names align with semconv v1.39 despite redisotel's v1.24
-  pin, so dashboards keyed on `db.system.name` / `db.query.text` /
-  `db.operation.batch.size` work uniformly with other DB
-  integrations.
+- Span attributes are full stable semconv v1.39 from the source,
+  not a rewrite of legacy keys: the trace pipeline never carries
+  `db.system`, `db.connection_string`, `db.statement`, or the
+  misleading `code.*` keys at all.
+- `db.connection_string` never enters the trace pipeline, so the
+  `redis://user:password@host:port/db` credential-leak path is
+  closed at the source rather than relying on a downstream filter.
+- `db.client.operation.duration` is recorded in seconds end to end,
+  matching v1.39 canonical units; no unit-drift compatibility note
+  needed.
 - `db.query.text` is off by default, closing the redisotel
   data-protection footgun.
-- `db.connection_string` is dropped, eliminating a credential-leak
-  path through span attributes.
-- `redis.Nil` no longer inflates error-rate dashboards.
+- `redis.Nil` is treated as success: span status `Unset`, no
+  `RecordError` event in the timeline, no `error.type` label on
+  the duration histogram. Error-rate dashboards are not inflated by
+  cache-miss control flow.
 - `pool_timeout` vs `client_timeout` distinction lets operators
   separate "scale the pool" from "raise the deadline" responses.
 - Cluster, Sentinel, and Ring topologies are supported through one
-  `redis.UniversalClient`-accepting API with no extra code.
+  `redis.UniversalClient`-accepting API; `OnNewNode` carries the
+  hook to each node automatically.
+- Pool-stats instruments come from `redisotel.InstrumentMetrics`
+  without modification — we do not reimplement what upstream gets
+  right.
 
 **Negative / Trade-offs**
 
-- The semconv-rewrite layer is dead weight the moment redisotel
-  upgrades its semconv pin. Until then it must be maintained.
-- The histogram unit drift (`ms` retained while name aligns to
-  v1.39 `db.client.operation.duration` which canonically uses `s`)
-  is a documented compatibility quirk. Dashboards reading the
-  histogram must know the unit.
+- ~120–150 LOC of SDK-owned tracing code (the `redis.Hook`
+  implementation), versus the ~80 LOC a pure-T2 facade would have
+  needed. Justified by the impossibility of removing attributes
+  through a post-hook; see §2.
+- The wrapper must track the `redis.Hook` interface across go-redis
+  versions. If go-redis v10 changes the interface shape, the
+  wrapper's hook must follow. CI pins go-redis and asserts
+  interface compatibility.
 - Pub/Sub gap is real. Services that rely on `PUBLISH` /
   `SUBSCRIBE` for non-trivial workflows will see no spans for
-  those operations under this ADR.
+  those operations under this ADR (the `redis.Hook` interface
+  does not fire for them).
 - `redis.error.kind` is intentionally narrower than
   `resty.error.kind`. Operators looking for `auth` / `loading` /
   `oom` distinctions must read the error message or wait for an
   amendment.
 - `valkey-go` users are not served. If RESP3 client-side caching
   becomes a target, a sibling ADR is required.
-- Adding a post-hook after redisotel's hook means the wrapper's
-  hook ordering on `*redis.Client.AddHook` matters. The
-  implementation PR documents the ordering invariant and asserts
-  it in a test.
+- The view that drops `db.client.connections.use_time` must be
+  registered at `o11y.Init` time (OTel Go views are fixed at
+  MeterProvider construction). The redis package exports the view
+  constructor; `o11y.Init` must include it. A consumer that builds
+  their own MeterProvider without composing this view will see the
+  upstream instrument alongside the SDK's `db.client.operation.duration`,
+  reporting roughly the same data twice under different names.
 
 ---
 
 ## Open questions
 
-- **Histogram unit drift on `db.client.operation.duration`.** §7
-  currently keeps the upstream `ms` unit while renaming the
-  instrument to the v1.39 name (which canonically expects `s`).
-  Alternatives: (a) accept the drift and document, (b) wait for a
-  redisotel semconv bump, (c) intercept records via a custom
-  exporter wrapper that divides by 1000. (c) is invasive enough to
-  warrant its own ADR. Lean: (a) for now.
 - **Per-command sub-spans inside pipelines.** Some users will
-  eventually ask for them. Doing it correctly requires either
-  forking redisotel or recording timings at the resp3 protocol
-  level. Defer until a concrete consumer asks.
+  eventually ask for them. The `redis.Hook` interface fires once
+  per batch, not per command; reconstructing per-command timing
+  requires instrumenting at the protocol layer. Defer until a
+  concrete consumer asks.
 - **`redis.cluster.node.role` (`primary` / `replica`).** Not
   emitted today. Adding it requires consulting cluster topology
   state, which the wrapper does not currently hold. Defer.
-- **redisotel's `db.statement` default flipping upstream.** If a
-  future redisotel release flips its default to off, §6's
-  defensive `WithDBStatement(false)` becomes redundant. Keep it
-  anyway as defense in depth; document the redundancy at that
-  point.
+- **Retiring the SDK-owned tracing hook.** If a future redisotel
+  release upgrades its semconv pin past v1.39, stops emitting
+  `db.connection_string`, and flips `db.statement` to default-off,
+  the architectural reasons for owning the tracing hook disappear.
+  At that point a follow-up ADR can amend §2 back to a pure-T2
+  facade and delete the SDK-owned hook. Track redisotel releases
+  per §audit-discipline.
