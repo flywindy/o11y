@@ -765,12 +765,45 @@ Cluster-specific concerns:
   An explicit `Unwrap(rdb redis.UniversalClient)` helper is
   exported for tests that need deterministic eviction without
   waiting for GC (e.g. table-driven tests over many cluster
-  fixtures). `Unwrap` deletes the entry, attempts to remove the
-  tracing hook only via the documented `OnNewNode` mechanism for
-  future nodes (existing hooks remain attached — there is no
-  public hook-remove API in go-redis v9.9.0, see §10's
-  hook-chain-inaccessibility discussion), and is intended for
-  test fixtures rather than production client teardown.
+  fixtures). `Unwrap` must remain safe under a subsequent
+  `Wrap(rdb)` on the same live Cluster/Ring client, because
+  `OnNewNode` in v9.9.0 only appends callbacks and exposes no
+  removal API — a naive `Unwrap` that just dropped the dedup
+  entry would leave the previous callback in place, and the
+  next `Wrap` would append a **second** callback, so any future
+  node would be hooked and metric-instrumented twice.
+
+  The wrapper closes this gap with a per-`Wrap`-call
+  `disabled atomic.Bool` captured by both the tracing hook and
+  the `OnNewNode` closure for that call. The dedup entry holds
+  a reference to the flag. `Unwrap` performs three steps under
+  the entry's mutex: set `disabled = true` (the still-attached
+  hooks become no-ops, the still-registered `OnNewNode`
+  callback returns immediately without touching new nodes),
+  `CompareAndDelete` the dedup entry, and unlock. A subsequent
+  `Wrap(rdb)` creates a fresh entry with its own fresh
+  `disabled` flag and registers a new callback; the old
+  callback is still in the cluster's callback slice but
+  observes `disabled = true` on every invocation, so no
+  double-installation occurs. Existing per-node tracing hooks
+  attached during the first `Wrap` remain attached but emit no
+  spans (their wrapper sees `disabled = true`); the second
+  `Wrap` re-hooks each node via the same `seenNodes` flow as
+  normal, and those new (non-disabled) hooks emit spans
+  correctly.
+
+  **Known limitation: `Unwrap` does not unregister
+  `redisotel.InstrumentMetrics` callbacks.** redisotel's
+  pool-stat observer callbacks are attached to the
+  MeterProvider, not to a closure we own, and redisotel exposes
+  no removal API. After `Unwrap` + `Wrap` on the same
+  Cluster/Ring node, both registrations stay live, so
+  `db.client.connections.*` series for that node will emit
+  twice. This is acceptable for test fixtures (which typically
+  use a fresh MeterProvider per test case anyway, or reset the
+  in-memory exporter), but `Unwrap` is **not** safe in
+  production teardown paths that share a MeterProvider across
+  Wraps. The doc-comment on `Unwrap` carries this warning.
 
   **Ordering and the unmodified-on-error contract.** Naively, one
   would gather shards first and install `OnNewNode` second, but
@@ -1156,6 +1189,15 @@ On every `go-redis` / `redisotel` version change:
     mutex serialises the racers) and zero double-hooked nodes:
     after the dust settles, a single command emits exactly one
     span, not N.
+  - **`Unwrap` + re-`Wrap` does not double-emit spans.** On a
+    warmed cluster: `Wrap`, run a `GET` (one span recorded),
+    `Unwrap`, `Wrap` again with the same MeterProvider, run
+    another `GET`. Assert exactly **one new span** appears in
+    the exporter — not two — proving the disabled-flag gate on
+    the old hook closure no-ops correctly. (The corresponding
+    pool-stat double-emission for Cluster/Ring is the documented
+    `Unwrap` limitation in §10 and is not asserted by this
+    test.)
   - **Dedup map does not pin clients.** Create K short-lived
     `*redis.Client` instances, `Wrap` each, then drop all
     references. After `runtime.GC` + a brief settle (or after an
