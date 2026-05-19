@@ -475,23 +475,47 @@ Cluster-specific concerns:
   exposes no public accessor for already-registered hooks, so the
   wrapper cannot ask "is my marker already in this client's chain?"
   Idempotency is therefore enforced at the wrapper layer using a
-  package-private `sync.Map[redis.UniversalClient]struct{}` keyed
-  by the interface value (interface equality compares dynamic
-  type plus pointer, which is well-defined for the four supported
+  package-private `sync.Map[redis.UniversalClient]*entry` keyed by
+  the interface value (interface equality compares dynamic type
+  plus pointer, which is well-defined for the four supported
   concrete types `*redis.Client`, `*redis.ClusterClient`,
-  `*redis.Ring`, `*redis.FailoverClient`). On entry, `Wrap` does a
-  `LoadOrStore`; on a hit it returns `(rdb, nil)` immediately
-  without touching hooks, `InstrumentMetrics`, `OnNewNode`, or
-  `ForEachShard`. This handles both repeated `Wrap` calls and the
-  cluster-pool-refresh case where `ForEachShard` may re-present
-  the same `*redis.Client` (which carries its own already-attached
-  hook from the first iteration). The `sync.Map` is local state of
-  the redis instrumentation package — it does **not** violate
-  ADR 0008's no-OTel-globals policy (which targets
-  `otel.SetTracerProvider` / `otel.SetMeterProvider` and the
-  global propagator), and it is the standard pattern wrap-once
-  libraries use. Entries are not removed; the `UniversalClient`
-  lifetime is the process lifetime in every adopter today.
+  `*redis.Ring`, `*redis.FailoverClient`). Each `entry` holds a
+  `sync.Mutex` plus a `done bool`. The flow on every `Wrap` call:
+
+  1. `LoadOrStore` an `*entry` for the client. This creates a
+     placeholder on first call without yet asserting "wrapped".
+  2. Lock the entry's mutex. This serialises concurrent `Wrap`
+     calls on the same client (a second goroutine blocks until the
+     first either commits or fails) and prevents a concurrent
+     caller from seeing a half-installed client and assuming it is
+     ready.
+  3. Under the lock, check `done`. If true, release and return
+     `(rdb, nil)` — this is the steady-state idempotent path.
+  4. If false, run the §10 / §7 commit sequence (instrument
+     creation → `ForEachShard` collection → `OnNewNode` +
+     `AddHook` + per-node `InstrumentMetrics` commit). On
+     success, set `done = true`, release, return `(rdb, nil)`.
+  5. On **any** failure before commit, leave `done = false`,
+     release, return `(rdb, err)`. A subsequent `Wrap` call can
+     therefore retry the work — the client is still unmodified
+     under §10's unmodified-on-error contract, so retry is safe.
+
+  Marking the client as wrapped only at the commit point (step 4)
+  is essential: storing the marker on entry (step 1) would leave a
+  failed-but-marked client that future retries would silently
+  no-op past, and a concurrent second `Wrap` would also see the
+  marker and report success before any hook is installed.
+
+  The cluster-pool-refresh case where `ForEachShard` may re-present
+  the same per-node `*redis.Client` on a later `Wrap` call is
+  handled by the same gate: the second `Wrap` finds `done = true`
+  and short-circuits before any per-shard work runs. The
+  `sync.Map` is local state of the redis instrumentation package —
+  it does **not** violate ADR 0008's no-OTel-globals policy (which
+  targets `otel.SetTracerProvider` / `otel.SetMeterProvider` and
+  the global propagator). Entries are not removed; the
+  `UniversalClient` lifetime is the process lifetime in every
+  adopter today.
 
   **Ordering and the unmodified-on-error contract.** To honour §3's
   "on error the original client is returned unmodified" promise,
@@ -677,6 +701,19 @@ On every `go-redis` / `redisotel` version change:
     **no** `db.client.operation.duration` samples — i.e. no
     `OnNewNode` callback and no partial per-shard hook installation
     survives the error path.
+  - **Retry-after-failure.** After a forced first-call failure
+    (e.g. `ForEachShard` returning a fixture error), a second
+    `Wrap` call with a healthy MeterProvider succeeds, returns
+    `(rdb, nil)`, and subsequent commands emit spans. This proves
+    that the failed first call did not mark the client as
+    "wrapped" in the package-private dedup map and that retry
+    actually performs the work, per the §10 commit-point rule.
+  - **Concurrent `Wrap`.** Launching N goroutines that call `Wrap`
+    on the same warmed `*redis.ClusterClient` simultaneously
+    results in exactly one successful commit (the per-entry
+    mutex serialises the racers) and zero double-hooked nodes:
+    after the dust settles, a single command emits exactly one
+    span, not N.
   - The hook short-circuits Pub/Sub commands (§11): asserting that
     `PUBLISH`, `SPUBLISH`, `SUBSCRIBE`, `PSUBSCRIBE`, `PUBSUB`
     produce no span and no `db.client.operation.duration` sample.
