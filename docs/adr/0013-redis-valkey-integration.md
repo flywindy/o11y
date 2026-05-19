@@ -671,12 +671,17 @@ Cluster-specific concerns:
           // instrumented some nodes already; v9.9.0 has no public
           // hook-remove API. Commit the dedup entry so retries are
           // silent no-ops and don't double-register on the
-          // already-touched nodes.
+          // already-touched nodes. Release the race-window map so
+          // post-return OnNewNode firings take the steady-state,
+          // no-retention branch.
+          seenNodesPtr.Store(nil)
           e.done = true
           runtime.AddCleanup(clientObj, deleteEntry, identity)
           e.mu.Unlock()
           return rdb, err
       case nil:
+          // Step 7's seenNodesPtr.Store(nil) ran during the commit
+          // sequence; here we just finalise the entry.
           e.done = true
           runtime.AddCleanup(clientObj, deleteEntry, identity)
           e.mu.Unlock()
@@ -734,11 +739,15 @@ Cluster-specific concerns:
          `OnNewNode` is already installed and may have hooked /
          instrumented some nodes during the failing iteration,
          and v9.9.0 has no public hook-remove API. Commit the
-         dedup entry anyway: set `done = true`, register
+         dedup entry anyway: `seenNodesPtr.Store(nil)` so any
+         post-return `OnNewNode` firing takes the steady-state
+         no-retention branch (without this step the callback
+         would keep capturing every refreshed node in the map
+         and leak), then set `done = true`, register
          `runtime.AddCleanup`, unlock, return `(rdb, err)`. A
          retry on the same client therefore short-circuits
          instead of double-registering on the already-touched
-         nodes.
+         nodes, and steady-state node creations do not leak.
 
   The canonicity check in step 3 makes concurrent waiters safe
   against the strict-pre-commit `CompareAndDelete` path: any
@@ -1363,9 +1372,13 @@ On every `go-redis` / `redisotel` version change:
     subsequent `GET` emitting a span); (c) the dedup map entry
     has `done = true` and `runtime.AddCleanup` is registered, so
     a second `Wrap` call is a silent no-op even with a healthy
-    `ForEachShard`. This locks in the §10 documented behaviour;
-    without it a future refactor might mistake this for the
-    strict pre-commit class and try (and fail) to roll back.
+    `ForEachShard`; (d) `seenNodesPtr.Load() == nil` after the
+    error return — proving the best-effort failure path released
+    the race-window map and post-return `OnNewNode` firings will
+    take the steady-state branch. A regression that forgets to
+    `Store(nil)` on the best-effort path would fail (d), and
+    subsequent topology refreshes would silently accumulate
+    `*redis.Client` references in the captured map.
   - The hook short-circuits Pub/Sub commands (§11): asserting that
     `PUBLISH`, `SPUBLISH`, `SUBSCRIBE`, `PSUBSCRIBE`, `PUBSUB`
     produce no span and no `db.client.operation.duration` sample.
