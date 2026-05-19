@@ -42,7 +42,7 @@ same repo as `go-redis` itself.
 | 2 | Maintenance signal | ✅ | Shipped in the `go-redis` repo's main release cadence; v9.9.0 tagged 2025-05-27. |
 | 3 | Semconv alignment with SDK v1.39 pin | ❌ | Imports `semconv/v1.24.0` (15 minor versions behind). Emits legacy `db.system`, `db.statement`, `db.connection_string` instead of stable `db.system.name`, `db.query.text`, etc. |
 | 4 | Configurability of names/attributes | ❌ | `WithTracerProvider`, `WithMeterProvider`, `WithDBStatement(bool)`, `WithAttributes(...)` exist, but there is no option to suppress `db.connection_string` or the `code.*` attributes, and OTel Go's `trace.Span` has no `DeleteAttribute`. A downstream hook cannot remove attributes redisotel set on span start. |
-| 5 | Framework signal access | ⚠️ | Tracing, dial, pool stats, pipeline, and cluster (via `OnNewNode`) are covered. Pub/Sub is **not instrumented** (no hook fires for `Subscribe` / `Publish`). Acceptable; see §11. |
+| 5 | Framework signal access | ⚠️ | Tracing, dial, pool stats, pipeline, and cluster (via `OnNewNode`) are covered. Pub/Sub is **not instrumented**: subscription receive (`*redis.PubSub.Receive*`) bypasses `ProcessHook` naturally, and the publish-side commands (`PUBLISH` / `SPUBLISH` etc.) which **do** travel through `ProcessHook` are explicitly short-circuited by command-name filter. Acceptable; see §11. |
 
 Item 3 fails strictly. Item 4 also fails on closer inspection: the
 OTel Go `trace.Span` API has **no DeleteAttribute** operation, and
@@ -140,12 +140,23 @@ revisit the choice if upstream semconv adds one.
 //
 // Wrap is idempotent: calling it twice on the same client is a no-op
 // after the first call.
+//
+// Wrap returns a non-nil error when rdb is nil, when the underlying
+// concrete type is not supported by redisotel.InstrumentMetrics
+// (single / cluster / ring / sentinel-failover are all supported in
+// v9.9.0; *redis.SentinelClient — the raw sentinel-monitor client —
+// is not), or when instrument creation against the supplied
+// MeterProvider fails. On error the original client is returned
+// unmodified so callers can choose to proceed without instrumentation;
+// they MUST NOT ignore the error silently — log it and surface it to
+// startup readiness, otherwise missing Redis spans/metrics become
+// invisible at runtime.
 func Wrap(
     rdb redis.UniversalClient,
     tp trace.TracerProvider,
     mp metric.MeterProvider,
     opts ...Option,
-) redis.UniversalClient
+) (redis.UniversalClient, error)
 
 type Option func(*config)
 
@@ -341,7 +352,7 @@ all. The flow on every command's return:
 | # | Condition | Action |
 |---|---|---|
 | 1 | `errors.Is(err, redis.Nil)` | Treat as success: span status stays `Unset`, no `RecordError`, no `error.type`. (`redis.Nil` is the sentinel for "key does not exist"; it is a normal control-flow signal, not a failure.) The duration histogram still records a sample with no `error.type` label. |
-| 2 | `errors.Is(err, redis.ErrPoolTimeout)` | `span.RecordError(err)`, `SetStatus(Error)`, `error.type="*redis.PoolError"`, `redis.error.kind="pool_timeout"`. Histogram sample carries `error.type` label. |
+| 2 | `errors.Is(err, redis.ErrPoolTimeout)` | `span.RecordError(err)`, `SetStatus(Error)`, `error.type` from `reflect.TypeOf(err).String()` (in go-redis v9.9.0 this evaluates to `*errors.errorString`, because `redis.ErrPoolTimeout` is created via `errors.New`; tests assert pool-timeout classification through `errors.Is`, not through the type string, so an upstream switch to a named type does not break callers), `redis.error.kind="pool_timeout"`. Histogram sample carries `error.type` label. |
 | 3 | `errors.Is(err, context.DeadlineExceeded)` | `RecordError`, `SetStatus(Error)`, `error.type="context.DeadlineExceeded"`, `redis.error.kind="client_timeout"`. |
 | 4 | `errors.Is(err, context.Canceled)` (and not row 3) | `RecordError`, `SetStatus(Error)`, `error.type="context.Canceled"`, `redis.error.kind="client_canceled"`. |
 | 5 | any other non-nil err | `RecordError`, `SetStatus(Error)`, `error.type` from `reflect.TypeOf(err).String()`. Do **not** set `redis.error.kind`. |
@@ -388,11 +399,19 @@ Cluster-specific concerns:
   two sibling spans (the first with the wrong-node address, the
   second with the right one). This is documented behavior, not a
   bug; the second span carries the successful response.
-- **Failover.** When a primary fails over, go-redis refreshes the
-  topology and `OnNewNode` fires for the new primary. The wrapper
-  caches no topology state, so the new primary's spans carry the
-  correct `server.address` from the first hook invocation. No
-  failover-specific logic is required.
+- **Sentinel / failover (`NewFailoverClient`).** `NewFailoverClient`
+  returns a `*redis.Client` whose `Options().Addr` is the literal
+  placeholder `"FailoverClient"` — the actual master/replica
+  endpoint is selected inside the dialer and is not exposed on the
+  client's `Options`. Reading `server.address` from `Options.Addr`
+  therefore yields `"FailoverClient"` with no real port, both
+  steady-state and across failover. The wrapper records this
+  placeholder as-is and does **not** claim to surface the current
+  master address; resolving to a real endpoint requires capturing
+  it inside `Options.Dialer`, which is out of scope for this ADR
+  and tracked under §Open questions. Sentinel-monitor RPCs (the
+  `*redis.SentinelClient` returned by `NewSentinelClient`) are not
+  instrumented at all — `Wrap` returns an error for it.
 - **Replica reads (`RouteByLatency`, `RouteRandomly`,
   `ReadOnly`).** Replica node addresses appear in `server.address`
   naturally. No `redis.cluster.node.role` attribute is emitted by
@@ -412,11 +431,21 @@ candidate for a separate ADR if demand appears:
   pubsub via `Receive`) and auto-pipelining are valkey-go's primary
   selling points. None of the current adopters need them.
 - **Pub/Sub instrumentation.** `Subscribe` / `Publish` are not
-  instrumented. The `redis.Hook` interface does not fire for them
-  in the first place, and the right model when Pub/Sub becomes a
-  target is `messaging.*` semconv (with
-  `messaging.system="redis"`), which is structurally unlike the
-  `db.*` model this ADR commits to.
+  instrumented. The subscription receive path (`Receive` /
+  `ReceiveMessage` on `*redis.PubSub`) bypasses `ProcessHook`
+  entirely, so it is naturally excluded. `Publish` / `SPublish` /
+  `PubSubChannels` / `PubSubNumSub` / `PubSubNumPat`, however,
+  travel through the normal command path and **do** invoke
+  `ProcessHook` in v9.9.0; if left unfiltered the wrapper would
+  emit `db.*` spans for them despite Pub/Sub being out of scope.
+  The hook therefore short-circuits — no span, no metric sample,
+  invoke `next(ctx, cmd)` directly — when `cmd.Name()` (lowercased)
+  matches the set `{publish, spublish, subscribe, unsubscribe,
+  psubscribe, punsubscribe, ssubscribe, sunsubscribe, pubsub}`.
+  When Pub/Sub becomes a target the right model is `messaging.*`
+  semconv (with `messaging.system="redis"`), which is structurally
+  unlike the `db.*` model this ADR commits to, so the filter stays
+  in place even then.
 - **Redis Streams (`XADD` / `XREAD` / consumer groups).** Same
   reasoning: `messaging.*` semconv, separate ADR.
 - **Client-side caching observability.** Tracking cache hit/miss
@@ -482,8 +511,18 @@ On every `go-redis` / `redisotel` version change:
 ## Testing
 
 - Unit tests for the wrapper:
-  - `Wrap` is idempotent (calling twice does not double-instrument).
-  - `Wrap` rejects a nil client.
+  - `Wrap` is idempotent (calling twice does not double-instrument
+    and returns `(rdb, nil)` on the second call).
+  - `Wrap` returns a non-nil error for a nil client, for
+    `*redis.SentinelClient`, and when given a MeterProvider whose
+    instrument creation has been forced to fail (the original
+    client is returned unmodified in each case).
+  - The hook short-circuits Pub/Sub commands (§11): asserting that
+    `PUBLISH`, `SPUBLISH`, `SUBSCRIBE`, `PSUBSCRIBE`, `PUBSUB`
+    produce no span and no `db.client.operation.duration` sample.
+  - Sentinel-failover clients (`NewFailoverClient`) emit
+    `server.address="FailoverClient"` (placeholder), matching the
+    limitation documented in §10 and the open question above.
   - Spans emit only the §5 attributes — assert presence of
     `db.system.name`, `db.operation.name`, `server.address`,
     `server.port` and absence of `db.connection_string`, `db.system`,
@@ -493,8 +532,10 @@ On every `go-redis` / `redisotel` version change:
   - Error classification table-driven tests for §9 rows 1–5, using
     real fixture errors (`redis.Nil` from `Get` against an empty
     server, `redis.ErrPoolTimeout` from an exhausted test pool,
-    `context.DeadlineExceeded` from a canceled context, a
-    `*net.OpError` from a closed listener).
+    `context.DeadlineExceeded` from an expired
+    `context.WithTimeout`, `context.Canceled` from an explicitly
+    cancelled `context.WithCancel`, a `*net.OpError` from a closed
+    listener).
   - `redis.Nil` does not call `RecordError`, does not set Error
     status, does not emit `error.type`, but does record a duration
     sample (asserting the histogram count increments).
@@ -515,9 +556,11 @@ On every `go-redis` / `redisotel` version change:
   - Valkey single-node (`valkey/valkey:7.2`): wrapper behaves
     identically to Redis single-node; `db.system.name="redis"` is
     asserted (not `"valkey"`).
-  - Sentinel failover: spans emitted before, during, and after
-    failover all carry a current `server.address` (no stale
-    addresses after topology refresh).
+  - Sentinel failover: spans emitted before, during, and after a
+    forced failover all carry the placeholder
+    `server.address="FailoverClient"` (per §10's documented
+    limitation), no spans are dropped, and the wrapper does not
+    panic across the topology refresh.
   - All integration tests are build-tagged out of default
     `go test ./...`.
 
@@ -547,9 +590,11 @@ On every `go-redis` / `redisotel` version change:
   cache-miss control flow.
 - `pool_timeout` vs `client_timeout` distinction lets operators
   separate "scale the pool" from "raise the deadline" responses.
-- Cluster, Sentinel, and Ring topologies are supported through one
-  `redis.UniversalClient`-accepting API; `OnNewNode` carries the
-  hook to each node automatically.
+- Cluster, Sentinel-failover, and Ring topologies are supported
+  through one `redis.UniversalClient`-accepting API. Cluster and
+  Ring carry the hook to each node automatically via `OnNewNode`;
+  single-node and Sentinel-failover use `AddHook`. (Sentinel
+  spans surface a placeholder `server.address` — see §10.)
 - Pool-stats instruments come from `redisotel.InstrumentMetrics`
   without modification — we do not reimplement what upstream gets
   right.
@@ -594,10 +639,20 @@ On every `go-redis` / `redisotel` version change:
 - **`redis.cluster.node.role` (`primary` / `replica`).** Not
   emitted today. Adding it requires consulting cluster topology
   state, which the wrapper does not currently hold. Defer.
+- **Real `server.address` for sentinel-failover clients.** As noted
+  in §10, `*redis.Client` from `NewFailoverClient` exposes
+  `Options.Addr == "FailoverClient"`; the actual master endpoint
+  is selected inside `Options.Dialer`. Surfacing the real address
+  on spans requires wrapping the dialer to capture the resolved
+  `host:port` and threading it through to the hook via a
+  per-connection context value or a `sync.Map` keyed by net.Conn
+  identity. Both approaches add complexity (and the latter risks
+  leaks); defer until a consumer demonstrates that distinguishing
+  masters across failover from telemetry alone is required.
 - **Retiring the SDK-owned tracing hook.** If a future redisotel
   release upgrades its semconv pin past v1.39, stops emitting
   `db.connection_string`, and flips `db.statement` to default-off,
   the architectural reasons for owning the tracing hook disappear.
   At that point a follow-up ADR can amend §2 back to a pure-T2
   facade and delete the SDK-owned hook. Track redisotel releases
-  per §audit-discipline.
+  per the "Audit discipline for upstream bumps" section above.
