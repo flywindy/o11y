@@ -629,15 +629,31 @@ Cluster-specific concerns:
           return rdb, nil     // steady-state idempotent hit
       }
       err := doCommitSequence(rdb, e)   // §10 / §7
-      if err != nil {
-          m.CompareAndDelete(key, e)    // remove placeholder
+      switch classify(err) {
+      case errStrictPreCommit:
+          // nil rdb, unsupported type, wrapper-owned instrument
+          // creation. Nothing was mutated: remove the placeholder
+          // so a retry can re-enter cleanly.
+          m.CompareAndDelete(key, e)
           e.mu.Unlock()
           return rdb, err
+      case errBestEffort:
+          // Warmed-Cluster ForEachShard failure or metrics-phase
+          // failure. OnNewNode is installed and may have hooked /
+          // instrumented some nodes already; v9.9.0 has no public
+          // hook-remove API. Commit the dedup entry so retries are
+          // silent no-ops and don't double-register on the
+          // already-touched nodes.
+          e.done = true
+          runtime.AddCleanup(clientObj, deleteEntry, identity)
+          e.mu.Unlock()
+          return rdb, err
+      case nil:
+          e.done = true
+          runtime.AddCleanup(clientObj, deleteEntry, identity)
+          e.mu.Unlock()
+          return rdb, nil
       }
-      e.done = true
-      runtime.AddCleanup(clientObj, deleteByGen, identity)
-      e.mu.Unlock()
-      return rdb, nil
   }
   ```
 
@@ -674,33 +690,44 @@ Cluster-specific concerns:
      entry, check `done`. If true, release and return
      `(rdb, nil)` — steady-state hit.
   6. If false, run the §10 / §7 commit sequence (instrument
-     creation → `ForEachShard` collection → `OnNewNode` +
-     `AddHook` + per-node `InstrumentMetrics` commit). On
-     success, set `done = true`, register the
-     `runtime.AddCleanup`, release, return `(rdb, nil)`.
-  7. On **strict pre-commit failure**, leave `done = false`,
-     **`CompareAndDelete` the map entry using the `*entry`
-     pointer as the witness value** (so the placeholder is
-     removed iff nothing else has already replaced it), unlock,
-     and return `(rdb, err)`. Removing the placeholder is
-     required because strict-failure paths never register the
-     `runtime.AddCleanup`, so a stranded `done=false` entry
-     would leak forever otherwise. The canonicity check in
-     step 3 makes concurrent waiters safe: any blocked-on-this-
-     entry goroutine observes the deletion on its next lock
-     acquisition and restarts the loop. The best-effort failure
-     paths (warmed-cluster `ForEachShard` error, metrics-phase
-     error) do **not** take this path — they set `done = true`
-     and register `runtime.AddCleanup` despite the error, so
-     retries are silent no-ops; see the "Failure paths"
-     discussion in the ordering section below.
+     creation → `OnNewNode` install → `ForEachShard` collection
+     → per-node `AddHook` + `InstrumentMetrics`). Classify the
+     result:
+       - **Success** → set `done = true`, register
+         `runtime.AddCleanup`, unlock, return `(rdb, nil)`.
+       - **Strict pre-commit error** (nil rdb, unsupported type,
+         wrapper-owned instrument creation): nothing has been
+         mutated. **`CompareAndDelete` the entry** using the
+         `*entry` pointer as the witness so the placeholder is
+         removed iff nothing else replaced it; unlock; return
+         `(rdb, err)`. A retry can then re-enter cleanly.
+       - **Best-effort error** (warmed-Cluster/Ring
+         `ForEachShard` failure or metrics-phase failure):
+         `OnNewNode` is already installed and may have hooked /
+         instrumented some nodes during the failing iteration,
+         and v9.9.0 has no public hook-remove API. Commit the
+         dedup entry anyway: set `done = true`, register
+         `runtime.AddCleanup`, unlock, return `(rdb, err)`. A
+         retry on the same client therefore short-circuits
+         instead of double-registering on the already-touched
+         nodes.
 
-  Marking the client as wrapped only at a commit point (step 6,
-  or the best-effort commit in step 7's carve-outs) is
-  essential: storing the marker on entry (step 1) would leave a
-  failed-but-marked client that future retries would silently
-  no-op past, and a concurrent second `Wrap` would also see the
-  marker and report success before any hook is installed.
+  The canonicity check in step 3 makes concurrent waiters safe
+  against the strict-pre-commit `CompareAndDelete` path: any
+  blocked-on-this-entry goroutine observes the deletion on its
+  next lock acquisition and restarts the loop. Concurrent
+  waiters on a best-effort error path simply observe
+  `done = true` after acquiring the lock and return `(rdb, nil)`
+  via the steady-state hit in step 5 — they correctly inherit
+  the partially-instrumented state without re-running the work.
+
+  Marking the client as wrapped only at a commit point (success
+  or best-effort error in step 6) is essential: storing the
+  marker on entry (step 1) would leave a failed-but-marked
+  client that future retries would silently no-op past even on
+  the strict-pre-commit class where retry should work, and a
+  concurrent second `Wrap` would also see the marker and report
+  success before any hook is installed.
 
   The cluster-pool-refresh case where `ForEachShard` may re-present
   the same per-node `*redis.Client` on a later `Wrap` call is
