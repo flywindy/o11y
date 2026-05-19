@@ -294,6 +294,23 @@ names that pass through unchanged from v1.24 to v1.39:
 `redisotel.InstrumentMetrics(rdb, redisotel.WithMeterProvider(mp))`
 to register these. The wrapper does not duplicate them.
 
+**Warmed-cluster / ring metric coverage.** In go-redis/redisotel
+v9.9.0, the `*redis.ClusterClient` and `*redis.Ring` branches of
+`InstrumentMetrics` install only an `OnNewNode` callback and
+return; they do **not** iterate pre-existing node clients. A
+warmed cluster passed to `Wrap` would therefore receive no
+`db.client.connections.*` samples for its already-created shards
+until topology refresh, even though §10's `ForEachShard` pass
+gives those shards spans. `Wrap` mirrors §10's dual mechanism for
+metrics: during the same transactional iteration over shards (see
+§10's ordering rules), it calls
+`redisotel.InstrumentMetrics(perNodeClient, redisotel.WithMeterProvider(mp))`
+on each per-node `*redis.Client` it collects, gated by the same
+sentinel marker so a second `Wrap` does not register pool
+instruments twice. `InstrumentMetrics` errors on a per-node
+invocation roll the whole `Wrap` call back under §10's
+unmodified-on-error contract.
+
 **C. Drop upstream `db.client.connections.use_time` via view.**
 
 `redisotel.InstrumentMetrics` also registers a duration histogram
@@ -600,10 +617,14 @@ On every `go-redis` / `redisotel` version change:
   - On a warmed `*redis.ClusterClient` / `*redis.Ring` (one whose
     `ForEachShard` already yields ≥1 node before `Wrap` is
     called), every existing shard's per-node `*redis.Client`
-    receives the hook before `Wrap` returns, and a subsequent
-    command routed to a pre-existing shard emits a span. This
-    asserts §10's "dual mechanism" contract; a regression where
-    only `OnNewNode` is installed would fail this test.
+    receives **both** the tracing hook and a
+    `redisotel.InstrumentMetrics` registration before `Wrap`
+    returns. A subsequent command routed to a pre-existing shard
+    emits a span, and the in-memory metric exporter records at
+    least one `db.client.connections.usage` sample for that
+    shard's pool. This asserts the dual-mechanism contract from
+    both §7 (metrics) and §10 (tracing); a regression where only
+    `OnNewNode` is installed for either path would fail this test.
   - `Wrap` returns a non-nil error for a nil client, for
     `*redis.SentinelClient`, when given a MeterProvider whose
     instrument creation has been forced to fail, and when
