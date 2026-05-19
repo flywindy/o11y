@@ -433,8 +433,34 @@ The wrapper's `ProcessPipelineHook` emits one flat span per
 **Single-node / Sentinel-failover** (both are `*redis.Client`,
 differentiated only by `Options().Addr`): one hook invocation per
 `Pipeline()` / `TxPipeline()` call, so one span and one sample per
-caller batch. `db.operation.batch.size` matches the caller-issued
-command count.
+caller batch.
+
+For `Pipeline()`, the hook sees exactly the caller-issued
+commands and `db.operation.batch.size` matches that count.
+
+For `TxPipeline()`, go-redis v9.9.0 wraps the user's commands
+with synthetic `MULTI` and `EXEC` via `wrapMultiExec` **before**
+`ProcessPipelineHook` fires, so the hook's `cmds` slice is
+`[MULTI, user1, user2, …, userN, EXEC]`. The wrapper compensates
+in two ways:
+
+- **`db.operation.batch.size` excludes framing.** When the first
+  cmd is `MULTI` and the last is `EXEC`, the wrapper subtracts
+  two from the count it reports as `db.operation.batch.size` so
+  the attribute reflects the user-issued command count, not the
+  on-wire RESP-level count. Dashboards that group by
+  `batch.size` therefore see `TxPipeline(3)` and `Pipeline(3)`
+  as the same size.
+- **Pub/Sub all-match short-circuit ignores framing.** When
+  evaluating "every command in the batch matches the Pub/Sub
+  filter" (the §11 set), the wrapper treats a leading `MULTI`
+  and trailing `EXEC` as transparent and checks only the
+  user-issued commands in between. Without this, an all-`Publish`
+  `TxPipeline` would carry MULTI/EXEC (not in the filter set),
+  the all-match check would fail, and `redis.pipeline`
+  telemetry would leak for what is conceptually a Pub/Sub-only
+  transaction. With this carve-out, an all-`Publish` `TxPipeline`
+  short-circuits cleanly (no span, no duration sample).
 
 **Cluster / Ring** (`*redis.ClusterClient`, `*redis.Ring`): go-redis
 v9.9.0 splits the caller batch by destination shard and invokes
@@ -444,13 +470,15 @@ caller-issued pipeline that crosses K shards therefore produces
 **K sibling `redis.pipeline` spans** (each carrying the
 node-specific `server.address`) and K duration samples; each
 span's `db.operation.batch.size` is the subset size routed to
-that shard, not the original batch length. Summing the per-node
-`batch.size` across the spans linked by the caller's trace
-reconstructs the caller-visible total. This is the honest
-description of what the hook contract surfaces in v9.9.0:
-hooking the top-level `ClusterClient` to own a single batch span
-is not supported because `ClusterClient.processPipeline` performs
-the shard split before any pipeline hook fires.
+that shard (with the same MULTI/EXEC compensation as the
+single-node case if the caller used `TxPipeline`), not the
+original batch length. Summing the per-node `batch.size` across
+the spans linked by the caller's trace reconstructs the
+caller-visible total. This is the honest description of what
+the hook contract surfaces in v9.9.0: hooking the top-level
+`ClusterClient` to own a single batch span is not supported
+because `ClusterClient.processPipeline` performs the shard
+split before any pipeline hook fires.
 
 Per-command sub-spans inside a pipeline are out of scope. The
 `redis.Hook` contract from go-redis surfaces only the batch
@@ -830,6 +858,7 @@ Cluster-specific concerns:
          client           *redis.Client
          hookInstalled    atomic.Bool   // CAS gate for AddHook
          metricsInstalled atomic.Bool   // CAS gate for InstrumentMetrics
+         metricsErr       atomic.Pointer[error] // surfaced by step 6
      }
      ```
 
@@ -855,7 +884,11 @@ Cluster-specific concerns:
          AddHook(newNode, traceHook)
      }
      if state.metricsInstalled.CompareAndSwap(false, true) {
-         InstrumentMetrics(newNode, WithMeterProvider(mp))
+         if err := InstrumentMetrics(newNode, WithMeterProvider(mp)); err != nil {
+             // Cannot return from a callback; store for step 6
+             // (and for the post-return error sink, below).
+             state.metricsErr.Store(&err)
+         }
      }
      ```
 
@@ -881,11 +914,26 @@ Cluster-specific concerns:
      hooked. `done = true` is set after step 6.
   6. **Best-effort metrics phase**: iterate `seenNodes` via
      `sync.Map.Range` (safe after concurrent writers have
-     finished). For each entry, CAS-claim
-     `state.metricsInstalled.CompareAndSwap(false, true)`; on
-     success call `InstrumentMetrics(state.client, …)`. Nodes
-     that step 3's callback already CAS-claimed during the race
-     window are correctly skipped — no double-registration. For
+     finished). For each entry:
+       - First read `state.metricsErr.Load()`. If non-nil, the
+         `OnNewNode` race-window path already attempted
+         `InstrumentMetrics` for this node and it failed; join
+         the stored error into the per-node error list and move
+         on (no retry — `metricsInstalled = true` and partial
+         redisotel state, see §7 group B).
+       - Otherwise CAS-claim
+         `state.metricsInstalled.CompareAndSwap(false, true)`;
+         on success call `InstrumentMetrics(state.client, …)`
+         and join any returned error. Nodes that step 3's
+         callback already CAS-claimed during the race window
+         are correctly skipped here — no double-registration.
+         The `metricsErr` field also serves as the sink for
+         **post-return** OnNewNode metric failures (nodes
+         created after `Wrap` returned): those errors stay
+         attached to `nodeState` and are surfaced through a
+         package-level error log per the documented limitation
+         below.
+     For
      single-node, `seenNodes` is empty and `InstrumentMetrics`
      is called on the top-level `rdb` instead. Errors gather
      via `errors.Join` per the §7 group B carve-out. For Cluster
@@ -901,6 +949,18 @@ Cluster-specific concerns:
   skip. There is no remaining window where a new node can sneak
   in unhooked, and no node is hooked or metric-installed more
   than once.
+
+  **Post-return OnNewNode metric errors.** New nodes created
+  after `Wrap` has returned still fire the `OnNewNode` callback
+  installed in step 3. If `InstrumentMetrics` fails for such a
+  node, the error lands in `state.metricsErr` after `Wrap`'s
+  return value has already been delivered to the caller, so it
+  cannot be surfaced via the function signature. The wrapper
+  logs these errors via the package's `slog` logger at WARN
+  level with the per-node `server.address`. This is a known
+  limitation listed alongside the §7 group B metrics-phase
+  carve-out; callers who need strict alerting on post-`Wrap`
+  per-node metric failures should subscribe to the log stream.
 
   **Failure paths.** The wrapper has three classes:
 
@@ -1228,6 +1288,17 @@ On every `go-redis` / `redisotel` version change:
     A regression that removes the `metricsInstalled` CAS gate
     would emit two duplicate pool-metric series for the raced
     node.
+  - **`OnNewNode` metric errors surface in `Wrap`'s return.**
+    Wire a MeterProvider that fails `InstrumentMetrics` on a
+    specific node identity. Inject that node via `OnNewNode`
+    during the race window (before step 6). Assert that
+    `Wrap` returns a non-nil error joined from the per-node
+    error (so the callback-path failure is **not** silently
+    swallowed), and that step 6 sees `metricsInstalled = true`
+    and `metricsErr != nil` for that node and propagates the
+    error rather than retrying or skipping silently. A
+    regression that drops the `metricsErr` field would let
+    `Wrap` return `nil` here despite missing pool metrics.
   - **Warmed-Cluster ForEachShard-failure carve-out.** Force
     `ForEachShard` to error after the wrapper's `OnNewNode` has
     already hooked one freshly-materialised node during the
@@ -1252,6 +1323,23 @@ On every `go-redis` / `redisotel` version change:
     pipeline semantics are covered separately by the integration
     test below — the §8 contract there is per-node-group, not
     single-batch.
+  - **`TxPipeline` MULTI/EXEC handling (§8).** Three sub-cases
+    against a single-node `*redis.Client`:
+    (a) `TxPipeline` with three user `Set` calls records exactly
+        one `redis.pipeline` span whose `db.operation.batch.size`
+        is `3`, not `5` — proving the MULTI/EXEC framing is
+        subtracted from the reported batch size.
+    (b) `TxPipeline` whose user commands are all `Publish` (so
+        the wire is `MULTI, PUBLISH, PUBLISH, EXEC`) records
+        **no** span and no duration sample — proving the all-
+        match Pub/Sub short-circuit ignores the framing commands.
+    (c) `TxPipeline` mixing `Publish` and `Set` records exactly
+        one `redis.pipeline` span with `db.operation.batch.size`
+        equal to the user-issued count, mirroring the mixed-
+        pipeline case above.
+    A regression that fails to special-case `TxPipeline` would
+    fail (a) by reporting `batch.size=5` and fail (b) by
+    emitting a span the ADR says should be absent.
   - **Redis Streams are covered as `db.*` (§11).** `XADD`,
     `XREAD`, `XREADGROUP`, `XGROUP CREATE`, `XACK`, and
     `XPENDING` each emit a span with `db.operation.name` set to
