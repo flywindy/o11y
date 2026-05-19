@@ -849,9 +849,16 @@ Cluster-specific concerns:
      value in local variables — no mutation of `rdb` yet.
   2. Allocate a `seenNodes` `sync.Map` (logically keyed by
      `uintptr` to `*nodeState` — same untyped-`sync.Map` caveat
-     as the idempotency map above), captured by both the
-     upcoming `OnNewNode` closure and the `ForEachShard` loop,
-     where:
+     as the idempotency map above), and wrap it behind a
+     `seenNodesPtr atomic.Pointer[sync.Map]` so the map can be
+     dropped for GC once steady-state begins (see step 7
+     below — the map's purpose is purely to dedup the in-flight
+     race window, and retaining strong `*redis.Client`
+     references in it for the rest of the process would leak
+     every node go-redis ever materialised after a topology
+     refresh). The pointer is initialised to the fresh map and
+     captured by both the upcoming `OnNewNode` closure and the
+     `ForEachShard` loop, where the node-state struct is:
 
      ```go
      type nodeState struct {
@@ -873,21 +880,37 @@ Cluster-specific concerns:
      **concurrently** per shard — `sync.Map` writes from N
      goroutines are safe.
   3. Install the wrapper's own
-     `OnNewNode(newNode *redis.Client)` callback. On each
-     invocation it does:
+     `OnNewNode(newNode *redis.Client)` callback. The closure
+     branches on whether the in-flight race window is still
+     open (`seenNodesPtr` non-nil):
 
      ```go
-     ns := &nodeState{client: newNode}
-     actual, _ := seenNodes.LoadOrStore(addr(newNode), ns)
-     state := actual.(*nodeState)
-     if state.hookInstalled.CompareAndSwap(false, true) {
+     onNewNode := func(newNode *redis.Client) {
+         if disabled.Load() { return }     // Unwrap gate, §10
+         if m := seenNodesPtr.Load(); m != nil {
+             // Setup phase: dedup against ForEachShard / step 6.
+             ns := &nodeState{client: newNode}
+             actual, _ := m.LoadOrStore(addr(newNode), ns)
+             state := actual.(*nodeState)
+             if state.hookInstalled.CompareAndSwap(false, true) {
+                 AddHook(newNode, traceHook)
+             }
+             if state.metricsInstalled.CompareAndSwap(false, true) {
+                 if err := InstrumentMetrics(newNode, WithMeterProvider(mp)); err != nil {
+                     state.metricsErr.Store(&err)
+                 }
+             }
+             return
+         }
+         // Steady state (post-Wrap-return): no dedup needed —
+         // go-redis fires OnNewNode exactly once per node-pool
+         // creation, and there is no concurrent ForEachShard
+         // pass to race with. Install hook and pool metrics
+         // directly without retaining a reference.
          AddHook(newNode, traceHook)
-     }
-     if state.metricsInstalled.CompareAndSwap(false, true) {
          if err := InstrumentMetrics(newNode, WithMeterProvider(mp)); err != nil {
-             // Cannot return from a callback; store for step 6
-             // (and for the post-return error sink, below).
-             state.metricsErr.Store(&err)
+             slog.Warn("redis: post-Wrap InstrumentMetrics failed",
+                 "addr", newNode.Options().Addr, "err", err)
          }
      }
      ```
@@ -911,10 +934,10 @@ Cluster-specific concerns:
   5. Once `ForEachShard` returns cleanly, the **tracing commit
      point** has been reached: every node that exists now is
      hooked, every node created from this moment on will be
-     hooked. `done = true` is set after step 6.
+     hooked. `done = true` is set after step 7.
   6. **Best-effort metrics phase**: iterate `seenNodes` via
-     `sync.Map.Range` (safe after concurrent writers have
-     finished). For each entry:
+     `sync.Map.Range` on the still-non-nil map (step 7 has not
+     yet swapped it out). For each entry:
        - First read `state.metricsErr.Load()`. If non-nil, the
          `OnNewNode` race-window path already attempted
          `InstrumentMetrics` for this node and it failed; join
@@ -927,18 +950,25 @@ Cluster-specific concerns:
          and join any returned error. Nodes that step 3's
          callback already CAS-claimed during the race window
          are correctly skipped here — no double-registration.
-         The `metricsErr` field also serves as the sink for
-         **post-return** OnNewNode metric failures (nodes
-         created after `Wrap` returned): those errors stay
-         attached to `nodeState` and are surfaced through a
-         package-level error log per the documented limitation
-         below.
-     For
-     single-node, `seenNodes` is empty and `InstrumentMetrics`
-     is called on the top-level `rdb` instead. Errors gather
-     via `errors.Join` per the §7 group B carve-out. For Cluster
-     / Ring there is no top-level `InstrumentMetrics(rdb)` call;
-     the per-node iteration is the entire metrics path.
+
+     For single-node, `seenNodes` is empty and
+     `InstrumentMetrics` is called on the top-level `rdb`
+     instead. Errors gather via `errors.Join` per the §7
+     group B carve-out. For Cluster / Ring there is no
+     top-level `InstrumentMetrics(rdb)` call; the per-node
+     iteration is the entire metrics path.
+  7. **Release the race-window map.** `seenNodesPtr.Store(nil)`.
+     From this point on the `OnNewNode` closure takes the
+     steady-state branch shown in step 3, which does not touch
+     `seenNodes` at all. The previously-allocated `sync.Map`
+     becomes unreachable and is GC-eligible, releasing every
+     `*redis.Client` reference it accumulated during the race
+     window. Without this swap, the closure would hold a strong
+     reference to every node go-redis ever materialised after a
+     topology refresh, leaking pool memory until the whole
+     Cluster/Ring client is collected. After this step, set
+     `done = true` and register `runtime.AddCleanup` per the
+     idempotency loop's commit path.
 
   The race-closing property: because `OnNewNode` is registered
   **before** `ForEachShard` runs, any node materialised during
@@ -952,15 +982,15 @@ Cluster-specific concerns:
 
   **Post-return OnNewNode metric errors.** New nodes created
   after `Wrap` has returned still fire the `OnNewNode` callback
-  installed in step 3. If `InstrumentMetrics` fails for such a
-  node, the error lands in `state.metricsErr` after `Wrap`'s
-  return value has already been delivered to the caller, so it
-  cannot be surfaced via the function signature. The wrapper
-  logs these errors via the package's `slog` logger at WARN
-  level with the per-node `server.address`. This is a known
-  limitation listed alongside the §7 group B metrics-phase
-  carve-out; callers who need strict alerting on post-`Wrap`
-  per-node metric failures should subscribe to the log stream.
+  installed in step 3, but now via its steady-state branch (no
+  `seenNodes` retention). `InstrumentMetrics` errors in this
+  branch are logged via the package's `slog` logger at WARN
+  level with the per-node `server.address`; they cannot be
+  surfaced through `Wrap`'s return because that call already
+  returned. This is a known limitation listed alongside the §7
+  group B metrics-phase carve-out; callers who need strict
+  alerting on post-`Wrap` per-node metric failures should
+  subscribe to the log stream.
 
   **Failure paths.** The wrapper has three classes:
 
@@ -1249,6 +1279,19 @@ On every `go-redis` / `redisotel` version change:
     mutex serialises the racers) and zero double-hooked nodes:
     after the dust settles, a single command emits exactly one
     span, not N.
+  - **`seenNodes` map is released after Wrap returns.**
+    Integration test: `Wrap` a `*redis.ClusterClient`, then
+    cycle the topology so `OnNewNode` fires for K new nodes
+    after `Wrap` returned. Assert (via an internal test
+    affordance that exposes the wrapper's `seenNodesPtr.Load()`)
+    that the map pointer is `nil` after step 7 and that the K
+    new node clients become unreachable once go-redis drops
+    them from the active topology (verified with a
+    `runtime.SetFinalizer` reachability probe on one of the K).
+    A regression that kept `seenNodesPtr` populated, or that
+    failed to take the steady-state branch in the callback,
+    would keep at least K `*redis.Client` references reachable
+    and fail this test.
   - **`Unwrap` + re-`Wrap` does not double-emit spans.** On a
     warmed cluster: `Wrap`, run a `GET` (one span recorded),
     `Unwrap`, `Wrap` again with the same MeterProvider, run
