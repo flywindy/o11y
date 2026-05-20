@@ -68,10 +68,11 @@ type SDK struct {
 	// Toggles reports which observability pillars were enabled at Init time.
 	Toggles FeatureToggles
 
-	// Internal providers are the concrete SDK-owned providers we shut down.
-	// Public providers are what callers see and may be wrapped by integrations
-	// such as otel-profiling-go. See ADR 0012 §2.
-	// Either field is nil when the corresponding pillar is disabled.
+	// Internal providers are the concrete SDK-owned providers we shut down;
+	// they are nil when the corresponding pillar is disabled.
+	// Public providers are always non-nil (noop when disabled), so callers
+	// never need to nil-check TracerProvider() or MeterProvider(). They may
+	// also be wrapped by integrations such as otel-profiling-go. See ADR 0012 §2.
 	tracerProviderInternal *sdktrace.TracerProvider
 	tracerProviderPublic   oteltrace.TracerProvider
 	meterProviderInternal  *sdkmetric.MeterProvider

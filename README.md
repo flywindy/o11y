@@ -189,6 +189,8 @@ O11Y_METRICS_ENABLED=false
 O11Y_LOG_ENABLED=false
 ```
 
+Accepted values: `1`/`t`/`true`/`TRUE` (truthy) and `0`/`f`/`false`/`FALSE` (falsy). Any other value (e.g. `"yes"`, `"on"`) emits a startup `WARN` log and falls back to the SDK default (`true`).
+
 Precedence: **code option > env var > SDK default (`true`)**.  
 An explicit `WithTraceEnabled(true)` always wins over `O11Y_TRACE_ENABLED=false`.
 

@@ -2,8 +2,10 @@ package o11y_test
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -59,14 +61,20 @@ func TestToggles_TraceDisabled(t *testing.T) {
 // no Prometheus HTTP server is started when metrics is turned off.
 func TestToggles_MetricsDisabled(t *testing.T) {
 	srv := testutil.FakeOTLPServer(t)
-	// Use an explicit metrics addr so we can probe it afterwards.
-	const metricsAddr = "127.0.0.1:19111"
+	// Obtain a free ephemeral port, release it, then pass the address to
+	// WithMetricsAddr. Since metrics is disabled the SDK never binds it, so
+	// the subsequent probe must fail regardless of which port was chosen.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	metricsAddr := ln.Addr().String()
+	require.NoError(t, ln.Close())
+
 	opts := append(commonOpts(srv.URL),
 		o11y.WithMetricsEnabled(false),
 		o11y.WithMetricsAddr(metricsAddr),
 	)
-	sdk, err := o11y.Init(context.Background(), opts...)
-	require.NoError(t, err)
+	sdk, initErr := o11y.Init(context.Background(), opts...)
+	require.NoError(t, initErr)
 	defer testutil.MustShutdown(t.Context(), t, sdk)
 
 	assert.False(t, sdk.Toggles.Metrics)
@@ -74,8 +82,9 @@ func TestToggles_MetricsDisabled(t *testing.T) {
 	assert.NotNil(t, sdk.TracerProvider(), "TracerProvider must still be available")
 
 	// The Prometheus /metrics endpoint must not be reachable.
-	resp, err := http.Get("http://" + metricsAddr + "/metrics")
-	if err == nil {
+	client := &http.Client{Timeout: 300 * time.Millisecond}
+	resp, probeErr := client.Get("http://" + metricsAddr + "/metrics")
+	if probeErr == nil {
 		resp.Body.Close()
 		t.Fatal("Prometheus server should not be listening when metrics is disabled")
 	}
