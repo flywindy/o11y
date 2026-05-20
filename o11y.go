@@ -26,13 +26,24 @@ import (
 	otelpyroscope "github.com/grafana/otel-profiling-go"
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel/metric"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
+
+// FeatureToggles reports which observability pillars were enabled at Init time.
+// Use sdk.Toggles to inspect active state at runtime, e.g. for health-check
+// endpoints or to conditionally log a startup warning when a pillar is off.
+type FeatureToggles struct {
+	Trace   bool
+	Metrics bool
+	Log     bool
+}
 
 // SDK holds the initialized observability providers.
 // It does not mutate any global state; callers wire it however they like,
@@ -45,15 +56,22 @@ type SDK struct {
 	//                    identity comes from the shared Resource, not per-record attrs)
 	// When a span is active in the context, traceId and spanId are included
 	// automatically in both destinations.
+	// When WithLogEnabled(false) is set, only the stdout destination is active.
 	Logger *slog.Logger
 
 	// Propagator is the W3C TraceContext + Baggage composite propagator.
 	// Pass it to nats.Inject / nats.Extract for distributed tracing over NATS.
+	// The propagator is always set (even when trace is disabled) so that
+	// incoming trace headers are still parsed and forwarded to downstream services.
 	Propagator propagation.TextMapPropagator
+
+	// Toggles reports which observability pillars were enabled at Init time.
+	Toggles FeatureToggles
 
 	// Internal providers are the concrete SDK-owned providers we shut down.
 	// Public providers are what callers see and may be wrapped by integrations
 	// such as otel-profiling-go. See ADR 0012 §2.
+	// Either field is nil when the corresponding pillar is disabled.
 	tracerProviderInternal *sdktrace.TracerProvider
 	tracerProviderPublic   oteltrace.TracerProvider
 	meterProviderInternal  *sdkmetric.MeterProvider
@@ -162,72 +180,59 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	}
 
 	// 2. Initialize TracerProvider (no global state).
-	tp, prop, err := trace.InitTracer(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, res)
-	if err != nil {
-		return nil, err
-	}
-	tracerProviderPublic := oteltrace.TracerProvider(tp)
-	if cfg.profilingEndpoint != "" {
-		tracerProviderPublic = otelpyroscope.NewTracerProvider(tp)
+	//    When trace is disabled, a no-op provider is used and the W3C propagator
+	//    is constructed directly so that downstream trace headers are still
+	//    forwarded correctly even without local span creation.
+	var tpInternal *sdktrace.TracerProvider
+	tracerProviderPublic := oteltrace.TracerProvider(tracenoop.NewTracerProvider())
+	prop := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})
+	tpShutdown := func(_ context.Context) error { return nil }
+
+	if cfg.traceEnabled {
+		tp, p, initErr := trace.InitTracer(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, res)
+		if initErr != nil {
+			return nil, initErr
+		}
+		tpInternal, prop = tp, p
+		tracerProviderPublic = tp
+		if cfg.profilingEndpoint != "" {
+			tracerProviderPublic = otelpyroscope.NewTracerProvider(tp)
+		}
+		tpShutdown = tp.Shutdown
 	}
 
 	// 3. Initialize MeterProvider + Prometheus scrape endpoint. On failure,
 	//    shut down the already-initialized tracer to avoid leaking its
 	//    background batch processor. The shared Resource is passed so that
 	//    service identity attributes are identical across all three providers.
-	mp, metricsCloser, err := metrics.InitMeter(ctx, metrics.Config{
-		Resource:            res,
-		MetricsOTLPEndpoint: cfg.metricsOTLPEndpoint,
-		OTLPHeaders:         cfg.otlpHeaders,
-		MetricsAddr:         cfg.metricsAddr,
-		RuntimeMetrics:      cfg.runtimeMetrics,
-		HistogramBuckets:    cfg.histogramBuckets,
-		DisableDefaultViews: cfg.disableDefaultViews,
-		MaxUniqueRoutes:     cfg.maxUniqueRoutes,
-	})
-	if err != nil {
-		_ = tp.Shutdown(ctx)
-		return nil, err
+	//    When metrics is disabled, a no-op provider is used and no HTTP server
+	//    is started; existing Grafana dashboards are unaffected.
+	var mpInternal *sdkmetric.MeterProvider
+	meterProviderPublic := metric.MeterProvider(metricnoop.NewMeterProvider())
+	metricsCloser := metrics.Closer(func(_ context.Context) error { return nil })
+	mpShutdown := func(_ context.Context) error { return nil }
+
+	if cfg.metricsEnabled {
+		mp, closer, initErr := metrics.InitMeter(ctx, metrics.Config{
+			Resource:            res,
+			MetricsOTLPEndpoint: cfg.metricsOTLPEndpoint,
+			OTLPHeaders:         cfg.otlpHeaders,
+			MetricsAddr:         cfg.metricsAddr,
+			RuntimeMetrics:      cfg.runtimeMetrics,
+			HistogramBuckets:    cfg.histogramBuckets,
+			DisableDefaultViews: cfg.disableDefaultViews,
+			MaxUniqueRoutes:     cfg.maxUniqueRoutes,
+		})
+		if initErr != nil {
+			_ = tpShutdown(ctx)
+			return nil, initErr
+		}
+		mpInternal, meterProviderPublic = mp, mp
+		metricsCloser, mpShutdown = closer, mp.Shutdown
 	}
 
-	// 4. Initialize LoggerProvider (no global state). On failure, shut down
-	//    previously initialized providers in reverse order.
-	lp, err := o11ylog.InitLogger(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, res)
-	if err != nil {
-		_ = metricsCloser(ctx)
-		_ = mp.Shutdown(ctx)
-		_ = tp.Shutdown(ctx)
-		return nil, err
-	}
-
-	// 5. Build a dual-output logger:
-	//
-	//    a) OTLP handler (otelslog bridge):
-	//       Converts slog records to OTel Log Data Model records and exports them
-	//       via OTLP/HTTP to the OTel Collector → Loki. service.name and
-	//       deployment.environment come from the shared Resource, not as
-	//       per-record attributes. traceId and spanId are extracted from the
-	//       context automatically by the bridge.
-	//
-	//    b) Stdout handler:
-	//       Writes JSON to stdout for local development and container log scraping.
-	//       service.name and environment are added as JSON fields here.
-	//       OtelSlogHandler wraps this to inject traceId and spanId.
-	otelOpts := []otelslog.Option{
-		otelslog.WithLoggerProvider(lp),
-		otelslog.WithSchemaURL(semconv.SchemaURL),
-	}
-	if cfg.serviceVersion != "" {
-		otelOpts = append(otelOpts, otelslog.WithVersion(cfg.serviceVersion))
-	}
-	// Wrap the OTLP handler with a minimum-level gate so that both outputs
-	// honour the same logLevel. Without this, the otelslog bridge would emit
-	// records at all levels regardless of the configured threshold.
-	otelHandler := &leveledHandler{
-		Handler: otelslog.NewHandler("github.com/flywindy/o11y", otelOpts...),
-		min:     cfg.logLevel,
-	}
-
+	// 4. Build the stdout JSON handler, shared by both the dual-output (log
+	//    enabled) and stdout-only (log disabled) paths below.
 	stdoutAttrs := []slog.Attr{slog.String("service.name", cfg.serviceName)}
 	if cfg.environment != "" {
 		stdoutAttrs = append(stdoutAttrs, slog.String("environment", cfg.environment))
@@ -237,54 +242,95 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	}).WithAttrs(stdoutAttrs)
 	stdoutHandler := o11ylog.NewOTelHandler(stdoutBase)
 
-	logger := slog.New(o11ylog.NewMultiHandler(otelHandler, stdoutHandler))
+	// 5. Initialize LoggerProvider and build the dual-output logger.
+	//    When log is disabled, only the stdout handler is active; no OTLP
+	//    connection is attempted and no LoggerProvider is started.
+	lpShutdown := func(_ context.Context) error { return nil }
+	var logger *slog.Logger
+
+	if cfg.logEnabled {
+		lp, initErr := o11ylog.InitLogger(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, res)
+		if initErr != nil {
+			_ = metricsCloser(ctx)
+			_ = mpShutdown(ctx)
+			_ = tpShutdown(ctx)
+			return nil, initErr
+		}
+		lpShutdown = lp.Shutdown
+
+		// Dual-output logger:
+		//   a) OTLP handler (otelslog bridge) → OTel Collector → Loki
+		//   b) Stdout handler → JSON for local dev / container log scraping
+		otelOpts := []otelslog.Option{
+			otelslog.WithLoggerProvider(lp),
+			otelslog.WithSchemaURL(semconv.SchemaURL),
+		}
+		if cfg.serviceVersion != "" {
+			otelOpts = append(otelOpts, otelslog.WithVersion(cfg.serviceVersion))
+		}
+		// Wrap the OTLP handler with a minimum-level gate so that both outputs
+		// honour the same logLevel. Without this, the otelslog bridge would emit
+		// records at all levels regardless of the configured threshold.
+		otelHandler := &leveledHandler{
+			Handler: otelslog.NewHandler("github.com/flywindy/o11y", otelOpts...),
+			min:     cfg.logLevel,
+		}
+		logger = slog.New(o11ylog.NewMultiHandler(otelHandler, stdoutHandler))
+	} else {
+		logger = slog.New(stdoutHandler)
+	}
 
 	var profilerCloser func(context.Context) error
 	if cfg.profilingEndpoint != "" {
-		closer, err := profiling.Start(ctx, profiling.Config{
+		closer, startErr := profiling.Start(ctx, profiling.Config{
 			ServiceName: cfg.serviceName,
 			Endpoint:    cfg.profilingEndpoint,
 			AuthHeaders: cfg.profilingAuthHeaders,
 			Resource:    res,
 			Logger:      logger,
 		})
-		if err != nil {
-			if errors.Is(err, profiling.ErrAlreadyStarted) {
+		if startErr != nil {
+			if errors.Is(startErr, profiling.ErrAlreadyStarted) {
 				_ = metricsCloser(ctx)
-				_ = mp.Shutdown(ctx)
-				_ = lp.Shutdown(ctx)
-				_ = tp.Shutdown(ctx)
-				return nil, err
+				_ = mpShutdown(ctx)
+				_ = lpShutdown(ctx)
+				_ = tpShutdown(ctx)
+				return nil, startErr
 			}
 			logger.WarnContext(ctx, "profiling disabled after Pyroscope start failure",
 				slog.String("endpoint", cfg.profilingEndpoint),
-				slog.Any("error", err),
+				slog.Any("error", startErr),
 			)
 		} else {
 			profilerCloser = closer
 		}
 	}
 
+	// Shutdowns run in registration order: drain scrape traffic first
+	// (metricsServer), then flush the meter provider, logs, optional profiling,
+	// then traces. Disabled pillars contribute a no-op that returns nil.
 	shutdowns := []func(context.Context) error{
 		metricsCloser,
-		mp.Shutdown,
-		lp.Shutdown,
+		mpShutdown,
+		lpShutdown,
 	}
 	if profilerCloser != nil {
 		shutdowns = append(shutdowns, profilerCloser)
 	}
-	shutdowns = append(shutdowns, tp.Shutdown)
+	shutdowns = append(shutdowns, tpShutdown)
 
-	// Shutdowns run in registration order: drain scrape traffic first
-	// (metricsServer), then flush the meter provider, logs, optional profiling,
-	// then traces.
 	return &SDK{
-		Logger:                 logger,
-		Propagator:             prop,
-		tracerProviderInternal: tp,
+		Logger:     logger,
+		Propagator: prop,
+		Toggles: FeatureToggles{
+			Trace:   cfg.traceEnabled,
+			Metrics: cfg.metricsEnabled,
+			Log:     cfg.logEnabled,
+		},
+		tracerProviderInternal: tpInternal,
 		tracerProviderPublic:   tracerProviderPublic,
-		meterProviderInternal:  mp,
-		meterProviderPublic:    mp,
+		meterProviderInternal:  mpInternal,
+		meterProviderPublic:    meterProviderPublic,
 		shutdowns:              shutdowns,
 	}, nil
 }

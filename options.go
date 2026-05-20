@@ -1,6 +1,10 @@
 package o11y
 
-import "log/slog"
+import (
+	"log/slog"
+	"os"
+	"strconv"
+)
 
 // DefaultMetricsAddr is the default listen address for the built-in
 // Prometheus /metrics HTTP server.
@@ -48,6 +52,13 @@ type Config struct {
 	namespace           string
 	disableDefaultViews bool
 	maxUniqueRoutes     int
+
+	// Feature toggles — all default to true; can be overridden via
+	// WithTraceEnabled / WithMetricsEnabled / WithLogEnabled or the
+	// corresponding O11Y_*_ENABLED environment variables.
+	traceEnabled   bool
+	metricsEnabled bool
+	logEnabled     bool
 }
 
 // Option is a functional option for configuring the o11y SDK.
@@ -217,6 +228,32 @@ func WithHistogramBuckets(buckets []float64) Option {
 	}
 }
 
+// WithTraceEnabled controls whether the SDK initialises a real TracerProvider
+// and exports spans via OTLP. When false, Init returns a no-op TracerProvider;
+// the W3C TraceContext propagator still parses and forwards trace headers so
+// downstream services are unaffected.
+// Default: true (env var O11Y_TRACE_ENABLED overrides the built-in default).
+func WithTraceEnabled(enabled bool) Option {
+	return func(c *Config) { c.traceEnabled = enabled }
+}
+
+// WithMetricsEnabled controls whether the SDK initialises a real MeterProvider.
+// When false, no Prometheus HTTP server is started and no OTLP metrics are
+// exported. All instrumentation that accepts a MeterProvider receives a no-op
+// provider, preserving compile-time compatibility with zero runtime cost.
+// Default: true (env var O11Y_METRICS_ENABLED overrides the built-in default).
+func WithMetricsEnabled(enabled bool) Option {
+	return func(c *Config) { c.metricsEnabled = enabled }
+}
+
+// WithLogEnabled controls whether the SDK exports logs via OTLP to the
+// OTel Collector. When false, slog records are written to stdout only; no
+// OTLP log provider is started and no collector connection is attempted.
+// Default: true (env var O11Y_LOG_ENABLED overrides the built-in default).
+func WithLogEnabled(enabled bool) Option {
+	return func(c *Config) { c.logEnabled = enabled }
+}
+
 // WithDisableDefaultViews disables SDK-managed HTTP metric views.
 func WithDisableDefaultViews() Option {
 	return func(c *Config) {
@@ -237,8 +274,10 @@ func WithMaxUniqueRoutes(n int) Option {
 	}
 }
 
-// defaultConfig returns a *Config initialized with the package's built-in defaults.
-// It sets otlpEndpoint to "http://localhost:4318", logLevel to slog.LevelInfo, metricsAddr to DefaultMetricsAddr, runtimeMetrics to true, and histogramBuckets to DefaultLatencyBuckets.
+// defaultConfig returns a *Config initialized with the package's built-in
+// defaults. Feature toggles default to true but respect the O11Y_*_ENABLED
+// environment variables so operators can disable pillars without code changes.
+// Explicit options (WithTraceEnabled etc.) always win over env vars.
 func defaultConfig() *Config {
 	return &Config{
 		otlpEndpoint:     "http://localhost:4318",
@@ -247,7 +286,26 @@ func defaultConfig() *Config {
 		runtimeMetrics:   true,
 		histogramBuckets: cloneFloat64s(defaultLatencyBuckets),
 		maxUniqueRoutes:  DefaultMaxUniqueRoutes,
+		traceEnabled:     parseBoolEnv("O11Y_TRACE_ENABLED", true),
+		metricsEnabled:   parseBoolEnv("O11Y_METRICS_ENABLED", true),
+		logEnabled:       parseBoolEnv("O11Y_LOG_ENABLED", true),
 	}
+}
+
+// parseBoolEnv reads key from the environment and parses it as a bool.
+// Returns def when the variable is absent or contains an unrecognised value.
+// Accepted truthy values: "1", "t", "T", "TRUE", "true", "True".
+// Accepted falsy values:  "0", "f", "F", "FALSE", "false", "False".
+func parseBoolEnv(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
 }
 
 func cloneFloat64s(in []float64) []float64 {
