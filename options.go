@@ -54,12 +54,17 @@ type Config struct {
 	disableDefaultViews bool
 	maxUniqueRoutes     int
 
-	// Feature toggles — all default to true; can be overridden via
-	// WithTraceEnabled / WithMetricsEnabled / WithLogEnabled or the
-	// corresponding O11Y_*_ENABLED environment variables.
-	traceEnabled   bool
-	metricsEnabled bool
-	logEnabled     bool
+	// Feature toggles. Trace, metrics, and log default to true; profiling
+	// defaults to false because it is an opt-in fourth signal. All four can
+	// be overridden via WithTraceEnabled / WithMetricsEnabled /
+	// WithLogEnabled / WithProfilingEnabled or the corresponding
+	// O11Y_*_ENABLED environment variables. Profiling requires both the
+	// toggle to be on AND a non-empty WithProfilingEndpoint before the SDK
+	// will start the Pyroscope profiler.
+	traceEnabled     bool
+	metricsEnabled   bool
+	logEnabled       bool
+	profilingEnabled bool
 
 	// initWarnings holds non-fatal diagnostics collected before the SDK logger
 	// exists (e.g. unparseable O11Y_*_ENABLED env var values). They are emitted
@@ -260,6 +265,20 @@ func WithLogEnabled(enabled bool) Option {
 	return func(c *Config) { c.logEnabled = enabled }
 }
 
+// WithProfilingEnabled controls whether the SDK starts the Pyroscope profiler
+// and wraps the TracerProvider with the trace-to-profile bridge. Profiling is
+// opt-in: it requires both this toggle to be on AND a non-empty endpoint set
+// via WithProfilingEndpoint. Either condition alone is insufficient. This
+// lets operators stage a profiling rollout (or roll it back) without removing
+// the endpoint from deployment manifests.
+//
+// Default: false (env var O11Y_PROFILING_ENABLED overrides the built-in
+// default). Unlike trace/metrics/log, profiling defaults off because it is
+// an additional fourth signal that must be explicitly enabled.
+func WithProfilingEnabled(enabled bool) Option {
+	return func(c *Config) { c.profilingEnabled = enabled }
+}
+
 // WithDisableDefaultViews disables SDK-managed HTTP metric views.
 func WithDisableDefaultViews() Option {
 	return func(c *Config) {
@@ -305,6 +324,10 @@ func defaultConfig() *Config {
 		cfg.initWarnings = append(cfg.initWarnings, warn)
 	}
 	cfg.logEnabled, warn = parseBoolEnv("O11Y_LOG_ENABLED", true)
+	if warn != "" {
+		cfg.initWarnings = append(cfg.initWarnings, warn)
+	}
+	cfg.profilingEnabled, warn = parseBoolEnv("O11Y_PROFILING_ENABLED", false)
 	if warn != "" {
 		cfg.initWarnings = append(cfg.initWarnings, warn)
 	}

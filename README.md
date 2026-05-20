@@ -30,10 +30,11 @@ push Pyroscope-format profiles to Alloy, which forwards them to Pyroscope.
 ### Telemetry Flow
 
 ```
-Traces:  App ──OTLP/HTTP──► OTel Collector ──► Tempo
-Logs:    App ──OTLP/HTTP──► OTel Collector ──► Loki   (primary: full OTel Log Data Model)
-         App stdout ──► Alloy ──OTLP/HTTP──► OTel Collector ──► Loki  (secondary: k8s pods via Alloy)
-Metrics: App :2112/metrics ◄──scrape── Prometheus ──► Grafana  (pull model)
+Traces:    App ──OTLP/HTTP──► OTel Collector ──► Tempo
+Logs:      App ──OTLP/HTTP──► OTel Collector ──► Loki   (primary: full OTel Log Data Model)
+           App stdout ──► Alloy ──OTLP/HTTP──► OTel Collector ──► Loki  (secondary: k8s pods via Alloy)
+Metrics:   App :2112/metrics ◄──scrape── Prometheus ──► Grafana  (pull model)
+Profiles:  App ──Pyroscope ingest──► Alloy ──► Pyroscope ──► Grafana
 ```
 
 Both log paths are active simultaneously. When running `go run` locally (outside the cluster),
@@ -109,8 +110,10 @@ func main() {
         o11y.WithServiceNamespace("platform"),     // required; maps to k8s namespace / team
         o11y.WithOTLPEndpoint("http://localhost:4318"),
         // Optional: enable continuous profiling. In-cluster, prefer
-        // "http://alloy.infra.svc.cluster.local:4040".
+        // "http://alloy.infra.svc.cluster.local:4040". Profiling requires
+        // both the endpoint and WithProfilingEnabled(true).
         // o11y.WithProfilingEndpoint("http://localhost:4040"),
+        // o11y.WithProfilingEnabled(true),
         o11y.WithLogLevel(slog.LevelInfo),
     )
     if err != nil {
@@ -131,25 +134,54 @@ func main() {
 
 **Available options:**
 
+_Required — Init returns an error if any of these are missing:_
+
+| Option | Description |
+|--------|-------------|
+| `WithServiceName(name)` | OTel `service.name` resource attribute |
+| `WithServiceVersion(ver)` | OTel `service.version`; used for canary/rollback tracking |
+| `WithEnvironment(env)` | OTel `deployment.environment.name`; accepted: `production`, `staging`, `development`, `testing` (aliases like `prod`/`stg` are normalized) |
+| `WithServiceNamespace(ns)` | OTel `service.namespace`; identifies the owning team/product, maps to k8s namespace |
+
+_OTLP (shared by traces and logs):_
+
 | Option | Default | Description |
 |--------|---------|-------------|
-| `WithServiceName(name)` | — **required** | OTel `service.name` resource attribute |
-| `WithServiceVersion(ver)` | — **required** | OTel `service.version`; used for canary/rollback tracking |
-| `WithEnvironment(env)` | — **required** | OTel `deployment.environment.name`; accepted: `production`, `staging`, `development`, `testing` (aliases like `prod`/`stg` are normalized) |
-| `WithServiceNamespace(ns)` | — **required** | OTel `service.namespace`; identifies the owning team/product, maps to k8s namespace |
 | `WithOTLPEndpoint(url)` | `http://localhost:4318` | OTLP/HTTP collector endpoint for traces and logs |
 | `WithOTLPHeaders(map[string]string)` | `nil` | Headers attached to every OTLP/HTTP request (auth tokens, multi-tenant routing) |
-| `WithProfilingEndpoint(url)` | `""` | Enable Pyroscope-compatible continuous profiling; empty means fully disabled |
-| `WithProfilingAuthHeaders(map[string]string)` | `nil` | Headers attached to every profile push (Grafana Cloud Profiles auth, `X-Scope-OrgID`, etc.) |
+
+_Metrics:_
+
+| Option | Default | Description |
+|--------|---------|-------------|
 | `WithMetricsOTLPEndpoint(url)` | `""` | Switch metrics to OTLP push (serverless); when unset, Prometheus pull on `:2112` is used |
 | `WithMetricsAddr(addr)` | `:2112` | Prometheus `/metrics` scrape address |
-| `WithLogLevel(level)` | `slog.LevelInfo` | Minimum log level |
 | `WithRuntimeMetrics(bool)` | `true` | Collect Go runtime metrics (goroutines, GC, memory) |
+| `WithHistogramBuckets([]float64)` | SLO defaults | Override HTTP latency histogram boundaries; see `DefaultLatencyBuckets()` |
 | `WithDisableDefaultViews()` | off | Disable SDK-managed HTTP metric label allowlists and bucket views |
 | `WithMaxUniqueRoutes(n)` | `1000` | Cap exported distinct `http.route` values and derive the SDK aggregation cardinality budget |
+
+_Logging:_
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `WithLogLevel(level)` | `slog.LevelInfo` | Minimum log level |
+
+_Profiling (opt-in via endpoint):_
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `WithProfilingEndpoint(url)` | `""` | Pyroscope-compatible ingest endpoint; empty means profiling never starts |
+| `WithProfilingAuthHeaders(map[string]string)` | `nil` | Headers attached to every profile push (Grafana Cloud Profiles auth, `X-Scope-OrgID`, etc.) |
+
+_Per-pillar feature toggles (progressive rollout):_
+
+| Option | Default | Description |
+|--------|---------|-------------|
 | `WithTraceEnabled(bool)` | `true` | When `false`, use a no-op TracerProvider; W3C headers are still parsed and forwarded |
 | `WithMetricsEnabled(bool)` | `true` | When `false`, use a no-op MeterProvider; no Prometheus server is started |
 | `WithLogEnabled(bool)` | `true` | When `false`, write logs to stdout only; no OTLP log provider is started |
+| `WithProfilingEnabled(bool)` | `false` | Opt-in. When `true` **and** `WithProfilingEndpoint` is set, the SDK starts the Pyroscope profiler and installs the trace-to-profile bridge |
 
 > **Migration note (pre-1.0 API change)** — `DefaultLatencyBuckets` is now a
 > function (`o11y.DefaultLatencyBuckets()` returning a fresh copy) rather
@@ -162,14 +194,16 @@ func main() {
 
 ### Feature Toggles (Progressive Rollout)
 
-Each observability pillar — Trace, Metrics, Log — can be disabled independently so teams can adopt the new SDK incrementally without breaking existing dashboards or pipelines.
+Each observability pillar — Trace, Metrics, Log, Profiling — can be controlled independently so teams can adopt the new SDK incrementally without breaking existing dashboards or pipelines.
 
 ```go
 obs, err := o11y.Init(ctx,
     // ... required options ...
-    o11y.WithTraceEnabled(false),   // keep existing trace logic, skip new SDK
-    o11y.WithMetricsEnabled(false), // keep ginprom /metrics; no new Prometheus server
-    o11y.WithLogEnabled(false),     // stdout only; no OTLP log export
+    o11y.WithTraceEnabled(false),     // keep existing trace logic, skip new SDK
+    o11y.WithMetricsEnabled(false),   // keep ginprom /metrics; no new Prometheus server
+    o11y.WithLogEnabled(false),       // stdout only; no OTLP log export
+    o11y.WithProfilingEndpoint("http://alloy.infra.svc.cluster.local:4040"),
+    o11y.WithProfilingEnabled(true),  // opt-in: profiling defaults to off
 )
 ```
 
@@ -180,25 +214,32 @@ obs, err := o11y.Init(ctx,
 | **Trace** | No-op `TracerProvider`; W3C `traceparent`/`tracestate` headers are still parsed and forwarded to downstream services |
 | **Metrics** | No-op `MeterProvider`; the Prometheus HTTP server is not started; existing `ginprom` dashboards are unaffected |
 | **Log** | `obs.Logger` writes to stdout only (JSON); no OTLP collector connection is attempted |
+| **Profiling** | No Pyroscope profiler is started; the trace-to-profile `pyroscope.profile.id` span attribute is not added. Trace/log/metric pillars are untouched |
 
 **Environment-variable control** (useful for staged rollouts without deploys):
 
-```bash
-O11Y_TRACE_ENABLED=false
-O11Y_METRICS_ENABLED=false
-O11Y_LOG_ENABLED=false
-```
+| Env var | Default |
+|---------|---------|
+| `O11Y_TRACE_ENABLED` | `true` |
+| `O11Y_METRICS_ENABLED` | `true` |
+| `O11Y_LOG_ENABLED` | `true` |
+| `O11Y_PROFILING_ENABLED` | `false` |
 
-Accepted values: `1`/`t`/`true`/`TRUE` (truthy) and `0`/`f`/`false`/`FALSE` (falsy). Any other value (e.g. `"yes"`, `"on"`) emits a startup `WARN` log and falls back to the SDK default (`true`).
+Accepted values: `1`/`t`/`true`/`TRUE` (truthy) and `0`/`f`/`false`/`FALSE` (falsy). Any other value (e.g. `"yes"`, `"on"`) emits a startup `WARN` log and falls back to the SDK default.
 
-Precedence: **code option > env var > SDK default (`true`)**.  
+Precedence: **code option > env var > SDK default**.  
 An explicit `WithTraceEnabled(true)` always wins over `O11Y_TRACE_ENABLED=false`.
+
+Profiling is opt-in and **doubly gated**: it requires both `WithProfilingEnabled(true)` (or `O11Y_PROFILING_ENABLED=true`) **and** a non-empty `WithProfilingEndpoint`. Either condition alone is insufficient, so misconfiguration cannot accidentally start the profiler. The SDK emits a startup `WARN` when only one of the two is set so the misconfig is noticed. `sdk.Toggles.Profiling` reports whether the SDK actually started a profiler.
 
 **Runtime introspection** — `sdk.Toggles` reports what is active:
 
 ```go
 if !obs.Toggles.Metrics {
     obs.Logger.Warn("metrics pillar disabled; Prometheus server not started")
+}
+if !obs.Toggles.Profiling {
+    obs.Logger.Warn("profiling inactive; toggle off or no Pyroscope endpoint")
 }
 ```
 
@@ -278,9 +319,10 @@ otel.SetTextMapPropagator(obs.Propagator)
 
 ### Continuous Profiling
 
-Profiling is opt-in. Set `WithProfilingEndpoint` to an HTTP endpoint that
-speaks the Pyroscope ingest protocol. In the provided Kubernetes stack,
-applications should send profiles to Alloy:
+Profiling is opt-in and **doubly gated**: it requires both a non-empty
+`WithProfilingEndpoint` AND `WithProfilingEnabled(true)` (or
+`O11Y_PROFILING_ENABLED=true`). Either alone is insufficient. In the provided
+Kubernetes stack, applications should send profiles to Alloy:
 
 ```go
 obs, err := o11y.Init(ctx,
@@ -290,6 +332,7 @@ obs, err := o11y.Init(ctx,
     o11y.WithServiceNamespace("platform"),
     o11y.WithOTLPEndpoint("http://otel-collector.infra.svc.cluster.local:4318"),
     o11y.WithProfilingEndpoint("http://alloy.infra.svc.cluster.local:4040"),
+    o11y.WithProfilingEnabled(true),
 )
 ```
 

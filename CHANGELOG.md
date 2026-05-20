@@ -16,17 +16,27 @@ adopters can plan their upgrades.
 ### Added
 
 - **Per-pillar feature toggles** for progressive SDK adoption:
-  `WithTraceEnabled(bool)`, `WithMetricsEnabled(bool)`, `WithLogEnabled(bool)`
-  each default to `true` (no change to existing behaviour). When a pillar is
-  disabled the SDK returns a no-op provider for that signal while keeping
-  everything else fully operational. Disabled pillars can also be controlled
-  without code changes via the `O11Y_TRACE_ENABLED`, `O11Y_METRICS_ENABLED`,
-  and `O11Y_LOG_ENABLED` environment variables; explicit option calls take
-  precedence. `sdk.Toggles` (`FeatureToggles{Trace, Metrics, Log}`) reports
-  the active state at runtime for health-check endpoints and startup logging.
-  Notable per-pillar behaviour: Trace-disabled still parses and forwards W3C
+  `WithTraceEnabled(bool)`, `WithMetricsEnabled(bool)`, `WithLogEnabled(bool)`,
+  and `WithProfilingEnabled(bool)`. Trace, metrics, and log default to `true`
+  (no change to existing behaviour); profiling defaults to `false` because it
+  is an opt-in fourth signal. When a pillar is disabled the SDK returns a
+  no-op provider for that signal while keeping everything else fully
+  operational. All four toggles are also controllable without code changes
+  via the `O11Y_TRACE_ENABLED`, `O11Y_METRICS_ENABLED`, `O11Y_LOG_ENABLED`,
+  and `O11Y_PROFILING_ENABLED` environment variables (same defaults as the
+  code options); explicit option calls take precedence. `sdk.Toggles`
+  (`FeatureToggles{Trace, Metrics, Log, Profiling}`) reports the active state
+  at runtime for health-check endpoints and startup logging. Notable
+  per-pillar behaviour: Trace-disabled still parses and forwards W3C
   `traceparent` headers; Metrics-disabled does not start the Prometheus HTTP
-  server; Log-disabled falls back to stdout-only JSON output.
+  server; Log-disabled falls back to stdout-only JSON output. Profiling is
+  doubly gated: it starts only when both `WithProfilingEnabled(true)` AND a
+  non-empty `WithProfilingEndpoint` are set — either alone is insufficient,
+  and the SDK emits a startup `WARN` when only one of the two is configured.
+  `Toggles.Profiling` reflects whether the SDK actually started a profiler.
+  The `otel-profiling-go` trace-to-profile wrapper is now installed only
+  after `pyroscope.Start` returns successfully, so spans no longer carry
+  `pyroscope.profile.id` when the profiler failed to start.
 
 - Continuous profiling integration via Pyroscope:
   `WithProfilingEndpoint(url)` enables Pyroscope-compatible profile pushes,
