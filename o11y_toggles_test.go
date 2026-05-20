@@ -190,3 +190,44 @@ func TestToggles_WithEnvVar_LogDisabled(t *testing.T) {
 	assert.False(t, sdk.Toggles.Log, "O11Y_LOG_ENABLED=false must disable log OTLP export")
 	assert.NotNil(t, sdk.Logger, "Logger must still be available (stdout-only mode)")
 }
+
+// TestToggles_InvalidEnvVar_FallsBackToDefault verifies that an unrecognised
+// env var value (e.g. "yes" instead of "true") is silently ignored and the
+// pillar defaults to enabled — Init must not fail.
+func TestToggles_InvalidEnvVar_FallsBackToDefault(t *testing.T) {
+	t.Setenv("O11Y_TRACE_ENABLED", "yes")   // not a valid bool
+	t.Setenv("O11Y_METRICS_ENABLED", "on")  // not a valid bool
+	t.Setenv("O11Y_LOG_ENABLED", "enabled") // not a valid bool
+
+	srv := testutil.FakeOTLPServer(t)
+	sdk, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
+	require.NoError(t, err, "invalid env var values must not cause Init to fail")
+	defer testutil.MustShutdown(t.Context(), t, sdk)
+
+	assert.True(t, sdk.Toggles.Trace, "invalid O11Y_TRACE_ENABLED should fall back to default true")
+	assert.True(t, sdk.Toggles.Metrics, "invalid O11Y_METRICS_ENABLED should fall back to default true")
+	assert.True(t, sdk.Toggles.Log, "invalid O11Y_LOG_ENABLED should fall back to default true")
+}
+
+// TestToggles_StartupWarning_DisabledPillar guards that Init does not panic
+// or error when all three disabled-pillar warning paths are exercised together,
+// and that sdk.Toggles accurately reflects the disabled state.
+func TestToggles_StartupWarning_DisabledPillar(t *testing.T) {
+	opts := []o11y.Option{
+		o11y.WithServiceName("warn-test"),
+		o11y.WithServiceVersion("0.0.1"),
+		o11y.WithEnvironment("testing"),
+		o11y.WithServiceNamespace("platform"),
+		o11y.WithTraceEnabled(false),
+		o11y.WithMetricsEnabled(false),
+		o11y.WithLogEnabled(false),
+	}
+	sdk, err := o11y.Init(context.Background(), opts...)
+	require.NoError(t, err, "Init must succeed even when all three disabled-pillar warnings fire")
+	defer sdk.Shutdown(context.Background()) //nolint:errcheck
+
+	assert.False(t, sdk.Toggles.Trace)
+	assert.False(t, sdk.Toggles.Metrics)
+	assert.False(t, sdk.Toggles.Log)
+}
+

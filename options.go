@@ -1,6 +1,7 @@
 package o11y
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"strconv"
@@ -59,6 +60,11 @@ type Config struct {
 	traceEnabled   bool
 	metricsEnabled bool
 	logEnabled     bool
+
+	// initWarnings holds non-fatal diagnostics collected before the SDK logger
+	// exists (e.g. unparseable O11Y_*_ENABLED env var values). They are emitted
+	// via WarnContext after Init builds its logger.
+	initWarnings []string
 }
 
 // Option is a functional option for configuring the o11y SDK.
@@ -278,34 +284,51 @@ func WithMaxUniqueRoutes(n int) Option {
 // defaults. Feature toggles default to true but respect the O11Y_*_ENABLED
 // environment variables so operators can disable pillars without code changes.
 // Explicit options (WithTraceEnabled etc.) always win over env vars.
+// Invalid env var values are collected in initWarnings and emitted after Init
+// builds its logger.
 func defaultConfig() *Config {
-	return &Config{
+	cfg := &Config{
 		otlpEndpoint:     "http://localhost:4318",
 		logLevel:         slog.LevelInfo,
 		metricsAddr:      DefaultMetricsAddr,
 		runtimeMetrics:   true,
 		histogramBuckets: cloneFloat64s(defaultLatencyBuckets),
 		maxUniqueRoutes:  DefaultMaxUniqueRoutes,
-		traceEnabled:     parseBoolEnv("O11Y_TRACE_ENABLED", true),
-		metricsEnabled:   parseBoolEnv("O11Y_METRICS_ENABLED", true),
-		logEnabled:       parseBoolEnv("O11Y_LOG_ENABLED", true),
 	}
+	var warn string
+	cfg.traceEnabled, warn = parseBoolEnv("O11Y_TRACE_ENABLED", true)
+	if warn != "" {
+		cfg.initWarnings = append(cfg.initWarnings, warn)
+	}
+	cfg.metricsEnabled, warn = parseBoolEnv("O11Y_METRICS_ENABLED", true)
+	if warn != "" {
+		cfg.initWarnings = append(cfg.initWarnings, warn)
+	}
+	cfg.logEnabled, warn = parseBoolEnv("O11Y_LOG_ENABLED", true)
+	if warn != "" {
+		cfg.initWarnings = append(cfg.initWarnings, warn)
+	}
+	return cfg
 }
 
 // parseBoolEnv reads key from the environment and parses it as a bool.
-// Returns def when the variable is absent or contains an unrecognised value.
+// Returns (def, "") when the variable is absent.
+// Returns (def, warning) when the value is present but not a recognised bool.
 // Accepted truthy values: "1", "t", "T", "TRUE", "true", "True".
 // Accepted falsy values:  "0", "f", "F", "FALSE", "false", "False".
-func parseBoolEnv(key string, def bool) bool {
+func parseBoolEnv(key string, def bool) (bool, string) {
 	v := os.Getenv(key)
 	if v == "" {
-		return def
+		return def, ""
 	}
 	b, err := strconv.ParseBool(v)
 	if err != nil {
-		return def
+		return def, fmt.Sprintf(
+			"env var %s=%q is not a recognised bool (accepted: 1/t/true/0/f/false); falling back to default (%v)",
+			key, v, def,
+		)
 	}
-	return b
+	return b, ""
 }
 
 func cloneFloat64s(in []float64) []float64 {

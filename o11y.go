@@ -280,6 +280,28 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		logger = slog.New(stdoutHandler)
 	}
 
+	// Emit diagnostics that could not be logged before the logger existed.
+	// initWarnings holds invalid O11Y_*_ENABLED values collected at config time.
+	for _, w := range cfg.initWarnings {
+		logger.WarnContext(ctx, w)
+	}
+	// Warn about disabled pillars so operators can confirm intent at startup.
+	if !cfg.traceEnabled {
+		logger.WarnContext(ctx, "trace pillar disabled; using no-op TracerProvider",
+			slog.String("toggle", "O11Y_TRACE_ENABLED"),
+		)
+	}
+	if !cfg.metricsEnabled {
+		logger.WarnContext(ctx, "metrics pillar disabled; Prometheus server not started",
+			slog.String("toggle", "O11Y_METRICS_ENABLED"),
+		)
+	}
+	if !cfg.logEnabled {
+		logger.WarnContext(ctx, "log pillar disabled; OTLP log export skipped (stdout only)",
+			slog.String("toggle", "O11Y_LOG_ENABLED"),
+		)
+	}
+
 	var profilerCloser func(context.Context) error
 	if cfg.profilingEndpoint != "" {
 		closer, startErr := profiling.Start(ctx, profiling.Config{
