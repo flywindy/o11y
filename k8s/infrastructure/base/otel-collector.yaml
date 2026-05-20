@@ -52,6 +52,18 @@ data:
         endpoint: "http://prometheus.infra.svc.cluster.local:9090/api/v1/write"
         tls:
           insecure: true
+        # Promote OTel Resource attributes (service.name, service.namespace,
+        # service.version, deployment.environment.name, plus host/process attrs)
+        # to per-series labels. Without this, the exporter writes those values
+        # only to the separate target_info series and per-series labels are
+        # limited to "job" and "instance". The o11y dashboards filter on
+        # service_name / service_namespace / service_version /
+        # deployment_environment_name directly, matching the Prometheus pull
+        # path which already attaches them as constant labels via the OTel
+        # SDK's WithResourceAsConstantLabels. Promoting here keeps both paths
+        # queryable with the same label schema.
+        resource_to_telemetry_conversion:
+          enabled: true
       debug:
         verbosity: basic
 

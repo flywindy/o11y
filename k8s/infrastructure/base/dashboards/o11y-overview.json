@@ -948,6 +948,7 @@
       {
         "name": "service_namespace",
         "label": "service.namespace",
+        "description": "Single-select. The Tempo (TraceQL) and Pyroscope panels use equality matchers, which cannot accept a multi-value or 'All' regex substitution.",
         "type": "query",
         "datasource": {"type": "prometheus", "uid": "prometheus"},
         "definition": "label_values(target_info, service_namespace)",
@@ -955,25 +956,24 @@
         "refresh": 2,
         "regex": "",
         "sort": 1,
-        "includeAll": true,
-        "multi": true,
-        "allValue": ".+",
-        "current": {"selected": false, "text": "All", "value": "$__all"}
+        "includeAll": false,
+        "multi": false,
+        "current": {}
       },
       {
         "name": "service_name",
         "label": "service.name",
+        "description": "Single-select. The Tempo (TraceQL) and Pyroscope panels use equality matchers, which cannot accept a multi-value or 'All' regex substitution.",
         "type": "query",
         "datasource": {"type": "prometheus", "uid": "prometheus"},
-        "definition": "label_values(target_info{service_namespace=~\"$service_namespace\"}, service_name)",
-        "query": {"query": "label_values(target_info{service_namespace=~\"$service_namespace\"}, service_name)", "refId": "service_name"},
+        "definition": "label_values(target_info{service_namespace=\"$service_namespace\"}, service_name)",
+        "query": {"query": "label_values(target_info{service_namespace=\"$service_namespace\"}, service_name)", "refId": "service_name"},
         "refresh": 2,
         "regex": "",
         "sort": 1,
-        "includeAll": true,
+        "includeAll": false,
         "multi": false,
-        "allValue": ".+",
-        "current": {"selected": false, "text": "All", "value": "$__all"}
+        "current": {}
       },
       {
         "name": "environment",
