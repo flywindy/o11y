@@ -69,6 +69,7 @@ type Config struct {
 	RuntimeMetrics      bool
 	HistogramBuckets    []float64
 	DisableDefaultViews bool
+	ExtraViews          []sdkmetric.View
 	MaxUniqueRoutes     int
 
 	// ExtraHTTPServerAttrKeys augments the SDK-managed attribute allow-list
@@ -118,6 +119,7 @@ func InitMeter(ctx context.Context, cfg Config) (*sdkmetric.MeterProvider, Close
 	}
 
 	views := defaultViews(cfg)
+	views = append(views, cfg.ExtraViews...)
 
 	if cfg.MetricsOTLPEndpoint != "" {
 		return initOTLP(ctx, cfg, res, views)
