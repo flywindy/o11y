@@ -54,17 +54,13 @@ kubectl get pods -n infra -w
 
 ## 2. Open local ports
 
-The browser connects to NATS WebSocket through `localhost:4223`, which is mapped by kind. The Go backend also needs a local NATS TCP port, and Grafana needs a local UI port:
+`kind-config.yaml` already maps `localhost:4222` (NATS TCP for the Go backend) and `localhost:4223` (NATS WebSocket for the browser), so no port-forward is needed for the example itself. Only Grafana needs a port-forward to inspect traces:
 
 ```sh
-# Terminal 1: NATS TCP for the Go backend
-kubectl port-forward -n infra svc/nats 4222:4222
-
-# Terminal 2: Grafana UI for Tempo verification
 kubectl port-forward -n infra svc/grafana 3000:3000
 ```
 
-Keep both port-forward commands running while you use the example. If another tool such as k9s already owns one of these ports, reuse that port-forward instead of starting a duplicate.
+If another tool such as k9s already owns this port, reuse that port-forward instead of starting a duplicate.
 
 ## 3. Start the Go backend subscriber
 

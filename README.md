@@ -430,14 +430,14 @@ metadata:
 
 ## Running the Examples
 
-Before running any example, port-forward the required services from the `kind` cluster:
+`kind-config.yaml` auto-maps every host port the examples need (OTel/OTLP 4318,
+NATS TCP 4222, NATS WebSocket 4223, MongoDB 27017, Pyroscope ingest 4040 via
+Alloy) through dedicated NodePort services, so the examples run with **zero
+port-forward setup**. Only the inspection UIs require a port-forward:
 
 ```bash
-kubectl port-forward -n infra svc/otel-collector 4318:4318  # OTel traces and logs
-kubectl port-forward -n infra svc/nats           4222:4222  # NATS connection
-kubectl port-forward -n infra svc/grafana        3000:3000  # Grafana UI
-kubectl port-forward -n infra svc/prometheus     9090:9090  # Prometheus UI
-kubectl port-forward -n infra svc/alloy          4040:4040  # Pyroscope ingest for local app profiling
+kubectl port-forward -n infra svc/grafana    3000:3000   # Grafana UI
+kubectl port-forward -n infra svc/prometheus 9090:9090   # Prometheus UI
 ```
 
 ### Basic (spans + logs)

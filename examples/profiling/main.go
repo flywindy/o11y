@@ -2,9 +2,9 @@
 //
 // Prerequisites:
 //
-//	# kind-config.yaml already maps localhost:4318 to the OTel Collector.
-//	kubectl port-forward -n infra svc/alloy 4040:4040
-//	kubectl port-forward -n infra svc/grafana 3000:3000
+//	# kind-config.yaml auto-maps both 4318 (OTLP) and 4040 (Pyroscope ingest
+//	# via Alloy) from the kind cluster to the host, so no port-forward is
+//	# required to run the example.
 //	go run examples/profiling/main.go
 //
 // In Grafana (http://localhost:3000), open Explore / Pyroscope and select the

@@ -73,7 +73,7 @@
           "refId": "A",
           "datasource": {"type": "prometheus", "uid": "prometheus"},
           "editorMode": "code",
-          "expr": "max(target_info{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"})",
+          "expr": "max(target_info{job=~\"$service_namespace/$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"})",
           "legendFormat": "up",
           "instant": true
         }
@@ -216,7 +216,7 @@
           "refId": "A",
           "datasource": {"type": "prometheus", "uid": "prometheus"},
           "editorMode": "code",
-          "expr": "sum(process_runtime_go_goroutines{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"})",
+          "expr": "sum(go_goroutine_count{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"})",
           "legendFormat": "goroutines",
           "range": true
         }
@@ -224,7 +224,7 @@
     },
     {
       "type": "stat",
-      "title": "Heap in use",
+      "title": "Memory in use",
       "id": 6,
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
@@ -250,8 +250,8 @@
           "refId": "A",
           "datasource": {"type": "prometheus", "uid": "prometheus"},
           "editorMode": "code",
-          "expr": "sum(process_runtime_go_mem_heap_inuse_bytes{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"})",
-          "legendFormat": "heap",
+          "expr": "sum(go_memory_used_bytes{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"})",
+          "legendFormat": "used",
           "range": true
         }
       ]
@@ -678,7 +678,7 @@
           "refId": "A",
           "datasource": {"type": "prometheus", "uid": "prometheus"},
           "editorMode": "code",
-          "expr": "sum(process_runtime_go_goroutines{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"})",
+          "expr": "sum(go_goroutine_count{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"})",
           "legendFormat": "goroutines",
           "range": true
         }
@@ -686,14 +686,14 @@
     },
     {
       "type": "timeseries",
-      "title": "Heap memory",
+      "title": "Memory used by type",
       "id": 31,
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "gridPos": {"h": 8, "w": 6, "x": 6, "y": 39},
-      "description": "Bytes in use vs bytes obtained from the OS. The gap is reclaimable headroom.",
+      "description": "Bytes used by the Go runtime, split by go.memory.type (stack vs other). \"other\" covers heap, GC metadata, and runtime structures.",
       "fieldConfig": {
         "defaults": {
-          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never"},
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never", "stacking": {"mode": "normal", "group": "A"}},
           "color": {"mode": "palette-classic"},
           "unit": "bytes"
         }
@@ -707,66 +707,56 @@
           "refId": "A",
           "datasource": {"type": "prometheus", "uid": "prometheus"},
           "editorMode": "code",
-          "expr": "sum(process_runtime_go_mem_heap_inuse_bytes{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"})",
-          "legendFormat": "in_use",
+          "expr": "sum by (go_memory_type) (go_memory_used_bytes{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"})",
+          "legendFormat": "{{go_memory_type}}",
           "range": true
         },
         {
           "refId": "B",
           "datasource": {"type": "prometheus", "uid": "prometheus"},
           "editorMode": "code",
-          "expr": "sum(process_runtime_go_mem_heap_sys_bytes{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"})",
-          "legendFormat": "sys",
-          "range": true
-        },
-        {
-          "refId": "C",
-          "datasource": {"type": "prometheus", "uid": "prometheus"},
-          "editorMode": "code",
-          "expr": "sum(process_runtime_go_mem_heap_released_bytes{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"})",
-          "legendFormat": "released",
-          "range": true
-        }
-      ]
-    },
-    {
-      "type": "heatmap",
-      "title": "GC pause distribution",
-      "id": 32,
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 39},
-      "description": "Distribution of GC pause durations. Bright bands at the top mean stop-the-world events are creeping into the tail.",
-      "fieldConfig": {"defaults": {"custom": {"scaleDistribution": {"type": "linear"}}}},
-      "options": {
-        "calculate": false,
-        "cellGap": 1,
-        "color": {"exponent": 0.5, "fill": "dark-orange", "mode": "scheme", "scheme": "Oranges", "scale": "exponential", "steps": 64},
-        "filterValues": {"le": 1e-9},
-        "legend": {"show": true},
-        "rowsFrame": {"layout": "auto"},
-        "showValue": "never",
-        "tooltip": {"mode": "single", "yHistogram": true},
-        "yAxis": {"axisPlacement": "left", "unit": "ns"}
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {"type": "prometheus", "uid": "prometheus"},
-          "editorMode": "code",
-          "expr": "sum by (le) (rate(process_runtime_go_gc_pause_ns_bucket{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"}[$__rate_interval]))",
-          "format": "heatmap",
-          "legendFormat": "{{le}}",
+          "expr": "sum(go_memory_gc_goal_bytes{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"})",
+          "legendFormat": "gc_goal",
           "range": true
         }
       ]
     },
     {
       "type": "timeseries",
-      "title": "GC frequency",
+      "title": "Allocation rate",
+      "id": 32,
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 39},
+      "description": "Bytes per second allocated to the Go heap (derivative of go.memory.allocated). Sustained high allocation drives GC pressure.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"drawStyle": "line", "fillOpacity": 20, "lineWidth": 1, "showPoints": "never"},
+          "color": {"mode": "palette-classic"},
+          "unit": "Bps"
+        }
+      },
+      "options": {
+        "legend": {"calcs": ["lastNotNull", "max"], "displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "expr": "sum(rate(go_memory_allocated_bytes_total{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"}[$__rate_interval]))",
+          "legendFormat": "alloc B/s",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Allocations / sec",
       "id": 33,
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "gridPos": {"h": 8, "w": 6, "x": 18, "y": 39},
-      "description": "GC completions per second (rate of process.runtime.go.gc.count).",
+      "description": "Allocations per second (rate of go.memory.allocations). High counts of small allocations are usually more costly than equivalent bytes in fewer, larger allocations.",
       "fieldConfig": {
         "defaults": {
           "custom": {"drawStyle": "line", "fillOpacity": 20, "lineWidth": 1, "showPoints": "never"},
@@ -783,8 +773,8 @@
           "refId": "A",
           "datasource": {"type": "prometheus", "uid": "prometheus"},
           "editorMode": "code",
-          "expr": "sum(rate(process_runtime_go_gc_count_total{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"}[$__rate_interval]))",
-          "legendFormat": "gc/s",
+          "expr": "sum(rate(go_memory_allocations_total{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\",service_version=~\"$service_version\"}[$__rate_interval]))",
+          "legendFormat": "allocs/s",
           "range": true
         }
       ]
@@ -951,8 +941,8 @@
         "description": "Single-select. The Tempo (TraceQL) and Pyroscope panels use equality matchers, which cannot accept a multi-value or 'All' regex substitution.",
         "type": "query",
         "datasource": {"type": "prometheus", "uid": "prometheus"},
-        "definition": "label_values(target_info, service_namespace)",
-        "query": {"query": "label_values(target_info, service_namespace)", "refId": "service_namespace"},
+        "definition": "label_values(go_goroutine_count, service_namespace)",
+        "query": {"query": "label_values(go_goroutine_count, service_namespace)", "refId": "service_namespace"},
         "refresh": 2,
         "regex": "",
         "sort": 1,
@@ -966,8 +956,8 @@
         "description": "Single-select. The Tempo (TraceQL) and Pyroscope panels use equality matchers, which cannot accept a multi-value or 'All' regex substitution.",
         "type": "query",
         "datasource": {"type": "prometheus", "uid": "prometheus"},
-        "definition": "label_values(target_info{service_namespace=\"$service_namespace\"}, service_name)",
-        "query": {"query": "label_values(target_info{service_namespace=\"$service_namespace\"}, service_name)", "refId": "service_name"},
+        "definition": "label_values(go_goroutine_count{service_namespace=\"$service_namespace\"}, service_name)",
+        "query": {"query": "label_values(go_goroutine_count{service_namespace=\"$service_namespace\"}, service_name)", "refId": "service_name"},
         "refresh": 2,
         "regex": "",
         "sort": 1,
@@ -980,8 +970,8 @@
         "label": "environment",
         "type": "query",
         "datasource": {"type": "prometheus", "uid": "prometheus"},
-        "definition": "label_values(target_info{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\"}, deployment_environment_name)",
-        "query": {"query": "label_values(target_info{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\"}, deployment_environment_name)", "refId": "environment"},
+        "definition": "label_values(go_goroutine_count{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\"}, deployment_environment_name)",
+        "query": {"query": "label_values(go_goroutine_count{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\"}, deployment_environment_name)", "refId": "environment"},
         "refresh": 2,
         "regex": "",
         "sort": 1,
@@ -995,8 +985,8 @@
         "label": "service.version",
         "type": "query",
         "datasource": {"type": "prometheus", "uid": "prometheus"},
-        "definition": "label_values(target_info{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\"}, service_version)",
-        "query": {"query": "label_values(target_info{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\"}, service_version)", "refId": "service_version"},
+        "definition": "label_values(go_goroutine_count{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\"}, service_version)",
+        "query": {"query": "label_values(go_goroutine_count{service_namespace=~\"$service_namespace\",service_name=~\"$service_name\",deployment_environment_name=~\"$environment\"}, service_version)", "refId": "service_version"},
         "refresh": 2,
         "regex": "",
         "sort": 1,

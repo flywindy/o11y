@@ -3,7 +3,18 @@ apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
 - role: control-plane
   extraPortMappings:
+  # OTLP/HTTP — receives traces, logs, and metrics from local example apps.
   - containerPort: 30000
     hostPort: 4318
+  # NATS WebSocket — used by examples/nats-ws-browser (browser → ws://localhost:4223).
   - containerPort: 30001
     hostPort: 4223
+  # NATS TCP client — used by examples/nats-core and examples/jetstream.
+  - containerPort: 30002
+    hostPort: 4222
+  # MongoDB — used by examples/mongodb.
+  - containerPort: 30003
+    hostPort: 27017
+  # Pyroscope ingest via Alloy — used by examples/profiling.
+  - containerPort: 30004
+    hostPort: 4040
