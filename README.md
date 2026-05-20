@@ -110,8 +110,10 @@ func main() {
         o11y.WithServiceNamespace("platform"),     // required; maps to k8s namespace / team
         o11y.WithOTLPEndpoint("http://localhost:4318"),
         // Optional: enable continuous profiling. In-cluster, prefer
-        // "http://alloy.infra.svc.cluster.local:4040".
+        // "http://alloy.infra.svc.cluster.local:4040". Profiling requires
+        // both the endpoint and WithProfilingEnabled(true).
         // o11y.WithProfilingEndpoint("http://localhost:4040"),
+        // o11y.WithProfilingEnabled(true),
         o11y.WithLogLevel(slog.LevelInfo),
     )
     if err != nil {
@@ -317,9 +319,10 @@ otel.SetTextMapPropagator(obs.Propagator)
 
 ### Continuous Profiling
 
-Profiling is opt-in. Set `WithProfilingEndpoint` to an HTTP endpoint that
-speaks the Pyroscope ingest protocol. In the provided Kubernetes stack,
-applications should send profiles to Alloy:
+Profiling is opt-in and **doubly gated**: it requires both a non-empty
+`WithProfilingEndpoint` AND `WithProfilingEnabled(true)` (or
+`O11Y_PROFILING_ENABLED=true`). Either alone is insufficient. In the provided
+Kubernetes stack, applications should send profiles to Alloy:
 
 ```go
 obs, err := o11y.Init(ctx,
@@ -329,6 +332,7 @@ obs, err := o11y.Init(ctx,
     o11y.WithServiceNamespace("platform"),
     o11y.WithOTLPEndpoint("http://otel-collector.infra.svc.cluster.local:4318"),
     o11y.WithProfilingEndpoint("http://alloy.infra.svc.cluster.local:4040"),
+    o11y.WithProfilingEnabled(true),
 )
 ```
 

@@ -42,6 +42,7 @@ func main() {
 		o11y.WithOTLPEndpoint(otlpEndpoint),
 		o11y.WithMetricsOTLPEndpoint(otlpEndpoint),
 		o11y.WithProfilingEndpoint(profilingEndpoint),
+		o11y.WithProfilingEnabled(true),
 		o11y.WithLogLevel(slog.LevelInfo),
 	)
 	if err != nil {
