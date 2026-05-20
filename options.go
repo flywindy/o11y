@@ -55,11 +55,15 @@ type Config struct {
 	maxUniqueRoutes     int
 
 	// Feature toggles — all default to true; can be overridden via
-	// WithTraceEnabled / WithMetricsEnabled / WithLogEnabled or the
-	// corresponding O11Y_*_ENABLED environment variables.
-	traceEnabled   bool
-	metricsEnabled bool
-	logEnabled     bool
+	// WithTraceEnabled / WithMetricsEnabled / WithLogEnabled /
+	// WithProfilingEnabled or the corresponding O11Y_*_ENABLED environment
+	// variables. The profiling toggle only takes effect when a Pyroscope
+	// endpoint is also configured (via WithProfilingEndpoint); when no
+	// endpoint is set profiling stays inactive regardless of the toggle.
+	traceEnabled     bool
+	metricsEnabled   bool
+	logEnabled       bool
+	profilingEnabled bool
 
 	// initWarnings holds non-fatal diagnostics collected before the SDK logger
 	// exists (e.g. unparseable O11Y_*_ENABLED env var values). They are emitted
@@ -260,6 +264,21 @@ func WithLogEnabled(enabled bool) Option {
 	return func(c *Config) { c.logEnabled = enabled }
 }
 
+// WithProfilingEnabled controls whether the SDK starts the Pyroscope profiler
+// and wraps the TracerProvider with the trace-to-profile bridge. When false,
+// no profiler goroutines are started and trace spans are not annotated with
+// pyroscope.profile.id, even when WithProfilingEndpoint is set. This lets
+// operators stage a profiling rollout without removing the endpoint from
+// deployment manifests.
+//
+// Profiling additionally requires a non-empty endpoint (via
+// WithProfilingEndpoint); the toggle alone does not enable profiling.
+// Default: true (env var O11Y_PROFILING_ENABLED overrides the built-in
+// default).
+func WithProfilingEnabled(enabled bool) Option {
+	return func(c *Config) { c.profilingEnabled = enabled }
+}
+
 // WithDisableDefaultViews disables SDK-managed HTTP metric views.
 func WithDisableDefaultViews() Option {
 	return func(c *Config) {
@@ -305,6 +324,10 @@ func defaultConfig() *Config {
 		cfg.initWarnings = append(cfg.initWarnings, warn)
 	}
 	cfg.logEnabled, warn = parseBoolEnv("O11Y_LOG_ENABLED", true)
+	if warn != "" {
+		cfg.initWarnings = append(cfg.initWarnings, warn)
+	}
+	cfg.profilingEnabled, warn = parseBoolEnv("O11Y_PROFILING_ENABLED", true)
 	if warn != "" {
 		cfg.initWarnings = append(cfg.initWarnings, warn)
 	}

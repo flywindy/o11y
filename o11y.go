@@ -39,10 +39,15 @@ import (
 // FeatureToggles reports which observability pillars were enabled at Init time.
 // Use sdk.Toggles to inspect active state at runtime, e.g. for health-check
 // endpoints or to conditionally log a startup warning when a pillar is off.
+//
+// Profiling reflects the combined state of WithProfilingEnabled and whether a
+// non-empty Pyroscope endpoint was configured: it is true only when the SDK
+// actually started a profiler.
 type FeatureToggles struct {
-	Trace   bool
-	Metrics bool
-	Log     bool
+	Trace     bool
+	Metrics   bool
+	Log       bool
+	Profiling bool
 }
 
 // SDK holds the initialized observability providers.
@@ -196,7 +201,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		}
 		tpInternal, prop = tp, p
 		tracerProviderPublic = tp
-		if cfg.profilingEndpoint != "" {
+		if cfg.profilingEnabled && cfg.profilingEndpoint != "" {
 			tracerProviderPublic = otelpyroscope.NewTracerProvider(tp)
 		}
 		tpShutdown = tp.Shutdown
@@ -302,9 +307,20 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 			slog.String("toggle", "O11Y_LOG_ENABLED"),
 		)
 	}
+	// Only warn when profiling was actively suppressed by the toggle despite
+	// an endpoint being configured. The default state (no endpoint, toggle on)
+	// is not noteworthy and would generate noise for every service that has
+	// not opted into profiling.
+	if !cfg.profilingEnabled && cfg.profilingEndpoint != "" {
+		logger.WarnContext(ctx, "profiling pillar disabled; Pyroscope endpoint ignored",
+			slog.String("toggle", "O11Y_PROFILING_ENABLED"),
+			slog.String("endpoint", cfg.profilingEndpoint),
+		)
+	}
 
+	var profilingStarted bool
 	var profilerCloser func(context.Context) error
-	if cfg.profilingEndpoint != "" {
+	if cfg.profilingEnabled && cfg.profilingEndpoint != "" {
 		closer, startErr := profiling.Start(ctx, profiling.Config{
 			ServiceName: cfg.serviceName,
 			Endpoint:    cfg.profilingEndpoint,
@@ -326,6 +342,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 			)
 		} else {
 			profilerCloser = closer
+			profilingStarted = true
 		}
 	}
 
@@ -346,9 +363,10 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		Logger:     logger,
 		Propagator: prop,
 		Toggles: FeatureToggles{
-			Trace:   cfg.traceEnabled,
-			Metrics: cfg.metricsEnabled,
-			Log:     cfg.logEnabled,
+			Trace:     cfg.traceEnabled,
+			Metrics:   cfg.metricsEnabled,
+			Log:       cfg.logEnabled,
+			Profiling: profilingStarted,
 		},
 		tracerProviderInternal: tpInternal,
 		tracerProviderPublic:   tracerProviderPublic,

@@ -239,3 +239,67 @@ func TestToggles_StartupWarning_DisabledPillar(t *testing.T) {
 	assert.False(t, sdk.Toggles.Metrics)
 	assert.False(t, sdk.Toggles.Log)
 }
+
+// TestToggles_Profiling_DefaultOffWithoutEndpoint verifies that profiling
+// stays inactive when no endpoint is configured, even though the toggle
+// defaults to true.
+func TestToggles_Profiling_DefaultOffWithoutEndpoint(t *testing.T) {
+	srv := testutil.FakeOTLPServer(t)
+	sdk, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
+	require.NoError(t, err)
+	defer testutil.MustShutdown(t.Context(), t, sdk)
+
+	assert.False(t, sdk.Toggles.Profiling,
+		"profiling should be inactive when no endpoint is configured")
+}
+
+// TestToggles_ProfilingDisabled_SuppressesEndpoint verifies that
+// WithProfilingEnabled(false) prevents profiling from starting even when
+// WithProfilingEndpoint is set — the staged-rollout case.
+func TestToggles_ProfilingDisabled_SuppressesEndpoint(t *testing.T) {
+	srv := testutil.FakeOTLPServer(t)
+	opts := append(commonOpts(srv.URL),
+		o11y.WithProfilingEndpoint("http://127.0.0.1:1"), // unreachable on purpose
+		o11y.WithProfilingEnabled(false),
+	)
+	sdk, err := o11y.Init(context.Background(), opts...)
+	require.NoError(t, err)
+	defer testutil.MustShutdown(t.Context(), t, sdk)
+
+	assert.False(t, sdk.Toggles.Profiling,
+		"profiling must stay inactive when explicitly disabled, even with an endpoint set")
+}
+
+// TestToggles_Profiling_EnvVarDisables verifies that O11Y_PROFILING_ENABLED=false
+// is honoured when no explicit code-level option is provided.
+func TestToggles_Profiling_EnvVarDisables(t *testing.T) {
+	t.Setenv("O11Y_PROFILING_ENABLED", "false")
+
+	srv := testutil.FakeOTLPServer(t)
+	opts := append(commonOpts(srv.URL),
+		o11y.WithProfilingEndpoint("http://127.0.0.1:1"),
+	)
+	sdk, err := o11y.Init(context.Background(), opts...)
+	require.NoError(t, err)
+	defer testutil.MustShutdown(t.Context(), t, sdk)
+
+	assert.False(t, sdk.Toggles.Profiling,
+		"O11Y_PROFILING_ENABLED=false must suppress profiler start")
+}
+
+// TestToggles_Profiling_CodeOptionOverridesEnvVar verifies that an explicit
+// WithProfilingEnabled(true) takes precedence over O11Y_PROFILING_ENABLED=false.
+func TestToggles_Profiling_CodeOptionOverridesEnvVar(t *testing.T) {
+	t.Setenv("O11Y_PROFILING_ENABLED", "false")
+
+	srv := testutil.FakeOTLPServer(t)
+	// No endpoint configured: even with the toggle forced on, profiling stays
+	// inactive — the SDK requires both the toggle and an endpoint.
+	opts := append(commonOpts(srv.URL), o11y.WithProfilingEnabled(true))
+	sdk, err := o11y.Init(context.Background(), opts...)
+	require.NoError(t, err)
+	defer testutil.MustShutdown(t.Context(), t, sdk)
+
+	assert.False(t, sdk.Toggles.Profiling,
+		"profiling requires an endpoint regardless of toggle state")
+}

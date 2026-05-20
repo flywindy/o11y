@@ -30,10 +30,11 @@ push Pyroscope-format profiles to Alloy, which forwards them to Pyroscope.
 ### Telemetry Flow
 
 ```
-Traces:  App ──OTLP/HTTP──► OTel Collector ──► Tempo
-Logs:    App ──OTLP/HTTP──► OTel Collector ──► Loki   (primary: full OTel Log Data Model)
-         App stdout ──► Alloy ──OTLP/HTTP──► OTel Collector ──► Loki  (secondary: k8s pods via Alloy)
-Metrics: App :2112/metrics ◄──scrape── Prometheus ──► Grafana  (pull model)
+Traces:    App ──OTLP/HTTP──► OTel Collector ──► Tempo
+Logs:      App ──OTLP/HTTP──► OTel Collector ──► Loki   (primary: full OTel Log Data Model)
+           App stdout ──► Alloy ──OTLP/HTTP──► OTel Collector ──► Loki  (secondary: k8s pods via Alloy)
+Metrics:   App :2112/metrics ◄──scrape── Prometheus ──► Grafana  (pull model)
+Profiles:  App ──Pyroscope ingest──► Alloy ──► Pyroscope ──► Grafana
 ```
 
 Both log paths are active simultaneously. When running `go run` locally (outside the cluster),
@@ -131,25 +132,54 @@ func main() {
 
 **Available options:**
 
+_Required — Init returns an error if any of these are missing:_
+
+| Option | Description |
+|--------|-------------|
+| `WithServiceName(name)` | OTel `service.name` resource attribute |
+| `WithServiceVersion(ver)` | OTel `service.version`; used for canary/rollback tracking |
+| `WithEnvironment(env)` | OTel `deployment.environment.name`; accepted: `production`, `staging`, `development`, `testing` (aliases like `prod`/`stg` are normalized) |
+| `WithServiceNamespace(ns)` | OTel `service.namespace`; identifies the owning team/product, maps to k8s namespace |
+
+_OTLP (shared by traces and logs):_
+
 | Option | Default | Description |
 |--------|---------|-------------|
-| `WithServiceName(name)` | — **required** | OTel `service.name` resource attribute |
-| `WithServiceVersion(ver)` | — **required** | OTel `service.version`; used for canary/rollback tracking |
-| `WithEnvironment(env)` | — **required** | OTel `deployment.environment.name`; accepted: `production`, `staging`, `development`, `testing` (aliases like `prod`/`stg` are normalized) |
-| `WithServiceNamespace(ns)` | — **required** | OTel `service.namespace`; identifies the owning team/product, maps to k8s namespace |
 | `WithOTLPEndpoint(url)` | `http://localhost:4318` | OTLP/HTTP collector endpoint for traces and logs |
 | `WithOTLPHeaders(map[string]string)` | `nil` | Headers attached to every OTLP/HTTP request (auth tokens, multi-tenant routing) |
-| `WithProfilingEndpoint(url)` | `""` | Enable Pyroscope-compatible continuous profiling; empty means fully disabled |
-| `WithProfilingAuthHeaders(map[string]string)` | `nil` | Headers attached to every profile push (Grafana Cloud Profiles auth, `X-Scope-OrgID`, etc.) |
+
+_Metrics:_
+
+| Option | Default | Description |
+|--------|---------|-------------|
 | `WithMetricsOTLPEndpoint(url)` | `""` | Switch metrics to OTLP push (serverless); when unset, Prometheus pull on `:2112` is used |
 | `WithMetricsAddr(addr)` | `:2112` | Prometheus `/metrics` scrape address |
-| `WithLogLevel(level)` | `slog.LevelInfo` | Minimum log level |
 | `WithRuntimeMetrics(bool)` | `true` | Collect Go runtime metrics (goroutines, GC, memory) |
+| `WithHistogramBuckets([]float64)` | SLO defaults | Override HTTP latency histogram boundaries; see `DefaultLatencyBuckets()` |
 | `WithDisableDefaultViews()` | off | Disable SDK-managed HTTP metric label allowlists and bucket views |
 | `WithMaxUniqueRoutes(n)` | `1000` | Cap exported distinct `http.route` values and derive the SDK aggregation cardinality budget |
+
+_Logging:_
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `WithLogLevel(level)` | `slog.LevelInfo` | Minimum log level |
+
+_Profiling (opt-in via endpoint):_
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `WithProfilingEndpoint(url)` | `""` | Pyroscope-compatible ingest endpoint; empty means profiling never starts |
+| `WithProfilingAuthHeaders(map[string]string)` | `nil` | Headers attached to every profile push (Grafana Cloud Profiles auth, `X-Scope-OrgID`, etc.) |
+
+_Per-pillar feature toggles (progressive rollout):_
+
+| Option | Default | Description |
+|--------|---------|-------------|
 | `WithTraceEnabled(bool)` | `true` | When `false`, use a no-op TracerProvider; W3C headers are still parsed and forwarded |
 | `WithMetricsEnabled(bool)` | `true` | When `false`, use a no-op MeterProvider; no Prometheus server is started |
 | `WithLogEnabled(bool)` | `true` | When `false`, write logs to stdout only; no OTLP log provider is started |
+| `WithProfilingEnabled(bool)` | `true` | When `false`, suppress profiling even when `WithProfilingEndpoint` is set; the trace-to-profile bridge is not installed |
 
 > **Migration note (pre-1.0 API change)** — `DefaultLatencyBuckets` is now a
 > function (`o11y.DefaultLatencyBuckets()` returning a fresh copy) rather
@@ -162,14 +192,15 @@ func main() {
 
 ### Feature Toggles (Progressive Rollout)
 
-Each observability pillar — Trace, Metrics, Log — can be disabled independently so teams can adopt the new SDK incrementally without breaking existing dashboards or pipelines.
+Each observability pillar — Trace, Metrics, Log, Profiling — can be disabled independently so teams can adopt the new SDK incrementally without breaking existing dashboards or pipelines.
 
 ```go
 obs, err := o11y.Init(ctx,
     // ... required options ...
-    o11y.WithTraceEnabled(false),   // keep existing trace logic, skip new SDK
-    o11y.WithMetricsEnabled(false), // keep ginprom /metrics; no new Prometheus server
-    o11y.WithLogEnabled(false),     // stdout only; no OTLP log export
+    o11y.WithTraceEnabled(false),     // keep existing trace logic, skip new SDK
+    o11y.WithMetricsEnabled(false),   // keep ginprom /metrics; no new Prometheus server
+    o11y.WithLogEnabled(false),       // stdout only; no OTLP log export
+    o11y.WithProfilingEnabled(false), // suppress profiler even when endpoint is set
 )
 ```
 
@@ -180,25 +211,36 @@ obs, err := o11y.Init(ctx,
 | **Trace** | No-op `TracerProvider`; W3C `traceparent`/`tracestate` headers are still parsed and forwarded to downstream services |
 | **Metrics** | No-op `MeterProvider`; the Prometheus HTTP server is not started; existing `ginprom` dashboards are unaffected |
 | **Log** | `obs.Logger` writes to stdout only (JSON); no OTLP collector connection is attempted |
+| **Profiling** | No Pyroscope profiler is started; the trace-to-profile `pyroscope.profile.id` span attribute is not added. Trace/log/metric pillars are untouched |
 
 **Environment-variable control** (useful for staged rollouts without deploys):
 
-```bash
-O11Y_TRACE_ENABLED=false
-O11Y_METRICS_ENABLED=false
-O11Y_LOG_ENABLED=false
-```
+| Env var | Default |
+|---------|---------|
+| `O11Y_TRACE_ENABLED` | `true` |
+| `O11Y_METRICS_ENABLED` | `true` |
+| `O11Y_LOG_ENABLED` | `true` |
+| `O11Y_PROFILING_ENABLED` | `true` |
 
 Accepted values: `1`/`t`/`true`/`TRUE` (truthy) and `0`/`f`/`false`/`FALSE` (falsy). Any other value (e.g. `"yes"`, `"on"`) emits a startup `WARN` log and falls back to the SDK default (`true`).
 
 Precedence: **code option > env var > SDK default (`true`)**.  
 An explicit `WithTraceEnabled(true)` always wins over `O11Y_TRACE_ENABLED=false`.
 
+Profiling is doubly gated: the toggle defaults to `true` but profiling only
+actually runs when `WithProfilingEndpoint` is also set. The toggle exists so
+operators can suppress profiling without removing the endpoint from deployment
+manifests during a staged rollout. `sdk.Toggles.Profiling` reports whether the
+SDK actually started a profiler (i.e. both the toggle and the endpoint were on).
+
 **Runtime introspection** — `sdk.Toggles` reports what is active:
 
 ```go
 if !obs.Toggles.Metrics {
     obs.Logger.Warn("metrics pillar disabled; Prometheus server not started")
+}
+if !obs.Toggles.Profiling {
+    obs.Logger.Warn("profiling inactive; no Pyroscope endpoint or toggle is off")
 }
 ```
 
