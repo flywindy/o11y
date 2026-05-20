@@ -147,6 +147,9 @@ func main() {
 | `WithRuntimeMetrics(bool)` | `true` | Collect Go runtime metrics (goroutines, GC, memory) |
 | `WithDisableDefaultViews()` | off | Disable SDK-managed HTTP metric label allowlists and bucket views |
 | `WithMaxUniqueRoutes(n)` | `1000` | Cap exported distinct `http.route` values and derive the SDK aggregation cardinality budget |
+| `WithTraceEnabled(bool)` | `true` | When `false`, use a no-op TracerProvider; W3C headers are still parsed and forwarded |
+| `WithMetricsEnabled(bool)` | `true` | When `false`, use a no-op MeterProvider; no Prometheus server is started |
+| `WithLogEnabled(bool)` | `true` | When `false`, write logs to stdout only; no OTLP log provider is started |
 
 > **Migration note (pre-1.0 API change)** — `DefaultLatencyBuckets` is now a
 > function (`o11y.DefaultLatencyBuckets()` returning a fresh copy) rather
@@ -157,12 +160,53 @@ func main() {
 > `WithMetricsAddr(":9090")` to override the metrics listener. See
 > `CHANGELOG.md` for the migration recipe.
 
+### Feature Toggles (Progressive Rollout)
+
+Each observability pillar — Trace, Metrics, Log — can be disabled independently so teams can adopt the new SDK incrementally without breaking existing dashboards or pipelines.
+
+```go
+obs, err := o11y.Init(ctx,
+    // ... required options ...
+    o11y.WithTraceEnabled(false),   // keep existing trace logic, skip new SDK
+    o11y.WithMetricsEnabled(false), // keep ginprom /metrics; no new Prometheus server
+    o11y.WithLogEnabled(false),     // stdout only; no OTLP log export
+)
+```
+
+**When disabled, each pillar is gracefully stubbed out:**
+
+| Pillar | Disabled behaviour |
+|--------|-------------------|
+| **Trace** | No-op `TracerProvider`; W3C `traceparent`/`tracestate` headers are still parsed and forwarded to downstream services |
+| **Metrics** | No-op `MeterProvider`; the Prometheus HTTP server is not started; existing `ginprom` dashboards are unaffected |
+| **Log** | `obs.Logger` writes to stdout only (JSON); no OTLP collector connection is attempted |
+
+**Environment-variable control** (useful for staged rollouts without deploys):
+
+```bash
+O11Y_TRACE_ENABLED=false
+O11Y_METRICS_ENABLED=false
+O11Y_LOG_ENABLED=false
+```
+
+Precedence: **code option > env var > SDK default (`true`)**.  
+An explicit `WithTraceEnabled(true)` always wins over `O11Y_TRACE_ENABLED=false`.
+
+**Runtime introspection** — `sdk.Toggles` reports what is active:
+
+```go
+if !obs.Toggles.Metrics {
+    obs.Logger.Warn("metrics pillar disabled; Prometheus server not started")
+}
+```
+
 ### Structured Logging with Trace Correlation
 
 Use `obs.Logger` instead of the global `slog` package. Every log record is written to two destinations automatically:
 
 - **OTLP → Loki**: Full OTel Log Data Model. `service.name` and `deployment.environment` live in the OTel Resource (not per-record attributes). `traceId`, `spanId`, and `trace_flags` are extracted from the context by the `otelslog` bridge.
 - **stdout (JSON)**: Human-readable output for local development. Includes `service.name`, `environment`, `traceId`, and `spanId` as flat JSON fields.
+- When `WithLogEnabled(false)` is set, only the stdout destination is active.
 
 ```go
 // Without a span — no trace fields in either destination
