@@ -201,9 +201,11 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		}
 		tpInternal, prop = tp, p
 		tracerProviderPublic = tp
-		if cfg.profilingEnabled && cfg.profilingEndpoint != "" {
-			tracerProviderPublic = otelpyroscope.NewTracerProvider(tp)
-		}
+		// The trace-to-profile wrapper (otelpyroscope.NewTracerProvider) is
+		// installed after profiling.Start succeeds (see below), not here.
+		// Installing it eagerly would annotate spans with pyroscope.profile.id
+		// even when profiling.Start later fails on the warn-and-continue path,
+		// producing dangling identifiers that point at no real profile.
 		tpShutdown = tp.Shutdown
 	}
 
@@ -307,14 +309,19 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 			slog.String("toggle", "O11Y_LOG_ENABLED"),
 		)
 	}
-	// Only warn when profiling was actively suppressed by the toggle despite
-	// an endpoint being configured. The default state (no endpoint, toggle on)
-	// is not noteworthy and would generate noise for every service that has
-	// not opted into profiling.
-	if !cfg.profilingEnabled && cfg.profilingEndpoint != "" {
+	// Warn about partial profiling configuration so operators notice misconfig
+	// quickly. Profiling is opt-in and requires both the toggle and the
+	// endpoint, so the all-default (toggle off, no endpoint) state is silent.
+	switch {
+	case !cfg.profilingEnabled && cfg.profilingEndpoint != "":
 		logger.WarnContext(ctx, "profiling pillar disabled; Pyroscope endpoint ignored",
 			slog.String("toggle", "O11Y_PROFILING_ENABLED"),
 			slog.String("endpoint", cfg.profilingEndpoint),
+		)
+	case cfg.profilingEnabled && cfg.profilingEndpoint == "":
+		logger.WarnContext(ctx, "profiling pillar enabled but no Pyroscope endpoint set; profiler not started",
+			slog.String("toggle", "O11Y_PROFILING_ENABLED"),
+			slog.String("option", "WithProfilingEndpoint"),
 		)
 	}
 
@@ -343,6 +350,11 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		} else {
 			profilerCloser = closer
 			profilingStarted = true
+			// Wrap only now that the profiler is running, so spans never
+			// carry pyroscope.profile.id when no profile actually exists.
+			if tpInternal != nil {
+				tracerProviderPublic = otelpyroscope.NewTracerProvider(tpInternal)
+			}
 		}
 	}
 

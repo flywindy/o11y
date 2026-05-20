@@ -179,7 +179,7 @@ _Per-pillar feature toggles (progressive rollout):_
 | `WithTraceEnabled(bool)` | `true` | When `false`, use a no-op TracerProvider; W3C headers are still parsed and forwarded |
 | `WithMetricsEnabled(bool)` | `true` | When `false`, use a no-op MeterProvider; no Prometheus server is started |
 | `WithLogEnabled(bool)` | `true` | When `false`, write logs to stdout only; no OTLP log provider is started |
-| `WithProfilingEnabled(bool)` | `true` | When `false`, suppress profiling even when `WithProfilingEndpoint` is set; the trace-to-profile bridge is not installed |
+| `WithProfilingEnabled(bool)` | `false` | Opt-in. When `true` **and** `WithProfilingEndpoint` is set, the SDK starts the Pyroscope profiler and installs the trace-to-profile bridge |
 
 > **Migration note (pre-1.0 API change)** — `DefaultLatencyBuckets` is now a
 > function (`o11y.DefaultLatencyBuckets()` returning a fresh copy) rather
@@ -192,7 +192,7 @@ _Per-pillar feature toggles (progressive rollout):_
 
 ### Feature Toggles (Progressive Rollout)
 
-Each observability pillar — Trace, Metrics, Log, Profiling — can be disabled independently so teams can adopt the new SDK incrementally without breaking existing dashboards or pipelines.
+Each observability pillar — Trace, Metrics, Log, Profiling — can be controlled independently so teams can adopt the new SDK incrementally without breaking existing dashboards or pipelines.
 
 ```go
 obs, err := o11y.Init(ctx,
@@ -200,7 +200,8 @@ obs, err := o11y.Init(ctx,
     o11y.WithTraceEnabled(false),     // keep existing trace logic, skip new SDK
     o11y.WithMetricsEnabled(false),   // keep ginprom /metrics; no new Prometheus server
     o11y.WithLogEnabled(false),       // stdout only; no OTLP log export
-    o11y.WithProfilingEnabled(false), // suppress profiler even when endpoint is set
+    o11y.WithProfilingEndpoint("http://alloy.infra.svc.cluster.local:4040"),
+    o11y.WithProfilingEnabled(true),  // opt-in: profiling defaults to off
 )
 ```
 
@@ -220,18 +221,14 @@ obs, err := o11y.Init(ctx,
 | `O11Y_TRACE_ENABLED` | `true` |
 | `O11Y_METRICS_ENABLED` | `true` |
 | `O11Y_LOG_ENABLED` | `true` |
-| `O11Y_PROFILING_ENABLED` | `true` |
+| `O11Y_PROFILING_ENABLED` | `false` |
 
-Accepted values: `1`/`t`/`true`/`TRUE` (truthy) and `0`/`f`/`false`/`FALSE` (falsy). Any other value (e.g. `"yes"`, `"on"`) emits a startup `WARN` log and falls back to the SDK default (`true`).
+Accepted values: `1`/`t`/`true`/`TRUE` (truthy) and `0`/`f`/`false`/`FALSE` (falsy). Any other value (e.g. `"yes"`, `"on"`) emits a startup `WARN` log and falls back to the SDK default.
 
-Precedence: **code option > env var > SDK default (`true`)**.  
+Precedence: **code option > env var > SDK default**.  
 An explicit `WithTraceEnabled(true)` always wins over `O11Y_TRACE_ENABLED=false`.
 
-Profiling is doubly gated: the toggle defaults to `true` but profiling only
-actually runs when `WithProfilingEndpoint` is also set. The toggle exists so
-operators can suppress profiling without removing the endpoint from deployment
-manifests during a staged rollout. `sdk.Toggles.Profiling` reports whether the
-SDK actually started a profiler (i.e. both the toggle and the endpoint were on).
+Profiling is opt-in and **doubly gated**: it requires both `WithProfilingEnabled(true)` (or `O11Y_PROFILING_ENABLED=true`) **and** a non-empty `WithProfilingEndpoint`. Either condition alone is insufficient, so misconfiguration cannot accidentally start the profiler. The SDK emits a startup `WARN` when only one of the two is set so the misconfig is noticed. `sdk.Toggles.Profiling` reports whether the SDK actually started a profiler.
 
 **Runtime introspection** — `sdk.Toggles` reports what is active:
 
@@ -240,7 +237,7 @@ if !obs.Toggles.Metrics {
     obs.Logger.Warn("metrics pillar disabled; Prometheus server not started")
 }
 if !obs.Toggles.Profiling {
-    obs.Logger.Warn("profiling inactive; no Pyroscope endpoint or toggle is off")
+    obs.Logger.Warn("profiling inactive; toggle off or no Pyroscope endpoint")
 }
 ```
 

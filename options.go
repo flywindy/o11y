@@ -54,12 +54,13 @@ type Config struct {
 	disableDefaultViews bool
 	maxUniqueRoutes     int
 
-	// Feature toggles — all default to true; can be overridden via
-	// WithTraceEnabled / WithMetricsEnabled / WithLogEnabled /
-	// WithProfilingEnabled or the corresponding O11Y_*_ENABLED environment
-	// variables. The profiling toggle only takes effect when a Pyroscope
-	// endpoint is also configured (via WithProfilingEndpoint); when no
-	// endpoint is set profiling stays inactive regardless of the toggle.
+	// Feature toggles. Trace, metrics, and log default to true; profiling
+	// defaults to false because it is an opt-in fourth signal. All four can
+	// be overridden via WithTraceEnabled / WithMetricsEnabled /
+	// WithLogEnabled / WithProfilingEnabled or the corresponding
+	// O11Y_*_ENABLED environment variables. Profiling requires both the
+	// toggle to be on AND a non-empty WithProfilingEndpoint before the SDK
+	// will start the Pyroscope profiler.
 	traceEnabled     bool
 	metricsEnabled   bool
 	logEnabled       bool
@@ -265,16 +266,15 @@ func WithLogEnabled(enabled bool) Option {
 }
 
 // WithProfilingEnabled controls whether the SDK starts the Pyroscope profiler
-// and wraps the TracerProvider with the trace-to-profile bridge. When false,
-// no profiler goroutines are started and trace spans are not annotated with
-// pyroscope.profile.id, even when WithProfilingEndpoint is set. This lets
-// operators stage a profiling rollout without removing the endpoint from
-// deployment manifests.
+// and wraps the TracerProvider with the trace-to-profile bridge. Profiling is
+// opt-in: it requires both this toggle to be on AND a non-empty endpoint set
+// via WithProfilingEndpoint. Either condition alone is insufficient. This
+// lets operators stage a profiling rollout (or roll it back) without removing
+// the endpoint from deployment manifests.
 //
-// Profiling additionally requires a non-empty endpoint (via
-// WithProfilingEndpoint); the toggle alone does not enable profiling.
-// Default: true (env var O11Y_PROFILING_ENABLED overrides the built-in
-// default).
+// Default: false (env var O11Y_PROFILING_ENABLED overrides the built-in
+// default). Unlike trace/metrics/log, profiling defaults off because it is
+// an additional fourth signal that must be explicitly enabled.
 func WithProfilingEnabled(enabled bool) Option {
 	return func(c *Config) { c.profilingEnabled = enabled }
 }
@@ -327,7 +327,7 @@ func defaultConfig() *Config {
 	if warn != "" {
 		cfg.initWarnings = append(cfg.initWarnings, warn)
 	}
-	cfg.profilingEnabled, warn = parseBoolEnv("O11Y_PROFILING_ENABLED", true)
+	cfg.profilingEnabled, warn = parseBoolEnv("O11Y_PROFILING_ENABLED", false)
 	if warn != "" {
 		cfg.initWarnings = append(cfg.initWarnings, warn)
 	}
