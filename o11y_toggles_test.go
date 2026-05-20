@@ -230,4 +230,3 @@ func TestToggles_StartupWarning_DisabledPillar(t *testing.T) {
 	assert.False(t, sdk.Toggles.Metrics)
 	assert.False(t, sdk.Toggles.Log)
 }
-
