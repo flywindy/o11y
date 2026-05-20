@@ -15,6 +15,19 @@ adopters can plan their upgrades.
 
 ### Added
 
+- **Per-pillar feature toggles** for progressive SDK adoption:
+  `WithTraceEnabled(bool)`, `WithMetricsEnabled(bool)`, `WithLogEnabled(bool)`
+  each default to `true` (no change to existing behaviour). When a pillar is
+  disabled the SDK returns a no-op provider for that signal while keeping
+  everything else fully operational. Disabled pillars can also be controlled
+  without code changes via the `O11Y_TRACE_ENABLED`, `O11Y_METRICS_ENABLED`,
+  and `O11Y_LOG_ENABLED` environment variables; explicit option calls take
+  precedence. `sdk.Toggles` (`FeatureToggles{Trace, Metrics, Log}`) reports
+  the active state at runtime for health-check endpoints and startup logging.
+  Notable per-pillar behaviour: Trace-disabled still parses and forwards W3C
+  `traceparent` headers; Metrics-disabled does not start the Prometheus HTTP
+  server; Log-disabled falls back to stdout-only JSON output.
+
 - Continuous profiling integration via Pyroscope:
   `WithProfilingEndpoint(url)` enables Pyroscope-compatible profile pushes,
   `WithProfilingAuthHeaders(map[string]string)` forwards auth / tenant headers,
