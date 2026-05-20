@@ -59,7 +59,7 @@ Before running the infrastructure, ensure you have the following installed:
 kind create cluster --config kind-config.yaml
 ```
 
-This configures a control-plane node with an extra port mapping for the OTel Collector (port `4318`).
+This configures a control-plane node with NodePort host-port mappings for OTel/OTLP (`4318`), NATS TCP (`4222`), NATS WebSocket (`4223`), MongoDB (`27017`), and Pyroscope ingest via Alloy (`4040`) — see [Running the Examples](#running-the-examples).
 
 ### 2. Deploy Infrastructure
 
@@ -247,11 +247,12 @@ obs, err := o11y.Init(ctx,
 )
 ```
 
-For local development, port-forward Alloy and use
-`WithProfilingEndpoint("http://localhost:4040")`. Use
-`WithProfilingAuthHeaders` when the Pyroscope endpoint requires auth or
-tenant routing headers. Header values are copied defensively and are not
-logged.
+For local development, the `kind-config.yaml` cluster maps host port `4040`
+straight to Alloy via a NodePort, so applications can keep using
+`WithProfilingEndpoint("http://localhost:4040")` without an additional
+`kubectl port-forward`. Use `WithProfilingAuthHeaders` when the Pyroscope
+endpoint requires auth or tenant routing headers. Header values are copied
+defensively and are not logged.
 
 When profiling is enabled, the SDK wraps its tracer provider with the Grafana
 span profiling bridge. Root spans receive a `pyroscope.profile.id` attribute,
@@ -519,13 +520,16 @@ go run examples/profiling/main.go
 The example starts a sampled root span every two seconds and burns CPU long
 enough for Pyroscope to capture useful samples. It sends profiles to
 `PYROSCOPE_ENDPOINT` (default `http://localhost:4040`) and traces/logs/OTLP
-metrics to `OTLP_ENDPOINT` (default `http://localhost:4318`). Keep the Alloy
-and Grafana port-forwards from the setup block running while the example runs.
+metrics to `OTLP_ENDPOINT` (default `http://localhost:4318`). Both host
+ports are pre-mapped by `kind-config.yaml`; only the Grafana port-forward
+from the setup block is required to inspect the resulting profiles.
 
 ### MongoDB
 
-Run a local MongoDB instance or port-forward one to `localhost:27017`, then
-enable the upstream tracing gates before running the example:
+`kind-config.yaml` maps host port `27017` to the in-cluster MongoDB via a
+NodePort, so `mongodb://localhost:27017` connects to the example MongoDB
+deployment with no extra setup (a local MongoDB instance also works). Enable
+the upstream tracing gates before running the example:
 
 ```bash
 export MONGODB_URI=mongodb://localhost:27017
