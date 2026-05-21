@@ -44,3 +44,11 @@ func TestParseBoolEnv_InvalidValue_FallsBackToDefault(t *testing.T) {
 			"warning should echo the bad value; got: %s", warn)
 	}
 }
+
+func TestWithExtraHTTPServerAttributeKeys_AccumulatesAndSkipsEmpty(t *testing.T) {
+	cfg := &Config{}
+	WithExtraHTTPServerAttributeKeys("app_name", "")(cfg)
+	WithExtraHTTPServerAttributeKeys("bot_name")(cfg)
+	WithExtraHTTPServerAttributeKeys()(cfg)
+	assert.Equal(t, []string{"app_name", "bot_name"}, cfg.extraHTTPServerAttrKeys)
+}

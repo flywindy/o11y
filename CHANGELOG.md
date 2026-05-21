@@ -15,6 +15,18 @@ adopters can plan their upgrades.
 
 ### Added
 
+- **`WithExtraHTTPServerAttributeKeys(keys ...string)`** to promote
+  caller-controlled attributes (e.g. `app_name`, `bot_name`) onto the
+  SDK-managed `http.server.request.duration` series. By default that view
+  keeps only `http.request.method`, `http.route`, and
+  `http.response.status_code` to bound cardinality; any other attributes
+  attached via `o11ygin.WithMetricAttributesFn` / `otelhttp` were silently
+  dropped from the exported series. The option appends user-supplied keys
+  to the view's allow-list so they participate in PromQL aggregations.
+  Cardinality is the caller's responsibility — prefer enumerable values
+  with bounded keyspaces. Has no effect when `WithDisableDefaultViews` is
+  set.
+
 - **Per-pillar feature toggles** for progressive SDK adoption:
   `WithTraceEnabled(bool)`, `WithMetricsEnabled(bool)`, `WithLogEnabled(bool)`,
   and `WithProfilingEnabled(bool)`. Trace, metrics, and log default to `true`
@@ -170,6 +182,23 @@ such as `Shutdown` and concrete-only mutation hooks remain owned by
 
 ### Fixed
 
+- Suppress `exemplar labels have N runes, exceeding the limit of 128` noise
+  on the SDK-managed HTTP histograms. The OTel SDK routes attributes
+  dropped by a view's `AttributeFilter` into the exemplar's
+  `FilteredAttributes`; the Prometheus exporter then asks `client_golang`
+  to build an exemplar from `trace_id` + `span_id` plus every filtered
+  attribute, and `client_golang` rejects exemplars whose combined label
+  runes exceed the OpenMetrics cap of 128. With typical otelhttp /
+  otelgin default attributes (`server.address`, `url.scheme`,
+  `network.protocol.*`, `user_agent.original`) the rejection fired on
+  every scrape and surfaced via `otel.Handle` as a recurring error log.
+  The SDK now wires a thin `ExemplarReservoirProviderSelector` wrapper on
+  `http.server.request.duration` and `http.client.request.duration` that
+  drops `FilteredAttributes` before the exemplar is offered: exemplars
+  retain `trace_id` + `span_id` (so trace-to-metric linking in Tempo /
+  Grafana still works) but no longer carry the verbose attribute payload
+  that overflows the rune cap. Custom user views and AP-defined metrics
+  are unaffected.
 - Test sleep removed: `internal/metrics` `TestInitMeter_HappyPath` no longer
   uses `time.Sleep(100ms)` for runtime-metrics readiness; it polls via
   `assert.Eventually` instead.

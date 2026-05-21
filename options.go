@@ -46,13 +46,14 @@ type Config struct {
 	profilingAuthHeaders map[string]string
 
 	// Metrics
-	metricsAddr         string
-	metricsOTLPEndpoint string // non-empty → OTLP push instead of Prometheus pull
-	runtimeMetrics      bool
-	histogramBuckets    []float64
-	namespace           string
-	disableDefaultViews bool
-	maxUniqueRoutes     int
+	metricsAddr             string
+	metricsOTLPEndpoint     string // non-empty → OTLP push instead of Prometheus pull
+	runtimeMetrics          bool
+	histogramBuckets        []float64
+	namespace               string
+	disableDefaultViews     bool
+	maxUniqueRoutes         int
+	extraHTTPServerAttrKeys []string
 
 	// Feature toggles. Trace, metrics, and log default to true; profiling
 	// defaults to false because it is an opt-in fourth signal. All four can
@@ -283,6 +284,34 @@ func WithProfilingEnabled(enabled bool) Option {
 func WithDisableDefaultViews() Option {
 	return func(c *Config) {
 		c.disableDefaultViews = true
+	}
+}
+
+// WithExtraHTTPServerAttributeKeys extends the SDK-managed allow-list on the
+// http.server.request.duration metric view. By default that view keeps only
+// http.request.method, http.route, and http.response.status_code to bound
+// cardinality; any other attributes attached to the record (for example via
+// o11ygin.WithMetricAttributesFn or otelhttp's WithMetricAttributesFn) are
+// dropped from the exported series and end up as exemplar labels, where the
+// OpenMetrics 128-rune cap quickly trips. Use this option to promote a small
+// set of caller-controlled keys (e.g. "app_name", "bot_name") onto the
+// series itself so they participate in PromQL aggregations.
+//
+// Cardinality is the caller's responsibility: every distinct value combination
+// multiplies the existing route×method×status series count. Prefer keys whose
+// value space is enumerable and small (tens, not thousands).
+//
+// Calls accumulate; duplicate keys are de-duplicated by the underlying view
+// filter. Has no effect when WithDisableDefaultViews is set, because no
+// SDK-managed view exists to extend.
+func WithExtraHTTPServerAttributeKeys(keys ...string) Option {
+	return func(c *Config) {
+		for _, k := range keys {
+			if k == "" {
+				continue
+			}
+			c.extraHTTPServerAttrKeys = append(c.extraHTTPServerAttrKeys, k)
+		}
 	}
 }
 

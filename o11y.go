@@ -222,14 +222,15 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 
 	if cfg.metricsEnabled {
 		mp, closer, initErr := metrics.InitMeter(ctx, metrics.Config{
-			Resource:            res,
-			MetricsOTLPEndpoint: cfg.metricsOTLPEndpoint,
-			OTLPHeaders:         cfg.otlpHeaders,
-			MetricsAddr:         cfg.metricsAddr,
-			RuntimeMetrics:      cfg.runtimeMetrics,
-			HistogramBuckets:    cfg.histogramBuckets,
-			DisableDefaultViews: cfg.disableDefaultViews,
-			MaxUniqueRoutes:     cfg.maxUniqueRoutes,
+			Resource:                res,
+			MetricsOTLPEndpoint:     cfg.metricsOTLPEndpoint,
+			OTLPHeaders:             cfg.otlpHeaders,
+			MetricsAddr:             cfg.metricsAddr,
+			RuntimeMetrics:          cfg.runtimeMetrics,
+			HistogramBuckets:        cfg.histogramBuckets,
+			DisableDefaultViews:     cfg.disableDefaultViews,
+			MaxUniqueRoutes:         cfg.maxUniqueRoutes,
+			ExtraHTTPServerAttrKeys: cfg.extraHTTPServerAttrKeys,
 		})
 		if initErr != nil {
 			_ = tpShutdown(ctx)
