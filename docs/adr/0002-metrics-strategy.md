@@ -101,6 +101,12 @@ a distinct series. The SDK enforces layered protection:
    `"other"` where route labels still reach export.
 4. The OTel SDK cardinality limit protects in-process aggregation memory when an
    instrument still records too many distinct attribute sets.
+5. Callers may extend the `http.server.request.duration` allow-list via
+   `WithExtraHTTPServerAttributeKeys(...)` to keep additional caller-controlled
+   dimensions (e.g. `app_name`, `bot_name`) on the series. Extending the
+   allow-list bypasses layer (2) for the listed keys, so the caller owns
+   the cardinality budget for them and must restrict values to an
+   enumerable, bounded keyspace.
 
 **Any new label dimension that can grow without bound must apply equivalent protection.**
 User IDs, request IDs, trace IDs, and similar high-cardinality values must never appear as
