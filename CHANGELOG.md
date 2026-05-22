@@ -23,13 +23,19 @@ adopters can plan their upgrades.
   attached via `o11ygin.WithMetricAttributesFn` / `otelhttp` were silently
   dropped from the exported series. The option appends user-supplied keys
   to the view's allow-list so they participate in PromQL aggregations.
-  Keys that collide with built-in Prometheus label names after
-  normalization (`.` → `_`) — for example `"http_route"` or
-  `"http.route"`, both of which would shadow the SDK's `http_route`
-  label and silently merge two attribute values into one exported label
-  — are dropped at startup with a structured `WARN` log instead of
-  corrupting the series. Cardinality is the caller's responsibility —
-  prefer enumerable values with bounded keyspaces. Has no effect when
+  Keys are checked at startup against the full Prometheus label-name
+  normalization the otelprom exporter applies (non-alphanumeric →
+  `_`, runs collapsed, leading digits prefixed with `key_`). The SDK
+  drops — with a structured `WARN` log — any key that, after
+  normalization, collides with a built-in SDK label (e.g.
+  `"http_route"`, `"http.route"`, `"http-route"`, `"http__route"` all
+  shadow the existing `http_route`), collides with another
+  caller-supplied key (e.g. `"app.name"` + `"app_name"`), or
+  normalizes to an invalid label name. Accepting either kind of
+  collision would silently merge two attribute values into one
+  exported label and corrupt PromQL grouping for that dimension.
+  Cardinality is the caller's responsibility — prefer enumerable
+  values with bounded keyspaces. Has no effect when
   `WithDisableDefaultViews` is set.
 
 - **Per-pillar feature toggles** for progressive SDK adoption:

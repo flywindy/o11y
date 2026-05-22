@@ -302,54 +302,109 @@ func WithDisableDefaultViews() Option {
 // multiplies the existing route×method×status series count. Prefer keys whose
 // value space is enumerable and small (tens, not thousands).
 //
-// Keys that collide with built-in Prometheus label names after normalization
-// (`.` → `_`) are dropped and a startup warning is emitted. For example
-// `"http_route"` and `"http.route"` both normalize to `http_route` which is
-// already exported by the SDK; accepting them would silently corrupt route
-// dimensions because two attribute values would be merged into the same
-// Prometheus label.
+// Keys are checked against the otelprom Prometheus label-name normalization
+// (non-alphanumeric → '_', runs collapsed, leading digits prefixed with
+// "key_"). The SDK drops — with a startup WARN log — any key that, after
+// normalization:
 //
-// Calls accumulate; duplicate keys are de-duplicated by the underlying view
-// filter. Has no effect when WithDisableDefaultViews is set, because no
-// SDK-managed view exists to extend.
+//   - matches a built-in label the SDK already exports (e.g. "http_route",
+//     "service_name"), or
+//   - matches another caller-supplied key from this or a prior
+//     WithExtraHTTPServerAttributeKeys call (e.g. "app.name" and "app_name"
+//     both normalize to "app_name"), or
+//   - normalizes to the empty string.
+//
+// Accepting either form of collision would silently merge two attribute
+// values into a single Prometheus label, corrupting PromQL grouping for
+// that dimension.
+//
+// Calls accumulate. Has no effect when WithDisableDefaultViews is set,
+// because no SDK-managed view exists to extend.
 func WithExtraHTTPServerAttributeKeys(keys ...string) Option {
 	return func(c *Config) {
+		seen := make(map[string]string, len(reservedHTTPServerPromLabels)+len(c.extraHTTPServerAttrKeys)+len(keys))
+		for _, builtin := range reservedHTTPServerPromLabels {
+			seen[builtin] = "<built-in SDK label>"
+		}
+		for _, prev := range c.extraHTTPServerAttrKeys {
+			seen[normalizePrometheusLabelName(prev)] = prev
+		}
 		for _, k := range keys {
 			if k == "" {
 				continue
 			}
-			if reserved, builtin := reservedPrometheusLabel(k); reserved {
+			norm := normalizePrometheusLabelName(k)
+			if norm == "" || norm == "_" {
 				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
-					"WithExtraHTTPServerAttributeKeys: key %q collides with built-in Prometheus label %q after normalization; dropping to prevent silent label-value merging",
-					k, builtin,
+					"WithExtraHTTPServerAttributeKeys: key %q normalizes to an invalid Prometheus label name; dropping",
+					k,
 				))
 				continue
 			}
+			if existing, ok := seen[norm]; ok {
+				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
+					"WithExtraHTTPServerAttributeKeys: key %q collides with %s (both normalize to Prometheus label %q); dropping to prevent silent label-value merging",
+					k, existing, norm,
+				))
+				continue
+			}
+			seen[norm] = fmt.Sprintf("%q", k)
 			c.extraHTTPServerAttrKeys = append(c.extraHTTPServerAttrKeys, k)
 		}
 	}
 }
 
-// reservedPrometheusLabel reports whether key, after Prometheus name
-// normalization (replacing '.' with '_'), collides with a label that the SDK
-// already exports on every series — either as a view-allowed HTTP semconv
-// attribute or as a resource-promoted constant label. Callers must not be
-// allowed to silently shadow these because otelprom would merge two distinct
-// attribute values into the same exported label.
-func reservedPrometheusLabel(key string) (bool, string) {
-	norm := strings.ReplaceAll(key, ".", "_")
-	switch norm {
-	case
-		"http_request_method",
-		"http_route",
-		"http_response_status_code",
-		"service_name",
-		"service_namespace",
-		"service_version",
-		"deployment_environment_name":
-		return true, norm
+// reservedHTTPServerPromLabels lists the Prometheus label names the SDK
+// already exports on http_server_request_duration_* series: three from the
+// view allow-list plus the four resource attributes promoted to constant
+// labels in internal/metrics.initPrometheus. They are stored in their
+// post-normalization form so the equality check is just a map lookup.
+var reservedHTTPServerPromLabels = []string{
+	"http_request_method",
+	"http_route",
+	"http_response_status_code",
+	"service_name",
+	"service_namespace",
+	"service_version",
+	"deployment_environment_name",
+}
+
+// normalizePrometheusLabelName mirrors the classic non-UTF8 Prometheus label
+// normalization that otelprom (via github.com/prometheus/otlptranslator)
+// applies on export: any rune outside [a-zA-Z0-9] becomes '_', adjacent
+// underscores collapse to a single one, and a leading digit is prefixed
+// with "key_" so the result is a syntactically valid Prometheus label.
+//
+// Reproducing the same rules at option-time is what lets us detect
+// collisions before they reach the exporter, where two distinct attribute
+// values would otherwise be silently merged into one label value.
+func normalizePrometheusLabelName(key string) string {
+	if key == "" {
+		return ""
 	}
-	return false, ""
+	var b strings.Builder
+	b.Grow(len(key))
+	prevUnderscore := false
+	for _, r := range key {
+		valid := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+		if valid {
+			b.WriteRune(r)
+			prevUnderscore = false
+			continue
+		}
+		if !prevUnderscore {
+			b.WriteRune('_')
+			prevUnderscore = true
+		}
+	}
+	out := b.String()
+	if out == "" {
+		return ""
+	}
+	if first := out[0]; first >= '0' && first <= '9' {
+		out = "key_" + out
+	}
+	return out
 }
 
 // WithMaxUniqueRoutes sets the distinct http.route export cap. Values <= 0
