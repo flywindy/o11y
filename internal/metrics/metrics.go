@@ -125,11 +125,12 @@ func defaultViews(cfg Config) []sdkmetric.View {
 	histogram := sdkmetric.AggregationExplicitBucketHistogram{
 		Boundaries: cfg.HistogramBuckets,
 	}
-	serverKeys := []attribute.Key{
+	serverKeys := make([]attribute.Key, 0, 3+len(cfg.ExtraHTTPServerAttrKeys))
+	serverKeys = append(serverKeys,
 		semconv.HTTPRequestMethodKey,
 		semconv.HTTPRouteKey,
 		semconv.HTTPResponseStatusCodeKey,
-	}
+	)
 	for _, k := range cfg.ExtraHTTPServerAttrKeys {
 		serverKeys = append(serverKeys, attribute.Key(k))
 	}
