@@ -15,6 +15,27 @@ adopters can plan their upgrades.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Breaking Changes (Migration Guide)
+
+### Fixed
+
+### Security
+
+---
+
+## [0.1.0] - 2026-05-22
+
+First tagged release. Subsequent minor versions may still introduce breaking
+changes per the pre-1.0 policy noted above.
+
+### Added
+
 - **`WithExtraHTTPServerAttributeKeys(keys ...string)`** to promote
   caller-controlled attributes (e.g. `app_name`, `bot_name`) onto the
   SDK-managed `http.server.request.duration` series. By default that view
