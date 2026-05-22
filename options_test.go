@@ -33,6 +33,18 @@ func TestParseBoolEnv_ValidFalse(t *testing.T) {
 	}
 }
 
+func TestWithExemplars_OverridesDefault(t *testing.T) {
+	// Default config carries exemplars=true so trace-to-metric linkage works
+	// out of the box; WithExemplars(false) is the documented opt-out for
+	// services migrating dashboards that hardcode integer le boundaries.
+	cfg := defaultConfig()
+	assert.True(t, cfg.exemplars, "default must be true")
+	WithExemplars(false)(cfg)
+	assert.False(t, cfg.exemplars, "WithExemplars(false) must flip the flag")
+	WithExemplars(true)(cfg)
+	assert.True(t, cfg.exemplars, "WithExemplars(true) must restore the flag")
+}
+
 func TestParseBoolEnv_InvalidValue_FallsBackToDefault(t *testing.T) {
 	for _, bad := range []string{"yes", "no", "on", "off", "enabled", "2"} {
 		t.Setenv("O11Y_TEST_BOOL", bad)

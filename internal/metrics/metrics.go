@@ -78,6 +78,13 @@ type Config struct {
 	// OpenMetrics 128-rune exemplar-label cap. Cardinality is the caller's
 	// responsibility.
 	ExtraHTTPServerAttrKeys []string
+
+	// Exemplars controls whether the Prometheus pull handler enables
+	// OpenMetrics content negotiation, which is the only path through which
+	// otelprom emits per-bucket exemplars. Set false to suppress the
+	// `le="1"` → `le="1.0"` bucket-boundary format change that OpenMetrics
+	// introduces, at the cost of disabling trace-to-metric linkage.
+	Exemplars bool
 }
 
 // Closer is a function that shuts down a component. For the Prometheus path it
@@ -224,20 +231,15 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 	mux := http.NewServeMux()
 	// EnableOpenMetrics lets the handler content-negotiate to OpenMetrics
 	// format (Accept: application/openmetrics-text). That is the only
-	// exposition format that carries per-bucket exemplars, so without this
-	// flag Prometheus would scrape the plain text format and the
-	// trace-to-metric linkage in Grafana would silently be empty. Both
-	// the SDK-managed HTTP histograms and any caller-recorded histograms
-	// inherit exemplar export from a single negotiation.
-	// EnableOpenMetrics lets the handler content-negotiate to OpenMetrics
-	// format (Accept: application/openmetrics-text). That is the only
-	// exposition format that carries per-bucket exemplars, so without this
-	// flag Prometheus would scrape the plain text format and the
-	// trace-to-metric linkage in Grafana would silently be empty. Both
-	// the SDK-managed HTTP histograms and any caller-recorded histograms
-	// inherit exemplar export from a single negotiation.
+	// exposition format otelprom renders per-bucket exemplars in, so without
+	// it the trace-to-metric linkage in Grafana / Tempo stays empty for both
+	// SDK-managed and caller-defined histograms. OpenMetrics also normalises
+	// integer histogram bucket boundaries to a `.0` suffix on the rendered
+	// `le` label (e.g. `le="1"` → `le="1.0"`); callers whose dashboards or
+	// recording rules cannot tolerate that one-time series-identity change
+	// can suppress the renegotiation via WithExemplars(false).
 	mux.Handle("/metrics", promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{
-		EnableOpenMetrics: true,
+		EnableOpenMetrics: cfg.Exemplars,
 	}))
 	server := &http.Server{
 		Handler:           mux,

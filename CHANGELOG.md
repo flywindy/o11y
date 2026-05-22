@@ -15,6 +15,13 @@ adopters can plan their upgrades.
 
 ### Added
 
+- `WithExemplars(bool)` controls OpenMetrics content negotiation on the
+  Prometheus pull `/metrics` handler. Defaults to `true` so per-bucket
+  exemplars carrying `trace_id` / `span_id` flow through to Grafana / Tempo
+  by default. Set `false` only as a temporary mitigation for services
+  whose dashboards / recording rules / alert rules hardcode integer
+  histogram bucket boundaries — see the Breaking Changes entry below.
+
 ### Changed
 
 ### Deprecated
@@ -23,21 +30,54 @@ adopters can plan their upgrades.
 
 ### Breaking Changes (Migration Guide)
 
+- The default Prometheus pull handler now content-negotiates to the
+  OpenMetrics exposition format when scrapers advertise it (which real
+  Prometheus does on every scrape). OpenMetrics is the only format
+  otelprom emits per-bucket exemplars in, so this is what makes
+  trace-to-metric linkage actually work — previously the SDK built
+  exemplars in memory and discarded them at serialization time, leaving
+  Prometheus's exemplar store empty regardless of
+  `--enable-feature=exemplar-storage`.
+
+  The renegotiation also normalises integer histogram bucket boundaries
+  on the rendered `le` label. The underlying `float64` values are
+  unchanged, but the text differs:
+
+  | Prometheus text format (pre-v0.2) | OpenMetrics (v0.2+, default) |
+  |---|---|
+  | `le="1"` | `le="1.0"` |
+  | `le="5"` | `le="5.0"` |
+  | `le="10"` | `le="10.0"` |
+
+  Queries that hardcode the integer form silently stop matching:
+
+  - `http_server_request_duration_seconds_bucket{le="1"}` → no series
+  - `histogram_quantile(0.95, sum by (le) (rate(..._bucket[5m])))` →
+    unaffected (aggregates across all buckets)
+
+  **Migration**: audit dashboards, recording rules, and alert rules for
+  literal integer `le` values that match the SDK's default bucket set
+  (`1`, `5`, `10`). Update to the `.0` form. If you cannot stage the
+  update before rolling the SDK, set `o11y.WithExemplars(false)` on the
+  affected service to keep the handler on plain Prometheus format and
+  preserve the integer `le` labels; trace-to-metric exemplars stay
+  disabled until the option is removed.
+
 ### Fixed
 
 - Enable OpenMetrics format on the Prometheus pull `/metrics` handler so
-  exemplars actually reach scrapers. `promhttp.HandlerFor` used the default
-  `HandlerOpts{}`, which leaves `EnableOpenMetrics` off; content negotiation
-  then always returned the plain Prometheus exposition format, and that
-  format has no syntax for per-bucket exemplars. As a result, even with
-  Prometheus running `--enable-feature=exemplar-storage` and a sampled trace
-  context attached to the measurement, exemplar storage stayed empty and
-  Grafana's histogram-to-trace links were dead. Setting
-  `EnableOpenMetrics: true` lets the handler respond in
-  `application/openmetrics-text` when the scraper advertises it (real
-  Prometheus does by default) and fall back to `text/plain` otherwise, so
-  no existing scrape integrations break. SDK-managed HTTP histograms and
-  caller-defined histograms both gain working exemplars.
+  exemplars actually reach scrapers. `promhttp.HandlerFor` used the
+  default `HandlerOpts{}`, which leaves `EnableOpenMetrics` off; content
+  negotiation then always returned the plain Prometheus exposition
+  format, and that format has no syntax for per-bucket exemplars. As a
+  result, even with Prometheus running
+  `--enable-feature=exemplar-storage` and a sampled trace context
+  attached to the measurement, exemplar storage stayed empty and
+  Grafana's histogram-to-trace links were dead. The new
+  `WithExemplars(bool)` option (default `true`) wires
+  `EnableOpenMetrics` so SDK-managed HTTP histograms and caller-defined
+  histograms both gain working exemplars; the bucket-boundary
+  serialisation change is documented under Breaking Changes.
 
 ### Security
 

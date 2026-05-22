@@ -231,6 +231,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 			DisableDefaultViews:     cfg.disableDefaultViews,
 			MaxUniqueRoutes:         cfg.maxUniqueRoutes,
 			ExtraHTTPServerAttrKeys: cfg.extraHTTPServerAttrKeys,
+			Exemplars:               cfg.exemplars,
 		})
 		if initErr != nil {
 			_ = tpShutdown(ctx)
