@@ -17,7 +17,15 @@ adopters can plan their upgrades.
 
 ### Changed
 
+### Deprecated
+
+### Removed
+
+### Breaking Changes (Migration Guide)
+
 ### Fixed
+
+### Security
 
 ---
 
