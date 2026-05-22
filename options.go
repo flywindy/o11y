@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // DefaultMetricsAddr is the default listen address for the built-in
@@ -46,13 +47,14 @@ type Config struct {
 	profilingAuthHeaders map[string]string
 
 	// Metrics
-	metricsAddr         string
-	metricsOTLPEndpoint string // non-empty → OTLP push instead of Prometheus pull
-	runtimeMetrics      bool
-	histogramBuckets    []float64
-	namespace           string
-	disableDefaultViews bool
-	maxUniqueRoutes     int
+	metricsAddr             string
+	metricsOTLPEndpoint     string // non-empty → OTLP push instead of Prometheus pull
+	runtimeMetrics          bool
+	histogramBuckets        []float64
+	namespace               string
+	disableDefaultViews     bool
+	maxUniqueRoutes         int
+	extraHTTPServerAttrKeys []string
 
 	// Feature toggles. Trace, metrics, and log default to true; profiling
 	// defaults to false because it is an opt-in fourth signal. All four can
@@ -284,6 +286,136 @@ func WithDisableDefaultViews() Option {
 	return func(c *Config) {
 		c.disableDefaultViews = true
 	}
+}
+
+// WithExtraHTTPServerAttributeKeys extends the SDK-managed allow-list on the
+// http.server.request.duration metric view. By default that view keeps only
+// http.request.method, http.route, and http.response.status_code to bound
+// cardinality; any other attributes attached to the record (for example via
+// o11ygin.WithMetricAttributesFn or otelhttp's WithMetricAttributesFn) are
+// dropped from the exported series and end up as exemplar labels, where the
+// OpenMetrics 128-rune cap quickly trips. Use this option to promote a small
+// set of caller-controlled keys (e.g. "app_name", "bot_name") onto the
+// series itself so they participate in PromQL aggregations.
+//
+// Cardinality is the caller's responsibility: every distinct value combination
+// multiplies the existing route×method×status series count. Prefer keys whose
+// value space is enumerable and small (tens, not thousands).
+//
+// Keys are checked against the otelprom Prometheus label-name normalization
+// (non-alphanumeric → '_', runs collapsed, leading digits prefixed with
+// "key_"). The SDK drops — with a startup WARN log — any key that, after
+// normalization:
+//
+//   - matches a built-in label the SDK already exports (the view-allowed
+//     HTTP semconv keys, the four resource constants, and the three
+//     otelprom scope labels otel_scope_name / _version / _schema_url), or
+//   - matches another caller-supplied key from this or a prior
+//     WithExtraHTTPServerAttributeKeys call (e.g. "app.name" and "app_name"
+//     both normalize to "app_name"), or
+//   - normalizes to the empty string.
+//
+// Accepting either form of collision would silently merge two attribute
+// values into a single Prometheus label, corrupting PromQL grouping for
+// that dimension.
+//
+// Calls accumulate. Has no effect when WithDisableDefaultViews is set,
+// because no SDK-managed view exists to extend.
+func WithExtraHTTPServerAttributeKeys(keys ...string) Option {
+	return func(c *Config) {
+		seen := make(map[string]string, len(reservedHTTPServerPromLabels)+len(c.extraHTTPServerAttrKeys)+len(keys))
+		for _, builtin := range reservedHTTPServerPromLabels {
+			seen[builtin] = "<built-in SDK label>"
+		}
+		for _, prev := range c.extraHTTPServerAttrKeys {
+			seen[normalizePrometheusLabelName(prev)] = prev
+		}
+		for _, k := range keys {
+			if k == "" {
+				continue
+			}
+			norm := normalizePrometheusLabelName(k)
+			if norm == "" || norm == "_" {
+				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
+					"WithExtraHTTPServerAttributeKeys: key %q normalizes to an invalid Prometheus label name; dropping",
+					k,
+				))
+				continue
+			}
+			if existing, ok := seen[norm]; ok {
+				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
+					"WithExtraHTTPServerAttributeKeys: key %q collides with %s (both normalize to Prometheus label %q); dropping to prevent silent label-value merging",
+					k, existing, norm,
+				))
+				continue
+			}
+			seen[norm] = fmt.Sprintf("%q", k)
+			c.extraHTTPServerAttrKeys = append(c.extraHTTPServerAttrKeys, k)
+		}
+	}
+}
+
+// reservedHTTPServerPromLabels lists the Prometheus label names the SDK
+// already exports on http_server_request_duration_* series:
+//
+//   - three from the view allow-list: http_request_method, http_route,
+//     http_response_status_code;
+//   - four resource attributes promoted to constant labels by
+//     internal/metrics.initPrometheus (service_*, deployment_*);
+//   - three scope labels otelprom adds to every series unless WithoutScopeInfo
+//     is set: otel_scope_name, otel_scope_version, otel_scope_schema_url.
+//
+// They are stored in their post-normalization form so the equality check is
+// just a map lookup.
+var reservedHTTPServerPromLabels = []string{
+	"http_request_method",
+	"http_route",
+	"http_response_status_code",
+	"service_name",
+	"service_namespace",
+	"service_version",
+	"deployment_environment_name",
+	"otel_scope_name",
+	"otel_scope_version",
+	"otel_scope_schema_url",
+}
+
+// normalizePrometheusLabelName mirrors the classic non-UTF8 Prometheus label
+// normalization that otelprom (via github.com/prometheus/otlptranslator)
+// applies on export: any rune outside [a-zA-Z0-9] becomes '_', adjacent
+// underscores collapse to a single one, and a leading digit is prefixed
+// with "key_" so the result is a syntactically valid Prometheus label.
+//
+// Reproducing the same rules at option-time is what lets us detect
+// collisions before they reach the exporter, where two distinct attribute
+// values would otherwise be silently merged into one label value.
+func normalizePrometheusLabelName(key string) string {
+	if key == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(key))
+	prevUnderscore := false
+	for _, r := range key {
+		valid := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+		if valid {
+			b.WriteRune(r)
+			prevUnderscore = false
+			continue
+		}
+		if !prevUnderscore {
+			b.WriteRune('_')
+			prevUnderscore = true
+		}
+	}
+	out := b.String()
+	if out == "" {
+		return ""
+	}
+	if first := out[0]; first >= '0' && first <= '9' {
+		out = "key_" + out
+	}
+	return out
 }
 
 // WithMaxUniqueRoutes sets the distinct http.route export cap. Values <= 0

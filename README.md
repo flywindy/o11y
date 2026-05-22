@@ -160,6 +160,7 @@ _Metrics:_
 | `WithHistogramBuckets([]float64)` | SLO defaults | Override HTTP latency histogram boundaries; see `DefaultLatencyBuckets()` |
 | `WithDisableDefaultViews()` | off | Disable SDK-managed HTTP metric label allowlists and bucket views |
 | `WithMaxUniqueRoutes(n)` | `1000` | Cap exported distinct `http.route` values and derive the SDK aggregation cardinality budget |
+| `WithExtraHTTPServerAttributeKeys(keys ...string)` | `nil` | Promote caller-controlled attribute keys (e.g. `app_name`, `bot_name`) onto the SDK-managed `http.server.request.duration` series. Pair with `o11ygin.WithMetricAttributesFn` / `otelhttp` equivalent to inject the values per request. Cardinality is the caller's responsibility — use enumerable, bounded keyspaces |
 
 _Logging:_
 

@@ -169,6 +169,14 @@ If `otelgin` emits attribute keys outside the allowlist (`net.peer.*`,
 `url.full`), they are filtered by the view at the SDK level. No work
 on this package's side.
 
+Callers that need additional caller-controlled dimensions on the
+series (e.g. `app_name`, `bot_name` for multi-tenant API gateways) can
+extend the allowlist via `o11y.WithExtraHTTPServerAttributeKeys(...)`
+and inject the values per request through
+`o11ygin.WithMetricAttributesFn`. Cardinality of the new keys is the
+caller's responsibility — the SDK does not separately cap them, so
+prefer values drawn from an enumerable, bounded keyspace.
+
 ### 4. Cardinality at `http.route` is bounded by gin's route table
 
 `otelgin` populates `http.route` from `c.FullPath()`, which is the

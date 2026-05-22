@@ -70,6 +70,14 @@ type Config struct {
 	HistogramBuckets    []float64
 	DisableDefaultViews bool
 	MaxUniqueRoutes     int
+
+	// ExtraHTTPServerAttrKeys augments the SDK-managed attribute allow-list
+	// for the http.server.request.duration view. Promoting caller-controlled
+	// keys onto the exported series (rather than letting them fall through to
+	// the exemplar) keeps PromQL aggregations meaningful and avoids the
+	// OpenMetrics 128-rune exemplar-label cap. Cardinality is the caller's
+	// responsibility.
+	ExtraHTTPServerAttrKeys []string
 }
 
 // Closer is a function that shuts down a component. For the Prometheus path it
@@ -117,16 +125,22 @@ func defaultViews(cfg Config) []sdkmetric.View {
 	histogram := sdkmetric.AggregationExplicitBucketHistogram{
 		Boundaries: cfg.HistogramBuckets,
 	}
+	serverKeys := make([]attribute.Key, 0, 3+len(cfg.ExtraHTTPServerAttrKeys))
+	serverKeys = append(serverKeys,
+		semconv.HTTPRequestMethodKey,
+		semconv.HTTPRouteKey,
+		semconv.HTTPResponseStatusCodeKey,
+	)
+	for _, k := range cfg.ExtraHTTPServerAttrKeys {
+		serverKeys = append(serverKeys, attribute.Key(k))
+	}
 	return []sdkmetric.View{
 		sdkmetric.NewView(
 			sdkmetric.Instrument{Name: "http.server.request.duration"},
 			sdkmetric.Stream{
-				Aggregation: histogram,
-				AttributeFilter: attribute.NewAllowKeysFilter(
-					semconv.HTTPRequestMethodKey,
-					semconv.HTTPRouteKey,
-					semconv.HTTPResponseStatusCodeKey,
-				),
+				Aggregation:                       histogram,
+				AttributeFilter:                   attribute.NewAllowKeysFilter(serverKeys...),
+				ExemplarReservoirProviderSelector: dropFilteredAttrsExemplarSelector,
 			},
 		),
 		sdkmetric.NewView(
@@ -140,6 +154,7 @@ func defaultViews(cfg Config) []sdkmetric.View {
 					semconv.ServerPortKey,
 					semconv.ErrorTypeKey,
 				),
+				ExemplarReservoirProviderSelector: dropFilteredAttrsExemplarSelector,
 			},
 		),
 	}
