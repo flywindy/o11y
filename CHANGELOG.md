@@ -23,9 +23,14 @@ adopters can plan their upgrades.
   attached via `o11ygin.WithMetricAttributesFn` / `otelhttp` were silently
   dropped from the exported series. The option appends user-supplied keys
   to the view's allow-list so they participate in PromQL aggregations.
-  Cardinality is the caller's responsibility — prefer enumerable values
-  with bounded keyspaces. Has no effect when `WithDisableDefaultViews` is
-  set.
+  Keys that collide with built-in Prometheus label names after
+  normalization (`.` → `_`) — for example `"http_route"` or
+  `"http.route"`, both of which would shadow the SDK's `http_route`
+  label and silently merge two attribute values into one exported label
+  — are dropped at startup with a structured `WARN` log instead of
+  corrupting the series. Cardinality is the caller's responsibility —
+  prefer enumerable values with bounded keyspaces. Has no effect when
+  `WithDisableDefaultViews` is set.
 
 - **Per-pillar feature toggles** for progressive SDK adoption:
   `WithTraceEnabled(bool)`, `WithMetricsEnabled(bool)`, `WithLogEnabled(bool)`,

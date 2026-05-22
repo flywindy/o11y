@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // DefaultMetricsAddr is the default listen address for the built-in
@@ -301,6 +302,13 @@ func WithDisableDefaultViews() Option {
 // multiplies the existing route×method×status series count. Prefer keys whose
 // value space is enumerable and small (tens, not thousands).
 //
+// Keys that collide with built-in Prometheus label names after normalization
+// (`.` → `_`) are dropped and a startup warning is emitted. For example
+// `"http_route"` and `"http.route"` both normalize to `http_route` which is
+// already exported by the SDK; accepting them would silently corrupt route
+// dimensions because two attribute values would be merged into the same
+// Prometheus label.
+//
 // Calls accumulate; duplicate keys are de-duplicated by the underlying view
 // filter. Has no effect when WithDisableDefaultViews is set, because no
 // SDK-managed view exists to extend.
@@ -310,9 +318,38 @@ func WithExtraHTTPServerAttributeKeys(keys ...string) Option {
 			if k == "" {
 				continue
 			}
+			if reserved, builtin := reservedPrometheusLabel(k); reserved {
+				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
+					"WithExtraHTTPServerAttributeKeys: key %q collides with built-in Prometheus label %q after normalization; dropping to prevent silent label-value merging",
+					k, builtin,
+				))
+				continue
+			}
 			c.extraHTTPServerAttrKeys = append(c.extraHTTPServerAttrKeys, k)
 		}
 	}
+}
+
+// reservedPrometheusLabel reports whether key, after Prometheus name
+// normalization (replacing '.' with '_'), collides with a label that the SDK
+// already exports on every series — either as a view-allowed HTTP semconv
+// attribute or as a resource-promoted constant label. Callers must not be
+// allowed to silently shadow these because otelprom would merge two distinct
+// attribute values into the same exported label.
+func reservedPrometheusLabel(key string) (bool, string) {
+	norm := strings.ReplaceAll(key, ".", "_")
+	switch norm {
+	case
+		"http_request_method",
+		"http_route",
+		"http_response_status_code",
+		"service_name",
+		"service_namespace",
+		"service_version",
+		"deployment_environment_name":
+		return true, norm
+	}
+	return false, ""
 }
 
 // WithMaxUniqueRoutes sets the distinct http.route export cap. Values <= 0

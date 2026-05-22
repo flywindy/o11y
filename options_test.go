@@ -51,4 +51,38 @@ func TestWithExtraHTTPServerAttributeKeys_AccumulatesAndSkipsEmpty(t *testing.T)
 	WithExtraHTTPServerAttributeKeys("bot_name")(cfg)
 	WithExtraHTTPServerAttributeKeys()(cfg)
 	assert.Equal(t, []string{"app_name", "bot_name"}, cfg.extraHTTPServerAttrKeys)
+	assert.Empty(t, cfg.initWarnings, "valid keys should not emit warnings")
+}
+
+func TestWithExtraHTTPServerAttributeKeys_RejectsReservedCollisions(t *testing.T) {
+	// Both dot and underscore forms normalize to the same Prometheus label
+	// name; accepting them would silently merge two attribute values into
+	// the same exported label and corrupt PromQL grouping.
+	colliders := []struct {
+		input    string
+		expected string
+	}{
+		{"http_route", "http_route"},
+		{"http.route", "http_route"},
+		{"http_request_method", "http_request_method"},
+		{"http.request.method", "http_request_method"},
+		{"http_response_status_code", "http_response_status_code"},
+		{"service.name", "service_name"},
+		{"service_namespace", "service_namespace"},
+		{"deployment.environment.name", "deployment_environment_name"},
+	}
+	for _, c := range colliders {
+		cfg := &Config{}
+		WithExtraHTTPServerAttributeKeys(c.input, "app_name")(cfg)
+		assert.Equal(t, []string{"app_name"}, cfg.extraHTTPServerAttrKeys,
+			"collider %q must be dropped, only non-colliding key %q kept", c.input, "app_name")
+		assert.Lenf(t, cfg.initWarnings, 1,
+			"collider %q must emit exactly one warning", c.input)
+		if len(cfg.initWarnings) == 1 {
+			assert.Contains(t, cfg.initWarnings[0], c.input,
+				"warning must echo the rejected input key")
+			assert.Contains(t, cfg.initWarnings[0], c.expected,
+				"warning must name the collided Prometheus label")
+		}
+	}
 }
