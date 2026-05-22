@@ -307,8 +307,9 @@ func WithDisableDefaultViews() Option {
 // "key_"). The SDK drops — with a startup WARN log — any key that, after
 // normalization:
 //
-//   - matches a built-in label the SDK already exports (e.g. "http_route",
-//     "service_name"), or
+//   - matches a built-in label the SDK already exports (the view-allowed
+//     HTTP semconv keys, the four resource constants, and the three
+//     otelprom scope labels otel_scope_name / _version / _schema_url), or
 //   - matches another caller-supplied key from this or a prior
 //     WithExtraHTTPServerAttributeKeys call (e.g. "app.name" and "app_name"
 //     both normalize to "app_name"), or
@@ -355,10 +356,17 @@ func WithExtraHTTPServerAttributeKeys(keys ...string) Option {
 }
 
 // reservedHTTPServerPromLabels lists the Prometheus label names the SDK
-// already exports on http_server_request_duration_* series: three from the
-// view allow-list plus the four resource attributes promoted to constant
-// labels in internal/metrics.initPrometheus. They are stored in their
-// post-normalization form so the equality check is just a map lookup.
+// already exports on http_server_request_duration_* series:
+//
+//   - three from the view allow-list: http_request_method, http_route,
+//     http_response_status_code;
+//   - four resource attributes promoted to constant labels by
+//     internal/metrics.initPrometheus (service_*, deployment_*);
+//   - three scope labels otelprom adds to every series unless WithoutScopeInfo
+//     is set: otel_scope_name, otel_scope_version, otel_scope_schema_url.
+//
+// They are stored in their post-normalization form so the equality check is
+// just a map lookup.
 var reservedHTTPServerPromLabels = []string{
 	"http_request_method",
 	"http_route",
@@ -367,6 +375,9 @@ var reservedHTTPServerPromLabels = []string{
 	"service_namespace",
 	"service_version",
 	"deployment_environment_name",
+	"otel_scope_name",
+	"otel_scope_version",
+	"otel_scope_schema_url",
 }
 
 // normalizePrometheusLabelName mirrors the classic non-UTF8 Prometheus label

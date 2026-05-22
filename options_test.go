@@ -78,6 +78,9 @@ func TestWithExtraHTTPServerAttributeKeys_RejectsReservedCollisions(t *testing.T
 		{"service_namespace", "service_namespace"},
 		{"service-version", "service_version"},
 		{"deployment.environment.name", "deployment_environment_name"},
+		{"otel.scope.name", "otel_scope_name"},
+		{"otel_scope_version", "otel_scope_version"},
+		{"otel.scope.schema_url", "otel_scope_schema_url"},
 	}
 	for _, c := range colliders {
 		cfg := &Config{}
