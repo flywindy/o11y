@@ -2,6 +2,7 @@ package metrics_test
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -31,6 +32,7 @@ func baseConfig(addr string) metrics.Config {
 		MetricsAddr:      addr,
 		RuntimeMetrics:   true,
 		HistogramBuckets: []float64{0.1, 1, 10},
+		Exemplars:        true,
 	}
 }
 
@@ -204,6 +206,153 @@ func (h *capturingErrorHandler) errors() []string {
 	out := make([]string, len(h.errs))
 	copy(out, h.errs)
 	return out
+}
+
+// TestInitMeter_OpenMetricsScrapeIncludesExemplars verifies that the
+// Prometheus pull handler content-negotiates to OpenMetrics format when the
+// scraper advertises support, and that exemplars recorded inside a sampled
+// trace context show up in the response body. This is the end-to-end signal
+// that Grafana's exemplar UI / Tempo trace-to-metric linkage will work — the
+// plain Prometheus exposition format the handler used to default to does not
+// carry exemplars at all, so scrapers got an empty exemplar store regardless
+// of `--enable-feature=exemplar-storage`.
+func TestInitMeter_OpenMetricsScrapeIncludesExemplars(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	traceID, err := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	require.NoError(t, err)
+	spanID, err := trace.SpanIDFromHex("00f067aa0ba902b7")
+	require.NoError(t, err)
+	sc := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    traceID,
+		SpanID:     spanID,
+		TraceFlags: trace.FlagsSampled,
+		Remote:     true,
+	})
+	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+
+	hist, err := mp.Meter("test").Float64Histogram("http.server.request.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	hist.Record(ctx, 0.05, metric.WithAttributes(
+		semconv.HTTPRequestMethodKey.String("POST"),
+		semconv.HTTPRoute("/api/v1/messages"),
+		semconv.HTTPResponseStatusCode(http.StatusOK),
+	))
+
+	body := scrapeOpenMetrics(t.Context(), t, addr)
+	require.Contains(t, body, "# TYPE http_server_request_duration_seconds histogram",
+		"openmetrics scrape must include the SDK histogram")
+
+	// Exemplar line shape: ..._bucket{...} <count> # {trace_id="...",span_id="..."} <value> <timestamp>
+	var exemplarLine string
+	for _, line := range strings.Split(body, "\n") {
+		if strings.Contains(line, "# {") && strings.Contains(line, "trace_id=") {
+			exemplarLine = line
+			break
+		}
+	}
+	require.NotEmptyf(t, exemplarLine,
+		"openmetrics scrape must contain at least one trace-linked exemplar; "+
+			"if missing, EnableOpenMetrics on promhttp.HandlerOpts is likely off")
+	assert.Contains(t, exemplarLine, traceID.String(), "exemplar must carry trace_id")
+	assert.Contains(t, exemplarLine, spanID.String(), "exemplar must carry span_id")
+	assert.True(t, strings.HasSuffix(strings.TrimSpace(body), "# EOF"),
+		"openmetrics format must terminate with the EOF marker; absence indicates fallback to plain Prometheus exposition format")
+}
+
+// TestInitMeter_ExemplarsDisabledSuppressesOpenMetrics verifies that
+// Exemplars=false keeps the handler on the plain Prometheus exposition
+// format (no exemplar lines, no "# EOF" sentinel, integer `le` boundaries
+// stay integer). This is the opt-out users need when migrating dashboards
+// that hardcode integer histogram bucket labels.
+func TestInitMeter_ExemplarsDisabledSuppressesOpenMetrics(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.RuntimeMetrics = false
+	cfg.Exemplars = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	sc := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    trace.TraceID{0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e, 0x47, 0x36},
+		SpanID:     trace.SpanID{0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7},
+		TraceFlags: trace.FlagsSampled,
+		Remote:     true,
+	})
+	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+
+	hist, err := mp.Meter("test").Float64Histogram("http.server.request.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	hist.Record(ctx, 0.05, metric.WithAttributes(
+		semconv.HTTPRequestMethodKey.String("GET"),
+		semconv.HTTPRoute("/x"),
+		semconv.HTTPResponseStatusCode(http.StatusOK),
+	))
+
+	// Even though the scraper advertises OpenMetrics, the handler must
+	// fall back to text/plain because EnableOpenMetrics is off.
+	reqCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://"+addr+"/metrics", nil)
+	require.NoError(t, err)
+	req.Header.Set("Accept", "application/openmetrics-text; version=1.0.0; charset=utf-8")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Containsf(t, resp.Header.Get("Content-Type"), "text/plain",
+		"WithExemplars(false) must keep the handler on plain Prometheus format (got %q)",
+		resp.Header.Get("Content-Type"))
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.NotContains(t, string(body), "# {trace_id=",
+		"no exemplar line may be rendered when Exemplars=false")
+	assert.NotContains(t, string(body), "# EOF",
+		"plain Prometheus format has no openmetrics EOF sentinel")
+	// Integer bucket boundary keeps its integer rendering — no `.0` suffix.
+	assert.Contains(t, string(body), `le="1"`,
+		"plain Prometheus format keeps integer le boundaries; this is the compatibility path WithExemplars(false) preserves")
+}
+
+func scrapeOpenMetrics(ctx context.Context, t *testing.T, addr string) string {
+	t.Helper()
+	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://"+addr+"/metrics", nil)
+	require.NoError(t, err)
+	// Matches the Accept header real Prometheus scrapers send when OpenMetrics
+	// is enabled in their scrape_config.
+	req.Header.Set("Accept", "application/openmetrics-text; version=1.0.0; charset=utf-8")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equalf(t, http.StatusOK, resp.StatusCode,
+		"openmetrics scrape failed; body=%s", string(body))
+	assert.Containsf(t, resp.Header.Get("Content-Type"), "openmetrics-text",
+		"handler must content-negotiate to OpenMetrics (got Content-Type %q)",
+		resp.Header.Get("Content-Type"))
+	return string(body)
 }
 
 func TestInitMeter_DisableDefaultViewsKeepsHTTPAttributes(t *testing.T) {

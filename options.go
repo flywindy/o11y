@@ -55,6 +55,7 @@ type Config struct {
 	disableDefaultViews     bool
 	maxUniqueRoutes         int
 	extraHTTPServerAttrKeys []string
+	exemplars               bool
 
 	// Feature toggles. Trace, metrics, and log default to true; profiling
 	// defaults to false because it is an opt-in fourth signal. All four can
@@ -281,6 +282,30 @@ func WithProfilingEnabled(enabled bool) Option {
 	return func(c *Config) { c.profilingEnabled = enabled }
 }
 
+// WithExemplars controls whether the Prometheus pull `/metrics` handler
+// content-negotiates the OpenMetrics exposition format. OpenMetrics is the
+// only format the Prometheus exporter renders per-bucket exemplars in, so
+// this option also governs whether trace-to-metric linkage in Grafana / Tempo
+// works for SDK-managed and caller-defined histograms. Default: true.
+//
+// Set to false only as a temporary mitigation when migrating a service whose
+// existing PromQL queries, recording rules, or alert rules hardcode integer
+// histogram bucket boundaries (e.g. `le="1"`, `le="5"`, `le="10"`). The
+// OpenMetrics format emits those as `le="1.0"`, `le="5.0"`, `le="10.0"` —
+// the underlying bucket boundary is identical (`float64`) but the rendered
+// label string differs, so queries matching the integer form silently stop
+// matching after rollout. Aggregate queries such as `histogram_quantile(...)`
+// are unaffected. Update the dependent queries, then remove this option.
+//
+// Has no effect on the OTLP push path (WithMetricsOTLPEndpoint): exemplars
+// travel in the OTLP proto and are not impacted by Prometheus text-format
+// negotiation.
+func WithExemplars(enabled bool) Option {
+	return func(c *Config) {
+		c.exemplars = enabled
+	}
+}
+
 // WithDisableDefaultViews disables SDK-managed HTTP metric views.
 func WithDisableDefaultViews() Option {
 	return func(c *Config) {
@@ -445,6 +470,7 @@ func defaultConfig() *Config {
 		runtimeMetrics:   true,
 		histogramBuckets: cloneFloat64s(defaultLatencyBuckets),
 		maxUniqueRoutes:  DefaultMaxUniqueRoutes,
+		exemplars:        true,
 	}
 	var warn string
 	cfg.traceEnabled, warn = parseBoolEnv("O11Y_TRACE_ENABLED", true)
