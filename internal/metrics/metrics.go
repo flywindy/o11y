@@ -222,7 +222,23 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{}))
+	// EnableOpenMetrics lets the handler content-negotiate to OpenMetrics
+	// format (Accept: application/openmetrics-text). That is the only
+	// exposition format that carries per-bucket exemplars, so without this
+	// flag Prometheus would scrape the plain text format and the
+	// trace-to-metric linkage in Grafana would silently be empty. Both
+	// the SDK-managed HTTP histograms and any caller-recorded histograms
+	// inherit exemplar export from a single negotiation.
+	// EnableOpenMetrics lets the handler content-negotiate to OpenMetrics
+	// format (Accept: application/openmetrics-text). That is the only
+	// exposition format that carries per-bucket exemplars, so without this
+	// flag Prometheus would scrape the plain text format and the
+	// trace-to-metric linkage in Grafana would silently be empty. Both
+	// the SDK-managed HTTP histograms and any caller-recorded histograms
+	// inherit exemplar export from a single negotiation.
+	mux.Handle("/metrics", promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{
+		EnableOpenMetrics: true,
+	}))
 	server := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,

@@ -2,6 +2,7 @@ package metrics_test
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -204,6 +205,91 @@ func (h *capturingErrorHandler) errors() []string {
 	out := make([]string, len(h.errs))
 	copy(out, h.errs)
 	return out
+}
+
+// TestInitMeter_OpenMetricsScrapeIncludesExemplars verifies that the
+// Prometheus pull handler content-negotiates to OpenMetrics format when the
+// scraper advertises support, and that exemplars recorded inside a sampled
+// trace context show up in the response body. This is the end-to-end signal
+// that Grafana's exemplar UI / Tempo trace-to-metric linkage will work — the
+// plain Prometheus exposition format the handler used to default to does not
+// carry exemplars at all, so scrapers got an empty exemplar store regardless
+// of `--enable-feature=exemplar-storage`.
+func TestInitMeter_OpenMetricsScrapeIncludesExemplars(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	traceID, err := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	require.NoError(t, err)
+	spanID, err := trace.SpanIDFromHex("00f067aa0ba902b7")
+	require.NoError(t, err)
+	sc := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    traceID,
+		SpanID:     spanID,
+		TraceFlags: trace.FlagsSampled,
+		Remote:     true,
+	})
+	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+
+	hist, err := mp.Meter("test").Float64Histogram("http.server.request.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	hist.Record(ctx, 0.05, metric.WithAttributes(
+		semconv.HTTPRequestMethodKey.String("POST"),
+		semconv.HTTPRoute("/api/v1/messages"),
+		semconv.HTTPResponseStatusCode(http.StatusOK),
+	))
+
+	body := scrapeOpenMetrics(t.Context(), t, addr)
+	require.Contains(t, body, "# TYPE http_server_request_duration_seconds histogram",
+		"openmetrics scrape must include the SDK histogram")
+
+	// Exemplar line shape: ..._bucket{...} <count> # {trace_id="...",span_id="..."} <value> <timestamp>
+	var exemplarLine string
+	for _, line := range strings.Split(body, "\n") {
+		if strings.Contains(line, "# {") && strings.Contains(line, "trace_id=") {
+			exemplarLine = line
+			break
+		}
+	}
+	require.NotEmptyf(t, exemplarLine,
+		"openmetrics scrape must contain at least one trace-linked exemplar; "+
+			"if missing, EnableOpenMetrics on promhttp.HandlerOpts is likely off")
+	assert.Contains(t, exemplarLine, traceID.String(), "exemplar must carry trace_id")
+	assert.Contains(t, exemplarLine, spanID.String(), "exemplar must carry span_id")
+	assert.True(t, strings.HasSuffix(strings.TrimSpace(body), "# EOF"),
+		"openmetrics format must terminate with the EOF marker; absence indicates fallback to plain Prometheus exposition format")
+}
+
+func scrapeOpenMetrics(ctx context.Context, t *testing.T, addr string) string {
+	t.Helper()
+	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://"+addr+"/metrics", nil)
+	require.NoError(t, err)
+	// Matches the Accept header real Prometheus scrapers send when OpenMetrics
+	// is enabled in their scrape_config.
+	req.Header.Set("Accept", "application/openmetrics-text; version=1.0.0; charset=utf-8")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equalf(t, http.StatusOK, resp.StatusCode,
+		"openmetrics scrape failed; body=%s", string(body))
+	assert.Containsf(t, resp.Header.Get("Content-Type"), "openmetrics-text",
+		"handler must content-negotiate to OpenMetrics (got Content-Type %q)",
+		resp.Header.Get("Content-Type"))
+	return string(body)
 }
 
 func TestInitMeter_DisableDefaultViewsKeepsHTTPAttributes(t *testing.T) {

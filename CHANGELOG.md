@@ -25,6 +25,20 @@ adopters can plan their upgrades.
 
 ### Fixed
 
+- Enable OpenMetrics format on the Prometheus pull `/metrics` handler so
+  exemplars actually reach scrapers. `promhttp.HandlerFor` used the default
+  `HandlerOpts{}`, which leaves `EnableOpenMetrics` off; content negotiation
+  then always returned the plain Prometheus exposition format, and that
+  format has no syntax for per-bucket exemplars. As a result, even with
+  Prometheus running `--enable-feature=exemplar-storage` and a sampled trace
+  context attached to the measurement, exemplar storage stayed empty and
+  Grafana's histogram-to-trace links were dead. Setting
+  `EnableOpenMetrics: true` lets the handler respond in
+  `application/openmetrics-text` when the scraper advertises it (real
+  Prometheus does by default) and fall back to `text/plain` otherwise, so
+  no existing scrape integrations break. SDK-managed HTTP histograms and
+  caller-defined histograms both gain working exemplars.
+
 ### Security
 
 ---
