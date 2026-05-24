@@ -310,7 +310,7 @@ func TestDialHookRecordsCreateTimeOnlyOnSuccess(t *testing.T) {
 	hook := newRedisHook(tp, operationDuration, pool.createTime, config{}, client, "test", &atomic.Bool{})
 
 	// Successful dial: emits one sample.
-	okDial := hook.DialHook(func(ctx context.Context, network, addr string) (net.Conn, error) {
+	okDial := hook.DialHook(func(_ context.Context, _, _ string) (net.Conn, error) {
 		c, _ := net.Pipe()
 		return c, nil
 	})
@@ -319,7 +319,7 @@ func TestDialHookRecordsCreateTimeOnlyOnSuccess(t *testing.T) {
 	_ = conn.Close()
 
 	// Failed dial: must NOT emit a create_time sample.
-	failDial := hook.DialHook(func(ctx context.Context, network, addr string) (net.Conn, error) {
+	failDial := hook.DialHook(func(_ context.Context, _, _ string) (net.Conn, error) {
 		return nil, errors.New("dial refused")
 	})
 	_, err = failDial(context.Background(), "tcp", "127.0.0.1:6379")
