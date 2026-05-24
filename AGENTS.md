@@ -26,6 +26,7 @@ so that every log entry is automatically enriched with `traceId` and `spanId`.
 | Web framework | gin v1 | `gin/` wraps `otelgin` with SDK providers and typed `c.Errors` recording |
 | Messaging | NATS | High-performance pub/sub |
 | Database | MongoDB | NoSQL persistence |
+| Cache | Redis / Valkey | Redis-protocol cache and data store instrumentation |
 | Tracing backend | Grafana Tempo | |
 | Log backend | Grafana Loki | |
 | Metrics backend | Prometheus | Scrapes k8s pods on `:2112`; also accepts remote write from OTel Collector |
@@ -44,6 +45,7 @@ so that every log entry is automatically enriched with `traceId` and `spanId`.
 | `gin/` | T2 facade over `otelgin` plus typed gin error recording |
 | `nats/` | T2 facade over NATS Core and JetStream instrumentation |
 | `mongo/` | T2 facade over MongoDB driver instrumentation |
+| `redis/` | SDK-owned Redis/Valkey instrumentation over go-redis/v9 |
 | `internal/` | SDK-owned logging, tracing, metrics, and test utilities |
 | `examples/` | Runnable examples for supported integrations |
 
@@ -127,6 +129,10 @@ go run examples/metrics/main.go
 #   OTEL_MONGO_TRACING_ENABLED=true
 go run examples/mongodb/main.go
 
+# Run the Redis example (cluster must be up with Redis port-forwarded to localhost:6379)
+kubectl port-forward -n infra svc/redis 6379:6379
+go run examples/redis/main.go
+
 # Port-forward Grafana (default credentials: admin/admin)
 kubectl port-forward -n infra svc/grafana 3000:3000
 
@@ -198,6 +204,7 @@ Full ADR documents live in [`docs/adr/`](docs/adr/).
 | Semconv version policy | Pin v1.39.0; upgrade only when concrete triggers fire | Single SDK-owned pin avoids cognitive cost and dashboard breakage. Upgrade triggers and process documented to keep version moves deliberate. See [ADR 0006](docs/adr/0006-semconv-upgrade-strategy.md) |
 | HTTP integration | `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` — wrapped by the `http/` package | Provides `NewServerHandler` and `NewTransport` with SDK providers and propagator wired explicitly. See [ADR 0009](docs/adr/0009-replace-http-with-otelhttp.md) |
 | Gin integration | `go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin` — wrapped by the `gin/` package | Provides canonical middleware ordering and typed `gin.error.type` events for `c.Errors`. See [ADR 0010](docs/adr/0010-gin-integration.md) |
+| Redis / Valkey integration | SDK-owned bounded T3 wrapper over `github.com/redis/go-redis/v9` | Avoids legacy `redisotel` semconv and sensitive defaults while emitting SDK-controlled spans, metrics, and views. See [ADR 0013](docs/adr/0013-redis-valkey-integration.md) |
 
 ---
 
@@ -275,6 +282,29 @@ client, err := o11ymongo.Connect(ctx, mongoURI, sdk.TracerProvider(), sdk.Propag
 
 ---
 
+## Redis / Valkey Usage
+
+All Redis and Valkey clients must use `github.com/flywindy/o11y/redis`
+so spans and metrics are emitted with SDK-owned semconv v1.39.0 attributes.
+The SDK wraps an existing `github.com/redis/go-redis/v9` client and does not
+call `redisotel`.
+
+```go
+rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+client, err := o11yredis.Wrap(
+    rdb,
+    sdk.TracerProvider(),
+    sdk.MeterProvider(),
+    o11yredis.WithPoolName("cache"),
+)
+```
+
+Redis command text is disabled by default. Only enable
+`o11yredis.WithCommandTextEnabled(true)` when the application explicitly
+accepts the key and value exposure risk.
+
+---
+
 ## Do NOT
 
 - ❌ Add `init()` functions with side effects in any package
@@ -288,6 +318,7 @@ client, err := o11ymongo.Connect(ctx, mongoURI, sdk.TracerProvider(), sdk.Propag
 - ❌ Call `otelnats.Connect` or `otelnats.ConnectWithOptions` directly — always go through `o11ynats.Connect` so the SDK providers are wired correctly
 - ❌ Import `github.com/Marz32onE/instrumentation-go/otel-mongo/v2` directly from services — always go through `o11ymongo.Connect` so the SDK providers are wired correctly and `_oteltrace` defaults stay enforced
 - ❌ Import `go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin` directly from services — always go through `o11ygin.Middleware` so SDK providers, propagator, and typed gin error events are wired consistently
+- ❌ Import `github.com/redis/go-redis/extra/redisotel/v9` directly from services — always go through `o11yredis.Wrap` so SDK-owned semconv v1.39.0 attributes, metrics, and sensitive defaults stay consistent
 - ❌ Enable MongoDB `_oteltrace` document injection by default — only use `o11ymongo.WithDocumentTracePropagation(true)` when an application explicitly opts in and accepts the schema/cardinality trade-offs
 - ❌ Use `msg.Respond(data)` inside a Subscribe handler when trace context must be preserved in the reply — use `conn.Publish(ctx, msg.Reply, data)` instead
 - ❌ Use `WithTeam` — it no longer exists; use `WithServiceNamespace` instead

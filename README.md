@@ -571,6 +571,7 @@ Before running any example, port-forward the required services from the `kind` c
 ```bash
 kubectl port-forward -n infra svc/otel-collector 4318:4318  # OTel traces and logs
 kubectl port-forward -n infra svc/nats           4222:4222  # NATS connection
+kubectl port-forward -n infra svc/redis          6379:6379  # Redis connection
 kubectl port-forward -n infra svc/grafana        3000:3000  # Grafana UI
 kubectl port-forward -n infra svc/prometheus     9090:9090  # Prometheus UI
 kubectl port-forward -n infra svc/alloy          4040:4040  # Pyroscope ingest for local app profiling
@@ -626,6 +627,19 @@ curl http://localhost:8080/fail
 
 The example registers `o11ygin.Middleware(...)` before `gin.Recovery()` and
 demonstrates typed `gin.error.type` span events from `c.AbortWithError`.
+
+### Redis
+
+Port-forward Redis to `localhost:6379`, then run the example:
+
+```bash
+kubectl port-forward -n infra svc/redis 6379:6379
+go run examples/redis/main.go
+```
+
+The example emits Redis command spans plus `db.client.operation.duration` and
+connection-pool metrics through OTLP metrics push. It runs `PING`, `SET`,
+`GET`, a cache-miss `GET`, and a pipeline every two seconds.
 
 ### Profiling
 

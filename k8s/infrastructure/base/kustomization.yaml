@@ -5,6 +5,7 @@ resources:
   - namespace.yaml
   - nats.yaml
   - mongodb.yaml
+  - redis.yaml
   - tempo.yaml
   - loki.yaml
   - pyroscope.yaml
