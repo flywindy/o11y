@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	goredis "github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel/attribute"
@@ -85,7 +86,13 @@ func (h *redisHook) DialHook(next goredis.DialHook) goredis.DialHook {
 
 		start := time.Now()
 		conn, err := next(ctx, network, addr)
-		h.connectionCreate.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(h.poolMetricAttrs...))
+		// Only record successful dials. semconv defines
+		// db.client.connection.create_time as the time to create a connection;
+		// folding failed-dial wall time into the same histogram skews the
+		// percentiles operators use to size pools and tune backoff.
+		if err == nil {
+			h.connectionCreate.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(h.poolMetricAttrs...))
+		}
 		return conn, err
 	}
 }
@@ -166,6 +173,12 @@ func (h *redisHook) spanAttrs(operation string) []attribute.KeyValue {
 }
 
 func (h *redisHook) namespace() string {
+	// Skip the default DB (0). go-redis always reports a DB, so emitting "0"
+	// on every span adds a constant attribute that carries no operational
+	// signal; an explicit non-default DB is meaningful and is recorded.
+	if h.db == 0 {
+		return ""
+	}
 	return strconv.Itoa(h.db)
 }
 
@@ -263,7 +276,14 @@ func truncateCommandText(text string) string {
 	if len(text) <= maxCommandTextLen {
 		return text
 	}
-	return text[:maxCommandTextLen]
+	// Back the cut up to a rune boundary so the truncated text stays valid
+	// UTF-8 even when the maxCommandTextLen-th byte falls inside a multi-byte
+	// rune. Some OTLP exporters reject invalid UTF-8 outright.
+	end := maxCommandTextLen
+	for end > 0 && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	return text[:end]
 }
 
 func isPubSubCommand(name string) bool {

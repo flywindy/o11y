@@ -3,10 +3,12 @@ package redis
 import (
 	"context"
 	"errors"
+	"net"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	goredis "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
@@ -249,25 +251,116 @@ func TestWrapIsIdempotentAndUnwrapAllowsRewrap(t *testing.T) {
 	require.Len(t, sr.Ended(), 2)
 }
 
-func TestWrapCleansUpAfterInstallHookFailure(t *testing.T) {
+func TestWrapBestEffortOnClusterShardFailure(t *testing.T) {
 	tp, _, mp, _ := newRedisTestProviders()
 	client := goredis.NewClusterClient(&goredis.ClusterOptions{
 		Addrs:       []string{"127.0.0.1:1"},
 		MaxRetries:  0,
-		DialTimeout: 10 * time.Millisecond,
+		DialTimeout: 100 * time.Millisecond,
 	})
 	defer client.Close()
 
-	_, err := Wrap(client, tp, mp, WithPoolName("broken-cluster"))
+	// Initial Wrap surfaces the shard-setup error so callers can log it and
+	// fail readiness if they choose.
+	_, err := Wrap(client, tp, mp, WithPoolName("best-effort"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "install hooks")
 
+	// ADR 0013 §10 best-effort: go-redis v9 has no hook-remove API, so the
+	// dedup entry is committed despite the error. Retries observe the
+	// committed entry and silently no-op rather than appending another
+	// OnNewNode callback to the cluster.
 	_, found := wrappedClients.Load(clientKey(client))
-	assert.False(t, found, "failed wrap must not poison future wrap attempts")
+	assert.True(t, found, "best-effort commit retains the dedup entry")
 
-	_, err = Wrap(client, tp, mp, WithPoolName("broken-cluster"))
+	_, err = Wrap(client, tp, mp, WithPoolName("best-effort"))
+	require.NoError(t, err, "subsequent Wrap is a silent no-op")
+
+	// Unwrap is the canonical way to detach: it disables previously-installed
+	// hooks via the shared atomic flag and clears the dedup entry so a future
+	// Wrap can re-instrument cleanly.
+	Unwrap(client)
+	_, found = wrappedClients.Load(clientKey(client))
+	assert.False(t, found, "Unwrap clears the dedup entry")
+}
+
+func TestSpanOmitsDBNamespaceForDefaultDB(t *testing.T) {
+	hook, sr, _ := newTestHook(t, config{}, "127.0.0.1:6379", 0)
+
+	err := hook.ProcessHook(func(context.Context, goredis.Cmder) error {
+		return nil
+	})(context.Background(), goredis.NewCmd(context.Background(), "get", "key"))
+	require.NoError(t, err)
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	assertSpanMissingKey(t, spans[0], "db.namespace")
+}
+
+func TestDialHookRecordsCreateTimeOnlyOnSuccess(t *testing.T) {
+	tp, _, mp, reader := newRedisTestProviders()
+	meter := mp.Meter(instrumentationName, metric.WithSchemaURL(semconv.SchemaURL))
+	operationDuration, err := meter.Float64Histogram("db.client.operation.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	pool, err := newPoolMetrics(meter)
+	require.NoError(t, err)
+
+	client := goredis.NewClient(&goredis.Options{Addr: "127.0.0.1:6379"})
+	t.Cleanup(func() { _ = client.Close() })
+	hook := newRedisHook(tp, operationDuration, pool.createTime, config{}, client, "test", &atomic.Bool{})
+
+	// Successful dial: emits one sample.
+	okDial := hook.DialHook(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		c, _ := net.Pipe()
+		return c, nil
+	})
+	conn, err := okDial(context.Background(), "tcp", "127.0.0.1:6379")
+	require.NoError(t, err)
+	_ = conn.Close()
+
+	// Failed dial: must NOT emit a create_time sample.
+	failDial := hook.DialHook(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, errors.New("dial refused")
+	})
+	_, err = failDial(context.Background(), "tcp", "127.0.0.1:6379")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "install hooks")
+
+	rm := collectRedisMetrics(t, reader)
+	m := findMetric(t, rm, "db.client.connection.create_time")
+	hist, ok := m.Data.(metricdata.Histogram[float64])
+	require.True(t, ok)
+	require.NotEmpty(t, hist.DataPoints)
+	var total uint64
+	for _, dp := range hist.DataPoints {
+		total += dp.Count
+	}
+	assert.Equal(t, uint64(1), total, "create_time must only count successful dials")
+}
+
+func TestCommandTextTruncationIsRuneSafe(t *testing.T) {
+	hook, sr, _ := newTestHook(t, config{commandTextEnabled: true}, "127.0.0.1:6379", 0)
+
+	// "set key " is 8 bytes; each "中" rune is 3 bytes; 339 runes produce
+	// 1017 bytes. Total command text = 8 + 1017 = 1025 bytes. A naive byte
+	// slice at maxCommandTextLen (1024) cuts inside the 339th rune
+	// (bytes 1022-1024), so the rune-safe truncation must back up to byte
+	// 1022 to keep the result valid UTF-8.
+	value := strings.Repeat("中", 339)
+
+	err := hook.ProcessHook(func(context.Context, goredis.Cmder) error {
+		return nil
+	})(context.Background(), goredis.NewCmd(context.Background(), "set", "key", value))
+	require.NoError(t, err)
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	v, ok := spanAttr(spans[0], semconv.DBQueryTextKey)
+	require.True(t, ok)
+	text := v.AsString()
+	assert.True(t, utf8.ValidString(text), "truncated text must be valid UTF-8")
+	assert.LessOrEqual(t, len(text), maxCommandTextLen)
+	// Confirm the truncation actually fired (length must shrink from 1025).
+	assert.Less(t, len(text), 1025)
 }
 
 func TestPoolMetricsEmitV139Names(t *testing.T) {

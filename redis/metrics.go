@@ -12,6 +12,11 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 )
 
+// poolTarget abstracts the per-topology pool observation walk.
+// Implementations live in this file; the type switch over go-redis concrete
+// client types lives in newClientOps so the rest of the package stays
+// polymorphic.
+
 type poolMetrics struct {
 	meter       metric.Meter
 	count       metric.Int64ObservableUpDownCounter
@@ -91,11 +96,7 @@ func newPoolMetrics(meter metric.Meter) (*poolMetrics, error) {
 	}, nil
 }
 
-func (p *poolMetrics) register(rdb goredis.UniversalClient, poolName string, disabled *atomic.Bool) (metric.Registration, error) {
-	target, err := newPoolTarget(rdb, poolName)
-	if err != nil {
-		return nil, err
-	}
+func (p *poolMetrics) register(target poolTarget, disabled *atomic.Bool) (metric.Registration, error) {
 	reg, err := p.meter.RegisterCallback(func(ctx context.Context, observer metric.Observer) error {
 		if disabled.Load() {
 			return nil
@@ -154,19 +155,6 @@ func (t ringPoolTarget) observe(ctx context.Context, p *poolMetrics, observer me
 		p.observeClient(observer, shard, shardPoolName(t.poolName, shard))
 		return nil
 	})
-}
-
-func newPoolTarget(rdb goredis.UniversalClient, poolName string) (poolTarget, error) {
-	switch client := rdb.(type) {
-	case *goredis.Client:
-		return singlePoolTarget{client: weak.Make(client), poolName: poolName}, nil
-	case *goredis.ClusterClient:
-		return clusterPoolTarget{client: weak.Make(client), poolName: poolName}, nil
-	case *goredis.Ring:
-		return ringPoolTarget{client: weak.Make(client), poolName: poolName}, nil
-	default:
-		return nil, fmt.Errorf("redis wrap: unsupported client type %T", rdb)
-	}
 }
 
 func (p *poolMetrics) observeClient(observer metric.Observer, client *goredis.Client, poolName string) {
