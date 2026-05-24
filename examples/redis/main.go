@@ -15,6 +15,7 @@ import (
 	"github.com/flywindy/o11y"
 	o11yredis "github.com/flywindy/o11y/redis"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -81,9 +82,7 @@ func run() error {
 	defer ticker.Stop()
 
 	for {
-		if err := runRedisCycle(ctx, logger, tracer, rdb); err != nil {
-			logger.ErrorContext(ctx, "Redis cycle failed", slog.Any("error", err))
-		}
+		runRedisCycle(ctx, logger, tracer, rdb)
 
 		select {
 		case <-ctx.Done():
@@ -99,7 +98,7 @@ func runRedisCycle(
 	logger *slog.Logger,
 	tracer trace.Tracer,
 	rdb *redis.Client,
-) error {
+) {
 	cycleCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	cycleCtx, span := tracer.Start(cycleCtx, "redis-cycle")
@@ -107,19 +106,28 @@ func runRedisCycle(
 
 	eventID := time.Now().UTC().Format("20060102T150405.000000000Z")
 	key := keyPrefix + ":" + eventID
+	fail := func(err error) {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		logger.ErrorContext(cycleCtx, "Redis cycle failed", slog.Any("error", err))
+	}
 
 	if err := rdb.Ping(cycleCtx).Err(); err != nil {
-		return fmt.Errorf("ping Redis: %w", err)
+		fail(fmt.Errorf("ping Redis: %w", err))
+		return
 	}
 	if err := rdb.Set(cycleCtx, key, "created", 30*time.Second).Err(); err != nil {
-		return fmt.Errorf("set %s: %w", key, err)
+		fail(fmt.Errorf("set %s: %w", key, err))
+		return
 	}
 	value, err := rdb.Get(cycleCtx, key).Result()
 	if err != nil {
-		return fmt.Errorf("get %s: %w", key, err)
+		fail(fmt.Errorf("get %s: %w", key, err))
+		return
 	}
 	if _, err := rdb.Get(cycleCtx, key+":missing").Result(); err != nil && !errors.Is(err, redis.Nil) {
-		return fmt.Errorf("get missing key: %w", err)
+		fail(fmt.Errorf("get missing key: %w", err))
+		return
 	}
 
 	pipe := rdb.Pipeline()
@@ -127,14 +135,14 @@ func runRedisCycle(
 	pipe.Expire(cycleCtx, keyPrefix+":cycles", time.Minute)
 	pipe.Del(cycleCtx, key)
 	if _, err := pipe.Exec(cycleCtx); err != nil {
-		return fmt.Errorf("execute pipeline: %w", err)
+		fail(fmt.Errorf("execute pipeline: %w", err))
+		return
 	}
 
 	logger.InfoContext(cycleCtx, "Redis cycle completed",
 		slog.String("key", key),
 		slog.String("value", value),
 	)
-	return nil
 }
 
 func envOrDefault(key, fallback string) string {
