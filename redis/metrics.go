@@ -171,7 +171,9 @@ func (p *poolMetrics) observeClient(observer metric.Observer, client *goredis.Cl
 	)...))
 	observer.ObserveInt64(p.idleMax, int64(opt.MaxIdleConns), metric.WithAttributes(attrs...))
 	observer.ObserveInt64(p.idleMin, int64(opt.MinIdleConns), metric.WithAttributes(attrs...))
-	observer.ObserveInt64(p.max, int64(maxConnections(opt)), metric.WithAttributes(attrs...))
+	if maxConns, ok := maxConnections(opt); ok {
+		observer.ObserveInt64(p.max, int64(maxConns), metric.WithAttributes(attrs...))
+	}
 	observer.ObserveInt64(p.timeouts, int64(stats.Timeouts), metric.WithAttributes(attrs...))
 }
 
@@ -188,9 +190,16 @@ func poolAttrs(poolName, addr string) []attribute.KeyValue {
 	return attrs
 }
 
-func maxConnections(opt *goredis.Options) int {
+// maxConnections returns the hard upper bound on connections that go-redis
+// will allocate for the pool, plus a flag indicating whether a hard bound
+// exists. go-redis treats MaxActiveConns == 0 as "unbounded" (PoolSize is only
+// a steady-state target, not a cap), so falling back to PoolSize would
+// under-report db.client.connection.max and mislead saturation dashboards.
+// When the pool is unbounded the wrapper omits the observation entirely
+// rather than emit a misleading value.
+func maxConnections(opt *goredis.Options) (int, bool) {
 	if opt.MaxActiveConns > 0 {
-		return opt.MaxActiveConns
+		return opt.MaxActiveConns, true
 	}
-	return opt.PoolSize
+	return 0, false
 }

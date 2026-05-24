@@ -394,6 +394,30 @@ func TestPoolMetricsEmitV139Names(t *testing.T) {
 	assert.Nil(t, metricByName(rm, "db.client.connections.use_time"))
 }
 
+func TestPoolMetricsOmitMaxWhenUnbounded(t *testing.T) {
+	tp, _, mp, reader := newRedisTestProviders()
+	// MaxActiveConns == 0 is go-redis's "no upper bound" sentinel. PoolSize is
+	// only a steady-state baseline, so the wrapper must omit
+	// db.client.connection.max rather than report a misleading value.
+	client := goredis.NewClient(&goredis.Options{
+		Addr:           "127.0.0.1:6379",
+		PoolSize:       11,
+		MaxActiveConns: 0,
+	})
+	defer client.Close()
+
+	_, err := Wrap(client, tp, mp, WithPoolName("unbounded"))
+	require.NoError(t, err)
+
+	rm := collectRedisMetrics(t, reader)
+	assert.Nil(t, metricByName(rm, "db.client.connection.max"),
+		"db.client.connection.max must be omitted when MaxActiveConns is 0 (unbounded)")
+	// Confirm the rest of the pool-metric set still reports — only the .max
+	// observation is conditional.
+	assert.NotNil(t, metricByName(rm, "db.client.connection.count"))
+	assert.NotNil(t, metricByName(rm, "db.client.connection.idle.max"))
+}
+
 func TestMetricViewsDropRedisotelLegacyInstruments(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(
