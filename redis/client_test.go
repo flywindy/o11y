@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	goredis "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
@@ -183,6 +184,28 @@ func TestPipelineHookHandlesTxFramingAndPubSubFiltering(t *testing.T) {
 	assertSpanHas(t, spans[0], semconv.DBOperationBatchSize(3))
 }
 
+func TestPipelinePrefersNonNilCommandError(t *testing.T) {
+	hook, sr, reader := newTestHook(t, config{}, "127.0.0.1:6379", 0)
+	cacheMiss := goredis.NewCmd(context.Background(), "get", "missing")
+	cacheMiss.SetErr(goredis.Nil)
+	badCommand := goredis.NewCmd(context.Background(), "incr", "not-an-int")
+	badCommand.SetErr(errors.New("ERR value is not an integer"))
+
+	err := hook.ProcessPipelineHook(func(context.Context, []goredis.Cmder) error {
+		return goredis.Nil
+	})(context.Background(), []goredis.Cmder{cacheMiss, badCommand})
+	require.ErrorIs(t, err, goredis.Nil)
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	assert.Equal(t, codes.Error, spans[0].Status().Code)
+	assertSpanHas(t, spans[0], semconv.ErrorTypeKey.String("*errors.errorString"))
+
+	rm := collectRedisMetrics(t, reader)
+	m := findMetric(t, rm, "db.client.operation.duration")
+	assertHistogramPointHas(t, m, semconv.ErrorTypeKey.String("*errors.errorString"))
+}
+
 func TestPipelineAllPubSubCommandsAreSkipped(t *testing.T) {
 	hook, sr, reader := newTestHook(t, config{}, "127.0.0.1:6379", 0)
 	cmds := []goredis.Cmder{
@@ -226,6 +249,27 @@ func TestWrapIsIdempotentAndUnwrapAllowsRewrap(t *testing.T) {
 	require.Len(t, sr.Ended(), 2)
 }
 
+func TestWrapCleansUpAfterInstallHookFailure(t *testing.T) {
+	tp, _, mp, _ := newRedisTestProviders()
+	client := goredis.NewClusterClient(&goredis.ClusterOptions{
+		Addrs:       []string{"127.0.0.1:1"},
+		MaxRetries:  0,
+		DialTimeout: 10 * time.Millisecond,
+	})
+	defer client.Close()
+
+	_, err := Wrap(client, tp, mp, WithPoolName("broken-cluster"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "install hooks")
+
+	_, found := wrappedClients.Load(clientKey(client))
+	assert.False(t, found, "failed wrap must not poison future wrap attempts")
+
+	_, err = Wrap(client, tp, mp, WithPoolName("broken-cluster"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "install hooks")
+}
+
 func TestPoolMetricsEmitV139Names(t *testing.T) {
 	tp, _, mp, reader := newRedisTestProviders()
 	client := goredis.NewClient(&goredis.Options{
@@ -255,6 +299,28 @@ func TestPoolMetricsEmitV139Names(t *testing.T) {
 		assertMetricPointHas(t, m, semconv.ServerPort(6379))
 	}
 	assert.Nil(t, metricByName(rm, "db.client.connections.use_time"))
+}
+
+func TestMetricViewsDropRedisotelLegacyInstruments(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithView(MetricViews()...),
+	)
+	meter := mp.Meter("redisotel")
+
+	legacyCounter, err := meter.Int64Counter("db.client.connections.hits")
+	require.NoError(t, err)
+	legacyCounter.Add(context.Background(), 1)
+
+	legacyHistogram, err := meter.Float64Histogram("db.client.connections.create_time")
+	require.NoError(t, err)
+	legacyHistogram.Record(context.Background(), 0.001)
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	assert.Nil(t, metricByName(rm, "db.client.connections.hits"))
+	assert.Nil(t, metricByName(rm, "db.client.connections.create_time"))
 }
 
 func newRedisTestProviders() (*sdktrace.TracerProvider, *tracetest.SpanRecorder, *sdkmetric.MeterProvider, *sdkmetric.ManualReader) {

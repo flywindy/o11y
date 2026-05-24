@@ -91,7 +91,7 @@ func Wrap(
 		case existing.ref.matches(rdb):
 			existing.mu.Unlock()
 			return rdb, errors.New("redis wrap: concurrent wrap in progress")
-		case !existing.ref.alive() || !existing.ref.matches(rdb):
+		case !existing.ref.alive():
 			existing.mu.Unlock()
 			wrappedClients.CompareAndDelete(key, existing)
 			continue
@@ -133,8 +133,9 @@ func Wrap(
 	entry.reg = reg
 
 	if err := installHooks(context.Background(), rdb, tp, operationDuration, pool.createTime, cfg, &entry.disabled); err != nil {
-		entry.done = true
-		entry.cleanup = addCleanup(rdb, cleanupArg{key: key, ref: ref})
+		entry.disabled.Store(true)
+		_ = entry.reg.Unregister()
+		wrappedClients.CompareAndDelete(key, entry)
 		return rdb, fmt.Errorf("redis wrap: install hooks: %w", err)
 	}
 
@@ -153,7 +154,7 @@ func Unwrap(rdb goredis.UniversalClient) {
 	if rdb == nil {
 		return
 	}
-	key, ref, err := clientIdentity(rdb)
+	key, _, err := clientIdentity(rdb)
 	if err != nil {
 		return
 	}
@@ -173,7 +174,7 @@ func Unwrap(rdb goredis.UniversalClient) {
 	}
 	entry.cleanup.Stop()
 	wrappedClients.CompareAndDelete(key, entry)
-	runtime.KeepAlive(ref)
+	runtime.KeepAlive(rdb)
 }
 
 func installHooks(

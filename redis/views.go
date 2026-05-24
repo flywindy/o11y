@@ -31,6 +31,8 @@ func MetricViews() []sdkmetric.View {
 		"db.client.connections.max",
 		"db.client.connections.pending_requests",
 		"db.client.connections.timeouts",
+		"db.client.connections.hits",
+		"db.client.connections.misses",
 		"db.client.connections.create_time",
 		"db.client.connections.use_time",
 		"db.client.connections.wait_time",

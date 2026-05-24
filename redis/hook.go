@@ -144,10 +144,7 @@ func (h *redisHook) ProcessPipelineHook(next goredis.ProcessPipelineHook) goredi
 		)
 		start := time.Now()
 		err := next(ctx, cmds)
-		observedErr := err
-		if observedErr == nil {
-			observedErr = firstCommandError(userCmds)
-		}
+		observedErr := pipelineError(err, userCmds)
 		h.finish(ctx, span, time.Since(start), "pipeline", observedErr)
 		return err
 	}
@@ -301,11 +298,11 @@ func allPubSubCommands(cmds []goredis.Cmder) bool {
 	return true
 }
 
-func firstCommandError(cmds []goredis.Cmder) error {
+func pipelineError(execErr error, cmds []goredis.Cmder) error {
 	for _, cmd := range cmds {
-		if err := cmd.Err(); err != nil {
+		if err := cmd.Err(); err != nil && !errors.Is(err, goredis.Nil) {
 			return err
 		}
 	}
-	return nil
+	return execErr
 }
