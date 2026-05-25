@@ -176,3 +176,80 @@ Whenever `otel-nats` is upgraded (any version change in `go.mod`):
   it to `(ctx, *nats.Msg)`. If future use cases need the richer type,
   expose a second handler signature rather than breaking the existing
   one.
+
+---
+
+## Amendment (2026-05-25) — Metrics scope: deferred
+
+The original ADR shipped a **trace-only** facade. This amendment records the
+deliberate decision to *not* add client-side NATS/JetStream metrics at this
+time, after the same library/value re-survey we ran for Redis (ADR 0013) and
+MongoDB (ADR 0014). `nats.Connect` stays `(tp, prop)` with no `MeterProvider`.
+
+### 1. Library re-survey (ADR 0008 §6)
+
+No trustworthy library exists for NATS client metrics — a weaker position than
+either Redis or MongoDB:
+
+- **No official OTel-contrib NATS instrumentation exists** (NATS has no
+  contrib auto-instrumentation package as of this date).
+- The **community contrib was already rejected** at original adoption (§1
+  above: missing JetStream consumer span-link semantics, lagging semconv).
+- The upstream `Marz32onE/.../otel-nats` v0.2.11 is **tracing-only**: source
+  inspection shows no `Meter` / `metric.` usage and no `WithMeterProvider`
+  option.
+- The `nats.go` client exposes **no per-message hook/monitor** (unlike
+  go-redis hooks or the mongo driver's `CommandMonitor`/`PoolMonitor`), so any
+  client metric must be hand-computed at our wrapper seam. NATS would therefore
+  be the **most self-written (full T3)** of the three integrations.
+
+### 2. Semconv maturity
+
+NATS metrics fall under the **messaging** semconv, which is still wholesale
+**Development** (the spec explicitly advises instrumentations not to change the
+emitted convention version until messaging is marked stable, gated by
+`OTEL_SEMCONV_STABILITY_OPT_IN`). This is less mature than the database metrics
+adopted for Redis/MongoDB, raising churn risk for anything emitted now.
+
+### 3. Value analysis (why even a minimal layer is not worth it)
+
+A minimal client-side layer would use the connection snapshot
+`nats.Conn.Stats()` (`InMsgs`, `OutMsgs`, `InBytes`, `OutBytes`, `Reconnects`).
+Assessed against the server-side `prometheus-nats-exporter` + OTel Collector
+path:
+
+| `nc.Stats()` field | Server exporter (`/varz`, `/connz`, `/jsz`) | Unique to client? |
+|---|---|---|
+| InMsgs / OutMsgs / InBytes / OutBytes | yes (aggregate + per-conn via connz) | only the convenience of auto-attached SDK Resource labels (`service.name`, pod, …) |
+| `Reconnects` | server sees churn as new connections, hard to attribute to a logical service | **yes** — the only genuinely client-only signal |
+
+Crucially, the **high-value JetStream operational signals are NOT in
+`nc.Stats()`**: consumer backlog/lag (`ConsumerInfo.NumPending`,
+`NumAckPending`, `NumRedelivered`, `NumWaiting`) require polling
+`consumer.Info()` (a larger T3) **and** are already exposed server-side via
+`/jsz`. So the minimal layer's unique value is thin (client-attributed
+throughput + perceived reconnects) while it omits the metric operators
+actually want, risking a false impression of "NATS metrics coverage."
+
+### 4. Decision
+
+- `nats/` remains **trace-only** (T2 facade); no `MeterProvider`, no SDK-owned
+  NATS metrics.
+- Operational NATS/JetStream metrics (throughput, connections, slow consumers,
+  JetStream storage, consumer lag) are obtained from **`prometheus-nats-exporter`
+  scraped by the OpenTelemetry Collector** — infrastructure configuration, zero
+  SDK code, and complementary to the SDK's client-side trace propagation.
+
+### 5. Revisit triggers
+
+Re-open this decision when **any** of the following holds:
+
+- the messaging metrics semconv is marked **stable**; or
+- a maintained library (official contrib or our corporate fork) starts emitting
+  NATS client metrics and passes the ADR 0008 §2 checklist; or
+- a concrete need arises for **client-attributed JetStream consumer-lag**
+  metrics that the server-side exporter cannot satisfy (e.g. per-service-instance
+  lag correlated with app metrics in the same backend).
+
+At that point evaluate a justified-T3 metrics layer (consumer-lag via
+`consumer.Info()` polling being the highest-value target) in its own ADR.
