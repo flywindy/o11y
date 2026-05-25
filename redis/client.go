@@ -199,8 +199,17 @@ func installShardedHooks(
 // setup while retaining full control of go-redis options such as addresses,
 // TLS, authentication, pool sizes, and timeouts.
 //
+// Hook ordering matters. go-redis runs hooks outermost-first in the order they
+// were added (hook-1 start -> hook-2 start -> exec -> hook-2 end -> hook-1
+// end), so the span Wrap opens only encloses hooks added after it. Call Wrap
+// before any client.AddHook(...) of your own if you want the span and its
+// recorded duration to cover those hooks' work.
+//
 // Wrap is idempotent: calling it twice on the same client is a no-op after the
-// first successful (or best-effort) call. A best-effort call is one where the
+// first successful (or best-effort) call. Options passed to a subsequent Wrap
+// call are ignored — the configuration (pool name, attributes, command-text
+// setting) from the first call stands. To change options, Unwrap first and then
+// Wrap again. A best-effort call is one where the
 // initial per-shard setup walk on a warmed Cluster/Ring returned an error
 // (e.g. an unreachable shard). In that case the metric callback and any
 // per-shard hooks installed before the error stay live, the dedup entry is
