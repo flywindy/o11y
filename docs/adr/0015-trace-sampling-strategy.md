@@ -16,11 +16,11 @@ this matter
 The SDK ships **no explicit sampler**. `internal/trace/trace.go` builds the
 `TracerProvider` with only `WithBatcher(exporter)` + `WithResource(res)` — no
 `WithSampler`. `options.go` exposes no sampling knob (21 `WithXxx` options, none
-for sampling). The effective behaviour is therefore the OTel Go SDK default,
+for sampling). The effective behavior is therefore the OTel Go SDK default,
 **`ParentBased(AlwaysSample)` = 100 % of traces**, with no documented decision
 about production posture.
 
-This was deprioritised until a concrete signal arrived: a sibling project (not
+This was deprioritized until a concrete signal arrived: a sibling project (not
 o11y, but using the **same upstream Marz instrumentation libs** o11y wraps) ran
 a **MongoDB change-stream watcher → JetStream → websocket worker** pipeline.
 Both services spiked CPU and memory under load; the fix applied in production
@@ -80,7 +80,7 @@ hot-path services that need it, rather than a low global rate.
 
 ---
 
-## Dependency behaviour (verified, OTel Go SDK v1.43.0)
+## Dependency behavior (verified, OTel Go SDK v1.43.0)
 
 Source inspection of `sdk/trace`:
 
@@ -203,7 +203,7 @@ func InitTracer(ctx context.Context, endpoint string, headers map[string]string,
   existing `validateHistogramBuckets` check, `o11y.go:178`); reject out-of-range
   rather than silently clamping.
 - This is a **non-breaking, additive** change (new options + an internal-package
-  signature change); no existing caller changes behaviour.
+  signature change); no existing caller changes behavior.
 
 ---
 
@@ -288,12 +288,12 @@ func InitTracer(ctx context.Context, endpoint string, headers map[string]string,
    `Init`, consistent with `validateHistogramBuckets`.
 3. **Docs** — README + a short "sampling" section: the head/tail split, the
    per-service guidance, the `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG`
-   and `OTEL_BSP_*` env vars, the propagation-cascade behaviour, and the
+   and `OTEL_BSP_*` env vars, the propagation-cascade behavior, and the
    exemplar/profiling coverage trade-off. Use the watcher→JetStream→worker case
    as the worked example.
 4. **Collector tail-sampling** — add a `tail_sampling` example to the `k8s/`
    Collector config in a follow-up (errors always-keep + latency policy +
-   probabilistic baseline), explicitly labelled as backend-cost control, not
+   probabilistic baseline), explicitly labeled as backend-cost control, not
    service protection.
 5. **No global-state impact** — `WithTraceSampler` accepts an SDK sampler value;
    nothing touches `otel.SetTracerProvider` or other globals (ADR 0003 holds).
