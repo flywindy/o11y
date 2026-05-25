@@ -142,6 +142,7 @@ Before introducing any `github.com/<vendor>/otel-<thing>` library, verify:
 | `github.com/grafana/otel-profiling-go` | v0.5.1 | ✅ | Wraps an explicit `trace.TracerProvider`; does not set OTel globals. It labels pprof samples and annotates root spans with `pyroscope.profile.id`. | See ADR 0012 |
 | `go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin` | v0.68.0 | ✅ | Reads globals as fallback only; safe when `WithTracerProvider`, `WithMeterProvider`, and `WithPropagators` are supplied. | See ADR 0010 |
 | `github.com/gin-gonic/gin` | v1.12.0 | ✅ | Pure HTTP framework; no OpenTelemetry provider globals. | See ADR 0010 |
+| `github.com/go-resty/resty/v2` | v2.17.2 | ✅ | Pure HTTP client; does not import OpenTelemetry or mutate provider globals. The SDK-owned `resty` wrapper wires providers explicitly. | See ADR 0011 |
 
 When a new library is added or an existing one bumped, update this table
 in the same PR as the version change.
