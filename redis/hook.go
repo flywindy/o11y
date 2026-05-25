@@ -108,11 +108,16 @@ func (h *redisHook) ProcessHook(next goredis.ProcessHook) goredis.ProcessHook {
 			operation = strings.ToUpper(cmd.Name())
 		}
 
-		attrs := h.spanAttrs(operation)
+		// User attributes go first so the SDK's own semconv attributes win on
+		// key collisions: OTel resolves duplicate keys last-wins, and the
+		// built-in keys (db.system.name, db.operation.name, server.*, etc.) are
+		// part of this package's contract and must not be silently overridden by
+		// WithAttributes.
+		attrs := append([]attribute.KeyValue{}, h.cfg.attrs...)
+		attrs = append(attrs, h.spanAttrs(operation)...)
 		if h.cfg.commandTextEnabled {
 			attrs = append(attrs, semconv.DBQueryText(truncateCommandText(commandText(cmd))))
 		}
-		attrs = append(attrs, h.cfg.attrs...)
 
 		ctx, span := h.tracer.Start(ctx, "redis."+operation,
 			trace.WithSpanKind(trace.SpanKindClient),
@@ -136,14 +141,16 @@ func (h *redisHook) ProcessPipelineHook(next goredis.ProcessPipelineHook) goredi
 			return next(ctx, cmds)
 		}
 
-		attrs := h.spanAttrs("pipeline")
+		// User attributes go first so the SDK's built-in semconv keys win on
+		// collision (OTel resolves duplicate keys last-wins). See ProcessHook.
+		attrs := append([]attribute.KeyValue{}, h.cfg.attrs...)
+		attrs = append(attrs, h.spanAttrs("pipeline")...)
 		if len(userCmds) >= 2 {
 			attrs = append(attrs, semconv.DBOperationBatchSize(len(userCmds)))
 		}
 		if h.cfg.commandTextEnabled {
 			attrs = append(attrs, semconv.DBQueryText(truncateCommandText(pipelineText(userCmds))))
 		}
-		attrs = append(attrs, h.cfg.attrs...)
 
 		ctx, span := h.tracer.Start(ctx, "redis.pipeline",
 			trace.WithSpanKind(trace.SpanKindClient),

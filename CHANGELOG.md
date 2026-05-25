@@ -11,6 +11,24 @@ adopters can plan their upgrades.
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- New `redis/` package: an SDK-owned T3 wrapper over
+  `github.com/redis/go-redis/v9` that emits OTel semconv v1.39.0 spans and pool
+  metrics for single, Cluster, and Ring topologies. Public surface is
+  `Wrap` / `Unwrap` / `MetricViews` / `WithCommandTextEnabled` /
+  `WithAttributes` / `WithPoolName`. `Wrap` is idempotent and installs its hook
+  before any caller hooks so the span encloses them; `WithAttributes` cannot
+  override the SDK's built-in semconv keys. See ADR 0013.
+- `internal/metrics.Config.ExtraViews` lets integration packages contribute
+  metric views at `MeterProvider` construction time; `o11y.Init` now composes
+  `o11yredis.MetricViews()` automatically so Redis pool-metric labels stay
+  within the SDK cardinality contract.
+
+---
+
 ## [0.2.0] - 2026-05-22
 
 ### Added

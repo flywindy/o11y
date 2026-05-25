@@ -24,6 +24,11 @@ func WithCommandTextEnabled(enabled bool) Option {
 
 // WithAttributes appends extra attributes to every emitted Redis span.
 //
+// The SDK's built-in semantic-convention attributes (db.system.name,
+// db.operation.name, server.address, server.port, db.namespace, db.query.text)
+// take precedence: if a supplied attribute reuses one of those keys, the
+// built-in value wins and the supplied one is dropped.
+//
 // These attributes are never applied to metric samples; Redis metric labels are
 // fixed by the SDK to keep cardinality bounded.
 func WithAttributes(attrs ...attribute.KeyValue) Option {

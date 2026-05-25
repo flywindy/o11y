@@ -169,7 +169,9 @@ func (p *poolMetrics) observeClient(observer metric.Observer, client *goredis.Cl
 	observer.ObserveInt64(p.count, int64(stats.IdleConns), metric.WithAttributes(append(attrs,
 		attribute.String("db.client.connection.state", "idle"),
 	)...))
-	observer.ObserveInt64(p.idleMax, int64(opt.MaxIdleConns), metric.WithAttributes(attrs...))
+	if idleMax, ok := maxIdleConnections(opt); ok {
+		observer.ObserveInt64(p.idleMax, int64(idleMax), metric.WithAttributes(attrs...))
+	}
 	observer.ObserveInt64(p.idleMin, int64(opt.MinIdleConns), metric.WithAttributes(attrs...))
 	if maxConns, ok := maxConnections(opt); ok {
 		observer.ObserveInt64(p.max, int64(maxConns), metric.WithAttributes(attrs...))
@@ -200,6 +202,19 @@ func poolAttrs(poolName, addr string) []attribute.KeyValue {
 func maxConnections(opt *goredis.Options) (int, bool) {
 	if opt.MaxActiveConns > 0 {
 		return opt.MaxActiveConns, true
+	}
+	return 0, false
+}
+
+// maxIdleConnections mirrors maxConnections for the idle pool. go-redis treats
+// MaxIdleConns == 0 as "no idle cap" (internal/pool keeps every returned
+// connection idle), so reporting 0 to db.client.connection.idle.max would
+// invert the semconv meaning ("zero idle connections allowed"). When the idle
+// pool is unbounded the wrapper omits the observation rather than emit a
+// misleading value.
+func maxIdleConnections(opt *goredis.Options) (int, bool) {
+	if opt.MaxIdleConns > 0 {
+		return opt.MaxIdleConns, true
 	}
 	return 0, false
 }

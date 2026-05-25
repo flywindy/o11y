@@ -74,6 +74,28 @@ func TestProcessHookEmitsSemconvSpanAndDuration(t *testing.T) {
 	assertHistogramPointMissingKey(t, m, semconv.ErrorTypeKey)
 }
 
+func TestWithAttributesCannotOverrideBuiltinKeys(t *testing.T) {
+	cfg := config{attrs: []attribute.KeyValue{
+		attribute.String("app.name", "checkout"),
+		semconv.DBSystemNameKey.String("postgres"), // collides with built-in
+	}}
+	hook, sr, _ := newTestHook(t, cfg, "127.0.0.1:6379", 0)
+
+	err := hook.ProcessHook(func(context.Context, goredis.Cmder) error {
+		return nil
+	})(context.Background(), goredis.NewCmd(context.Background(), "get", "k"))
+	require.NoError(t, err)
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	// Custom, non-colliding attribute is kept.
+	assertSpanHas(t, spans[0], attribute.String("app.name", "checkout"))
+	// Built-in semconv key wins over the colliding user value.
+	value, ok := spanAttr(spans[0], semconv.DBSystemNameKey)
+	require.True(t, ok)
+	assert.Equal(t, "redis", value.AsString())
+}
+
 func TestCommandTextIsOptInAndTruncated(t *testing.T) {
 	hook, sr, _ := newTestHook(t, config{commandTextEnabled: true}, "127.0.0.1:6379", 0)
 	longValue := strings.Repeat("x", maxCommandTextLen+100)
@@ -412,10 +434,37 @@ func TestPoolMetricsOmitMaxWhenUnbounded(t *testing.T) {
 	rm := collectRedisMetrics(t, reader)
 	assert.Nil(t, metricByName(rm, "db.client.connection.max"),
 		"db.client.connection.max must be omitted when MaxActiveConns is 0 (unbounded)")
-	// Confirm the rest of the pool-metric set still reports — only the .max
-	// observation is conditional.
+	// Confirm the unconditional pool-metric set still reports — only the .max
+	// observations (connection.max here, idle.max in its own test) are
+	// conditional.
 	assert.NotNil(t, metricByName(rm, "db.client.connection.count"))
-	assert.NotNil(t, metricByName(rm, "db.client.connection.idle.max"))
+	assert.NotNil(t, metricByName(rm, "db.client.connection.idle.min"))
+}
+
+func TestPoolMetricsOmitIdleMaxWhenUnbounded(t *testing.T) {
+	tp, _, mp, reader := newRedisTestProviders()
+	// MaxIdleConns == 0 is go-redis's "no idle cap" sentinel: every returned
+	// connection is kept idle. Reporting 0 to db.client.connection.idle.max
+	// would invert the semconv meaning ("zero idle allowed"), so the wrapper
+	// must omit it. MaxActiveConns is set so db.client.connection.max stays
+	// present and we can see idle.max is dropped independently.
+	client := goredis.NewClient(&goredis.Options{
+		Addr:           "127.0.0.1:6379",
+		PoolSize:       11,
+		MaxActiveConns: 13,
+		MaxIdleConns:   0,
+	})
+	defer client.Close()
+
+	_, err := Wrap(client, tp, mp, WithPoolName("idle-unbounded"))
+	require.NoError(t, err)
+
+	rm := collectRedisMetrics(t, reader)
+	assert.Nil(t, metricByName(rm, "db.client.connection.idle.max"),
+		"db.client.connection.idle.max must be omitted when MaxIdleConns is 0 (unbounded)")
+	assert.NotNil(t, metricByName(rm, "db.client.connection.max"),
+		"db.client.connection.max stays present when MaxActiveConns is bounded")
+	assert.NotNil(t, metricByName(rm, "db.client.connection.idle.min"))
 }
 
 func TestMetricViewsDropRedisotelLegacyInstruments(t *testing.T) {
