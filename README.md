@@ -16,6 +16,7 @@ This project provides a "Context-First" observability layer for Go applications,
 - **Infrastructure**:
   - **NATS**: High-performance messaging
   - **MongoDB**: NoSQL database for persistence
+  - **Redis / Valkey**: Cache and Redis-protocol data stores
   - **Tempo**: Distributed tracing backend
   - **Loki**: Log aggregation system
   - **Pyroscope**: Continuous profiling backend
@@ -434,6 +435,50 @@ client, err := o11ymongo.Connect(ctx, mongoURI, obs.TracerProvider(), obs.Propag
 )
 ```
 
+### Redis / Valkey
+
+Use the `redis` sub-package to instrument `github.com/redis/go-redis/v9`
+clients. The wrapper supports Redis and Valkey servers through go-redis and
+does not call `redisotel`; spans and metrics are emitted directly with the
+SDK's pinned semantic conventions.
+
+```go
+import (
+    o11yredis "github.com/flywindy/o11y/redis"
+    "github.com/redis/go-redis/v9"
+)
+
+rdb := redis.NewClient(&redis.Options{
+    Addr: "localhost:6379",
+    DB:   0,
+})
+defer rdb.Close()
+
+_, err := o11yredis.Wrap(
+    rdb,
+    obs.TracerProvider(),
+    obs.MeterProvider(),
+    o11yredis.WithPoolName("sessions-cache"),
+)
+if err != nil {
+    obs.Logger.ErrorContext(ctx, "Redis instrumentation failed", slog.Any("error", err))
+}
+
+if err := rdb.Set(ctx, "health", "ok", 0).Err(); err != nil {
+    obs.Logger.ErrorContext(ctx, "Redis set failed", slog.Any("error", err))
+}
+```
+
+`db.query.text` is off by default because Redis commands often contain key
+names or values that may be sensitive. Enable it only when that data is safe
+for your trace backend:
+
+```go
+_, err := o11yredis.Wrap(rdb, obs.TracerProvider(), obs.MeterProvider(),
+    o11yredis.WithCommandTextEnabled(true),
+)
+```
+
 ### Prometheus Metrics
 
 By default the SDK exposes a `/metrics` endpoint on `:2112` for Prometheus to scrape. Every series carries `service_namespace`, `service_name`, `service_version`, and `deployment_environment_name` as constant labels.
@@ -526,6 +571,7 @@ Before running any example, port-forward the required services from the `kind` c
 ```bash
 kubectl port-forward -n infra svc/otel-collector 4318:4318  # OTel traces and logs
 kubectl port-forward -n infra svc/nats           4222:4222  # NATS connection
+kubectl port-forward -n infra svc/redis          6379:6379  # Redis connection
 kubectl port-forward -n infra svc/grafana        3000:3000  # Grafana UI
 kubectl port-forward -n infra svc/prometheus     9090:9090  # Prometheus UI
 kubectl port-forward -n infra svc/alloy          4040:4040  # Pyroscope ingest for local app profiling
@@ -582,6 +628,19 @@ curl http://localhost:8080/fail
 The example registers `o11ygin.Middleware(...)` before `gin.Recovery()` and
 demonstrates typed `gin.error.type` span events from `c.AbortWithError`.
 
+### Redis
+
+Port-forward Redis to `localhost:6379`, then run the example:
+
+```bash
+kubectl port-forward -n infra svc/redis 6379:6379
+go run examples/redis/main.go
+```
+
+The example emits Redis command spans plus `db.client.operation.duration` and
+connection-pool metrics through OTLP metrics push. It runs `PING`, `SET`,
+`GET`, a cache-miss `GET`, and a pipeline every two seconds.
+
 ### Profiling
 
 ```bash
@@ -625,6 +684,7 @@ go run examples/mongodb/main.go
 
 - [`github.com/Marz32onE/instrumentation-go/otel-nats`](https://github.com/Marz32onE/instrumentation-go) — provides the underlying NATS Core + JetStream tracing semantics used by the `nats/` wrapper. Verified at v0.2.11 not to mutate OTel globals and to import semconv v1.39.0. See [ADR 0004](docs/adr/0004-nats-integration.md) for the integration decision and audit discipline.
 - [`github.com/Marz32onE/instrumentation-go/otel-mongo/v2`](https://github.com/Marz32onE/instrumentation-go) — provides the underlying MongoDB driver v2 tracing semantics used by the `mongo/` wrapper. Verified at the `otel-mongo/v2/v0.2.11` tag not to mutate OTel globals, with `_oteltrace` document propagation disabled by default through the o11y wrapper. See [ADR 0005](docs/adr/0005-mongodb-integration.md).
+- [`github.com/redis/go-redis/v9`](https://pkg.go.dev/github.com/redis/go-redis/v9) — is the Redis/Valkey client wrapped by the SDK-owned `redis/` instrumentation. The wrapper does not call `redisotel`; see [ADR 0013](docs/adr/0013-redis-valkey-integration.md).
 - [`go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp`](https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp) — provides the underlying HTTP server/client instrumentation used by the `http/` facade. See [ADR 0009](docs/adr/0009-replace-http-with-otelhttp.md).
 - [`github.com/grafana/pyroscope-go`](https://github.com/grafana/pyroscope-go) and [`github.com/grafana/otel-profiling-go`](https://github.com/grafana/otel-profiling-go) provide the Pyroscope profiler and trace-to-profile bridge. See [ADR 0012](docs/adr/0012-profiling-integration.md).
 - [`go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin`](https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin) — provides the underlying gin instrumentation used by the `gin/` facade. See [ADR 0010](docs/adr/0010-gin-integration.md).

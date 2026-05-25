@@ -23,6 +23,7 @@ import (
 	"github.com/flywindy/o11y/internal/metrics"
 	"github.com/flywindy/o11y/internal/profiling"
 	"github.com/flywindy/o11y/internal/trace"
+	o11yredis "github.com/flywindy/o11y/redis"
 	otelpyroscope "github.com/grafana/otel-profiling-go"
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel/metric"
@@ -229,6 +230,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 			RuntimeMetrics:          cfg.runtimeMetrics,
 			HistogramBuckets:        cfg.histogramBuckets,
 			DisableDefaultViews:     cfg.disableDefaultViews,
+			ExtraViews:              o11yredis.MetricViews(),
 			MaxUniqueRoutes:         cfg.maxUniqueRoutes,
 			ExtraHTTPServerAttrKeys: cfg.extraHTTPServerAttrKeys,
 			Exemplars:               cfg.exemplars,

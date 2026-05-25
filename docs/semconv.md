@@ -162,6 +162,50 @@ through `mongo.WithDocumentTracePropagation(true)`.
 
 ---
 
+## Database - Redis / Valkey
+
+Spans and metrics are emitted by the SDK-owned
+`github.com/flywindy/o11y/redis` wrapper for
+`github.com/redis/go-redis/v9`. The wrapper does not call
+`redisotel.InstrumentTracing` or `redisotel.InstrumentMetrics`; see ADR 0013.
+
+### Span Attributes
+
+| Key | Type | Notes |
+|---|---|---|
+| `db.system.name` | string | Constant `"redis"` for Redis and Valkey backends. |
+| `db.operation.name` | string | Uppercase command name such as `GET`, or `pipeline` for batches. |
+| `db.namespace` | string | Selected Redis DB number, when known. |
+| `db.operation.batch.size` | int | Pipeline user-command count when the effective count is at least 2. |
+| `db.query.text` | string | Only when `redis.WithCommandTextEnabled(true)` is used; truncated to 1 KiB. |
+| `error.type` | string | Emitted for errors except `redis.Nil`, which is treated as a cache miss success. |
+| `redis.error.kind` | string | SDK-owned closed enum: `pool_timeout`, `client_timeout`, `client_canceled`. |
+| `server.address` | string | Redis endpoint host, or go-redis sentinel placeholder when that is all the client exposes. |
+| `server.port` | int | Redis endpoint port when the address parses as `host:port`. |
+
+### Instruments
+
+| Name | Kind | Unit | Attributes |
+|---|---|---|---|
+| `db.client.operation.duration` | Float64Histogram | `s` | `db.system.name`, `db.operation.name`, `server.address`, `server.port`, `error.type` |
+| `db.client.connection.count` | Int64ObservableUpDownCounter | `{connection}` | `db.system.name`, `db.client.connection.pool.name`, `db.client.connection.state`, `server.address`, `server.port` |
+| `db.client.connection.idle.max` | Int64ObservableUpDownCounter | `{connection}` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
+| `db.client.connection.idle.min` | Int64ObservableUpDownCounter | `{connection}` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
+| `db.client.connection.max` | Int64ObservableUpDownCounter | `{connection}` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
+| `db.client.connection.timeouts` | Int64ObservableCounter | `{timeout}` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
+| `db.client.connection.create_time` | Float64Histogram | `s` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
+
+### Explicitly NOT Emitted by Default
+
+| Key | Reason |
+|---|---|
+| `db.connection_string` | May contain credentials in Redis URLs. |
+| `db.system` | Legacy semconv key replaced by `db.system.name`. |
+| `db.statement` | Legacy semconv key replaced by opt-in `db.query.text`. |
+| `code.function`, `code.filepath`, `code.lineno` | Would describe instrumentation internals rather than application call sites. |
+
+---
+
 ## Logs
 
 All log records pass through the `otelslog` bridge, which applies OTel Log
@@ -183,6 +227,7 @@ Data Model attributes automatically.
 | Key family | Source | Reason |
 |---|---|---|
 | `nats.*` | `otel-nats` trace-event spans | NATS server trace-event payload fields have no direct stable OTel semconv equivalent. They are isolated to the optional infrastructure trace-event flow. |
+| `redis.error.kind` | `redis` wrapper | Redis-specific bounded error class that distinguishes pool exhaustion from caller cancellation/deadline without using it as a metric label. |
 
 Any new deviation must list:
 
