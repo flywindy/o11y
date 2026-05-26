@@ -200,8 +200,10 @@ func InitTracer(ctx context.Context, endpoint string, headers map[string]string,
 
 - Call site `o11y.go:199` passes `cfg.sampler`.
 - `WithSamplingRatio` validates `0.0 ≤ ratio ≤ 1.0` at `Init` (alongside the
-  existing `validateHistogramBuckets` check, `o11y.go:178`); reject out-of-range
-  rather than silently clamping.
+  existing `validateHistogramBuckets` check, `o11y.go:178`) and rejects
+  out-of-range values. This is a **deliberate** addition on top of OTel's native
+  behavior: `sdktrace.TraceIDRatioBased` itself silently clamps (`≤0`→0,
+  `≥1`→1); we fail fast instead so a misconfigured rate surfaces at startup.
 - This is a **non-breaking, additive** change (new options + an internal-package
   signature change); no existing caller changes behavior.
 

@@ -66,8 +66,9 @@ attached on the `*options.ClientOptions` we already build, before handing it to
 
 - Attach the **official contrib `otelmongo` CommandMonitor in metrics-only
   mode**: `otelmongo.NewMonitor(otelmongo.WithMeterProvider(mp),
-  otelmongo.WithTracerProvider(noop.NewTracerProvider()))` via
-  `clientOptions.SetMonitor(...)`. The noop tracer suppresses the monitor's own
+  otelmongo.WithTracerProvider(tracenoop.NewTracerProvider()))` via
+  `clientOptions.SetMonitor(...)` (`tracenoop` =
+  `"go.opentelemetry.io/otel/trace/noop"`, the alias `o11y.go` already uses). The noop tracer suppresses the monitor's own
   spans so they cannot double-emit alongside the Marz API-wrapping spans (and
   cannot bypass the ADR 0005 env-gate); only `db.client.operation.duration`
   flows out.
@@ -149,9 +150,9 @@ func Connect(ctx, uri string, tp trace.TracerProvider, mp metric.MeterProvider,
   T3** (no candidate implements a pool observer).
 - `mongo/doc.go` Tier line must be updated to reflect the mixed sourcing once
   Phase 2 lands (T2 facade for spans + duration; T3 for the SDK-owned pool
-  observer, justified in this ADR per §2). Resolve whether the CI gate
-  (ADR 0008 §7.2) accepts a dual annotation or whether the pool observer moves
-  to a clearly-scoped file under the same package.
+  observer, justified in this ADR per §2). Use a **dual annotation**
+  (`// Tier: T2` + `// Tier: T3`) — the CI gate (ADR 0008 §7.2) accepts both
+  lines, as decided in Q3 below; no gate change is required.
 - **ADR 0003**: add the contrib `otelmongo` module to the Approved-integrations
   table (global-state grep + semconv row), per ADR 0008 §4 / §7.1.
 - **ADR 0005**: cross-reference this ADR; note metrics now augment the trace
@@ -166,8 +167,10 @@ func Connect(ctx, uri string, tp trace.TracerProvider, mp metric.MeterProvider,
 ## Testing
 
 - **Phase 1**: assert `db.client.operation.duration` is recorded with
-  `db.system.name=mongodb` / `db.operation.name` / `server.*` / `error.type` on
-  failure; assert the contrib monitor's spans do **not** appear (noop tracer);
+  `db.system.name=mongodb` / `db.operation.name` / `network.peer.address` /
+  `network.peer.port` / `error.type` on failure (the contrib emits
+  `network.peer.*`, not `server.*` — see Decision analysis and Implementation
+  specifics #2); assert the contrib monitor's spans do **not** appear (noop tracer);
   assert provider wiring rejects nil `mp`.
 - **Phase 2**: unit-testable without a real server — `event.PoolMonitor` and
   `event.CommandMonitor` are plain structs of funcs, so feed synthetic
