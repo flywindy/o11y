@@ -77,6 +77,28 @@ func TestWrapNilPropagatorDefaultsToTraceContext(t *testing.T) {
 	assert.Equal(t, parent.SpanContext().TraceID().String(), parts.traceID)
 }
 
+func TestWrapRecordsComposedRestyURL(t *testing.T) {
+	tp, mp, sr := testProviders()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.SetBaseURL(ts.URL)
+
+	resp, err := client.R().
+		SetPathParam("id", "123").
+		SetQueryParam("include", "items").
+		Get("/orders/{id}")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode())
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	assertAttr(t, spans[0], semconv.URLFullKey, ts.URL+"/orders/123?include=items")
+}
+
 func TestWrapIsIdempotent(t *testing.T) {
 	tp, mp, sr := testProviders()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -184,6 +206,36 @@ func TestServerTimeoutStatusSetsRestyErrorKind(t *testing.T) {
 	assertAttr(t, spans[0], restyErrorKindKey, "server_timeout")
 	assertAttr(t, spans[0], semconv.ErrorTypeKey, "504")
 	assert.Equal(t, codes.Error, spans[0].Status().Code)
+}
+
+func TestResponseErrorPreservesHTTPStatusCode(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("too large"))
+	}))
+	defer ts.Close()
+
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.SetResponseBodyLimit(1)
+
+	_, err := client.R().Get(ts.URL + "/too-large")
+	require.Error(t, err)
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	assertAttr(t, spans[0], semconv.HTTPResponseStatusCodeKey, int64(http.StatusInternalServerError))
+	assertAttr(t, spans[0], semconv.URLFullKey, ts.URL+"/too-large")
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	point := findClientDurationPoint(t, rm)
+	statusCode, ok := point.Attributes.Value(semconv.HTTPResponseStatusCodeKey)
+	require.True(t, ok)
+	assert.Equal(t, int64(http.StatusInternalServerError), statusCode.AsInt64())
 }
 
 func TestRouteFromContextControlsSpanNameAndMetricRoute(t *testing.T) {

@@ -79,19 +79,9 @@ func (h *hook) beforeRequest(c *restyclient.Client, req *restyclient.Request) er
 		method = http.MethodGet
 	}
 	route := h.route(parentCtx)
-	target := requestTarget(c, req)
 
 	attrs := []attribute.KeyValue{
 		semconv.HTTPRequestMethodKey.String(method),
-	}
-	if target.host != "" {
-		attrs = append(attrs, semconv.ServerAddress(target.host))
-	}
-	if target.port > 0 {
-		attrs = append(attrs, semconv.ServerPort(target.port))
-	}
-	if target.fullURL != "" {
-		attrs = append(attrs, semconv.URLFull(target.fullURL))
 	}
 	if req.Attempt >= 2 {
 		attrs = append(attrs, semconv.HTTPRequestResendCount(req.Attempt-1))
@@ -111,7 +101,6 @@ func (h *hook) beforeRequest(c *restyclient.Client, req *restyclient.Request) er
 		start:      time.Now(),
 		method:     method,
 		route:      route,
-		target:     target,
 		attempt:    req.Attempt,
 		retryCount: c.RetryCount,
 	}
@@ -131,8 +120,9 @@ func (h *hook) afterResponse(c *restyclient.Client, resp *restyclient.Response) 
 		return nil
 	}
 
+	state.target = requestTarget(c, resp.Request)
 	statusCode := resp.StatusCode()
-	attrs := []attribute.KeyValue{semconv.HTTPResponseStatusCode(statusCode)}
+	attrs := append(targetAttributes(state.target), semconv.HTTPResponseStatusCode(statusCode))
 	if statusCode == http.StatusRequestTimeout || statusCode == http.StatusGatewayTimeout {
 		attrs = append(attrs, restyErrorKindKey.String("server_timeout"))
 	}
@@ -192,15 +182,31 @@ func (h *hook) error(req *restyclient.Request, err error) {
 
 func (h *hook) finishError(req *restyclient.Request, state *requestState, err error, retryExhausted bool) {
 	errType := errorType(err)
-	attrs := []attribute.KeyValue{
+	statusCode := 0
+	var responseErr *restyclient.ResponseError
+	if errors.As(err, &responseErr) && responseErr.Response != nil {
+		statusCode = responseErr.Response.StatusCode()
+		if responseErr.Response.Request != nil {
+			req = responseErr.Response.Request
+		}
+	}
+	state.target = requestTarget(nil, req)
+
+	attrs := append(targetAttributes(state.target),
 		semconv.ErrorTypeKey.String(errType),
 		restyErrorKindKey.String(restyErrorKind(err)),
+	)
+	if statusCode > 0 {
+		attrs = append(attrs, semconv.HTTPResponseStatusCode(statusCode))
 	}
 	if retryExhausted && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		attrs = append(attrs, restyRetryExhaustedKey.Bool(true))
 		addRetryExhaustedEvent(state.parentCtx)
 	}
 	metricAttrs := append(h.metricAttrs(state), semconv.ErrorTypeKey.String(errType))
+	if statusCode > 0 {
+		metricAttrs = append(metricAttrs, semconv.HTTPResponseStatusCode(statusCode))
+	}
 	h.finish(req, state, codes.Error, err.Error(), err, attrs, metricAttrs)
 }
 
@@ -299,12 +305,18 @@ func addRetryExhaustedEvent(ctx context.Context) {
 }
 
 func requestTarget(c *restyclient.Client, req *restyclient.Request) targetAttrs {
+	if req == nil {
+		return targetAttrs{}
+	}
 	if req.RawRequest != nil && req.RawRequest.URL != nil {
 		return targetFromURL(req.RawRequest.URL)
 	}
 	rawURL := req.URL
 	if parsed, err := url.Parse(rawURL); err == nil && parsed.IsAbs() {
 		return targetFromURL(parsed)
+	}
+	if c == nil {
+		return targetAttrs{fullURL: rawURL}
 	}
 	base := c.BaseURL
 	if base == "" {
@@ -322,6 +334,20 @@ func requestTarget(c *restyclient.Client, req *restyclient.Request) targetAttrs 
 		return targetFromURL(baseURL)
 	}
 	return targetFromURL(baseURL.ResolveReference(rel))
+}
+
+func targetAttributes(target targetAttrs) []attribute.KeyValue {
+	attrs := make([]attribute.KeyValue, 0, 3)
+	if target.host != "" {
+		attrs = append(attrs, semconv.ServerAddress(target.host))
+	}
+	if target.port > 0 {
+		attrs = append(attrs, semconv.ServerPort(target.port))
+	}
+	if target.fullURL != "" {
+		attrs = append(attrs, semconv.URLFull(target.fullURL))
+	}
+	return attrs
 }
 
 func targetFromURL(u *url.URL) targetAttrs {
