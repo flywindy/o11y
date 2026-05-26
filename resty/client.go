@@ -58,7 +58,7 @@ func Wrap(
 		mp = metricnoop.NewMeterProvider()
 	}
 	if prop == nil {
-		prop = propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})
+		prop = propagation.TraceContext{}
 	}
 
 	key := clientKey(rc)
@@ -103,6 +103,7 @@ func Wrap(
 		h := newHook(tp, duration, prop, cfg)
 		rc.OnBeforeRequest(h.beforeRequest)
 		rc.OnAfterResponse(h.afterResponse)
+		rc.OnSuccess(h.success)
 		rc.AddRetryHook(h.retry)
 		rc.OnError(h.error)
 

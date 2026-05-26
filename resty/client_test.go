@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -59,13 +60,20 @@ func TestWrapInjectsTraceContextAndCreatesClientSpan(t *testing.T) {
 func TestWrapNilPropagatorDefaultsToTraceContext(t *testing.T) {
 	tp, mp, _ := testProviders()
 	var traceparent string
+	var baggageHeader string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		traceparent = r.Header.Get("traceparent")
+		baggageHeader = r.Header.Get("baggage")
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer ts.Close()
 
-	parentCtx, parent := tp.Tracer("test").Start(context.Background(), "caller")
+	member, err := baggage.NewMember("tenant", "acme")
+	require.NoError(t, err)
+	bag, err := baggage.New(member)
+	require.NoError(t, err)
+	ctx := baggage.ContextWithBaggage(context.Background(), bag)
+	parentCtx, parent := tp.Tracer("test").Start(ctx, "caller")
 	defer parent.End()
 
 	client := NewClient(tp, mp, nil)
@@ -75,6 +83,7 @@ func TestWrapNilPropagatorDefaultsToTraceContext(t *testing.T) {
 
 	parts := traceparentParts(t, traceparent)
 	assert.Equal(t, parent.SpanContext().TraceID().String(), parts.traceID)
+	assert.Empty(t, baggageHeader)
 }
 
 func TestWrapRecordsComposedRestyURL(t *testing.T) {
@@ -208,6 +217,26 @@ func TestServerTimeoutStatusSetsRestyErrorKind(t *testing.T) {
 	assert.Equal(t, codes.Error, spans[0].Status().Code)
 }
 
+func TestNilRouteContextKeyDoesNotPanic(t *testing.T) {
+	tp, mp, sr := testProviders()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	client := NewClient(tp, mp, propagation.TraceContext{},
+		WithRouteFromContext(nil),
+		WithMetricRouteEnabled(true),
+	)
+	resp, err := client.R().Get(ts.URL)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode())
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	assertNoAttr(t, spans[0], semconv.HTTPRouteKey)
+}
+
 func TestResponseErrorPreservesHTTPStatusCode(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
@@ -236,6 +265,29 @@ func TestResponseErrorPreservesHTTPStatusCode(t *testing.T) {
 	statusCode, ok := point.Attributes.Value(semconv.HTTPResponseStatusCodeKey)
 	require.True(t, ok)
 	assert.Equal(t, int64(http.StatusInternalServerError), statusCode.AsInt64())
+}
+
+func TestResponseMiddlewareErrorFinishesSpanAsError(t *testing.T) {
+	tp, mp, sr := testProviders()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.OnAfterResponse(func(_ *restyclient.Client, _ *restyclient.Response) error {
+		return errors.New("response middleware failed")
+	})
+
+	_, err := client.R().Get(ts.URL + "/middleware")
+	require.Error(t, err)
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	assert.Equal(t, codes.Error, spans[0].Status().Code)
+	assertAttr(t, spans[0], semconv.HTTPResponseStatusCodeKey, int64(http.StatusOK))
+	assertAttr(t, spans[0], semconv.URLFullKey, ts.URL+"/middleware")
+	assertAttr(t, spans[0], semconv.ErrorTypeKey, "*resty.ResponseError")
 }
 
 func TestRouteFromContextControlsSpanNameAndMetricRoute(t *testing.T) {

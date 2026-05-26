@@ -119,7 +119,24 @@ func (h *hook) afterResponse(c *restyclient.Client, resp *restyclient.Response) 
 	if state == nil || state.finished {
 		return nil
 	}
+	if h.retryableResponse(c, resp) {
+		h.finishResponse(c, resp, state)
+	}
+	return nil
+}
 
+func (h *hook) success(c *restyclient.Client, resp *restyclient.Response) {
+	if resp == nil || resp.Request == nil {
+		return
+	}
+	state := stateFromContext(resp.Request.Context())
+	if state == nil || state.finished {
+		return
+	}
+	h.finishResponse(c, resp, state)
+}
+
+func (h *hook) finishResponse(c *restyclient.Client, resp *restyclient.Response, state *requestState) {
 	state.target = requestTarget(c, resp.Request)
 	statusCode := resp.StatusCode()
 	attrs := append(targetAttributes(state.target), semconv.HTTPResponseStatusCode(statusCode))
@@ -151,11 +168,10 @@ func (h *hook) afterResponse(c *restyclient.Client, resp *restyclient.Response) 
 		description = resp.Status()
 	}
 	h.finish(resp.Request, state, status, description, nil, attrs, metricAttrs)
-	return nil
 }
 
 func isErrorStatusCode(code int) bool {
-	return code >= 400 || code < 100
+	return code >= 400 && code < 600
 }
 
 func (h *hook) retry(resp *restyclient.Response, err error) {

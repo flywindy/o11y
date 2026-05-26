@@ -20,6 +20,9 @@ type config struct {
 // also emit the same bounded route template on http.client.request.duration.
 func WithRouteFromContext(key any) Option {
 	return func(cfg *config) {
+		if key == nil {
+			return
+		}
 		cfg.routeKey = key
 		cfg.routeEnabled = true
 	}
