@@ -126,12 +126,20 @@ Add the "set once, flows everywhere" capability:
 - A fixed **whitelist** (`user.name` only, to start) bounds baggage header size
   and prevents baggage sprawl. Both the setter and the enrichers respect it.
 
-**Default posture: the feature is OFF at the SDK level, enabled explicitly per
-service (e.g. a `WithUserBaggage()`-style option). Once enabled, enrichment is
-fully automatic for that service — no per-call and no downstream code.** Default
-OFF because Phase 2 puts PII on the wire and should be a deliberate choice, not
-an implicit default forced on every SDK consumer. The product's NATS mesh enables
-it on purpose.
+**Default posture: the feature is OFF at the SDK level and requires explicit
+opt-in. Phase 2 has two separate opt-in boundaries:**
+
+- `ContextWithUser` is the source-side opt-in that places `user.name` into
+  baggage. Because the SDK's composite propagator already includes W3C Baggage,
+  this is the point where PII can start riding HTTP/NATS headers.
+- `WithUserBaggage()` is the per-service opt-in that materializes whitelisted
+  baggage onto that service's spans and logs. It does not by itself create
+  baggage or make baggage propagate.
+
+Once both are used in the intended places, enrichment is fully automatic for that
+service — no per-call and no downstream code. Default OFF because Phase 2 puts
+PII on the wire and should be a deliberate choice, not an implicit default forced
+on every SDK consumer. The product's NATS mesh enables it on purpose.
 
 **Mandatory guardrails when Phase 2 is enabled (documented, partly the
 deploying service's responsibility):**
@@ -165,15 +173,22 @@ func UserName(name string) slog.Attr {
     return slog.String(string(semconv.UserNameKey), name)
 }
 
-// Phase 2 — opt-in carrier + whitelist; enrichment wired inside Init.
-func ContextWithUser(ctx context.Context, name string) context.Context {
-    m, _ := baggage.NewMember(string(semconv.UserNameKey), name)
-    b, _ := baggage.FromContext(ctx).SetMember(m)
-    return baggage.ContextWithBaggage(ctx, b)
+// Phase 2 — source-side opt-in carrier. Use NewMemberRaw because usernames are
+// application strings, not pre-percent-encoded baggage values.
+func ContextWithUser(ctx context.Context, name string) (context.Context, error) {
+    m, err := baggage.NewMemberRaw(string(semconv.UserNameKey), name)
+    if err != nil {
+        return ctx, fmt.Errorf("invalid user.name baggage member: %w", err)
+    }
+    b, err := baggage.FromContext(ctx).SetMember(m)
+    if err != nil {
+        return ctx, fmt.Errorf("set user.name baggage member: %w", err)
+    }
+    return baggage.ContextWithBaggage(ctx, b), nil
 }
 
 // Enabled via an Init option; OFF by default. Registers the baggage->log handler
-// enrichment and the baggage->span SpanProcessor.
+// enrichment and the baggage->span SpanProcessor for this service.
 func WithUserBaggage() Option {
     return func(c *Config) { /* register handler enrich + SpanProcessor */ }
 }
@@ -268,7 +283,12 @@ an SDK consumer that does nothing sees no behavior change.
 2. **Phase 2** — `ContextWithUser` + `WithUserBaggage()` option; extend
    `OtelSlogHandler.Handle` and add the baggage SpanProcessor wired in
    `internal/trace/trace.go`; the processor and handler share one whitelist
-   constant. No global-state mutation (ADR 0003): the processor goes into the
+   constant. `ContextWithUser` must use raw-value baggage construction for
+   application usernames, return errors instead of silently dropping invalid
+   values, and be covered by tests for spaces, Unicode usernames, empty values,
+   and invalid baggage inputs. Unit-test the SpanProcessor and handler enrichment
+   logic, including whitelist filtering, baggage extraction, and attribute
+   setting. No global-state mutation (ADR 0003): the processor goes into the
    SDK-built provider, not via `otel.SetTracerProvider`.
 3. **Whitelist** — start with `["user.name"]`; expanding it is a conscious change
    (header-size and PII review), not an open door.
