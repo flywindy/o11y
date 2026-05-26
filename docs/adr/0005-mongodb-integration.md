@@ -2,7 +2,7 @@
 
 **Status**: Accepted (implemented through local wrapper)
 **Date**: 2026-04-22
-**Updated**: 2026-05-03
+**Updated**: 2026-05-26
 
 ---
 
@@ -17,6 +17,10 @@ meant:
 - Trace/log/metric correlation for DB operations requires ad-hoc code per
   service.
 - Semconv compliance for `db.*` attributes is not enforced.
+
+ADR 0014 extends this wrapper with MongoDB operation-duration metrics while
+keeping this ADR's tracing and `_oteltrace` document-propagation decisions
+intact.
 
 The reference implementation surveyed for this ADR is
 `github.com/Marz32onE/instrumentation-go/otel-mongo/v2`. Earlier revisions
@@ -79,6 +83,7 @@ func Connect(
     ctx context.Context,
     uri string,
     tp trace.TracerProvider,
+    mp metric.MeterProvider,
     prop propagation.TextMapPropagator,
     opts ...Option,
 ) (*Client, error)

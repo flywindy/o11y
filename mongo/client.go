@@ -1,5 +1,6 @@
-// Package mongo provides a tracing-aware MongoDB client wrapper that wires the
-// o11y SDK's TracerProvider and Propagator into otel-mongo/v2.
+// Package mongo provides a tracing- and metrics-aware MongoDB client wrapper
+// that wires the o11y SDK's TracerProvider, MeterProvider, and Propagator into
+// MongoDB instrumentation.
 //
 // All MongoDB clients in a service should go through this package so command
 // spans and optional document trace propagation are configured without relying
@@ -11,10 +12,14 @@ import (
 	"errors"
 	"fmt"
 
-	otelmongo "github.com/Marz32onE/instrumentation-go/otel-mongo/v2"
+	marzmongo "github.com/Marz32onE/instrumentation-go/otel-mongo/v2"
+	"go.mongodb.org/mongo-driver/v2/event"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	otelmongo "go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/v2/mongo/otelmongo"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
 // Option configures MongoDB instrumentation behavior.
@@ -30,7 +35,7 @@ type config struct {
 // available while application code can name the type without importing the
 // upstream instrumentation package directly.
 type Client struct {
-	*otelmongo.Client
+	*marzmongo.Client
 }
 
 // WithDocumentTracePropagation controls whether the upstream MongoDB wrapper
@@ -65,9 +70,10 @@ func newConfig(opts []Option) config {
 // ctx is checked before client construction; the underlying driver does not
 // dial until the first operation or Ping.
 //
-// tp and prop are required and are passed directly to the upstream wrapper.
-// Connect rejects nil values so upstream never falls back to global
-// OpenTelemetry providers.
+// tp, mp, and prop are required. The tracer provider and propagator are passed
+// directly to the upstream wrapper. The meter provider is wired into the
+// official OTel contrib CommandMonitor in metrics-only mode. Connect rejects
+// nil values so upstream never falls back to global OpenTelemetry providers.
 //
 // MongoDB command spans are gated by upstream environment variables:
 // OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true and
@@ -77,6 +83,7 @@ func Connect(
 	ctx context.Context,
 	uri string,
 	tp trace.TracerProvider,
+	mp metric.MeterProvider,
 	prop propagation.TextMapPropagator,
 	opts ...Option,
 ) (*Client, error) {
@@ -92,21 +99,35 @@ func Connect(
 	if tp == nil {
 		return nil, errors.New("mongo connect: tracer provider must not be nil")
 	}
+	if mp == nil {
+		return nil, errors.New("mongo connect: meter provider must not be nil")
+	}
 	if prop == nil {
 		return nil, errors.New("mongo connect: propagator must not be nil")
 	}
 
 	cfg := newConfig(opts)
-	client, err := otelmongo.ConnectWithOptions(
-		[]otelmongo.ClientOption{
-			otelmongo.WithTracerProvider(tp),
-			otelmongo.WithPropagators(prop),
-			otelmongo.WithTracePropagationEnabled(cfg.documentTracePropagation),
+	clientOptions := options.Client().ApplyURI(uri)
+	clientOptions.SetMonitor(newMetricsMonitor(mp))
+
+	client, err := marzmongo.ConnectWithOptions(
+		[]marzmongo.ClientOption{
+			marzmongo.WithTracerProvider(tp),
+			marzmongo.WithPropagators(prop),
+			marzmongo.WithTracePropagationEnabled(cfg.documentTracePropagation),
 		},
-		options.Client().ApplyURI(uri),
+		clientOptions,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("mongo connect: %w", err)
 	}
 	return &Client{Client: client}, nil
+}
+
+func newMetricsMonitor(mp metric.MeterProvider) *event.CommandMonitor {
+	return otelmongo.NewMonitor(
+		otelmongo.WithMeterProvider(mp),
+		otelmongo.WithTracerProvider(tracenoop.NewTracerProvider()),
+		otelmongo.WithCommandAttributeDisabled(true),
+	)
 }

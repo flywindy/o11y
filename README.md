@@ -395,14 +395,18 @@ defer func() { _ = sub.Drain() }() // gracefully drain on shutdown
 
 ### MongoDB
 
-Use the `mongo` sub-package to wire MongoDB tracing to the SDK-owned
-TracerProvider and Propagator. Do not import the upstream `otel-mongo/v2`
-package directly from application code.
+Use the `mongo` sub-package to wire MongoDB tracing and operation-duration
+metrics to the SDK-owned TracerProvider, MeterProvider, and Propagator. Do not
+import the upstream `otel-mongo/v2` package directly from application code.
 
 ```go
 import o11ymongo "github.com/flywindy/o11y/mongo"
 
-client, err := o11ymongo.Connect(ctx, mongoURI, obs.TracerProvider(), obs.Propagator)
+client, err := o11ymongo.Connect(ctx, mongoURI,
+    obs.TracerProvider(),
+    obs.MeterProvider(),
+    obs.Propagator,
+)
 if err != nil {
     obs.Logger.ErrorContext(ctx, "MongoDB connect failed", slog.Any("error", err))
     return
@@ -424,13 +428,19 @@ export OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true
 export OTEL_MONGO_TRACING_ENABLED=true
 ```
 
+MongoDB operation-duration metrics are emitted through the MeterProvider even
+when those tracing flags are not set.
+
 Document trace propagation is disabled by default because it writes an
 `_oteltrace` field into persisted documents. Enable it only for asynchronous
 patterns such as change streams or outbox processors that need to restore trace
 context from MongoDB documents:
 
 ```go
-client, err := o11ymongo.Connect(ctx, mongoURI, obs.TracerProvider(), obs.Propagator,
+client, err := o11ymongo.Connect(ctx, mongoURI,
+    obs.TracerProvider(),
+    obs.MeterProvider(),
+    obs.Propagator,
     o11ymongo.WithDocumentTracePropagation(true),
 )
 ```
@@ -731,6 +741,7 @@ go run examples/mongodb/main.go
 
 - [`github.com/Marz32onE/instrumentation-go/otel-nats`](https://github.com/Marz32onE/instrumentation-go) — provides the underlying NATS Core + JetStream tracing semantics used by the `nats/` wrapper. Verified at v0.2.11 not to mutate OTel globals and to import semconv v1.39.0. See [ADR 0004](docs/adr/0004-nats-integration.md) for the integration decision and audit discipline.
 - [`github.com/Marz32onE/instrumentation-go/otel-mongo/v2`](https://github.com/Marz32onE/instrumentation-go) — provides the underlying MongoDB driver v2 tracing semantics used by the `mongo/` wrapper. Verified at the `otel-mongo/v2/v0.2.11` tag not to mutate OTel globals, with `_oteltrace` document propagation disabled by default through the o11y wrapper. See [ADR 0005](docs/adr/0005-mongodb-integration.md).
+- [`go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/v2/mongo/otelmongo`](https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/v2/mongo/otelmongo) provides MongoDB `db.client.operation.duration` metrics through the `mongo` wrapper. See [ADR 0014](docs/adr/0014-mongodb-metrics.md).
 - [`github.com/redis/go-redis/v9`](https://pkg.go.dev/github.com/redis/go-redis/v9) — is the Redis/Valkey client wrapped by the SDK-owned `redis/` instrumentation. The wrapper does not call `redisotel`; see [ADR 0013](docs/adr/0013-redis-valkey-integration.md).
 - [`go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp`](https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp) — provides the underlying HTTP server/client instrumentation used by the `http/` facade. See [ADR 0009](docs/adr/0009-replace-http-with-otelhttp.md).
 - [`github.com/grafana/pyroscope-go`](https://github.com/grafana/pyroscope-go) and [`github.com/grafana/otel-profiling-go`](https://github.com/grafana/otel-profiling-go) provide the Pyroscope profiler and trace-to-profile bridge. See [ADR 0012](docs/adr/0012-profiling-integration.md).

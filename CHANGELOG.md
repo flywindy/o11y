@@ -26,6 +26,20 @@ adopters can plan their upgrades.
   metric views at `MeterProvider` construction time; `o11y.Init` now composes
   `o11yredis.MetricViews()` automatically so Redis pool-metric labels stay
   within the SDK cardinality contract.
+- MongoDB operation-duration metrics via the official contrib `otelmongo`
+  CommandMonitor in metrics-only mode. The `mongo` wrapper now emits
+  `db.client.operation.duration` with bounded labels and keeps existing Marz
+  tracing behavior unchanged. See ADR 0014.
+- Added the official MongoDB contrib instrumentation dependency, which requires
+  `go.mongodb.org/mongo-driver/v2 v2.6.0` and the corresponding OTel
+  `v1.43.1-0.20260521080857-e5bdc311108b` pseudo-version set.
+
+### Breaking Changes (Migration Guide)
+
+- `mongo.Connect` now requires an explicit `metric.MeterProvider` argument:
+  pass `obs.MeterProvider()` between `obs.TracerProvider()` and
+  `obs.Propagator`. This preserves the SDK's no-global-provider policy while
+  enabling MongoDB operation-duration metrics.
 
 ---
 
