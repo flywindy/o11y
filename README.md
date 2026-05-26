@@ -515,6 +515,42 @@ in-process aggregators from attacker-controlled attribute sets. If the separate
 SDK guard trips, metrics are preserved under `otel_metric_overflow="true"`
 with route detail intentionally dropped.
 
+### Resty HTTP Client
+
+Use the `resty` sub-package to instrument `github.com/go-resty/resty/v2`
+clients. The wrapper creates one client span per attempt, injects
+`traceparent` on every attempt, and records `http.client.request.duration`.
+
+```go
+import (
+    "context"
+    "net/http"
+
+    o11yresty "github.com/flywindy/o11y/resty"
+    restyclient "github.com/go-resty/resty/v2"
+)
+
+type routeKey struct{}
+
+client := o11yresty.NewClient(
+    obs.TracerProvider(),
+    obs.MeterProvider(),
+    obs.Propagator,
+    o11yresty.WithRouteFromContext(routeKey{}),
+    o11yresty.WithMetricRouteEnabled(true),
+)
+client.SetRetryCount(1).AddRetryCondition(func(resp *restyclient.Response, _ error) bool {
+    return resp != nil && resp.StatusCode() == http.StatusServiceUnavailable
+})
+
+ctx := context.WithValue(parentCtx, routeKey{}, "/api/orders/{id}")
+resp, err := client.R().SetContext(ctx).Get("http://orders:8080/api/orders/123")
+```
+
+Route metrics are opt-in. Use bounded route templates such as
+`/api/orders/{id}`; never put raw URL paths, user IDs, or trace IDs into
+`http.route`.
+
 ### Using with gin
 
 Use the `gin` sub-package to wire gin's OTel middleware to the SDK-owned
@@ -628,6 +664,17 @@ curl http://localhost:8080/fail
 The example registers `o11ygin.Middleware(...)` before `gin.Recovery()` and
 demonstrates typed `gin.error.type` span events from `c.AbortWithError`.
 
+### Resty
+
+```bash
+go run examples/resty/main.go
+```
+
+The example starts a local downstream HTTP server on `:8081`, calls it through
+the o11y Resty wrapper every two seconds, and intentionally returns periodic
+503 responses so retry attempts appear as sibling client spans with
+`http.request.resend_count`.
+
 ### Redis
 
 Port-forward Redis to `localhost:6379`, then run the example:
@@ -688,6 +735,7 @@ go run examples/mongodb/main.go
 - [`go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp`](https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp) — provides the underlying HTTP server/client instrumentation used by the `http/` facade. See [ADR 0009](docs/adr/0009-replace-http-with-otelhttp.md).
 - [`github.com/grafana/pyroscope-go`](https://github.com/grafana/pyroscope-go) and [`github.com/grafana/otel-profiling-go`](https://github.com/grafana/otel-profiling-go) provide the Pyroscope profiler and trace-to-profile bridge. See [ADR 0012](docs/adr/0012-profiling-integration.md).
 - [`go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin`](https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin) — provides the underlying gin instrumentation used by the `gin/` facade. See [ADR 0010](docs/adr/0010-gin-integration.md).
+- [`github.com/go-resty/resty/v2`](https://pkg.go.dev/github.com/go-resty/resty/v2) is the HTTP client wrapped by the SDK-owned `resty` instrumentation. The wrapper does not use `otelhttp` for Resty; it owns span lifecycle in Resty hooks so retry attempts stay observable. See [ADR 0011](docs/adr/0011-resty-integration.md).
 
 ## AI Collaboration
 

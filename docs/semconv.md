@@ -76,6 +76,39 @@ Histogram boundaries pinned via an OTel View to
 
 ---
 
+## HTTP Client (packages `github.com/flywindy/o11y/http` and `github.com/flywindy/o11y/resty`)
+
+### Instruments
+
+| Name | Kind | Unit | Description |
+|---|---|---|---|
+| `http.client.request.duration` | Float64Histogram | `s` | Duration of outbound HTTP client requests. Emitted by the `http` otelhttp facade and by the SDK-owned `resty` wrapper. |
+
+Histogram boundaries use the SDK's configured latency buckets.
+
+### Attributes
+
+| Key | Type | Notes |
+|---|---|---|
+| `http.request.method` | string | e.g. `GET`, `POST`. |
+| `http.route` | string | Resty only, opt-in through `resty.WithRouteFromContext` and `resty.WithMetricRouteEnabled(true)`. Must be a caller-supplied route template, never the raw URL path. Export cardinality is capped through `WithMaxUniqueRoutes`. |
+| `http.response.status_code` | int | Response-path metric label and span attribute. |
+| `http.request.resend_count` | int | Resty spans only; emitted on retry attempts after the first attempt. |
+| `url.full` | string | Resty spans only; full outbound URL. Do not put secrets in URLs. |
+| `error.type` | string | Error-path metric label and span attribute. |
+| `resty.error.kind` | string | Resty spans only; SDK-owned closed enum: `client_canceled`, `client_timeout`, `server_timeout`, `tls`, `transport`, `protocol`, `unknown`. |
+| `resty.retry.exhausted` | bool | Resty spans only; set on the last failed attempt when resty's retry budget is exhausted. |
+| `server.address` | string | Upstream host. |
+| `server.port` | int | Upstream port. |
+
+### Explicitly NOT Emitted by Default
+
+| Key | Reason |
+|---|---|
+| Raw URL path as `http.route` | High cardinality. Resty route metrics require explicit caller-provided templates. |
+
+---
+
 ## Go Runtime (package `go.opentelemetry.io/contrib/instrumentation/runtime`)
 
 Enabled by default via `WithRuntimeMetrics(true)`. The emitted metric set is
@@ -228,6 +261,7 @@ Data Model attributes automatically.
 |---|---|---|
 | `nats.*` | `otel-nats` trace-event spans | NATS server trace-event payload fields have no direct stable OTel semconv equivalent. They are isolated to the optional infrastructure trace-event flow. |
 | `redis.error.kind` | `redis` wrapper | Redis-specific bounded error class that distinguishes pool exhaustion from caller cancellation/deadline without using it as a metric label. |
+| `resty.error.kind`, `resty.retry.exhausted` | `resty` wrapper | Resty-specific bounded failure class and retry-budget marker. Standard `error.type` remains present; these keys preserve operator-facing retry and transport semantics without adding metric cardinality. |
 
 Any new deviation must list:
 

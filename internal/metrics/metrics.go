@@ -158,6 +158,7 @@ func defaultViews(cfg Config) []sdkmetric.View {
 				Aggregation: histogram,
 				AttributeFilter: attribute.NewAllowKeysFilter(
 					semconv.HTTPRequestMethodKey,
+					semconv.HTTPRouteKey,
 					semconv.HTTPResponseStatusCodeKey,
 					semconv.ServerAddressKey,
 					semconv.ServerPortKey,
@@ -223,11 +224,18 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 
 	gatherer := prometheus.Gatherer(reg)
 	if cfg.MaxUniqueRoutes > 0 {
-		gatherer = metricscap.NewGatherer(reg, metricscap.PrometheusRule{
-			MetricName: "http_server_request_duration_seconds",
-			LabelName:  "http_route",
-			Max:        cfg.MaxUniqueRoutes,
-		})
+		gatherer = metricscap.NewGatherer(reg,
+			metricscap.PrometheusRule{
+				MetricName: "http_server_request_duration_seconds",
+				LabelName:  "http_route",
+				Max:        cfg.MaxUniqueRoutes,
+			},
+			metricscap.PrometheusRule{
+				MetricName: "http_client_request_duration_seconds",
+				LabelName:  "http_route",
+				Max:        cfg.MaxUniqueRoutes,
+			},
+		)
 	}
 
 	mux := http.NewServeMux()
@@ -267,11 +275,18 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []s
 	}
 	cappedExporter := sdkmetric.Exporter(exporter)
 	if cfg.MaxUniqueRoutes > 0 {
-		cappedExporter = metricscap.NewExporter(exporter, metricscap.Rule{
-			InstrumentName: "http.server.request.duration",
-			Key:            semconv.HTTPRouteKey,
-			Max:            cfg.MaxUniqueRoutes,
-		})
+		cappedExporter = metricscap.NewExporter(exporter,
+			metricscap.Rule{
+				InstrumentName: "http.server.request.duration",
+				Key:            semconv.HTTPRouteKey,
+				Max:            cfg.MaxUniqueRoutes,
+			},
+			metricscap.Rule{
+				InstrumentName: "http.client.request.duration",
+				Key:            semconv.HTTPRouteKey,
+				Max:            cfg.MaxUniqueRoutes,
+			},
+		)
 	}
 
 	var initSucceeded bool
