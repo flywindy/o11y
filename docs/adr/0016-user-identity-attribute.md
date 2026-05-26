@@ -154,17 +154,29 @@ deploying service's responsibility):**
 ## API change (sketch — settle in the implementing PRs)
 
 ```go
-// Phase 1 — additive, no internal change.
+// Phase 1 — additive, no internal change. The user.name key is sourced from the
+// pinned semconv package (see Implementation specifics §1), not a string literal,
+// per docs/semconv.md. UserNameKey is illustrative — confirm the exact symbol at
+// implementation.
 func SetUser(ctx context.Context, name string) {
-    trace.SpanFromContext(ctx).SetAttributes(/* semconv user.name */ name)
+    trace.SpanFromContext(ctx).SetAttributes(semconv.UserNameKey.String(name))
 }
-func UserName(name string) slog.Attr { return slog.String(/* user.name */, name) }
+func UserName(name string) slog.Attr {
+    return slog.String(string(semconv.UserNameKey), name)
+}
 
 // Phase 2 — opt-in carrier + whitelist; enrichment wired inside Init.
-func ContextWithUser(ctx context.Context, name string) context.Context { /* baggage */ }
+func ContextWithUser(ctx context.Context, name string) context.Context {
+    m, _ := baggage.NewMember(string(semconv.UserNameKey), name)
+    b, _ := baggage.FromContext(ctx).SetMember(m)
+    return baggage.ContextWithBaggage(ctx, b)
+}
 
-// Enabled via an Init option; OFF by default.
-func WithUserBaggage() Option { /* registers handler enrich + SpanProcessor */ }
+// Enabled via an Init option; OFF by default. Registers the baggage->log handler
+// enrichment and the baggage->span SpanProcessor.
+func WithUserBaggage() Option {
+    return func(c *Config) { /* register handler enrich + SpanProcessor */ }
+}
 ```
 
 Both phases are **non-breaking, additive**. Phase 2 changes the *internal* log
