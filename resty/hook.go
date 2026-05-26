@@ -136,6 +136,11 @@ func (h *hook) afterResponse(c *restyclient.Client, resp *restyclient.Response) 
 	if statusCode == http.StatusRequestTimeout || statusCode == http.StatusGatewayTimeout {
 		attrs = append(attrs, restyErrorKindKey.String("server_timeout"))
 	}
+	errType := ""
+	if isErrorStatusCode(statusCode) {
+		errType = strconv.Itoa(statusCode)
+		attrs = append(attrs, semconv.ErrorTypeKey.String(errType))
+	}
 	if isLastAttempt(state) && h.retryableResponse(c, resp) {
 		attrs = append(attrs, restyRetryExhaustedKey.Bool(true))
 		addRetryExhaustedEvent(state.parentCtx)
@@ -144,6 +149,9 @@ func (h *hook) afterResponse(c *restyclient.Client, resp *restyclient.Response) 
 	metricAttrs := h.metricAttrs(state)
 	if statusCode > 0 {
 		metricAttrs = append(metricAttrs, semconv.HTTPResponseStatusCode(statusCode))
+	}
+	if errType != "" {
+		metricAttrs = append(metricAttrs, semconv.ErrorTypeKey.String(errType))
 	}
 
 	status := codes.Unset
@@ -154,6 +162,10 @@ func (h *hook) afterResponse(c *restyclient.Client, resp *restyclient.Response) 
 	}
 	h.finish(resp.Request, state, status, description, nil, attrs, metricAttrs)
 	return nil
+}
+
+func isErrorStatusCode(code int) bool {
+	return code >= 400 || code < 100
 }
 
 func (h *hook) retry(resp *restyclient.Response, err error) {

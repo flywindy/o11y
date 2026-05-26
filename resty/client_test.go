@@ -56,6 +56,27 @@ func TestWrapInjectsTraceContextAndCreatesClientSpan(t *testing.T) {
 	assertNoAttr(t, spans[0], restyErrorKindKey)
 }
 
+func TestWrapNilPropagatorDefaultsToTraceContext(t *testing.T) {
+	tp, mp, _ := testProviders()
+	var traceparent string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		traceparent = r.Header.Get("traceparent")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	parentCtx, parent := tp.Tracer("test").Start(context.Background(), "caller")
+	defer parent.End()
+
+	client := NewClient(tp, mp, nil)
+	resp, err := client.R().SetContext(parentCtx).Get(ts.URL)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode())
+
+	parts := traceparentParts(t, traceparent)
+	assert.Equal(t, parent.SpanContext().TraceID().String(), parts.traceID)
+}
+
 func TestWrapIsIdempotent(t *testing.T) {
 	tp, mp, sr := testProviders()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -107,6 +128,7 @@ func TestRetrySuccessCreatesSiblingSpansAndInjectsPerAttemptTraceparent(t *testi
 	assert.Equal(t, parent.SpanContext().SpanID(), spans[0].Parent().SpanID())
 	assert.Equal(t, parent.SpanContext().SpanID(), spans[1].Parent().SpanID())
 	assertAttr(t, spans[0], semconv.HTTPResponseStatusCodeKey, int64(http.StatusServiceUnavailable))
+	assertAttr(t, spans[0], semconv.ErrorTypeKey, "503")
 	assertNoAttr(t, spans[0], semconv.HTTPRequestResendCountKey)
 	assertAttr(t, spans[1], semconv.HTTPResponseStatusCodeKey, int64(http.StatusOK))
 	assertAttr(t, spans[1], semconv.HTTPRequestResendCountKey, int64(1))
@@ -160,6 +182,7 @@ func TestServerTimeoutStatusSetsRestyErrorKind(t *testing.T) {
 	spans := endedClientSpans(sr)
 	require.Len(t, spans, 1)
 	assertAttr(t, spans[0], restyErrorKindKey, "server_timeout")
+	assertAttr(t, spans[0], semconv.ErrorTypeKey, "504")
 	assert.Equal(t, codes.Error, spans[0].Status().Code)
 }
 

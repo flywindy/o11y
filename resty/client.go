@@ -58,7 +58,7 @@ func Wrap(
 		mp = metricnoop.NewMeterProvider()
 	}
 	if prop == nil {
-		prop = propagation.NewCompositeTextMapPropagator()
+		prop = propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})
 	}
 
 	key := clientKey(rc)
@@ -88,11 +88,18 @@ func Wrap(
 
 		cfg := newConfig(opts)
 		meter := mp.Meter(instrumentationName, metric.WithSchemaURL(semconv.SchemaURL))
-		duration, _ := meter.Float64Histogram(
+		duration, err := meter.Float64Histogram(
 			"http.client.request.duration",
 			metric.WithDescription("Duration of outbound HTTP client requests."),
 			metric.WithUnit("s"),
 		)
+		if err != nil {
+			duration, _ = metricnoop.NewMeterProvider().Meter(instrumentationName).Float64Histogram(
+				"http.client.request.duration",
+				metric.WithDescription("Duration of outbound HTTP client requests."),
+				metric.WithUnit("s"),
+			)
+		}
 		h := newHook(tp, duration, prop, cfg)
 		rc.OnBeforeRequest(h.beforeRequest)
 		rc.OnAfterResponse(h.afterResponse)

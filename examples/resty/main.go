@@ -25,16 +25,16 @@ import (
 type routeKey struct{}
 
 func main() {
-	if err := run(); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := run(ctx); err != nil {
 		slog.ErrorContext(context.Background(), "Resty example failed", slog.Any("error", err))
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
+func run(ctx context.Context) error {
 	obs, err := o11y.Init(ctx,
 		o11y.WithServiceName("resty-example"),
 		o11y.WithServiceVersion("0.1.0"),
