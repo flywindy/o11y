@@ -6,10 +6,12 @@ import (
 	"testing"
 	"time"
 
+	o11yredis "github.com/flywindy/o11y/redis"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/event"
+	otelmongo "go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/v2/mongo/otelmongo"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
@@ -212,6 +214,77 @@ func TestMetricsMonitor_RecordsOperationDuration(t *testing.T) {
 	assertMissingAttributeKey(t, dp.Attributes.ToSlice(), semconv.DBNamespaceKey)
 	assertMissingAttributeKey(t, dp.Attributes.ToSlice(), semconv.NetworkTransportKey)
 	assertMissingAttributeKey(t, dp.Attributes.ToSlice(), semconv.ErrorTypeKey)
+}
+
+// redisInstrumentationName mirrors the meter scope the Redis wrapper uses
+// (redis.instrumentationName, unexported). Kept here so this test can record an
+// instrument under that scope without importing an internal symbol.
+const redisInstrumentationName = "github.com/flywindy/o11y/redis"
+
+// TestMetricViews_ScopedPerInstrumentation guards against the Redis and MongoDB
+// db.client.operation.duration views matching each other's instrument. o11y.Init
+// installs both view sets together; if either view matched by name only it would
+// also catch the other integration's instrument, and the first matching view in
+// the slice would win the stream-definition conflict — silently applying the
+// wrong attribute filter (e.g. MongoDB durations would drop network.peer.* and
+// keep the never-set server.*). Scoping each view to its own instrumentation
+// keeps the two streams independent.
+func TestMetricViews_ScopedPerInstrumentation(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithView(append(o11yredis.MetricViews(testHistogramBuckets), MetricViews(testHistogramBuckets)...)...),
+	)
+
+	record := func(scope string) {
+		meter := provider.Meter(scope)
+		hist, err := meter.Float64Histogram("db.client.operation.duration", metric.WithUnit("s"))
+		require.NoError(t, err)
+		hist.Record(context.Background(), 0.01, metric.WithAttributes(
+			semconv.NetworkPeerAddress("10.0.0.1"),
+			semconv.ServerAddress("10.0.0.1"),
+			semconv.DBNamespace("o11y_test"),
+		))
+	}
+	record(otelmongo.ScopeName)
+	record(redisInstrumentationName)
+
+	rm := collectMongoMetrics(t, reader)
+
+	mongoAttrs := scopedDurationAttrs(t, rm, otelmongo.ScopeName)
+	assert.Contains(t, mongoAttrs, semconv.NetworkPeerAddress("10.0.0.1"))
+	assertMissingAttributeKey(t, mongoAttrs, semconv.ServerAddressKey)
+	assertMissingAttributeKey(t, mongoAttrs, semconv.DBNamespaceKey)
+
+	redisAttrs := scopedDurationAttrs(t, rm, redisInstrumentationName)
+	assert.Contains(t, redisAttrs, semconv.ServerAddress("10.0.0.1"))
+	assertMissingAttributeKey(t, redisAttrs, semconv.NetworkPeerAddressKey)
+	assertMissingAttributeKey(t, redisAttrs, semconv.DBNamespaceKey)
+}
+
+// scopedDurationAttrs returns the attribute set of the single
+// db.client.operation.duration stream emitted under the named instrumentation
+// scope, failing if that scope has zero or more than one such stream.
+func scopedDurationAttrs(t *testing.T, rm metricdata.ResourceMetrics, scope string) []attribute.KeyValue {
+	t.Helper()
+
+	var matches []metricdata.Metrics
+	for i := range rm.ScopeMetrics {
+		if rm.ScopeMetrics[i].Scope.Name != scope {
+			continue
+		}
+		for j := range rm.ScopeMetrics[i].Metrics {
+			if rm.ScopeMetrics[i].Metrics[j].Name == "db.client.operation.duration" {
+				matches = append(matches, rm.ScopeMetrics[i].Metrics[j])
+			}
+		}
+	}
+	require.Lenf(t, matches, 1, "scope %q: expected exactly one db.client.operation.duration stream", scope)
+
+	hist, ok := matches[0].Data.(metricdata.Histogram[float64])
+	require.True(t, ok)
+	require.Len(t, hist.DataPoints, 1)
+	return hist.DataPoints[0].Attributes.ToSlice()
 }
 
 func TestMetricsMonitor_RecordsFailureErrorType(t *testing.T) {

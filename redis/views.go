@@ -2,6 +2,7 @@ package redis
 
 import (
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk/instrumentation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 )
@@ -12,10 +13,18 @@ import (
 // histogramBuckets are applied to db.client.operation.duration so Redis latency
 // buckets follow the SDK's configured WithHistogramBuckets policy (matching the
 // HTTP and MongoDB duration histograms).
+//
+// The duration view is scoped to this package's instrumentation so it never
+// matches another integration's db.client.operation.duration instrument (e.g.
+// the MongoDB wrapper's), which would otherwise produce a duplicate, conflicting
+// stream when both wrappers are active in the same process.
 func MetricViews(histogramBuckets []float64) []sdkmetric.View {
 	views := []sdkmetric.View{
 		sdkmetric.NewView(
-			sdkmetric.Instrument{Name: "db.client.operation.duration"},
+			sdkmetric.Instrument{
+				Name:  "db.client.operation.duration",
+				Scope: instrumentation.Scope{Name: instrumentationName},
+			},
 			sdkmetric.Stream{
 				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
 					Boundaries: histogramBuckets,

@@ -41,7 +41,10 @@ adopters can plan their upgrades.
   matching the HTTP duration histograms. Previously the MongoDB metric inherited
   the contrib instrument's baked-in boundaries and the Redis metric inherited
   the SDK default boundaries. `mongo.MetricViews` and `redis.MetricViews` now
-  take a `[]float64` buckets argument.
+  take a `[]float64` buckets argument. Each view is also scoped to its own
+  instrumentation so the two `db.client.operation.duration` views no longer
+  match each other's instrument (which produced a conflicting stream with the
+  wrong attribute filter when both wrappers were active in one process).
 
 ### Breaking Changes (Migration Guide)
 
