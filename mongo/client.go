@@ -79,6 +79,10 @@ func newConfig(opts []Option) config {
 // OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true and
 // OTEL_MONGO_TRACING_ENABLED=true. This wrapper documents those deployment
 // requirements but does not set process-global environment variables.
+//
+// Operation-duration metrics are not gated by those variables: the contrib
+// CommandMonitor records db.client.operation.duration for every command,
+// independent of whether command spans are enabled.
 func Connect(
 	ctx context.Context,
 	uri string,
@@ -125,9 +129,11 @@ func Connect(
 }
 
 func newMetricsMonitor(mp metric.MeterProvider) *event.CommandMonitor {
+	// Metrics-only mode: the noop tracer suppresses the contrib monitor's own
+	// command spans (those come from the Marz wrapper and stay subject to the
+	// ADR 0005 env gate), so only db.client.operation.duration flows out.
 	return otelmongo.NewMonitor(
 		otelmongo.WithMeterProvider(mp),
 		otelmongo.WithTracerProvider(tracenoop.NewTracerProvider()),
-		otelmongo.WithCommandAttributeDisabled(true),
 	)
 }

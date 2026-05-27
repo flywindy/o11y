@@ -46,6 +46,14 @@ adopters can plan their upgrades.
   match each other's instrument (which produced a conflicting stream with the
   wrong attribute filter when both wrappers were active in one process).
 
+### Security
+
+- Bumped indirect dependencies `golang.org/x/crypto` to `v0.52.0` and
+  `golang.org/x/net` to `v0.55.0` to clear the GO-2026-50xx advisory set. Both
+  are transitive (the SDK does not import them directly) and the affected
+  `ssh`/`html`/`idna` paths are unused, but the pins are raised to the fixed
+  versions to keep vulnerability scanners clean.
+
 ### Breaking Changes (Migration Guide)
 
 - `mongo.Connect` now requires an explicit `metric.MeterProvider` argument:
