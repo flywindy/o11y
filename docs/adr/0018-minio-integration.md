@@ -1,0 +1,453 @@
+# ADR 0018 — MinIO / S3 Object Storage Integration
+
+**Status**: Proposed
+**Date**: 2026-05-27
+
+**Applies** ADR 0008 (sourcing policy); **inherits the metric.View
+cardinality controls established by** ADR 0009 (the
+`http.client.request.duration` allowlist applies to any HTTP client
+histogram produced under this package's optional transport layer);
+**reuses** the `otelhttp` approved-integration entry from ADR 0009.
+
+---
+
+## Context
+
+The SDK has no object-storage instrumentation today. Services that
+upload and download files through `github.com/minio/minio-go/v7`
+(MinIO, and any S3-compatible backend) get no span for the storage
+operation: the inbound server span exists, an adjacent `redis` or
+`mongo` span exists, but the object-storage round-trip is invisible.
+
+The motivating incident: a file-upload API span measured **~16 s
+wall-clock**, while the CPU profile for the same window totalled only
+**~2 s**. The `redis` span on that trace was present and fast. The
+remaining ~14 s was off-CPU wait (network I/O to the object store)
+that is invisible to both the CPU profiler (ADR 0012 default
+`ProfileTypes` are CPU + alloc/inuse — no block/mutex profile) **and**
+to the trace, because nothing instruments the MinIO call. The time
+appeared only as an unattributed gap inside the parent span.
+
+This ADR applies ADR 0008 to MinIO. Per ADR 0008 §2 we evaluate
+candidate libraries before defaulting to T3 (self-written).
+
+### ADR 0008 §2 evaluation
+
+**Candidate A: a maintained OTel instrumentation library for the
+data-plane client (`minio-go/v7`).**
+
+| Item | Result |
+|---|---|
+| ADR 0003 compliance | — |
+| Maintenance signal | ❌ **No such library exists.** `minio-go/v7` ships no first-party OTel instrumentation, and `opentelemetry-go-contrib` has no `otelminio`. The only MinIO package that carries OpenTelemetry code is `minio/madmin-go` (`opentelemetry.go`), which instruments the **admin** API (server status, healing, config), not the data-plane `PutObject` / `GetObject` path that the upload service uses. |
+| Semconv alignment | — |
+| Configurability | — |
+| Framework signal access | — |
+
+No candidate exists to evaluate; the maintenance-signal item fails by
+absence. T2 facade adoption over a MinIO-specific library is not
+viable.
+
+**Candidate B: pure `otelhttp.NewTransport` via `minio.Options.Transport`.**
+
+`minio-go/v7` exposes exactly one observability seam — the
+`Transport http.RoundTripper` field on `minio.Options`. It has **no**
+hook / middleware / event-listener API analogous to go-redis's `Hook`
+interface (ADR 0013) or resty's `OnBeforeRequest` (ADR 0011), so the
+only library-native interception point is the HTTP transport.
+
+| Item | Result |
+|---|---|
+| ADR 0003 compliance | ✅ (the SDK's `http.NewTransport`, ADR 0009) |
+| Maintenance signal | ✅ OTel contrib. |
+| Semconv alignment | ✅ v1.39.0 HTTP client semconv. |
+| Configurability | ✅ |
+| Framework signal access | ❌ **The operative fail.** The HTTP boundary cannot express a *logical* object-storage operation. See below. |
+
+Why the §5 fail is decisive — a transport-only solution gives HTTP
+spans, not object-storage spans:
+
+1. **No logical operation identity.** A single `PutObject` of a large
+   file becomes a multipart upload: an `InitiateMultipartUpload`
+   POST, N `UploadPart` PUTs, and a `CompleteMultipartUpload` POST.
+   The transport sees N+2 unrelated HTTP requests, never one
+   "PutObject took 16 s" span. Distinguishing `GetObject` from
+   `StatObject` (HEAD) from `ListObjects` from the HTTP verb +
+   URL alone is brittle and incomplete.
+2. **No object-storage attributes.** Bucket, object key, object size,
+   storage-system identity, and the structured S3 error code
+   (`NoSuchKey`, `AccessDenied`, …) are not derivable at the
+   `RoundTripper` boundary without re-parsing S3 REST semantics from
+   raw requests — i.e. reimplementing the client.
+3. **The original goal was per-operation attribution.** The incident
+   needs "this span = one PutObject, here is where its 16 s went",
+   which is precisely the signal the HTTP layer cannot synthesize.
+
+Four passes, one decisive fail.
+
+### Conclusion
+
+The decision under ADR 0008 is **T3 (self-written) for the logical
+operation layer**, with **optional reuse of the ADR 0009 `otelhttp`
+transport as a nested HTTP layer** underneath it.
+
+Unlike resty (ADR 0011), the hybrid composition is sound here, and the
+lifecycle objection that ruled out resty's hybrid does **not** apply:
+
+- In resty, `otelhttp` opened and `defer`-ended its span *inside*
+  `RoundTrip`, before resty's `OnAfterResponse` hook could annotate
+  it — so the resty signals had no live span to attach to.
+- Here, **the SDK owns the outer logical span across the entire
+  method call** (`PutObject` entry → return). The `otelhttp` transport
+  spans are genuine child round-trips that open and close *within*
+  that window. There is no annotation-after-end problem: the logical
+  span is annotated by our wrapper directly, and the HTTP children are
+  independent, correctly-nested spans (one per multipart part). The
+  two layers compose without contending for the same span.
+
+This satisfies ADR 0008: the §2 checklist fails for every candidate
+data-plane library (enumerated above), and self-writing the logical
+layer is the smallest answer that delivers per-operation attribution.
+
+Relevant existing files / context:
+
+- ADR 0008 — sourcing policy (T2 default, T3 exception gate)
+- ADR 0009 — `otelhttp` facade and the `http.client.request.duration`
+  metric.View cardinality allowlist (applies automatically to the
+  optional transport layer here)
+- ADR 0011 — resty integration (the T3 precedent; contrasted above)
+- ADR 0012 — profiling (explains why the CPU profile did not see the
+  off-CPU storage wait)
+- ADR 0013 — redis integration (the hook-based T3 shape MinIO cannot
+  use, since `minio-go` exposes no hook API)
+
+---
+
+## Decisions
+
+### 1. Architecture: a method-wrapping client owns the logical span
+
+`minio-go` has no hook API, so the wrapper cannot be a hook (redis) or
+a middleware (resty). It is a **client wrapper** that embeds
+`*minio.Client` (the shape `mongo/` uses, ADR 0005) and overrides the
+data-plane methods to bracket each call in a span.
+
+```text
+svc.PutObject(ctx, bucket, key, r, size, opts)
+   │
+   ├─ tracer.Start(ctx, "PutObject {bucket}", SpanKindClient)
+   │    set minio.* attributes (bucket, key, size, operation, system)
+   │    record start time
+   │
+   ▼  delegate to embedded *minio.Client.PutObject(spanCtx, ...)
+   │       │
+   │       └─ (optional) o11y http.NewTransport child spans:
+   │             InitiateMultipartUpload / UploadPart×N / Complete
+   │
+   ├─ on return: set status_code / minio.error.kind, record histogram
+   └─ span.End()
+```
+
+Two layers, both optional-composable:
+
+- **Logical layer (always on, T3):** one span per high-level
+  operation, with object-storage attributes. This is the layer that
+  answers the incident.
+- **HTTP layer (opt-in via constructor):** `http.NewTransport`
+  (ADR 0009) injected into `minio.Options.Transport`, producing child
+  spans for the actual round-trips — including each multipart part, so
+  an operator can see *which* part of a 16 s upload stalled.
+
+### 2. Public API
+
+```go
+package minio
+
+import (
+    miniogo "github.com/minio/minio-go/v7"
+    "go.opentelemetry.io/otel/metric"
+    "go.opentelemetry.io/otel/propagation"
+    "go.opentelemetry.io/otel/trace"
+)
+
+// Client is a tracing-aware MinIO / S3 client. It embeds the upstream
+// *minio.Client so the full driver API stays available; the data-plane
+// methods listed in §5 are shadowed by instrumented overrides.
+type Client struct {
+    *miniogo.Client
+}
+
+// New constructs an instrumented client. The transport seam is set at
+// construction (minio-go only accepts Options.Transport at New time),
+// so New is the only entry point that can enable the optional HTTP
+// child-span layer (§1).
+//
+// tp/mp/prop are required and are passed explicitly; the wrapper never
+// reads or writes OTel globals (ADR 0003).
+func New(
+    endpoint string,
+    minioOpts *miniogo.Options,
+    tp trace.TracerProvider,
+    mp metric.MeterProvider,
+    prop propagation.TextMapPropagator,
+    opts ...Option,
+) (*Client, error)
+```
+
+```go
+type Option func(*config)
+
+// WithHTTPChildSpans injects o11y http.NewTransport into the client's
+// transport so each underlying HTTP round-trip (incl. multipart parts)
+// becomes a child span of the logical operation span. Default: off.
+// When on, the transport is configured with a no-op propagator (§7).
+func WithHTTPChildSpans(enabled bool) Option
+
+// WithSpanNameFormatter overrides the default "{Operation} {bucket}"
+// span name.
+func WithSpanNameFormatter(func(op, bucket, key string) string) Option
+
+// WithObjectKeyAttribute controls whether the (potentially high-
+// cardinality) object key is set on the span. Default: true (spans
+// tolerate high cardinality; metrics never carry the key — §3).
+func WithObjectKeyAttribute(enabled bool) Option
+```
+
+There is intentionally **no** `Wrap(existing *minio.Client)`. The
+transport seam is only settable at `minio.New` time, so wrapping a
+pre-built client could offer the logical layer but never the HTTP
+child-span layer; exposing a half-capable entry point invites the
+"why are my part spans missing" support load. Callers construct
+through `minio.New`.
+
+### 3. Metrics
+
+One histogram is created at `New` time:
+
+```go
+hist, _ := mp.Meter("github.com/flywindy/o11y/minio").
+    Float64Histogram(
+        "minio.client.operation.duration",
+        metric.WithUnit("s"),
+        metric.WithDescription("Duration of MinIO/S3 logical operations."),
+    )
+```
+
+A package-specific metric name (not `http.client.request.duration`) is
+used deliberately: the logical operation and the underlying HTTP
+round-trips are different units of work, and reusing the HTTP metric
+name would double-count whenever `WithHTTPChildSpans` is on (the
+transport already emits `http.client.request.duration`, governed by
+the ADR 0009 allowlist).
+
+Labels — a closed, bounded set:
+
+- `minio.operation` (enum: `PutObject`, `GetObject`, …) — bounded.
+- `minio.bucket` — bounded by the service's bucket set. Acceptable.
+- `otel.status_code` / `error.type` — bounded.
+
+Explicitly **not** a label:
+
+- `minio.object.key` — unbounded. Span attribute only (§4), never a
+  metric dimension. A package-owned metric.View registered alongside
+  the instrument drops any key that escapes the closed set, mirroring
+  ADR 0009 §2 Layer A defense-in-depth.
+
+### 4. Span model
+
+- One span per logical operation, kind `SpanKindClient`, tracer name
+  `"github.com/flywindy/o11y/minio"`, schema URL pinned to the SDK
+  semconv version (v1.39.0, ADR 0006).
+- Default span name: `"{Operation} {bucket}"` (e.g. `PutObject media`).
+  Operation and bucket are low/bounded cardinality; the **object key is
+  never in the span name** (it is an attribute).
+- Attributes set before delegation:
+  - `minio.operation` — the logical method name.
+  - `minio.bucket` — bucket name.
+  - `minio.object.key` — object key (subject to
+    `WithObjectKeyAttribute`).
+  - object size — for `PutObject`/`FPutObject` from the caller-supplied
+    size; for downloads from the response `Content-Length` when known.
+  - a storage-system identity attribute and `server.address` /
+    `server.port` derived from the endpoint.
+  - These map to OTel AWS-S3 semantic conventions where a stable key
+    exists; where one does not, the `minio.*` namespace is used. The
+    exact key crosswalk is pinned in the implementation PR against
+    semconv v1.39.0 and is an open question (below) until the OTel
+    object-store conventions stabilize.
+- Attributes set after delegation:
+  - `otel.status` — Error on failure, Unset on success.
+  - `error.type` — Go type / S3 code on failure (§8).
+  - `minio.error.kind` — closed SRE-facing classification (§8).
+- **No trace-context propagation to the object store** (§7): the
+  storage backend is a leaf dependency that will not continue the
+  trace, so the logical span injects no `traceparent`.
+
+### 5. Instrumented method surface (incremental)
+
+The first PR wraps the synchronous data-plane methods that dominate
+the upload/download path. Other `*minio.Client` methods remain
+available unmodified through the embedded pointer and may be wrapped in
+follow-ups as needs appear.
+
+| Method | Span captures | Notes |
+|---|---|---|
+| `PutObject` | Full upload incl. multipart | Synchronous; size known up front. |
+| `FPutObject` | Full file upload | Synchronous. |
+| `FGetObject` | Full download to file | Synchronous — span covers the whole transfer. |
+| `StatObject` | HEAD round-trip | Synchronous. |
+| `RemoveObject` | DELETE round-trip | Synchronous. |
+| `CopyObject` | Server-side copy | Synchronous. |
+| `ListObjects` | First page latency | Returns a channel; see §6. |
+
+**`GetObject` is a deliberate exception.** `minio-go`'s `GetObject`
+is *lazy*: it returns an `*minio.Object` and performs no network I/O
+until the first `Read`/`Stat`/`Seek`. Bracketing the `GetObject` call
+would close the span before any bytes move and mismeasure download
+latency as ~0. The decision:
+
+- `GetObject` gets a **thin span around the call itself** (it can
+  still fail fast, e.g. arg validation) and the returned `*Object`'s
+  transfer is **not** wrapped in the logical layer in v1.
+- For *measured* downloads, callers use `FGetObject` (synchronous), or
+  enable `WithHTTPChildSpans` so the lazy `Read`'s GET appears as an
+  HTTP span (it will land under whatever span is active when `Read`
+  is called, since the request context is the one captured at
+  `GetObject` time). This limitation is documented in godoc.
+- Wrapping the `*Object` reader to emit a transfer span is tracked as
+  an open question.
+
+### 6. Channel-returning APIs (`ListObjects`, `RemoveObjects`)
+
+These return a channel and stream results lazily, so a single
+start/end bracket cannot bound the whole operation. v1 records a span
+that ends when the wrapper's goroutine observes channel close (for the
+common drain-to-completion pattern) and sets `minio.error.kind` if any
+streamed element carries an error. Callers that abandon the channel
+early get a span ended at GC-safe teardown via a `context` cancellation
+guard, not a leak. The streaming-span shape is the least certain part
+of this ADR and is flagged as an open question.
+
+### 7. Trace-context propagation is disabled toward the store
+
+When `WithHTTPChildSpans` is enabled, the injected `http.NewTransport`
+is constructed with an **empty propagator**
+(`propagation.NewCompositeTextMapPropagator()`), not the SDK's W3C
+propagator. Rationale:
+
+- A MinIO/S3 server does not continue the client's trace, so injecting
+  `traceparent` yields no downstream linkage.
+- S3 SigV4 signs a specific `SignedHeaders` set. Adding unsigned
+  headers is tolerated by S3-compatible servers, but emitting trace
+  headers that travel toward a storage backend is needless surface;
+  suppressing injection keeps the request bytes minimal and avoids any
+  interaction with presign/signature edge cases.
+
+Child-span *parenting* still works: it flows through the Go
+`context.Context` passed into the minio method, not through wire
+headers.
+
+### 8. `minio.error.kind` taxonomy
+
+`error.type` (Go type name, or the S3 error code from
+`minio.ToErrorResponse(err).Code`) is the programmer view.
+`minio.error.kind` is a closed, SRE-facing classification set on the
+span (not on metrics beyond the bounded set in §3). **First match
+wins.**
+
+| # | Value | Trigger | Detection |
+|---|---|---|---|
+| 1 | `client_canceled` | Caller canceled the context, no deadline | `errors.Is(err, context.Canceled)` and **not** `DeadlineExceeded` |
+| 2 | `client_timeout` | Caller deadline expired mid-transfer | `errors.Is(err, context.DeadlineExceeded)` |
+| 3 | `not_found` | Object or bucket missing | `ToErrorResponse(err).Code` in `NoSuchKey` / `NoSuchBucket` |
+| 4 | `access_denied` | AuthN/AuthZ rejected | code `AccessDenied` / `InvalidAccessKeyId` / `SignatureDoesNotMatch` |
+| 5 | `precondition` | ETag / If-Match style failure | code `PreconditionFailed` |
+| 6 | `throttled` | Server slow-down / rate limit | code `SlowDown` / HTTP 503 from the store |
+| 7 | `transport` | DNS / TCP / TLS / RST before a structured S3 response | `errors.As` to `*net.OpError` / TLS error with no `ErrorResponse.Code` |
+| 8 | `server_error` | Structured 5xx with an S3 code | `ErrorResponse.StatusCode >= 500` and a non-empty code |
+| 9 | `unknown` | none of the above | default |
+
+The mapping is unit-tested table-driven with fixture errors built from
+real underlying types so `errors.Is`/`As` behave as in production.
+Logging is left to the caller; the wrapper only sets span/metric
+signals.
+
+### 9. Golden trace tests
+
+The implementation PR ships golden-trace tests (the ADR 0011 §9
+pattern: in-memory `tracetest.SpanRecorder`, committed expected JSON
+with ids/timestamps blanked, `UPDATE_GOLDEN=1` regenerator). Backend
+under test is a containerized MinIO in CI, with a lightweight
+`httptest`-based S3 double for the error-classification rows that do
+not need a real server.
+
+| # | Scenario | Expected span tree |
+|---|---|---|
+| 1 | Small `PutObject` success | 1 logical span, `status_code=200`, size set, no error kind |
+| 2 | Large `PutObject` (multipart) with `WithHTTPChildSpans` | 1 logical span → child HTTP spans: Initiate, UploadPart×N, Complete |
+| 3 | `FGetObject` success | 1 logical span, size from response |
+| 4 | `StatObject` on missing key | 1 logical span, Error, `error.type=NoSuchKey`, `minio.error.kind=not_found` |
+| 5 | `PutObject` with bad credentials | 1 logical span, Error, `minio.error.kind=access_denied` |
+| 6 | `FPutObject` with caller timeout | 1 logical span, Error, `minio.error.kind=client_timeout` |
+| 7 | `RemoveObject` success | 1 logical span, no error |
+| 8 | Connection refused (server down) | 1 logical span, Error, `minio.error.kind=transport` |
+
+### 10. Compliance with ADR 0003
+
+`minio-go/v7` does not import OpenTelemetry or mutate OTel globals.
+The wrapper takes `tp`/`mp`/`prop` explicitly and never reads or
+writes any `go.opentelemetry.io/otel` global. The optional HTTP layer
+reuses `http.NewTransport` (already approved, ADR 0009). The ADR 0003
+approved-integrations table is updated in the same PR:
+
+| Library | Version | Verified | Behavior | Notes |
+|---|---|---|---|---|
+| `github.com/minio/minio-go/v7` | (pinned at PR time) | ✅ | Pure S3 client; does not import OpenTelemetry or mutate provider globals. The SDK-owned `minio` wrapper wires providers explicitly and only uses the public `Options.Transport` seam. | See ADR 0018 |
+
+---
+
+## Consequences
+
+**Positive**
+
+- The motivating incident is directly addressed: a file upload now
+  produces a `PutObject` span with wall-clock duration, sitting beside
+  the `redis` span on the same trace. With `WithHTTPChildSpans`, the
+  ~14 s off-CPU gap resolves into per-part HTTP child spans.
+- Per-operation object-storage attributes (bucket, key, size, error
+  kind) that the HTTP layer cannot synthesize.
+- Services do not name storage spans themselves; naming and attributes
+  are consistent across all consumers (the user's explicit goal).
+- Metric cardinality bounded by default; object key never enters
+  metrics.
+- The hybrid is clean here (outer logical span owns the lifecycle),
+  unlike the resty case it is contrasted against.
+
+**Negative / Trade-offs**
+
+- T3 means the SDK owns this code and must track `minio-go` API
+  changes; the §2 evaluation is re-run on each `minio-go` major bump
+  and at least annually, adopting a maintained `otelminio` (T2) if one
+  emerges.
+- `GetObject`'s laziness (§5) makes streaming-download latency a
+  second-class signal in v1; `FGetObject` or `WithHTTPChildSpans` is
+  the measured path.
+- Channel-returning APIs (§6) have a less certain span shape.
+- The method surface is wrapped incrementally, so an un-wrapped method
+  silently produces no logical span (the embedded client still works).
+
+---
+
+## Open questions
+
+- **Semconv crosswalk.** Which keys are AWS-S3 stable conventions vs.
+  `minio.*` package-local, pinned against v1.39.0; revisit when OTel
+  object-store conventions stabilize.
+- **`*Object` reader instrumentation.** Whether to wrap the
+  `GetObject`-returned reader to emit a transfer span, making streaming
+  downloads first-class (§5).
+- **Streaming-span semantics** for `ListObjects` / `RemoveObjects`
+  (§6): end-on-close vs. first-page vs. per-page events.
+- **Idempotency / double construction.** `New` always builds a fresh
+  client, so there is no resty-style `Wrap` idempotency concern; if a
+  future `Wrap` is added, it inherits ADR 0011 §6's open question.
