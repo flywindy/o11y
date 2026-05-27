@@ -144,5 +144,5 @@ func assertAttr(t *testing.T, attrs attribute.Set, key attribute.Key, want strin
 	t.Helper()
 	value, ok := attrs.Value(key)
 	require.True(t, ok, "missing attribute %s", key)
-	assert.Equal(t, want, value.Emit())
+	assert.Equal(t, want, value.String())
 }

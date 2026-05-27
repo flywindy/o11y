@@ -177,11 +177,13 @@ func TestConnect_UsesProvidedTracerProvider(t *testing.T) {
 	assert.NotContains(t, attrs, attribute.String("db.system", "mongodb"))
 }
 
+var testHistogramBuckets = []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10}
+
 func TestMetricsMonitor_RecordsOperationDuration(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	provider := sdkmetric.NewMeterProvider(
 		sdkmetric.WithReader(reader),
-		sdkmetric.WithView(MetricViews()...),
+		sdkmetric.WithView(MetricViews(testHistogramBuckets)...),
 	)
 
 	monitor := newMetricsMonitor(provider)
@@ -202,7 +204,7 @@ func TestMetricsMonitor_RecordsOperationDuration(t *testing.T) {
 
 	dp := histogram.DataPoints[0]
 	assert.Equal(t, uint64(1), dp.Count)
-	assert.Equal(t, operationDurationBuckets, dp.Bounds)
+	assert.Equal(t, testHistogramBuckets, dp.Bounds)
 	assert.Contains(t, dp.Attributes.ToSlice(), semconv.DBSystemNameMongoDB)
 	assert.Contains(t, dp.Attributes.ToSlice(), semconv.DBOperationName("insert"))
 	assert.Contains(t, dp.Attributes.ToSlice(), semconv.NetworkPeerAddress("127.0.0.1"))
@@ -216,7 +218,7 @@ func TestMetricsMonitor_RecordsFailureErrorType(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	provider := sdkmetric.NewMeterProvider(
 		sdkmetric.WithReader(reader),
-		sdkmetric.WithView(MetricViews()...),
+		sdkmetric.WithView(MetricViews(testHistogramBuckets)...),
 	)
 
 	monitor := newMetricsMonitor(provider)

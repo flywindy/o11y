@@ -34,6 +34,15 @@ adopters can plan their upgrades.
   `go.mongodb.org/mongo-driver/v2 v2.6.0` and the corresponding OTel
   `v1.43.1-0.20260521080857-e5bdc311108b` pseudo-version set.
 
+### Changed
+
+- `db.client.operation.duration` from both the `mongo` and `redis` wrappers now
+  honors the SDK's configured histogram boundaries (`WithHistogramBuckets`),
+  matching the HTTP duration histograms. Previously the MongoDB metric inherited
+  the contrib instrument's baked-in boundaries and the Redis metric inherited
+  the SDK default boundaries. `mongo.MetricViews` and `redis.MetricViews` now
+  take a `[]float64` buckets argument.
+
 ### Breaking Changes (Migration Guide)
 
 - `mongo.Connect` now requires an explicit `metric.MeterProvider` argument:

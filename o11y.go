@@ -231,7 +231,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 			RuntimeMetrics:          cfg.runtimeMetrics,
 			HistogramBuckets:        cfg.histogramBuckets,
 			DisableDefaultViews:     cfg.disableDefaultViews,
-			ExtraViews:              append(o11yredis.MetricViews(), o11ymongo.MetricViews()...),
+			ExtraViews:              append(o11yredis.MetricViews(cfg.histogramBuckets), o11ymongo.MetricViews(cfg.histogramBuckets)...),
 			MaxUniqueRoutes:         cfg.maxUniqueRoutes,
 			ExtraHTTPServerAttrKeys: cfg.extraHTTPServerAttrKeys,
 			Exemplars:               cfg.exemplars,

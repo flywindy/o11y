@@ -8,11 +8,18 @@ import (
 
 // MetricViews returns the metric views required to keep Redis metric labels
 // aligned with the SDK's semantic-convention and cardinality contract.
-func MetricViews() []sdkmetric.View {
+//
+// histogramBuckets are applied to db.client.operation.duration so Redis latency
+// buckets follow the SDK's configured WithHistogramBuckets policy (matching the
+// HTTP and MongoDB duration histograms).
+func MetricViews(histogramBuckets []float64) []sdkmetric.View {
 	views := []sdkmetric.View{
 		sdkmetric.NewView(
 			sdkmetric.Instrument{Name: "db.client.operation.duration"},
 			sdkmetric.Stream{
+				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
+					Boundaries: histogramBuckets,
+				},
 				AttributeFilter: attribute.NewAllowKeysFilter(
 					semconv.DBSystemNameKey,
 					semconv.DBOperationNameKey,
