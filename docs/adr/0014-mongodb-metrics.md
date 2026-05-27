@@ -1,7 +1,7 @@
 # ADR 0014 — MongoDB Metrics
 
-**Status**: Accepted — phased implementation pending (Option A; Phase 1 first;
-dual tier annotation at Phase 2)
+**Status**: Accepted — Phase 1 (operation duration) implemented; Phase 2
+(connection pool metrics) pending (Option A; dual tier annotation at Phase 2)
 **Date**: 2026-05-25
 **Relates to**: ADR 0005 (MongoDB integration), ADR 0008 (sourcing policy),
 ADR 0013 (Redis/Valkey integration — reference for the pool-metric pattern)
