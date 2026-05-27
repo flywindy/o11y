@@ -471,7 +471,7 @@ func TestMetricViewsDropRedisotelLegacyInstruments(t *testing.T) {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(
 		sdkmetric.WithReader(reader),
-		sdkmetric.WithView(MetricViews()...),
+		sdkmetric.WithView(MetricViews([]float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10})...),
 	)
 	meter := mp.Meter("redisotel")
 
@@ -495,7 +495,7 @@ func newRedisTestProviders() (*sdktrace.TracerProvider, *tracetest.SpanRecorder,
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(
 		sdkmetric.WithReader(reader),
-		sdkmetric.WithView(MetricViews()...),
+		sdkmetric.WithView(MetricViews([]float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10})...),
 	)
 	return tp, sr, mp, reader
 }

@@ -68,6 +68,7 @@ func run() error {
 		ctx,
 		mongoURI,
 		obs.TracerProvider(),
+		obs.MeterProvider(),
 		obs.Propagator,
 		o11ymongo.WithDocumentTracePropagation(documentTracePropagation),
 	)

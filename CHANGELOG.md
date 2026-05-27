@@ -26,6 +26,40 @@ adopters can plan their upgrades.
   metric views at `MeterProvider` construction time; `o11y.Init` now composes
   `o11yredis.MetricViews()` automatically so Redis pool-metric labels stay
   within the SDK cardinality contract.
+- MongoDB operation-duration metrics via the official contrib `otelmongo`
+  CommandMonitor in metrics-only mode. The `mongo` wrapper now emits
+  `db.client.operation.duration` with bounded labels and keeps existing Marz
+  tracing behavior unchanged. See ADR 0014.
+- Added the official MongoDB contrib instrumentation dependency, which requires
+  `go.mongodb.org/mongo-driver/v2 v2.6.0` and the corresponding OTel
+  `v1.43.1-0.20260521080857-e5bdc311108b` pseudo-version set.
+
+### Changed
+
+- `db.client.operation.duration` from both the `mongo` and `redis` wrappers now
+  honors the SDK's configured histogram boundaries (`WithHistogramBuckets`),
+  matching the HTTP duration histograms. Previously the MongoDB metric inherited
+  the contrib instrument's baked-in boundaries and the Redis metric inherited
+  the SDK default boundaries. `mongo.MetricViews` and `redis.MetricViews` now
+  take a `[]float64` buckets argument. Each view is also scoped to its own
+  instrumentation so the two `db.client.operation.duration` views no longer
+  match each other's instrument (which produced a conflicting stream with the
+  wrong attribute filter when both wrappers were active in one process).
+
+### Security
+
+- Bumped indirect dependencies `golang.org/x/crypto` to `v0.52.0` and
+  `golang.org/x/net` to `v0.55.0` to clear the GO-2026-50xx advisory set. Both
+  are transitive (the SDK does not import them directly) and the affected
+  `ssh`/`html`/`idna` paths are unused, but the pins are raised to the fixed
+  versions to keep vulnerability scanners clean.
+
+### Breaking Changes (Migration Guide)
+
+- `mongo.Connect` now requires an explicit `metric.MeterProvider` argument:
+  pass `obs.MeterProvider()` between `obs.TracerProvider()` and
+  `obs.Propagator`. This preserves the SDK's no-global-provider policy while
+  enabling MongoDB operation-duration metrics.
 
 ---
 

@@ -319,7 +319,7 @@ func assertSpanAttr(t *testing.T, span sdktrace.ReadOnlySpan, key attribute.Key,
 	t.Helper()
 	for _, attr := range span.Attributes() {
 		if attr.Key == key {
-			assert.Equal(t, want, attr.Value.Emit())
+			assert.Equal(t, want, attr.Value.String())
 			return
 		}
 	}
@@ -330,7 +330,7 @@ func assertSpanAttrMissing(t *testing.T, span sdktrace.ReadOnlySpan, key attribu
 	t.Helper()
 	for _, attr := range span.Attributes() {
 		if attr.Key == key {
-			t.Fatalf("unexpected span attribute %s=%s", key, attr.Value.Emit())
+			t.Fatalf("unexpected span attribute %s=%s", key, attr.Value.String())
 		}
 	}
 }
@@ -353,7 +353,7 @@ func assertTypedErrorEvents(t *testing.T, span sdktrace.ReadOnlySpan, want ...ty
 func eventAttribute(event sdktrace.Event, key attribute.Key) (string, bool) {
 	for _, attr := range event.Attributes {
 		if attr.Key == key {
-			return attr.Value.Emit(), true
+			return attr.Value.String(), true
 		}
 	}
 	return "", false
@@ -372,7 +372,7 @@ func assertMetricStatusCodes(t *testing.T, rm metricdata.ResourceMetrics, want .
 			for _, point := range histogram.DataPoints {
 				value, ok := point.Attributes.Value(semconv.HTTPResponseStatusCodeKey)
 				if ok {
-					got = append(got, value.Emit())
+					got = append(got, value.String())
 				}
 			}
 		}
@@ -392,7 +392,7 @@ func assertMetricAttr(t *testing.T, rm metricdata.ResourceMetrics, key attribute
 			for _, point := range histogram.DataPoints {
 				value, ok := point.Attributes.Value(key)
 				if ok {
-					assert.Equal(t, want, value.Emit())
+					assert.Equal(t, want, value.String())
 					return
 				}
 			}

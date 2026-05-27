@@ -163,7 +163,15 @@ payload.
 Spans are emitted by
 `github.com/Marz32onE/instrumentation-go/otel-mongo/v2`, wrapped by
 `github.com/flywindy/o11y/mongo`. The upstream module is pinned to the
-`otel-mongo/v2/v0.2.11` tag commit through a Go pseudo-version. See ADR 0005.
+`otel-mongo/v2/v0.2.11` tag commit through a Go pseudo-version. Operation
+duration metrics are emitted by the official contrib `otelmongo`
+CommandMonitor in metrics-only mode. See ADR 0005 and ADR 0014.
+
+### Instruments
+
+| Name | Kind | Unit | Attributes |
+|---|---|---|---|
+| `db.client.operation.duration` | Float64Histogram | `s` | `db.system.name`, `db.operation.name`, `network.peer.address`, `network.peer.port`, `error.type` |
 
 ### Expected Attributes
 
@@ -260,6 +268,7 @@ Data Model attributes automatically.
 | Key family | Source | Reason |
 |---|---|---|
 | `nats.*` | `otel-nats` trace-event spans | NATS server trace-event payload fields have no direct stable OTel semconv equivalent. They are isolated to the optional infrastructure trace-event flow. |
+| MongoDB operation metric `network.peer.*` labels | contrib `otelmongo` CommandMonitor | The maintained contrib instrumentation emits `network.peer.address` / `network.peer.port` for `db.client.operation.duration`; the SDK keeps those labels and filters out `network.transport` rather than forking the T2 dependency. See ADR 0014. |
 | `redis.error.kind` | `redis` wrapper | Redis-specific bounded error class that distinguishes pool exhaustion from caller cancellation/deadline without using it as a metric label. |
 | `resty.error.kind`, `resty.retry.exhausted` | `resty` wrapper | Resty-specific bounded failure class and retry-budget marker. Standard `error.type` remains present; these keys preserve operator-facing retry and transport semantics without adding metric cardinality. |
 

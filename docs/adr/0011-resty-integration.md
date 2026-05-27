@@ -1,6 +1,6 @@
 # ADR 0011 — Resty Integration
 
-**Status**: Proposed
+**Status**: Accepted (implemented)
 **Date**: 2026-05-08
 
 **Applies** ADR 0008 (sourcing policy); **inherits the metric.View

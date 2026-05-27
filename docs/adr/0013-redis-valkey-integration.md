@@ -1,6 +1,6 @@
 # ADR 0013 — Redis & Valkey Integration
 
-**Status**: Proposed
+**Status**: Accepted (implemented)
 **Date**: 2026-05-18
 
 **Applies** ADR 0008 (sourcing policy); **inherits** the metric.View
