@@ -319,22 +319,35 @@ paths). Callers needing extra dimensions use
 `o11yecho.WithMetricAttributesFn(...)`, with cardinality their
 responsibility — identical contract to gin.
 
-### 8. Body-size histograms
+### 8. Body-size histograms — already symmetric with gin, no echo-specific work
 
 `otelecho` v0.68.0 additionally emits `http.server.request.body.size`
-and `http.server.response.body.size`. The follow-up PR must:
+and `http.server.response.body.size`. **So does `otelgin` v0.68.0** —
+both call the same internal semconv `RecordMetrics`
+(`otelgin` passes `c.Request.ContentLength` / `c.Writer.Size()`,
+`otelecho` passes `request.ContentLength` / `c.Response().Size`). There
+is therefore **no gin↔echo asymmetry** to correct; an earlier draft of
+this ADR wrongly assumed gin did not emit them.
 
-1. Decide whether these belong in the SDK's exported surface or should
-   be view-dropped to match the gin facade's narrower default (gin via
-   `otelgin` does not emit them, so leaving them on makes echo and gin
-   asymmetric).
-2. If kept, register their `metric.View` allowlists alongside the
-   duration histogram and document the keys in `docs/semconv.md`.
+Current SDK state (verified in `internal/metrics/metrics.go:147-169`):
+the only views registered target `http.server.request.duration` and
+`http.client.request.duration` by instrument name. Nothing drops or
+trims the body-size histograms, so today the gin facade (and the
+`otelhttp` facade) already export them with their default attribute set.
+Echo will behave identically out of the box — parity is automatic and
+this facade needs **no** body-size-specific code.
 
-Recommendation: **drop them by default** for gin/echo parity via a
-view, and revisit if a service asks for payload-size signals. This keeps
-the two HTTP-framework facades observably interchangeable, echoing the
-Redis/Valkey "same shape" discipline in ADR 0008 §5.
+The open question is therefore **not** echo-specific: should the SDK
+trim or drop `http.server.*.body.size` for *all* HTTP instrumentation?
+The OTel HTTP semconv marks these histograms **Opt-In** (not
+recommended by default) because each adds buckets × attribute
+cardinality on top of the RED signals. If the team wants them dropped or
+allowlist-trimmed, that is a cross-cutting change to the ADR 0009
+metrics pipeline (one view per body-size instrument, applied to gin,
+echo, and `otelhttp` at once), not something this echo ADR should decide
+alone. This ADR's position: **leave body-size handling exactly as gin
+has it today**, and if a payload-size policy is wanted, raise it as an
+ADR 0009 amendment covering every HTTP facade uniformly.
 
 ### 9. Curated `Option` set
 
@@ -413,8 +426,9 @@ in-flight integration and can land on its own.
   thin wrapper around `otelecho` + a default `WithOnError`, comfortably
   inside ADR 0008's ~100-LOC T2 budget.
 - Echo and gin facades stay observably interchangeable (same option
-  names, same metric naming, recommended body-size parity), matching the
-  cross-framework consistency discipline in ADR 0008.
+  names, same metric naming — including identical body-size behavior,
+  see Decision 8), matching the cross-framework consistency discipline in
+  ADR 0008.
 
 **Negative / Trade-offs**
 
@@ -448,9 +462,10 @@ in-flight integration and can land on its own.
 
 ## Open questions (for the implementation PR)
 
-- **Body-size histograms** (Decision 8): drop for gin parity, or keep
-  and document. Recommendation is to drop; final call belongs to the
-  code PR with the view wiring in front of the reviewer.
+- **Body-size histograms** (Decision 8): no echo-specific question — gin
+  and echo both emit them today and the SDK trims neither. If a
+  payload-size policy is desired, it belongs in an ADR 0009 amendment
+  covering all HTTP facades uniformly, not here.
 - **`WithEchoMetricAttributesFn`** (Decision 9): ship now or defer until
   a consumer needs echo-context-derived labels. Lean defer.
 - **Convenience overload `MiddlewareFromSDK(obs *o11y.SDK, ...)`.**
