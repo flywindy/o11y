@@ -15,6 +15,24 @@ adopters can plan their upgrades.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+### Breaking Changes (Migration Guide)
+
+---
+
+## [0.3.0] - 2026-06-01
+
+### Added
+
 - New `redis/` package: an SDK-owned T3 wrapper over
   `github.com/redis/go-redis/v9` that emits OTel semconv v1.39.0 spans and pool
   metrics for single, Cluster, and Ring topologies. Public surface is
