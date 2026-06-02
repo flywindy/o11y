@@ -188,7 +188,10 @@ func recordEchoError(c echo.Context, err error) {
     if !c.Response().Committed {
         c.Error(err) // routes through Echo.HTTPErrorHandler exactly once
     }
-    if c.Response().Status >= 500 {
+    // Re-check validity here (not just at the top): SetStatus must read the
+    // status *after* the commit above, and err.Error() should not be
+    // evaluated when tracing is inactive.
+    if span.SpanContext().IsValid() && c.Response().Status >= 500 {
         span.SetStatus(codes.Error, err.Error())
     }
 }
