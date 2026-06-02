@@ -333,9 +333,18 @@ Current SDK state (verified in `internal/metrics/metrics.go:147-169`):
 the only views registered target `http.server.request.duration` and
 `http.client.request.duration` by instrument name. Nothing drops or
 trims the body-size histograms, so today the gin facade (and the
-`otelhttp` facade) already export them with their default attribute set.
-Echo will behave identically out of the box — parity is automatic and
-this facade needs **no** body-size-specific code.
+`otelhttp` facade) already export them. Echo will behave identically out
+of the box — parity is automatic and this facade needs **no**
+body-size-specific code.
+
+Note the cardinality subtlety this exposes: because the allowlist
+`AttributeFilter` is attached **only** to the duration view, the
+body-size histograms are exported with the **full default attribute
+set** (method, route, status, scheme, network attrs, …), i.e. a *wider*
+keyset than the 3-key duration series. If a payload-size policy is ever
+adopted, trimming the body-size attribute set is at least as important
+as deciding whether to keep the instruments at all — and again, it
+applies identically to gin, echo, and `otelhttp`.
 
 The open question is therefore **not** echo-specific: should the SDK
 trim or drop `http.server.*.body.size` for *all* HTTP instrumentation?
@@ -366,8 +375,33 @@ Mapped onto `otelecho` options, names kept consistent with `gin/`:
 - `WithOnError(func(echo.Context, error))` → overrides the SDK default
   from Decision 2a for callers who want full control. When supplied, the
   caller owns the `c.Error`-commit responsibility from Decision 4.
-- Optionally `WithEchoMetricAttributesFn(func(echo.Context) ...)` for
-  echo-context-derived labels; defer unless a consumer needs it.
+- Optionally `WithEchoMetricAttributesFn(func(echo.Context) ...)` →
+  `otelecho.WithEchoMetricAttributeFn`, for labels derived from echo's
+  richer context (route params, `c.Path()`, handler name, values set by
+  upstream middleware via `c.Get(...)` such as tenant / principal).
+  **Deferred** by default — and not exposed alone. Rationale:
+
+  - **Why it is tempting.** The `*http.Request` variant only sees
+    headers / URL / method; the context variant reaches framework state
+    a raw request cannot, which is the natural source for a `tenant` or
+    `api_version` label.
+  - **Why we defer it.** (a) *Cardinality footgun* — the context makes
+    it trivial to pull an unbounded value (user id, raw path) into a
+    metric label; this is worse than the request variant precisely
+    because the context is richer. (b) *Symmetry* — the gin facade does
+    not expose its `WithGinMetricAttributeFn` counterpart, so exposing
+    echo's alone breaks the "interchangeable facades" discipline
+    (ADR 0008 §5); if added, gin and echo gain it together. (c) *Cost* —
+    each option couples the facade to a framework-context type and adds
+    docs/tests against the thin-facade budget. (d) *Not free anyway* —
+    injected keys still need `WithExtraHTTPServerAttributeKeys` to
+    survive the duration view's allowlist, while on the currently
+    un-allowlisted body-size histograms (Decision 8) they would appear
+    unfiltered. (e) *Precedence subtlety* — when both fns set the same
+    key, the echo-context value wins, an extra rule for users to hold.
+
+  When a consumer presents a concrete bounded use case, add it to both
+  the gin and echo facades in the same PR.
 
 No span-name option (Decision 5). No provider/propagator override
 options — the facade owns those (ADR 0003), same as gin.
