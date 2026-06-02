@@ -21,7 +21,7 @@ ADR 0010 (gin integration).
 Several candidate services use [Echo](https://echo.labstack.com/)
 (`github.com/labstack/echo/v4`) rather than gin. Today the SDK ships a
 first-party gin facade (ADR 0010) but nothing for echo, so an echo
-service either drops down to the framework-agnostic `http/` facade
+service either drops to the framework-agnostic `http/` facade
 (ADR 0009) — losing echo's route template as a bounded `http.route`
 source and losing visibility into echo's returned-error flow — or wires
 `otelecho` by hand with its own provider plumbing, re-deriving the
@@ -159,6 +159,33 @@ intentional and documented in godoc: gin needed a self-written
 hook; echo gets the same observability from the upstream `WithOnError`,
 so a single middleware is the simpler, more echo-idiomatic shape.
 
+`otelecho` invokes `OnError` but then **returns the error** to
+`Echo.ServeHTTP` (verified in v0.68.0: it does not call `c.Error` itself
+and ends with `return err`). So a default `OnError` that calls
+`c.Error(err)` would make `HTTPErrorHandler` run **twice** — once from
+`c.Error`, once from `ServeHTTP`. To keep it to a single invocation
+(Decision 4), the facade wraps `otelecho.Middleware` in a thin outer
+middleware that swallows the propagated error once the response is
+committed. The public return type stays a single `echo.MiddlewareFunc`;
+the wrapper is an internal detail:
+
+```go
+func Middleware(service string, tp trace.TracerProvider, mp metric.MeterProvider,
+    prop propagation.TextMapPropagator, opts ...Option) echo.MiddlewareFunc {
+    om := otelecho.Middleware(service, base...) // providers + default OnError
+    return func(next echo.HandlerFunc) echo.HandlerFunc {
+        h := om(next)
+        return func(c echo.Context) error {
+            err := h(c)
+            if err != nil && c.Response().Committed {
+                return nil // default OnError already ran HTTPErrorHandler once
+            }
+            return err // not committed: let ServeHTTP handle it exactly once
+        }
+    }
+}
+```
+
 #### 2a. Default `OnError` semantics (echo's analog of ADR 0010 §2)
 
 Pseudocode (concrete implementation in the follow-up PR):
@@ -186,7 +213,9 @@ func recordEchoError(c echo.Context, err error) {
     // Commit the response so the span observes the real status code
     // before it ends; see Decision 4. Guard against double-write.
     if !c.Response().Committed {
-        c.Error(err) // routes through Echo.HTTPErrorHandler exactly once
+        c.Error(err) // runs HTTPErrorHandler now; the Decision 2 wrapper
+                     // then swallows the propagated error so ServeHTTP
+                     // does not run it a second time
     }
     // Re-check validity here (not just at the top): SetStatus must read the
     // status *after* the commit above, and err.Error() should not be
@@ -235,22 +264,37 @@ span and the `http.server.request.duration` sample would record `200`
 for a request the client saw as `500`.
 
 Decision: the default `OnError` calls `c.Error(err)` (guarded by
-`!c.Response().Committed`) so the centralized error handler runs, and
-the response is committed, **inside** the middleware/span scope. This is
-exactly the pattern `otelecho`'s documentation prescribes ("depends on
-calling `c.Error()`").
+`!c.Response().Committed`) so the centralized error handler runs and the
+response is committed **inside** the middleware/span scope — the pattern
+`otelecho`'s documentation prescribes ("depends on calling `c.Error()`").
 
-Two caveats the follow-up PR documents in godoc + README:
+`c.Error` alone is **not** enough to bound the handler to one execution.
+`otelecho` invokes `OnError` and then returns the error to
+`Echo.ServeHTTP`, which calls `HTTPErrorHandler` again. Echo's *default*
+handler no-ops that second call via its own `Committed` check, but a
+**custom** `HTTPErrorHandler` that logs or increments a counter *before*
+checking `Committed` would double-fire. The single-invocation guarantee
+therefore comes from the Decision 2 wrapper swallowing the propagated
+error once the response is committed — not from `c.Error` itself. This is
+the reason the "exactly once" property is a property of the *facade*, not
+of the upstream hook.
 
-- **Custom `HTTPErrorHandler`.** Services that set
-  `e.HTTPErrorHandler` keep their handler; `c.Error` routes through
-  whatever handler is installed. The only requirement is that the custom
+Caveats the follow-up PR documents in godoc + README:
+
+- **Custom `HTTPErrorHandler`.** Services that set `e.HTTPErrorHandler`
+  keep their handler; `c.Error` routes through whatever is installed, and
+  the wrapper holds it to a single run. The only requirement is that the
   handler commits a response (the echo default does). A handler that
-  intentionally leaves the response uncommitted will still record `200`
-  — documented as a known footgun, not worked around.
-- **Double-commit.** If user middleware already called `c.Error`, the
-  `Committed` guard makes the facade a no-op on the second call, so the
-  response is written exactly once.
+  intentionally leaves the response uncommitted records `200` **and**,
+  having never set `Committed`, is re-invoked by `ServeHTTP` — documented
+  as a known footgun, not worked around.
+- **Caller-supplied `OnError`.** Overriding `WithOnError` transfers the
+  commit responsibility to the caller; the wrapper still gives single
+  invocation when their handler commits, and otherwise lets the error
+  propagate so `ServeHTTP` handles it once.
+- **Double-`c.Error`.** If user middleware already called `c.Error`, the
+  `!Committed` guard makes the default `OnError` a no-op, so the response
+  body is written once.
 
 ### 5. Configurability gap: no `WithSpanNameFormatter` upstream
 
@@ -303,10 +347,13 @@ the `http.server.request.duration` `status_code` sample.
 | 9 | Inverted order: `Recover()` outermost, o11y inner, handler panics | yes | 500 (recovered by outer Recover) | **span incomplete**: opened by otelecho, ended by its defer, but post-`next` status/metric not recorded because the panic propagated past otelecho before it read the status | none | **not recorded** |
 
 Row 5 is the load-bearing test: it proves the facade surfaces the hidden
-`Internal` cause that the agnostic `http/` facade cannot. Row 9
-documents the wrong-order failure mode as a regression guard, exactly as
-ADR 0010 §5 row 10 does for gin; the README's echo section references it
-to discourage inversion.
+`Internal` cause that the agnostic `http/` facade cannot. Row 8 must
+additionally assert the custom `HTTPErrorHandler` is invoked **once**
+(via a call counter), proving the Decision 2 wrapper prevents the
+`OnError`-then-`ServeHTTP` double-invocation. Row 9 documents the
+wrong-order failure mode as a regression guard, as ADR 0010 §5 row 10
+does for gin; the README's echo section references it to discourage
+inversion.
 
 ### 7. Cardinality control is inherited (same as ADR 0010 §3–§4)
 
@@ -493,6 +540,10 @@ in-flight integration and can land on its own.
   the slice-return shape for no benefit.
 - **Return type.** Single `echo.MiddlewareFunc`, not a slice — a
   deliberate, documented divergence from ADR 0010 driven by Decision 2.
+- **Single `HTTPErrorHandler` execution.** Not guaranteed by `c.Error`
+  alone, because `otelecho` returns the error to `ServeHTTP` after
+  `OnError`. Resolved by the Decision 2 wrapper swallowing the propagated
+  error once the response is committed; asserted by Decision 6 row 8.
 - **`echo.http_error.code` as a metric label.** Rejected — span-only, to
   avoid duplicating `http.response.status_code` and inflating
   cardinality (same reasoning as ADR 0010 §2 for `gin.error.type`).
