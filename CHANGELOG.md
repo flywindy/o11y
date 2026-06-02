@@ -15,6 +15,14 @@ adopters can plan their upgrades.
 
 ### Added
 
+- Added `WithSamplingRatio` and `WithTraceSampler` so services can configure
+  SDK-side head sampling explicitly while preserving OpenTelemetry
+  `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` support when no typed
+  sampler is set.
+- Documented trace sampling guidance, including the head-vs-tail sampling split,
+  high-throughput producer recommendations, and `OTEL_BSP_*` batch span
+  processor environment variables.
+
 ### Changed
 
 ### Deprecated

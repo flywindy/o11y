@@ -110,6 +110,8 @@ func main() {
         o11y.WithEnvironment("production"),        // required; see canonical values below
         o11y.WithServiceNamespace("platform"),     // required; maps to k8s namespace / team
         o11y.WithOTLPEndpoint("http://localhost:4318"),
+        // Optional: reduce head sampling on high-throughput producers.
+        // o11y.WithSamplingRatio(0.001),
         // Optional: enable continuous profiling. In-cluster, prefer
         // "http://alloy.infra.svc.cluster.local:4040". Profiling requires
         // both the endpoint and WithProfilingEnabled(true).
@@ -150,6 +152,13 @@ _OTLP (shared by traces and logs):_
 |--------|---------|-------------|
 | `WithOTLPEndpoint(url)` | `http://localhost:4318` | OTLP/HTTP collector endpoint for traces and logs |
 | `WithOTLPHeaders(map[string]string)` | `nil` | Headers attached to every OTLP/HTTP request (auth tokens, multi-tenant routing) |
+
+_Tracing:_
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `WithSamplingRatio(ratio)` | unset → OTel default/env | Configure SDK-side head sampling as `ParentBased(TraceIDRatioBased(ratio))`; `ratio` must be in `[0.0, 1.0]` |
+| `WithTraceSampler(sampler)` | unset → OTel default/env | Escape hatch for a custom `sdktrace.Sampler`; a non-nil sampler overrides `OTEL_TRACES_SAMPLER` for this SDK instance |
 
 _Metrics:_
 
@@ -319,6 +328,69 @@ import "go.opentelemetry.io/otel"
 otel.SetTracerProvider(obs.TracerProvider())
 otel.SetTextMapPropagator(obs.Propagator)
 ```
+
+
+### Trace Sampling
+
+The SDK default remains OpenTelemetry's `ParentBased(AlwaysSample)`, so local
+development and normal services get 100% trace visibility and full
+log/metric/profile correlation unless they opt into a lower rate. This is
+intentional: exemplars and profile-to-trace links require an active sampled
+span, so aggressive head sampling reduces those links in proportion to the
+sampling ratio.
+
+Use **head sampling** when a producing service needs protection from span
+allocation, BatchSpanProcessor queue pressure, and GC overhead. Message
+workers, MongoDB change-stream watchers, JetStream publishers, and other
+high-throughput producers should set a per-service rate at the most upstream
+trace origin so the `ParentBased` sampled flag propagates to downstream
+consumers automatically. Typical hot-path rates are `0.01` to `0.001`;
+normal or low-traffic services should usually stay at `1.0`.
+
+```go
+obs, err := o11y.Init(ctx,
+    o11y.WithServiceName("orders-watcher"),
+    o11y.WithServiceVersion("1.0.0"),
+    o11y.WithEnvironment("production"),
+    o11y.WithServiceNamespace("platform"),
+    o11y.WithOTLPEndpoint("http://otel-collector.infra.svc.cluster.local:4318"),
+    o11y.WithSamplingRatio(0.001), // 0.1% head sampling for a hot producer
+)
+```
+
+Typed sampling options and OpenTelemetry environment variables coexist:
+
+- If `WithSamplingRatio` or non-nil `WithTraceSampler` is set, that typed
+  sampler wins for this SDK instance.
+- If no typed sampler is set, the OTel Go SDK still honors
+  `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG`. For example:
+
+  ```bash
+  OTEL_TRACES_SAMPLER=parentbased_traceidratio
+  OTEL_TRACES_SAMPLER_ARG=0.001
+  ```
+
+- If neither typed options nor env vars are set, the default is 100% sampling.
+
+`OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`,
+`OTEL_BSP_SCHEDULE_DELAY`, and `OTEL_BSP_EXPORT_TIMEOUT` can also tune the OTel
+BatchSpanProcessor queue, batch size, and timeout without code changes. These
+settings bound exporter behavior, but they do not avoid creating recording
+spans; use head sampling when the application itself is under CPU or memory
+pressure.
+
+**Head sampling vs. tail sampling:** SDK head sampling protects the service
+creating spans. Collector tail sampling protects backend storage and can retain
+all errors or slow traces intelligently, but it runs after the application has
+already paid span creation cost. Use tail sampling as deployment configuration
+for backend cost control, not as a substitute for SDK head sampling on hot
+producers.
+
+Worked example: in a MongoDB change-stream watcher → JetStream → websocket
+worker pipeline, setting `WithSamplingRatio(0.001)` on the watcher causes most
+root spans to be non-recording. The unsampled `traceparent` then flows through
+JetStream, and downstream workers using `ParentBased` also avoid recording
+those traces, thinning the whole pipeline from the source.
 
 ### Continuous Profiling
 

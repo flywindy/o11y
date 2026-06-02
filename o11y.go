@@ -179,6 +179,9 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	if err := validateHistogramBuckets(cfg.histogramBuckets); err != nil {
 		return nil, err
 	}
+	if err := configureSampler(cfg); err != nil {
+		return nil, err
+	}
 
 	// 1. Build a shared Resource so TracerProvider, MeterProvider, and
 	//    LoggerProvider all carry identical service-identity attributes.
@@ -197,7 +200,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	tpShutdown := func(_ context.Context) error { return nil }
 
 	if cfg.traceEnabled {
-		tp, p, initErr := trace.InitTracer(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, res)
+		tp, p, initErr := trace.InitTracer(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, res, cfg.sampler)
 		if initErr != nil {
 			return nil, initErr
 		}
@@ -451,6 +454,20 @@ var envAliases = map[string]string{
 	"dev":         "development",
 	"testing":     "testing",
 	"test":        "testing",
+}
+
+// configureSampler validates and materializes a typed sampling ratio only when
+// the caller explicitly configured one, preserving OTel env/default sampling
+// when the SDK option is unset.
+func configureSampler(cfg *Config) error {
+	if !cfg.samplingRatioSet {
+		return nil
+	}
+	if math.IsNaN(cfg.samplingRatio) || math.IsInf(cfg.samplingRatio, 0) || cfg.samplingRatio < 0 || cfg.samplingRatio > 1 {
+		return fmt.Errorf("sampling ratio must be between 0.0 and 1.0 inclusive, got %v", cfg.samplingRatio)
+	}
+	cfg.sampler = sdktrace.ParentBased(sdktrace.TraceIDRatioBased(cfg.samplingRatio))
+	return nil
 }
 
 // validateHistogramBuckets ensures the histogram boundaries are in a state
