@@ -376,10 +376,21 @@ These return a channel and stream results lazily, so a single
 start/end bracket cannot bound the whole operation. v1 records a span
 that ends when the wrapper's goroutine observes channel close (for the
 common drain-to-completion pattern) and sets `minio.error.kind` if any
-streamed element carries an error. Callers that abandon the channel
-early get a span ended at GC-safe teardown via a `context` cancellation
-guard, not a leak. The streaming-span shape is the least certain part
-of this ADR and is flagged as an open question.
+streamed element carries an error.
+
+The wrapper inherits — and cannot weaken — minio-go's existing
+contract for channel-returning APIs: **callers must either drain the
+channel or cancel the request context**. Abandoning the channel
+without cancelling is already a goroutine leak in minio-go itself
+(its producer blocks on send to the un-drained channel), and our
+wrapper goroutine and the open span have the same fate. A GC-driven
+teardown is not viable here because the live producer goroutine
+keeps the channel reachable. We do not attempt to paper over a
+contract the underlying library cannot enforce; godoc on the wrapped
+methods will reproduce minio-go's drain-or-cancel requirement.
+
+The streaming-span shape is the least certain part of this ADR and
+is flagged as an open question.
 
 ### 7. Trace-context propagation is disabled toward the store
 
@@ -477,7 +488,12 @@ import (
     "github.com/minio/minio-go/v7/pkg/credentials"
 )
 
-sdk, err := o11y.Init(ctx, o11y.WithServiceName("uploader"))
+sdk, err := o11y.Init(ctx,
+    o11y.WithServiceName("uploader"),
+    o11y.WithServiceVersion("1.4.2"),
+    o11y.WithServiceNamespace("media"),
+    o11y.WithEnvironment("production"),
+)
 if err != nil { /* ... */ }
 defer sdk.Shutdown(context.Background())
 
