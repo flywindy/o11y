@@ -365,20 +365,35 @@ follow-ups as needs appear.
 
 **`GetObject` is a deliberate exception.** `minio-go`'s `GetObject`
 is *lazy*: it returns an `*minio.Object` and performs no network I/O
-until the first `Read`/`Stat`/`Seek`. Bracketing the `GetObject` call
+until the first `Read`/`Stat`/`Seek`. `minio-go` additionally
+**stashes the `ctx` passed to `GetObject` on the returned `*Object`**
+and reuses it for every subsequent transfer call — not whatever
+context is active at Read time. Bracketing the `GetObject` call
 would close the span before any bytes move and mismeasure download
 latency as ~0. The decision:
 
 - `GetObject` gets a **thin span around the call itself** (it can
-  still fail fast, e.g. arg validation) and the returned `*Object`'s
-  transfer is **not** wrapped in the logical layer in v1.
-- For *measured* downloads, callers use `FGetObject` (synchronous), or
-  enable `WithHTTPChildSpans` so the lazy `Read`'s GET appears as an
-  HTTP span (it will land under whatever span is active when `Read`
-  is called, since the request context is the one captured at
-  `GetObject` time). This limitation is documented in godoc.
-- Wrapping the `*Object` reader to emit a transfer span is tracked as
-  an open question.
+  still fail fast, e.g. arg validation), and the `ctx` actually
+  passed to `minio-go.GetObject` is **the caller's original `ctx`,
+  not the `ctx` carrying our thin span**. Trojan-horsing our span
+  context into the stashed context would parent every lazy Read's
+  HTTP span to a span that has already been `End()`-ed by the time
+  `GetObject` returned — a valid parent reference per the OTel
+  data model, but a misleading and impossible-looking trace shape.
+- The returned `*Object`'s transfer is **not** wrapped in the
+  logical layer in v1.
+- Consequence: when `WithHTTPChildSpans` is on, the lazy Read's
+  HTTP span is parented to whatever caller span was active **at
+  `GetObject` time** (not at Read time — that distinction is not
+  ours to make, it is fixed by `minio-go`'s stashed context).
+  Read latency is visible on the HTTP span; no `object_store.*`
+  attributes appear on it because no logical wrapper span
+  participates in the stashed context.
+- For *measured* downloads with logical-span coverage, callers use
+  `FGetObject` (synchronous). Wrapping the returned `*Object` to
+  emit a transfer span — which would also restore the
+  parent-at-Read-time story — is tracked under Open questions
+  ("`*Object` reader instrumentation").
 
 ### 6. Channel-returning APIs (`ListObjects`, `RemoveObjects`)
 
