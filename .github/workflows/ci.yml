@@ -23,9 +23,9 @@ jobs:
 
       # Tests run on the Go version declared in go.mod so we exercise
       # exactly the stdlib surface our minimum-supported toolchain ships.
-      # govulncheck (in the vuln job below) uses `stable` instead so it
-      # sees the latest stdlib CVE patches.
-      - uses: actions/setup-go@v5
+      # govulncheck (in the vuln job below) uses a patched Go 1.25 toolchain
+      # so it sees stdlib CVE fixes on our supported Go line.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version-file: go.mod
           cache: true
@@ -66,7 +66,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version-file: go.mod
           cache: false
@@ -90,9 +90,9 @@ jobs:
 
       # govulncheck must see a patched Go 1.25 stdlib so vulnerability matches
       # reflect what a freshly-built binary on our supported Go line would link.
-      # Pin to the latest 1.25 patch train instead of the go.mod floor (1.25.0),
-      # otherwise stdlib CVEs fixed after the initial Go 1.25 release fail CI.
-      - uses: actions/setup-go@v5
+      # Use setup-go for cache/path setup, then force the exact patched toolchain
+      # through GOTOOLCHAIN because setup-go's 1.25.x manifest can lag releases.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version: '1.25.x'
           check-latest: true
@@ -102,6 +102,9 @@ jobs:
       # changes between releases have broken pipelines historically).
       # Manage upgrades via Dependabot / Renovate.
       - name: govulncheck
+        env:
+          GOTOOLCHAIN: go1.25.11
         run: |
+          go version
           go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
           govulncheck ./...
