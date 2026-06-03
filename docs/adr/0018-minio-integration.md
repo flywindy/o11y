@@ -262,7 +262,14 @@ in §4:
   `server.address` aggregate consistently across the HTTP and
   object-store layers and so multi-endpoint deployments can break
   out per-backend latency.
-- `otel.status_code` / `error.type` — bounded.
+- `error.type` — bounded. Encodes both the failure class and (by
+  its absence on success) the success/failure axis itself; this
+  matches the OTel HTTP client metric pattern. **No `otel.status_code`
+  label** is set: the OTel registry defines that attribute's values
+  as `OK`/`ERROR` only, with the attribute absent for `UNSET`, so a
+  literal `"Unset"` value would be non-conformant with semconv
+  v1.39.0 and would not be interpreted as a span status by
+  downstream processors.
 
 Explicitly **not** a label:
 
@@ -606,7 +613,7 @@ minio.client.operation.duration   = 14.2s         histogram
    object_store.bucket.name    = "media"
    server.address              = "minio.internal"
    server.port                 = 9000
-   otel.status_code            = "Unset"
+   # error.type and otel.status_code both absent on success
 ```
 
 The 14 s of off-CPU storage time from the motivating incident is
@@ -669,7 +676,8 @@ minio.client.operation.duration   = 0.023s        histogram
    server.address              = "minio.internal"
    server.port                 = 9000
    error.type                  = "NoSuchKey"
-   otel.status_code            = "Error"
+   # otel.status_code is intentionally not set — error.type's
+   # presence already marks the failure (§3, semconv v1.39.0)
 ```
 
 The split between `error.type` (programmer view: the S3 wire code)
