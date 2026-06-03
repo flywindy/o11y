@@ -256,6 +256,13 @@ in §4:
   bounded.
 - `object_store.bucket.name` — bounded by the service's bucket set.
   Acceptable.
+- `server.address`, `server.port` — bounded by the set of MinIO
+  endpoints the service connects to (typically 1–3, constant per
+  `*Client` instance). Included to mirror the HTTP client metric
+  label set in ADR 0009 §2 Layer A, so dashboards keyed on
+  `server.address` aggregate consistently across the HTTP and
+  object-store layers and so multi-endpoint deployments can break
+  out per-backend latency.
 - `otel.status_code` / `error.type` — bounded.
 
 Explicitly **not** a label:
@@ -530,6 +537,8 @@ And one metric observation:
 minio.client.operation.duration   = 14.2s         histogram
    object_store.operation.name = "PutObject"
    object_store.bucket.name    = "media"
+   server.address              = "minio.internal"
+   server.port                 = 9000
    otel.status_code            = "Unset"
 ```
 
@@ -589,9 +598,11 @@ StatObject media                                               client  ERROR
 Histogram observation:
 
 ```
-minio.client.operation.duration   = 23ms          histogram
+minio.client.operation.duration   = 0.023s        histogram
    object_store.operation.name = "StatObject"
    object_store.bucket.name    = "media"
+   server.address              = "minio.internal"
+   server.port                 = 9000
    error.type                  = "NoSuchKey"
    otel.status_code            = "Error"
 ```
