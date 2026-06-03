@@ -201,6 +201,19 @@ type Option func(*config)
 // transport so each underlying HTTP round-trip (incl. multipart parts)
 // becomes a child span of the logical operation span. Default: off.
 // When on, the transport is configured with a no-op propagator (§7).
+//
+// To avoid silently changing minio-go's data-plane HTTP semantics,
+// the base RoundTripper that o11y wraps is selected as:
+//
+//   - minioOpts.Transport, if the caller already set it; the
+//     wrapper does not replace caller-supplied transports.
+//   - otherwise miniogo.DefaultTransport(minioOpts.Secure) — minio-go's
+//     own default transport (response decompression disabled, S3-tuned
+//     timeouts and connection pool), NOT http.DefaultTransport. The
+//     SDK's http.NewTransport substitutes http.DefaultTransport when
+//     handed a nil base, which would re-enable compression and shift
+//     pool/timeout behavior; this wrapper passes minio-go's default
+//     explicitly to keep enabling child spans behavior-neutral.
 func WithHTTPChildSpans(enabled bool) Option
 
 // WithSpanNameFormatter overrides the default "{Operation} {bucket}"
@@ -423,13 +436,13 @@ latency as ~0. The decision:
   parent-at-Read-time story — is tracked under Open questions
   ("`*Object` reader instrumentation").
 
-### 6. Channel-returning APIs (`ListObjects`, `RemoveObjects`)
+### 6. Channel-returning APIs (`ListObjects` in v1)
 
-These return a channel and stream results lazily, so a single
-start/end bracket cannot bound the whole operation. v1 records a span
-that ends when the wrapper's goroutine observes channel close (for the
-common drain-to-completion pattern) and sets `minio.error.kind` if any
-streamed element carries an error.
+`ListObjects` returns a channel and streams results lazily, so a
+single start/end bracket cannot bound the whole operation. v1 records
+a span that ends when the wrapper's goroutine observes channel close
+(for the common drain-to-completion pattern) and sets
+`minio.error.kind` if any streamed element carries an error.
 
 The wrapper inherits — and cannot weaken — minio-go's existing
 contract for channel-returning APIs: **callers must either drain the
@@ -440,7 +453,15 @@ wrapper goroutine and the open span have the same fate. A GC-driven
 teardown is not viable here because the live producer goroutine
 keeps the channel reachable. We do not attempt to paper over a
 contract the underlying library cannot enforce; godoc on the wrapped
-methods will reproduce minio-go's drain-or-cancel requirement.
+method will reproduce minio-go's drain-or-cancel requirement.
+
+**Scope:** v1 wraps `ListObjects` only. `RemoveObjects` (bulk delete)
+has the same channel-in / channel-out shape and the same contract,
+but is **not** wrapped in v1 — calls flow through the embedded
+`*minio.Client` and produce no logical span. Wrapping it (and any
+other channel API minio-go adds) reuses this section's lifecycle
+verbatim and is tracked alongside the open question on streaming-span
+semantics.
 
 The streaming-span shape is the least certain part of this ADR and
 is flagged as an open question.
