@@ -321,7 +321,7 @@ mode, so cardinality is constant.
   | `object_store.operation.name` | `"PutObject"`, `"GetObject"`, … | always | `db.operation.name`, `messaging.operation.name`, `gen_ai.operation.name` (all use the `.operation.name` form) |
   | `object_store.bucket.name` | bucket | always | `messaging.destination.name`, `db.collection.name` (named container the operation targets) |
   | `object_store.object.key` | object key | controlled by `WithObjectKeyAttribute` (default on) | retains the S3 term-of-art "key" rather than overloading "name"; high cardinality, span-only |
-  | `object_store.object.size` | bytes (int) | when known | from caller-supplied size for `PutObject`/`FPutObject`; from response `Content-Length` for downloads |
+  | `object_store.object.size` | bytes (int) | when known | from caller-supplied size for `PutObject`/`FPutObject`. For downloads the wrapper has no observable response — `FGetObject` returns only `error`, and `GetObject` is lazy (§5) — so download size is not populated in v1. A caller that needs download-size visibility issues a `StatObject` first. |
   | `server.address`, `server.port` | endpoint host/port | always | stable HTTP/network semconv — carries the truthful backend identity (e.g. `minio.internal:9000`), so no `cloud.provider` is set |
 
   Naming follows the OTel naming guide: dots as namespace
@@ -495,7 +495,7 @@ not need a real server.
 |---|---|---|
 | 1 | Small `PutObject` success | 1 logical span, `otel.status=Unset`, `object_store.object.size` set, no `error.type` / `minio.error.kind` |
 | 2 | Large `PutObject` (multipart) with `WithHTTPChildSpans` | 1 logical span → child HTTP spans: Initiate, UploadPart×N, Complete |
-| 3 | `FGetObject` success | 1 logical span, size from response |
+| 3 | `FGetObject` success | 1 logical span, `otel.status=Unset`, no `object_store.object.size` (FGetObject returns only `error`; §4) |
 | 4 | `StatObject` on missing key | 1 logical span, Error, `error.type=NoSuchKey`, `minio.error.kind=not_found` |
 | 5 | `PutObject` with bad credentials | 1 logical span, Error, `minio.error.kind=access_denied` |
 | 6 | `FPutObject` with caller timeout | 1 logical span, Error, `minio.error.kind=client_timeout` |
@@ -507,12 +507,20 @@ not need a real server.
 `minio-go/v7` does not import OpenTelemetry or mutate OTel globals.
 The wrapper takes `tp`/`mp`/`prop` explicitly and never reads or
 writes any `go.opentelemetry.io/otel` global. The optional HTTP layer
-reuses `http.NewTransport` (already approved, ADR 0009). The ADR 0003
-approved-integrations table is updated in the same PR:
+reuses `http.NewTransport` (already approved, ADR 0009).
+
+`minio-go/v7` is not yet a dependency of this repo (`go.mod` has no
+`minio-go` line at the time of this ADR). Per ADR 0003 — "When a new
+library is added or an existing one bumped, update this table in the
+same PR as the version change" — the registry row lands in the
+**implementing PR** that adds `minio-go/v7` to `go.mod`. The row
+content is pre-specified here so reviewers can verify the
+ADR 0003 §"For every new instrumentation integration" checklist
+ahead of that PR:
 
 | Library | Version | Verified | Behavior | Notes |
 |---|---|---|---|---|
-| `github.com/minio/minio-go/v7` | (pinned at PR time) | ✅ | Pure S3 client; does not import OpenTelemetry or mutate provider globals. The SDK-owned `minio` wrapper wires providers explicitly and only uses the public `Options.Transport` seam. | See ADR 0018 |
+| `github.com/minio/minio-go/v7` | (pinned by implementing PR) | ✅ | Pure S3 client; does not import OpenTelemetry or mutate provider globals. The SDK-owned `minio` wrapper wires providers explicitly and only uses the public `Options.Transport` seam. | See ADR 0018 |
 
 ---
 
