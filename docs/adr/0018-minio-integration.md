@@ -452,6 +452,156 @@ approved-integrations table is updated in the same PR:
 
 ---
 
+## Example
+
+End-to-end illustration of how §2 (API), §3 (metrics), and §4 (span
+schema) compose. Attribute values are realistic; trace ids and exact
+durations are elided.
+
+### Construction
+
+```go
+import (
+    "context"
+
+    "github.com/flywindy/o11y"
+    o11yminio "github.com/flywindy/o11y/minio"
+    miniogo "github.com/minio/minio-go/v7"
+    "github.com/minio/minio-go/v7/pkg/credentials"
+)
+
+sdk, err := o11y.Init(ctx, o11y.WithServiceName("uploader"))
+if err != nil { /* ... */ }
+defer sdk.Shutdown(context.Background())
+
+client, err := o11yminio.New(
+    "minio.internal:9000",
+    &miniogo.Options{
+        Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
+        Secure: false,
+    },
+    sdk.TracerProvider(),
+    sdk.MeterProvider(),
+    sdk.Propagator,
+    o11yminio.WithHTTPChildSpans(true),
+)
+```
+
+### Successful multipart upload (default schema)
+
+```go
+_, err := client.PutObject(ctx, "media",
+    "videos/2026/clip.mp4",
+    file, 40*miniogo.MiB,
+    miniogo.PutObjectOptions{ContentType: "video/mp4"})
+```
+
+Resulting trace (the parent HTTP-server span from gin/echo is omitted
+for brevity; the logical span is its direct child via `ctx`):
+
+```
+PutObject media                                                client
+│  object_store.system.name      = "s3"
+│  object_store.operation.name   = "PutObject"
+│  object_store.bucket.name      = "media"
+│  object_store.object.key       = "videos/2026/clip.mp4"
+│  object_store.object.size      = 41943040
+│  server.address                = "minio.internal"
+│  server.port                   = 9000
+│  otel.status                   = Unset
+├── HTTP POST minio.internal/media/...?uploads                  client
+│      http.request.method           = "POST"
+│      http.response.status_code     = 200
+│      (InitiateMultipartUpload)
+├── HTTP PUT  minio.internal/media/...?partNumber=1&uploadId=…  client
+│      http.request.method               = "PUT"
+│      http.response.status_code         = 200
+│      object_store.multipart.upload_id   = "abc123..."
+│      object_store.multipart.part_number = 1
+├── HTTP PUT  ...?partNumber=2&uploadId=…                       client
+│      object_store.multipart.part_number = 2
+└── HTTP POST minio.internal/media/...?uploadId=…               client
+       http.request.method = "POST"      (CompleteMultipartUpload)
+```
+
+And one metric observation:
+
+```
+minio.client.operation.duration   = 14.2s         histogram
+   object_store.operation.name = "PutObject"
+   object_store.bucket.name    = "media"
+   otel.status_code            = "Unset"
+```
+
+The 14 s of off-CPU storage time from the motivating incident is
+now attributed to a named span and decomposed by HTTP child into
+"InitiateMultipart / per-part PUTs / Complete" — exactly the
+breakdown the CPU profile alone could not provide.
+
+### Same call with `WithAWSS3CompatAttributes(true)`
+
+The compat flag dual-emits the experimental `aws.s3.*` keys
+alongside the generic ones; the generic schema is unchanged.
+
+```
+PutObject media                                                client
+│  object_store.system.name      = "s3"
+│  object_store.operation.name   = "PutObject"
+│  object_store.bucket.name      = "media"
+│  aws.s3.bucket                 = "media"                  ← alias
+│  object_store.object.key       = "videos/2026/clip.mp4"
+│  aws.s3.key                    = "videos/2026/clip.mp4"   ← alias
+│  object_store.object.size      = 41943040
+│  ...
+├── HTTP PUT ...?partNumber=1&uploadId=…                       client
+│      object_store.multipart.upload_id   = "abc123..."
+│      aws.s3.upload_id                   = "abc123..."     ← alias
+│      object_store.multipart.part_number = 1
+│      aws.s3.part_number                 = 1               ← alias
+...
+```
+
+Metric labels are **unchanged** — `aws.s3.*` aliases appear on spans
+only (§3), so cardinality is identical between the two modes.
+
+### Failure: missing key on `StatObject`
+
+```go
+_, err := client.StatObject(ctx, "media",
+    "videos/missing.mp4",
+    miniogo.StatObjectOptions{})
+// err: *miniogo.ErrorResponse{Code: "NoSuchKey", ...}
+```
+
+```
+StatObject media                                               client  ERROR
+   object_store.system.name      = "s3"
+   object_store.operation.name   = "StatObject"
+   object_store.bucket.name      = "media"
+   object_store.object.key       = "videos/missing.mp4"
+   server.address                = "minio.internal"
+   server.port                   = 9000
+   error.type                    = "NoSuchKey"
+   minio.error.kind              = "not_found"
+   otel.status                   = Error
+```
+
+Histogram observation:
+
+```
+minio.client.operation.duration   = 23ms          histogram
+   object_store.operation.name = "StatObject"
+   object_store.bucket.name    = "media"
+   error.type                  = "NoSuchKey"
+   otel.status_code            = "Error"
+```
+
+The split between `error.type` (programmer view: the S3 wire code)
+and `minio.error.kind` (SRE view: the closed taxonomy in §8) is the
+intent described in §4 / §8 — both keys coexist.
+
+---
+
 ## Consequences
 
 **Positive**
