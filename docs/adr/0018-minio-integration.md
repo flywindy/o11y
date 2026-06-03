@@ -267,9 +267,30 @@ in §4:
 Explicitly **not** a label:
 
 - `object_store.object.key` — unbounded. Span attribute only (§4),
-  never a metric dimension. A package-owned metric.View registered
-  alongside the instrument drops any key that escapes the closed set,
-  mirroring ADR 0009 §2 Layer A defense-in-depth.
+  never a metric dimension. A package-owned `metric.View` drops any
+  key that escapes the closed set, mirroring ADR 0009 §2 Layer A
+  defense-in-depth.
+
+OTel Go `View`s are fixed when the SDK `MeterProvider` is built and
+cannot be retro-fitted at instrument creation. Following the
+established repo pattern (see `redis/views.go`, `mongo/views.go`,
+and the `ExtraViews` composition at `o11y.go:234`), this package
+exports:
+
+```go
+// MetricViews returns the metric.Views that bound the cardinality
+// of minio.client.operation.duration and pin its histogram buckets.
+// Composed by o11y.Init via the ExtraViews seam; client code does
+// not call this directly.
+func MetricViews(histogramBuckets []float64) []sdkmetric.View
+```
+
+`o11y.Init` appends `o11yminio.MetricViews(cfg.histogramBuckets)`
+to its `ExtraViews` list alongside the existing redis/mongo entries.
+Services that build their own `MeterProvider` outside `o11y.Init` are
+expected to register the same views via `sdkmetric.WithView(...)` at
+construction; otherwise the allowlist is not in effect and
+high-cardinality attributes would export unfiltered.
 
 When `WithAWSS3CompatAttributes` is enabled, the AWS-S3 alias keys
 (§4) appear on **spans only**, not on metric labels — the metric
