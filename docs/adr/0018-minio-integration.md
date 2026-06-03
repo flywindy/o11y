@@ -211,6 +211,15 @@ func WithSpanNameFormatter(func(op, bucket, key string) string) Option
 // cardinality) object key is set on the span. Default: true (spans
 // tolerate high cardinality; metrics never carry the key — §3).
 func WithObjectKeyAttribute(enabled bool) Option
+
+// WithAWSS3CompatAttributes additionally emits the experimental
+// aws.s3.* attribute keys (aws.s3.bucket, aws.s3.key,
+// aws.s3.upload_id, aws.s3.part_number) alongside the default
+// object_store.* attributes (§4), for compatibility with dashboards
+// and processors keyed on the OTel AWS-S3 semantic conventions. The
+// two sets are dual-emitted — generic stays on when this is enabled.
+// Default: false.
+func WithAWSS3CompatAttributes(enabled bool) Option
 ```
 
 There is intentionally **no** `Wrap(existing *minio.Client)`. The
@@ -240,18 +249,26 @@ name would double-count whenever `WithHTTPChildSpans` is on (the
 transport already emits `http.client.request.duration`, governed by
 the ADR 0009 allowlist).
 
-Labels — a closed, bounded set:
+Labels — a closed, bounded set, matching the span attribute schema
+in §4:
 
-- `minio.operation` (enum: `PutObject`, `GetObject`, …) — bounded.
-- `minio.bucket` — bounded by the service's bucket set. Acceptable.
+- `object_store.operation.name` (enum: `PutObject`, `GetObject`, …) —
+  bounded.
+- `object_store.bucket.name` — bounded by the service's bucket set.
+  Acceptable.
 - `otel.status_code` / `error.type` — bounded.
 
 Explicitly **not** a label:
 
-- `minio.object.key` — unbounded. Span attribute only (§4), never a
-  metric dimension. A package-owned metric.View registered alongside
-  the instrument drops any key that escapes the closed set, mirroring
-  ADR 0009 §2 Layer A defense-in-depth.
+- `object_store.object.key` — unbounded. Span attribute only (§4),
+  never a metric dimension. A package-owned metric.View registered
+  alongside the instrument drops any key that escapes the closed set,
+  mirroring ADR 0009 §2 Layer A defense-in-depth.
+
+When `WithAWSS3CompatAttributes` is enabled, the AWS-S3 alias keys
+(§4) appear on **spans only**, not on metric labels — the metric
+schema is single-sourced on `object_store.*` regardless of compat
+mode, so cardinality is constant.
 
 ### 4. Span model
 
@@ -261,20 +278,49 @@ Explicitly **not** a label:
 - Default span name: `"{Operation} {bucket}"` (e.g. `PutObject media`).
   Operation and bucket are low/bounded cardinality; the **object key is
   never in the span name** (it is an attribute).
-- Attributes set before delegation:
-  - `minio.operation` — the logical method name.
-  - `minio.bucket` — bucket name.
-  - `minio.object.key` — object key (subject to
-    `WithObjectKeyAttribute`).
-  - object size — for `PutObject`/`FPutObject` from the caller-supplied
-    size; for downloads from the response `Content-Length` when known.
-  - a storage-system identity attribute and `server.address` /
-    `server.port` derived from the endpoint.
-  - These map to OTel AWS-S3 semantic conventions where a stable key
-    exists; where one does not, the `minio.*` namespace is used. The
-    exact key crosswalk is pinned in the implementation PR against
-    semconv v1.39.0 and is an open question (below) until the OTel
-    object-store conventions stabilize.
+- Attributes set before delegation — **default schema:
+  package-local `object_store.*` namespace** (vendor-neutral).
+  OTel has no stable, vendor-neutral object-store convention; only
+  the experimental AWS-S3 page exists, and that page is tightly
+  framed as AWS-SDK / `rpc.system=aws-api`, which is not the wire
+  framing here (minio-go is not the AWS SDK). The schema below is
+  package-local but shaped to mirror current OTel naming patterns
+  — see References — so a future migration to a blessed
+  convention is a key rename rather than a re-modeling:
+
+  | Attribute | Value | Required | Mirrors |
+  |---|---|---|---|
+  | `object_store.system.name` | `"s3"` | always | `db.system.name` — the **client-perceived** dialect, parallel to setting `db.system.name="postgresql"` when pgx connects to CockroachDB. The actual backend is told by `server.address`, not by this attribute. |
+  | `object_store.operation.name` | `"PutObject"`, `"GetObject"`, … | always | `db.operation.name`, `messaging.operation.name`, `gen_ai.operation.name` (all use the `.operation.name` form) |
+  | `object_store.bucket.name` | bucket | always | `messaging.destination.name`, `db.collection.name` (named container the operation targets) |
+  | `object_store.object.key` | object key | controlled by `WithObjectKeyAttribute` (default on) | retains the S3 term-of-art "key" rather than overloading "name"; high cardinality, span-only |
+  | `object_store.object.size` | bytes (int) | when known | from caller-supplied size for `PutObject`/`FPutObject`; from response `Content-Length` for downloads |
+  | `object_store.multipart.upload_id` | string | multipart child spans only | mirrors `aws.s3.upload_id` shape under the generic namespace |
+  | `object_store.multipart.part_number` | int | `UploadPart` child spans only | mirrors `aws.s3.part_number` |
+  | `server.address`, `server.port` | endpoint host/port | always | stable HTTP/network semconv — carries the truthful backend identity (e.g. `minio.internal:9000`), so no `cloud.provider` is set |
+
+  Naming follows the OTel naming guide: dots as namespace
+  separators, snake_case within a segment (e.g.
+  `object_store.bucket.name`, not `objectstore.bucketName`).
+
+- Attributes set before delegation — **opt-in `aws.s3.*` compat
+  layer** (`WithAWSS3CompatAttributes`, §2). When enabled, the
+  following experimental AWS-S3 keys are **dual-emitted** alongside
+  the generic ones (generic stays on; compat does not replace it):
+
+  | AWS-S3 alias (opt-in) | Aliases the generic |
+  |---|---|
+  | `aws.s3.bucket` | `object_store.bucket.name` |
+  | `aws.s3.key` | `object_store.object.key` |
+  | `aws.s3.upload_id` | `object_store.multipart.upload_id` |
+  | `aws.s3.part_number` | `object_store.multipart.part_number` |
+
+  We deliberately do **not** adopt `rpc.system=aws-api` or the
+  `Service.Operation` span-name rule from the AWS-SDK convention:
+  those assert AWS-SDK framing that is false here. The compat
+  flag is scoped to attribute-key aliasing only.
+
+  `cloud.provider=aws` is **never** set — the backend is not AWS.
 - Attributes set after delegation:
   - `otel.status` — Error on failure, Unset on success.
   - `error.type` — Go type / S3 code on failure (§8).
@@ -440,9 +486,20 @@ approved-integrations table is updated in the same PR:
 
 ## Open questions
 
-- **Semconv crosswalk.** Which keys are AWS-S3 stable conventions vs.
-  `minio.*` package-local, pinned against v1.39.0; revisit when OTel
-  object-store conventions stabilize.
+- **Semconv evolution.** §4 commits to a package-local
+  `object_store.*` schema modeled on current OTel naming
+  (`db.system.name` / `*.operation.name` / `*.bucket.name` patterns).
+  If OTel later mints a vendor-neutral object-store convention, the
+  migration is expected to be a key rename rather than a re-modeling;
+  the `WithAWSS3CompatAttributes` flag is reusable as the
+  dual-emit mechanism during that transition (per the
+  `OTEL_SEMCONV_STABILITY_OPT_IN` precedent used by the database
+  migration).
+- **Configurable system identity.** `object_store.system.name`
+  is hardcoded to `"s3"` in v1 (the dialect minio-go speaks).
+  An option to override it (e.g. for instrumentation embedded in a
+  multi-protocol wrapper) is deferred until a concrete need
+  appears.
 - **`*Object` reader instrumentation.** Whether to wrap the
   `GetObject`-returned reader to emit a transfer span, making streaming
   downloads first-class (§5).
@@ -451,3 +508,35 @@ approved-integrations table is updated in the same PR:
 - **Idempotency / double construction.** `New` always builds a fresh
   client, so there is no resty-style `Wrap` idempotency concern; if a
   future `Wrap` is added, it inherits ADR 0011 §6's open question.
+
+---
+
+## References
+
+OTel semantic conventions consulted when shaping §4. All linked pages
+are at status **Development** (experimental) as of this ADR:
+
+- [Naming | OpenTelemetry](https://opentelemetry.io/docs/specs/semconv/general/naming/)
+  — namespace separator + snake_case-within-segment rule (justifies
+  `object_store.bucket.name` over `objectstore.bucketName`).
+- [Database semantic convention stability migration guide | OpenTelemetry](https://opentelemetry.io/docs/specs/semconv/non-normative/db-migration/)
+  — `db.system` → `db.system.name` rename and the
+  `OTEL_SEMCONV_STABILITY_OPT_IN` dual-emit precedent.
+- [Semantic conventions for database client spans | OpenTelemetry](https://opentelemetry.io/docs/specs/semconv/db/database-spans/)
+  — `db.system.name` as the **client-perceived** dialect identifier
+  (PostgreSQL client → CockroachDB note); the model for setting
+  `object_store.system.name="s3"` regardless of the actual backend.
+- [Semantic conventions for AWS S3 client spans | OpenTelemetry](https://opentelemetry.io/docs/specs/semconv/object-stores/s3/)
+  — the only existing object-store convention; source of the
+  `aws.s3.*` keys exposed via `WithAWSS3CompatAttributes`. AWS-SDK
+  framing (`rpc.system=aws-api`, `Service.Operation` span name)
+  deliberately not adopted (§4).
+- [Semantic conventions for AWS SDK client spans | OpenTelemetry](https://opentelemetry.io/docs/specs/semconv/cloud-providers/aws-sdk/)
+  — the framing the S3 page sits inside; cited as the explicit
+  reason we adopt attribute keys but not the RPC framing.
+- [Semantic conventions for GenAI agent and framework spans | OpenTelemetry](https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-agent-spans/)
+  — the most recent `.operation.name` precedent, alongside
+  `messaging.operation.name`.
+- [Semantic conventions for object stores | OpenTelemetry](https://opentelemetry.io/docs/specs/semconv/object-stores/)
+  — top-level object-store group; confirms no vendor-neutral
+  namespace exists yet.
