@@ -13,6 +13,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Review this pin when Go publishes a new 1.25.x security patch.
+  GOVULNCHECK_GOTOOLCHAIN: go1.25.11
+
 jobs:
   test:
     name: test (race + cover)
@@ -103,7 +107,7 @@ jobs:
       # Manage upgrades via Dependabot / Renovate.
       - name: govulncheck
         env:
-          GOTOOLCHAIN: go1.25.11
+          GOTOOLCHAIN: ${{ env.GOVULNCHECK_GOTOOLCHAIN }}
         run: |
           go version
           go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
