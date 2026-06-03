@@ -13,19 +13,23 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Review this pin when Go publishes a new 1.25.x security patch.
+  GOVULNCHECK_GOTOOLCHAIN: go1.25.11
+
 jobs:
   test:
     name: test (race + cover)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
       # Tests run on the Go version declared in go.mod so we exercise
       # exactly the stdlib surface our minimum-supported toolchain ships.
-      # govulncheck (in the vuln job below) uses `stable` instead so it
-      # sees the latest stdlib CVE patches.
-      - uses: actions/setup-go@v5
+      # govulncheck (in the vuln job below) uses a patched Go 1.25 toolchain
+      # so it sees stdlib CVE fixes on our supported Go line.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version-file: go.mod
           cache: true
@@ -52,7 +56,7 @@ jobs:
             echo "::endgroup::"
           done < <(find examples -name main.go)
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: coverage
@@ -64,9 +68,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
           go-version-file: go.mod
           cache: false
@@ -76,7 +80,7 @@ jobs:
       # rather than silently changing behaviour on every CI run.
       # NOTE: golangci-lint-action@v7 is required for golangci-lint v2.x;
       # the older @v6 line only supports v1.x.
-      - uses: golangci/golangci-lint-action@v7
+      - uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa
         with:
           version: v2.11.4
           args: --timeout=5m
@@ -86,18 +90,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
-      # govulncheck must see the latest stdlib so vulnerability matches
-      # reflect what a freshly-built binary would actually link. Using the
-      # go.mod version (1.25.0) here would surface only the patches that
-      # were available on the day go.mod was last bumped, which is rarely
-      # what the user wants from a vuln scan. `stable` + check-latest
-      # always installs the newest released Go, which is the source of
-      # truth for stdlib CVE coverage.
-      - uses: actions/setup-go@v5
+      # govulncheck must see a patched Go 1.25 stdlib so vulnerability matches
+      # reflect what a freshly-built binary on our supported Go line would link.
+      # Use setup-go for cache/path setup, then force the exact patched toolchain
+      # through GOTOOLCHAIN because setup-go's 1.25.x manifest can lag releases.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version: stable
+          go-version: '1.25.x'
           check-latest: true
           cache: true
 
@@ -105,6 +106,9 @@ jobs:
       # changes between releases have broken pipelines historically).
       # Manage upgrades via Dependabot / Renovate.
       - name: govulncheck
+        env:
+          GOTOOLCHAIN: ${{ env.GOVULNCHECK_GOTOOLCHAIN }}
         run: |
+          go version
           go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
           govulncheck ./...

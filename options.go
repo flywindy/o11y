@@ -6,6 +6,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 // DefaultMetricsAddr is the default listen address for the built-in
@@ -41,6 +43,11 @@ type Config struct {
 	otlpEndpoint   string
 	otlpHeaders    map[string]string
 	logLevel       slog.Level
+
+	// Tracing
+	sampler          sdktrace.Sampler
+	samplingRatio    float64
+	samplingRatioSet bool
 
 	// Profiling
 	profilingEndpoint    string
@@ -118,6 +125,40 @@ func WithEnvironment(env string) Option {
 func WithOTLPEndpoint(endpoint string) Option {
 	return func(c *Config) {
 		c.otlpEndpoint = endpoint
+	}
+}
+
+// WithSamplingRatio configures head sampling for root traces using
+// ParentBased(TraceIDRatioBased(ratio)). Use this on high-throughput producer
+// services to reduce in-process span allocation, batch-processor pressure, and
+// downstream trace volume while preserving whole-trace consistency through
+// context propagation.
+//
+// The ratio must be between 0.0 and 1.0 inclusive; Init returns an error for
+// out-of-range, NaN, or infinite values instead of relying on OTel's native
+// clamping. When this option is set, it overrides OTEL_TRACES_SAMPLER /
+// OTEL_TRACES_SAMPLER_ARG for this SDK instance. When unset, those OTel env
+// vars remain active.
+func WithSamplingRatio(ratio float64) Option {
+	return func(c *Config) {
+		c.samplingRatio = ratio
+		c.samplingRatioSet = true
+		c.sampler = nil
+	}
+}
+
+// WithTraceSampler configures an explicit OpenTelemetry sampler for the SDK's
+// TracerProvider. It is an escape hatch for custom samplers not expressible via
+// WithSamplingRatio or the OTEL_TRACES_SAMPLER environment variable.
+//
+// Passing nil leaves sampling unset, preserving the OTel environment/default
+// sampler path. A non-nil sampler overrides OTEL_TRACES_SAMPLER /
+// OTEL_TRACES_SAMPLER_ARG for this SDK instance.
+func WithTraceSampler(sampler sdktrace.Sampler) Option {
+	return func(c *Config) {
+		c.sampler = sampler
+		c.samplingRatioSet = false
+		c.samplingRatio = 0
 	}
 }
 

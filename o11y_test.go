@@ -2,7 +2,9 @@ package o11y_test
 
 import (
 	"context"
+	"fmt"
 	"math"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/flywindy/o11y"
 	"github.com/flywindy/o11y/internal/testutil"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 // commonOpts returns the full set of required options for Init to succeed in
@@ -151,6 +154,160 @@ func TestInit_RejectsInvalidHistogramBuckets(t *testing.T) {
 			assert.Contains(t, err.Error(), tc.want)
 		})
 	}
+}
+
+// TestInit_RejectsInvalidSamplingRatio verifies the SDK rejects typed sampling
+// ratios that would otherwise be silently clamped by the OTel SDK.
+func TestInit_RejectsInvalidSamplingRatio(t *testing.T) {
+	srv := testutil.FakeOTLPServer(t)
+
+	cases := []struct {
+		name  string
+		ratio float64
+	}{
+		{"negative", -0.1},
+		{"above_one", 1.1},
+		{"nan", math.NaN()},
+		{"posinf", math.Inf(1)},
+		{"neginf", math.Inf(-1)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := append(commonOpts(srv.URL), o11y.WithSamplingRatio(tc.ratio))
+			_, err := o11y.Init(context.Background(), opts...)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "sampling ratio must be between 0.0 and 1.0 inclusive")
+		})
+	}
+}
+
+// TestInit_SkipsSamplingRatioValidationWhenTraceDisabled verifies sampling
+// configuration does not block startup when the trace pillar is disabled.
+func TestInit_SkipsSamplingRatioValidationWhenTraceDisabled(t *testing.T) {
+	srv := testutil.FakeOTLPServer(t)
+
+	opts := append(commonOpts(srv.URL),
+		o11y.WithTraceEnabled(false),
+		o11y.WithSamplingRatio(math.NaN()),
+	)
+	sdk, err := o11y.Init(context.Background(), opts...)
+	require.NoError(t, err)
+	defer testutil.MustShutdown(t.Context(), t, sdk)
+
+	assert.False(t, sdk.Toggles.Trace)
+	assert.False(t, startRootSpanSampled(sdk),
+		"trace-disabled SDK should expose a no-op tracer provider")
+}
+
+// TestInit_AcceptsSamplingRatioBounds verifies valid boundary and hot-path
+// sampling ratios can initialize successfully.
+func TestInit_AcceptsSamplingRatioBounds(t *testing.T) {
+	srv := testutil.FakeOTLPServer(t)
+
+	for _, ratio := range []float64{0, 0.001, 1} {
+		t.Run(fmt.Sprintf("%g", ratio), func(t *testing.T) {
+			opts := append(commonOpts(srv.URL), o11y.WithSamplingRatio(ratio))
+			sdk, err := o11y.Init(context.Background(), opts...)
+			require.NoError(t, err)
+			testutil.MustShutdown(t.Context(), t, sdk)
+		})
+	}
+}
+
+// TestInit_SamplingPrecedence locks down ADR 0015 precedence: typed samplers
+// override OTel env samplers, while an unset typed option preserves env/defaults.
+func TestInit_SamplingPrecedence(t *testing.T) {
+	t.Run("env sampler applies when typed option unset", func(t *testing.T) {
+		srv := testutil.FakeOTLPServer(t)
+		t.Setenv("OTEL_TRACES_SAMPLER", "always_off")
+		unsetEnvForTest(t, "OTEL_TRACES_SAMPLER_ARG")
+
+		sdk, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
+		require.NoError(t, err)
+		defer testutil.MustShutdown(t.Context(), t, sdk)
+
+		assert.False(t, startRootSpanSampled(sdk),
+			"OTEL_TRACES_SAMPLER=always_off must be honored when no typed sampler is set")
+	})
+
+	t.Run("typed sampling ratio overrides env sampler", func(t *testing.T) {
+		srv := testutil.FakeOTLPServer(t)
+		t.Setenv("OTEL_TRACES_SAMPLER", "always_off")
+		unsetEnvForTest(t, "OTEL_TRACES_SAMPLER_ARG")
+
+		opts := append(commonOpts(srv.URL), o11y.WithSamplingRatio(1.0))
+		sdk, err := o11y.Init(context.Background(), opts...)
+		require.NoError(t, err)
+		defer testutil.MustShutdown(t.Context(), t, sdk)
+
+		assert.True(t, startRootSpanSampled(sdk),
+			"WithSamplingRatio must override OTEL_TRACES_SAMPLER")
+	})
+
+	t.Run("default sampler samples when env and typed option unset", func(t *testing.T) {
+		srv := testutil.FakeOTLPServer(t)
+		unsetEnvForTest(t, "OTEL_TRACES_SAMPLER")
+		unsetEnvForTest(t, "OTEL_TRACES_SAMPLER_ARG")
+
+		sdk, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
+		require.NoError(t, err)
+		defer testutil.MustShutdown(t.Context(), t, sdk)
+
+		assert.True(t, startRootSpanSampled(sdk),
+			"OTel default ParentBased(AlwaysSample) should sample root spans")
+	})
+}
+
+// TestInit_WithTraceSampler verifies custom sampler wiring and the nil sampler
+// behavior that intentionally leaves OTel env/default sampling active.
+func TestInit_WithTraceSampler(t *testing.T) {
+	t.Run("custom sampler", func(t *testing.T) {
+		srv := testutil.FakeOTLPServer(t)
+		opts := append(commonOpts(srv.URL), o11y.WithTraceSampler(sdktrace.NeverSample()))
+		sdk, err := o11y.Init(context.Background(), opts...)
+		require.NoError(t, err)
+		defer testutil.MustShutdown(t.Context(), t, sdk)
+
+		assert.False(t, startRootSpanSampled(sdk),
+			"custom NeverSample sampler should drop root spans")
+	})
+
+	t.Run("nil sampler preserves env", func(t *testing.T) {
+		srv := testutil.FakeOTLPServer(t)
+		t.Setenv("OTEL_TRACES_SAMPLER", "always_off")
+		unsetEnvForTest(t, "OTEL_TRACES_SAMPLER_ARG")
+
+		opts := append(commonOpts(srv.URL), o11y.WithTraceSampler(nil))
+		sdk, err := o11y.Init(context.Background(), opts...)
+		require.NoError(t, err)
+		defer testutil.MustShutdown(t.Context(), t, sdk)
+
+		assert.False(t, startRootSpanSampled(sdk),
+			"WithTraceSampler(nil) should leave OTEL_TRACES_SAMPLER active")
+	})
+}
+
+// startRootSpanSampled starts a local root span and reports whether the active
+// sampler marked it as sampled.
+func startRootSpanSampled(sdk *o11y.SDK) bool {
+	_, span := sdk.Tracer("sampling-test").Start(context.Background(), "root")
+	defer span.End()
+	return span.SpanContext().IsSampled()
+}
+
+// unsetEnvForTest removes an environment variable for the current test and
+// restores its previous state during cleanup.
+func unsetEnvForTest(t *testing.T, key string) {
+	t.Helper()
+	oldValue, hadOldValue := os.LookupEnv(key)
+	require.NoError(t, os.Unsetenv(key))
+	t.Cleanup(func() {
+		if hadOldValue {
+			_ = os.Setenv(key, oldValue)
+			return
+		}
+		_ = os.Unsetenv(key)
+	})
 }
 
 // TestInit_AcceptsExtremeValidBuckets ensures very small and very large
