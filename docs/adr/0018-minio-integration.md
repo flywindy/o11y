@@ -213,12 +213,11 @@ func WithSpanNameFormatter(func(op, bucket, key string) string) Option
 func WithObjectKeyAttribute(enabled bool) Option
 
 // WithAWSS3CompatAttributes additionally emits the experimental
-// aws.s3.* attribute keys (aws.s3.bucket, aws.s3.key,
-// aws.s3.upload_id, aws.s3.part_number) alongside the default
-// object_store.* attributes (§4), for compatibility with dashboards
-// and processors keyed on the OTel AWS-S3 semantic conventions. The
-// two sets are dual-emitted — generic stays on when this is enabled.
-// Default: false.
+// aws.s3.* attribute keys (aws.s3.bucket, aws.s3.key) alongside the
+// default object_store.* attributes (§4), for compatibility with
+// dashboards and processors keyed on the OTel AWS-S3 semantic
+// conventions. The two sets are dual-emitted — generic stays on
+// when this is enabled. Default: false.
 func WithAWSS3CompatAttributes(enabled bool) Option
 ```
 
@@ -302,13 +301,22 @@ mode, so cardinality is constant.
   | `object_store.bucket.name` | bucket | always | `messaging.destination.name`, `db.collection.name` (named container the operation targets) |
   | `object_store.object.key` | object key | controlled by `WithObjectKeyAttribute` (default on) | retains the S3 term-of-art "key" rather than overloading "name"; high cardinality, span-only |
   | `object_store.object.size` | bytes (int) | when known | from caller-supplied size for `PutObject`/`FPutObject`; from response `Content-Length` for downloads |
-  | `object_store.multipart.upload_id` | string | multipart child spans only | mirrors `aws.s3.upload_id` shape under the generic namespace |
-  | `object_store.multipart.part_number` | int | `UploadPart` child spans only | mirrors `aws.s3.part_number` |
   | `server.address`, `server.port` | endpoint host/port | always | stable HTTP/network semconv — carries the truthful backend identity (e.g. `minio.internal:9000`), so no `cloud.provider` is set |
 
   Naming follows the OTel naming guide: dots as namespace
   separators, snake_case within a segment (e.g.
   `object_store.bucket.name`, not `objectstore.bucketName`).
+
+  **Multipart attributes are intentionally not part of v1.** The
+  upstream `minio-go` UploadInfo result does not surface `UploadID`
+  or part count, and the optional HTTP child-span layer uses generic
+  `otelhttp` (ADR 0009), which has no S3-URL parser to attach
+  `object_store.multipart.*` to per-part spans. The information is
+  still visible on the HTTP children's URL/query bytes
+  (`?partNumber=N&uploadId=…`) in v1; promoting it to structured
+  attributes requires either a thin minio-aware `RoundTripper`
+  layered above `otelhttp` or for `minio-go` to expose multipart
+  state in its public API. Tracked under Open questions.
 
 - Attributes set before delegation — **opt-in `aws.s3.*` compat
   layer** (`WithAWSS3CompatAttributes`, §2). When enabled, the
@@ -319,8 +327,10 @@ mode, so cardinality is constant.
   |---|---|
   | `aws.s3.bucket` | `object_store.bucket.name` |
   | `aws.s3.key` | `object_store.object.key` |
-  | `aws.s3.upload_id` | `object_store.multipart.upload_id` |
-  | `aws.s3.part_number` | `object_store.multipart.part_number` |
+
+  `aws.s3.upload_id` / `aws.s3.part_number` are intentionally
+  omitted from the v1 compat layer for the same reason their generic
+  counterparts are: there is no v1 emission point for them.
 
   We deliberately do **not** adopt `rpc.system=aws-api` or the
   `Service.Operation` span-name rule from the AWS-SDK convention:
@@ -537,12 +547,9 @@ PutObject media                                                client
 │      http.response.status_code     = 200
 │      (InitiateMultipartUpload)
 ├── HTTP PUT  minio.internal/media/...?partNumber=1&uploadId=…  client
-│      http.request.method               = "PUT"
-│      http.response.status_code         = 200
-│      object_store.multipart.upload_id   = "abc123..."
-│      object_store.multipart.part_number = 1
+│      http.request.method           = "PUT"
+│      http.response.status_code     = 200
 ├── HTTP PUT  ...?partNumber=2&uploadId=…                       client
-│      object_store.multipart.part_number = 2
 └── HTTP POST minio.internal/media/...?uploadId=…               client
        http.request.method = "POST"      (CompleteMultipartUpload)
 ```
@@ -579,10 +586,8 @@ PutObject media                                                client
 │  object_store.object.size      = 41943040
 │  ...
 ├── HTTP PUT ...?partNumber=1&uploadId=…                       client
-│      object_store.multipart.upload_id   = "abc123..."
-│      aws.s3.upload_id                   = "abc123..."     ← alias
-│      object_store.multipart.part_number = 1
-│      aws.s3.part_number                 = 1               ← alias
+│      (HTTP client attributes only; multipart structured
+│       attributes are out of scope for v1 — see §4)
 ...
 ```
 
@@ -677,6 +682,15 @@ intent described in §4 / §8 — both keys coexist.
   An option to override it (e.g. for instrumentation embedded in a
   multi-protocol wrapper) is deferred until a concrete need
   appears.
+- **Multipart attribute enrichment.** v1 emits no
+  `object_store.multipart.*` / `aws.s3.upload_id` /
+  `aws.s3.part_number` (§4 default schema). Two paths to add them in
+  v2: (a) a thin minio-aware `RoundTripper` layered above `otelhttp`
+  that parses the S3 query string and annotates the live HTTP child
+  span before `otelhttp`'s span ends; (b) an upstream change in
+  `minio-go` to surface `UploadID` and part count on `UploadInfo`,
+  enabling enrichment on the outer logical span. Path (a) is the
+  more likely route.
 - **`*Object` reader instrumentation.** Whether to wrap the
   `GetObject`-returned reader to emit a transfer span, making streaming
   downloads first-class (§5).
