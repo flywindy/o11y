@@ -1,7 +1,7 @@
 # ADR 0015 — Trace Sampling Strategy
 
-**Status**: Accepted — implementation pending (typed options + docs; Collector
-tail-sampling is deployment config, out of SDK scope)
+**Status**: Accepted — implemented (Collector tail-sampling is deployment
+config, out of SDK scope)
 **Date**: 2026-05-25
 **Relates to**: ADR 0002 (metrics strategy — exemplars depend on sampled spans),
 ADR 0003 (global-state policy — no global provider/sampler mutation),
