@@ -156,6 +156,8 @@ func TestInit_RejectsInvalidHistogramBuckets(t *testing.T) {
 	}
 }
 
+// TestInit_RejectsInvalidSamplingRatio verifies the SDK rejects typed sampling
+// ratios that would otherwise be silently clamped by the OTel SDK.
 func TestInit_RejectsInvalidSamplingRatio(t *testing.T) {
 	srv := testutil.FakeOTLPServer(t)
 
@@ -179,6 +181,26 @@ func TestInit_RejectsInvalidSamplingRatio(t *testing.T) {
 	}
 }
 
+// TestInit_SkipsSamplingRatioValidationWhenTraceDisabled verifies sampling
+// configuration does not block startup when the trace pillar is disabled.
+func TestInit_SkipsSamplingRatioValidationWhenTraceDisabled(t *testing.T) {
+	srv := testutil.FakeOTLPServer(t)
+
+	opts := append(commonOpts(srv.URL),
+		o11y.WithTraceEnabled(false),
+		o11y.WithSamplingRatio(math.NaN()),
+	)
+	sdk, err := o11y.Init(context.Background(), opts...)
+	require.NoError(t, err)
+	defer testutil.MustShutdown(t.Context(), t, sdk)
+
+	assert.False(t, sdk.Toggles.Trace)
+	assert.False(t, startRootSpanSampled(sdk),
+		"trace-disabled SDK should expose a no-op tracer provider")
+}
+
+// TestInit_AcceptsSamplingRatioBounds verifies valid boundary and hot-path
+// sampling ratios can initialize successfully.
 func TestInit_AcceptsSamplingRatioBounds(t *testing.T) {
 	srv := testutil.FakeOTLPServer(t)
 
@@ -192,6 +214,8 @@ func TestInit_AcceptsSamplingRatioBounds(t *testing.T) {
 	}
 }
 
+// TestInit_SamplingPrecedence locks down ADR 0015 precedence: typed samplers
+// override OTel env samplers, while an unset typed option preserves env/defaults.
 func TestInit_SamplingPrecedence(t *testing.T) {
 	t.Run("env sampler applies when typed option unset", func(t *testing.T) {
 		srv := testutil.FakeOTLPServer(t)
@@ -234,6 +258,8 @@ func TestInit_SamplingPrecedence(t *testing.T) {
 	})
 }
 
+// TestInit_WithTraceSampler verifies custom sampler wiring and the nil sampler
+// behavior that intentionally leaves OTel env/default sampling active.
 func TestInit_WithTraceSampler(t *testing.T) {
 	t.Run("custom sampler", func(t *testing.T) {
 		srv := testutil.FakeOTLPServer(t)
@@ -261,12 +287,16 @@ func TestInit_WithTraceSampler(t *testing.T) {
 	})
 }
 
+// startRootSpanSampled starts a local root span and reports whether the active
+// sampler marked it as sampled.
 func startRootSpanSampled(sdk *o11y.SDK) bool {
 	_, span := sdk.Tracer("sampling-test").Start(context.Background(), "root")
 	defer span.End()
 	return span.SpanContext().IsSampled()
 }
 
+// unsetEnvForTest removes an environment variable for the current test and
+// restores its previous state during cleanup.
 func unsetEnvForTest(t *testing.T, key string) {
 	t.Helper()
 	oldValue, hadOldValue := os.LookupEnv(key)

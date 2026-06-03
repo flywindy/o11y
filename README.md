@@ -336,8 +336,8 @@ The SDK default remains OpenTelemetry's `ParentBased(AlwaysSample)`, so local
 development and normal services get 100% trace visibility and full
 log/metric/profile correlation unless they opt into a lower rate. This is
 intentional: exemplars and profile-to-trace links require an active sampled
-span, so aggressive head sampling reduces those links in proportion to the
-sampling ratio.
+span, so aggressive head sampling reduces those links at roughly the same
+rate.
 
 Use **head sampling** when a producing service needs protection from span
 allocation, BatchSpanProcessor queue pressure, and GC overhead. Message

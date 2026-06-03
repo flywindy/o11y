@@ -457,13 +457,13 @@ var envAliases = map[string]string{
 }
 
 // configureSampler validates and materializes a typed sampling ratio only when
-// the caller explicitly configured one, preserving OTel env/default sampling
-// when the SDK option is unset.
+// tracing is enabled and the caller explicitly configured a ratio, preserving
+// OTel env/default sampling when the SDK option is unset.
 func configureSampler(cfg *Config) error {
-	if !cfg.samplingRatioSet {
+	if !cfg.traceEnabled || !cfg.samplingRatioSet {
 		return nil
 	}
-	if math.IsNaN(cfg.samplingRatio) || math.IsInf(cfg.samplingRatio, 0) || cfg.samplingRatio < 0 || cfg.samplingRatio > 1 {
+	if math.IsNaN(cfg.samplingRatio) || cfg.samplingRatio < 0 || cfg.samplingRatio > 1 {
 		return fmt.Errorf("sampling ratio must be between 0.0 and 1.0 inclusive, got %v", cfg.samplingRatio)
 	}
 	cfg.sampler = sdktrace.ParentBased(sdktrace.TraceIDRatioBased(cfg.samplingRatio))
