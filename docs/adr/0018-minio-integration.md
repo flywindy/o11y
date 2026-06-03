@@ -382,7 +382,7 @@ follow-ups as needs appear.
 | `StatObject` | HEAD round-trip | Synchronous. |
 | `RemoveObject` | DELETE round-trip | Synchronous. |
 | `CopyObject` | Server-side copy | Synchronous. |
-| `ListObjects` | First page latency | Returns a channel; see §6. |
+| `ListObjects` | Full stream — span ends when channel closes | Channel-returning; lifecycle and caller contract in §6. |
 
 **`GetObject` is a deliberate exception.** `minio-go`'s `GetObject`
 is *lazy*: it returns an `*minio.Object` and performs no network I/O
@@ -493,7 +493,7 @@ not need a real server.
 
 | # | Scenario | Expected span tree |
 |---|---|---|
-| 1 | Small `PutObject` success | 1 logical span, `status_code=200`, size set, no error kind |
+| 1 | Small `PutObject` success | 1 logical span, `otel.status=Unset`, `object_store.object.size` set, no `error.type` / `minio.error.kind` |
 | 2 | Large `PutObject` (multipart) with `WithHTTPChildSpans` | 1 logical span → child HTTP spans: Initiate, UploadPart×N, Complete |
 | 3 | `FGetObject` success | 1 logical span, size from response |
 | 4 | `StatObject` on missing key | 1 logical span, Error, `error.type=NoSuchKey`, `minio.error.kind=not_found` |
