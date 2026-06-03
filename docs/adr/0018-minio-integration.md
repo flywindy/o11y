@@ -522,7 +522,7 @@ _, err := client.PutObject(ctx, "media",
 Resulting trace (the parent HTTP-server span from gin/echo is omitted
 for brevity; the logical span is its direct child via `ctx`):
 
-```
+```text
 PutObject media                                                client
 │  object_store.system.name      = "s3"
 │  object_store.operation.name   = "PutObject"
@@ -549,7 +549,7 @@ PutObject media                                                client
 
 And one metric observation:
 
-```
+```text
 minio.client.operation.duration   = 14.2s         histogram
    object_store.operation.name = "PutObject"
    object_store.bucket.name    = "media"
@@ -568,7 +568,7 @@ breakdown the CPU profile alone could not provide.
 The compat flag dual-emits the experimental `aws.s3.*` keys
 alongside the generic ones; the generic schema is unchanged.
 
-```
+```text
 PutObject media                                                client
 │  object_store.system.name      = "s3"
 │  object_store.operation.name   = "PutObject"
@@ -598,7 +598,7 @@ _, err := client.StatObject(ctx, "media",
 // err: *miniogo.ErrorResponse{Code: "NoSuchKey", ...}
 ```
 
-```
+```text
 StatObject media                                               client  ERROR
    object_store.system.name      = "s3"
    object_store.operation.name   = "StatObject"
@@ -613,7 +613,7 @@ StatObject media                                               client  ERROR
 
 Histogram observation:
 
-```
+```text
 minio.client.operation.duration   = 0.023s        histogram
    object_store.operation.name = "StatObject"
    object_store.bucket.name    = "media"
