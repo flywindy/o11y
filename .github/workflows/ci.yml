@@ -88,16 +88,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # govulncheck must see the latest stdlib so vulnerability matches
-      # reflect what a freshly-built binary would actually link. Using the
-      # go.mod version (1.25.0) here would surface only the patches that
-      # were available on the day go.mod was last bumped, which is rarely
-      # what the user wants from a vuln scan. `stable` + check-latest
-      # always installs the newest released Go, which is the source of
-      # truth for stdlib CVE coverage.
+      # govulncheck must see a patched Go 1.25 stdlib so vulnerability matches
+      # reflect what a freshly-built binary on our supported Go line would link.
+      # Pin to the latest 1.25 patch train instead of the go.mod floor (1.25.0),
+      # otherwise stdlib CVEs fixed after the initial Go 1.25 release fail CI.
       - uses: actions/setup-go@v5
         with:
-          go-version: stable
+          go-version: '1.25.x'
           check-latest: true
           cache: true
 
