@@ -19,6 +19,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/flywindy/o11y/internal/baggageattrs"
 	o11ylog "github.com/flywindy/o11y/internal/log"
 	"github.com/flywindy/o11y/internal/metrics"
 	"github.com/flywindy/o11y/internal/profiling"
@@ -182,6 +183,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	if err := configureSampler(cfg); err != nil {
 		return nil, err
 	}
+	appendUserBaggageWarnings(cfg)
 
 	// 1. Build a shared Resource so TracerProvider, MeterProvider, and
 	//    LoggerProvider all carry identical service-identity attributes.
@@ -200,7 +202,11 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	tpShutdown := func(_ context.Context) error { return nil }
 
 	if cfg.traceEnabled {
-		tp, p, initErr := trace.InitTracer(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, res, cfg.sampler)
+		var spanProcessors []sdktrace.SpanProcessor
+		if cfg.userBaggage {
+			spanProcessors = append(spanProcessors, baggageattrs.NewSpanProcessor())
+		}
+		tp, p, initErr := trace.InitTracer(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, res, cfg.sampler, spanProcessors...)
 		if initErr != nil {
 			return nil, initErr
 		}
@@ -291,9 +297,17 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 			Handler: otelslog.NewHandler("github.com/flywindy/o11y", otelOpts...),
 			min:     cfg.logLevel,
 		}
-		logger = slog.New(o11ylog.NewMultiHandler(otelHandler, stdoutHandler))
+		logHandler := o11ylog.NewMultiHandler(otelHandler, stdoutHandler)
+		if cfg.userBaggage {
+			logHandler = o11ylog.NewBaggageHandler(logHandler)
+		}
+		logger = slog.New(logHandler)
 	} else {
-		logger = slog.New(stdoutHandler)
+		logHandler := stdoutHandler
+		if cfg.userBaggage {
+			logHandler = o11ylog.NewBaggageHandler(logHandler)
+		}
+		logger = slog.New(logHandler)
 	}
 
 	// Emit diagnostics that could not be logged before the logger existed.
@@ -468,6 +482,14 @@ func configureSampler(cfg *Config) error {
 	}
 	cfg.sampler = sdktrace.ParentBased(sdktrace.TraceIDRatioBased(cfg.samplingRatio))
 	return nil
+}
+
+func appendUserBaggageWarnings(cfg *Config) {
+	if cfg.userBaggage && !cfg.traceEnabled {
+		cfg.initWarnings = append(cfg.initWarnings,
+			"WithUserBaggage enabled while trace pillar disabled; user.name baggage will materialize on logs only, not spans",
+		)
+	}
 }
 
 // validateHistogramBuckets ensures the histogram boundaries are in a state

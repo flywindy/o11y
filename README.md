@@ -276,6 +276,60 @@ obs.Logger.InfoContext(ctx, "processing request", slog.String("user_id", "42"))
 // Loki:   OTel Log Record — Body="processing request", TraceId=4bf92f..., SpanId=00f067..., Attributes={user_id: "42"}, Resource={service.name: "my-service", ...}
 ```
 
+### User Identity Attributes
+
+Use the explicit user helpers when a service has authenticated the acting user
+and needs the login name on a specific span or log record:
+
+```go
+ctx, span := obs.Tracer("my-service").Start(ctx, "handle-request")
+defer span.End()
+
+o11y.SetUser(ctx, "a.einstein")
+obs.Logger.InfoContext(ctx, "processing request", o11y.UserName("a.einstein"))
+```
+
+`SetUser` writes `user.name` to the current span only. `UserName` returns a
+`slog.Attr` for the log record where it is supplied. These helpers are explicit
+and in-process: they do not use OTel Baggage, do not add per-service provider
+wiring, and do not propagate usernames across HTTP/NATS boundaries. Empty
+usernames are treated as unauthenticated and do not emit `user.name`.
+
+Use opt-in baggage propagation when the product needs to identify the user once
+at the source and have downstream services materialize the same `user.name`
+without per-call helper usage:
+
+```go
+obs, err := o11y.Init(
+    ctx,
+    o11y.WithServiceName("edge"),
+    o11y.WithServiceVersion("1.2.3"),
+    o11y.WithServiceNamespace("platform"),
+    o11y.WithEnvironment("production"),
+    o11y.WithUserBaggage(),
+)
+if err != nil {
+    return err
+}
+
+ctx, err = o11y.ContextWithUser(ctx, "a.einstein")
+if err != nil {
+    return err
+}
+
+ctx, span := obs.Tracer("edge").Start(ctx, "handle-request")
+defer span.End()
+
+obs.Logger.InfoContext(ctx, "processing request")
+```
+
+`ContextWithUser` is the source-side opt-in that puts `user.name` into W3C
+Baggage. `WithUserBaggage` is the per-service opt-in that copies whitelisted
+baggage onto that service's spans and SDK log records. Empty usernames leave the
+context unchanged. Enable it only after authenticating the user, ignore or
+overwrite untrusted inbound baggage at the edge, strip baggage before calls to
+external third parties, and never promote `user.name` into metric labels.
+
 ### Logging Guidelines
 
 The dual-output logger forwards every record to two backends. Treat both as

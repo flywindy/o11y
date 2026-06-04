@@ -48,6 +48,7 @@ type Config struct {
 	sampler          sdktrace.Sampler
 	samplingRatio    float64
 	samplingRatioSet bool
+	userBaggage      bool
 
 	// Profiling
 	profilingEndpoint    string
@@ -159,6 +160,20 @@ func WithTraceSampler(sampler sdktrace.Sampler) Option {
 		c.sampler = sampler
 		c.samplingRatioSet = false
 		c.samplingRatio = 0
+	}
+}
+
+// WithUserBaggage enables ADR 0016 opt-in materialization of whitelisted user
+// identity baggage onto this service's spans and log records.
+//
+// This option does not create baggage by itself. Use ContextWithUser after
+// authentication to put user.name into the context; WithUserBaggage then copies
+// that whitelisted value onto spans at start time and onto slog records emitted
+// by this SDK's logger. The feature is off by default because user.name is PII
+// and propagated baggage can cross service boundaries.
+func WithUserBaggage() Option {
+	return func(c *Config) {
+		c.userBaggage = true
 	}
 }
 

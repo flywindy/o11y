@@ -247,6 +247,21 @@ Spans and metrics are emitted by the SDK-owned
 
 ---
 
+## User Identity Helpers (package `github.com/flywindy/o11y`)
+
+ADR 0016 exposes explicit helpers and opt-in baggage materialization for the
+acting user's login name. Explicit helpers are call-site controlled.
+`ContextWithUser` propagates over W3C Baggage; `WithUserBaggage` materializes
+the whitelisted baggage value onto this service's spans and SDK log records.
+
+### Attributes
+
+| Key | Type | Source | Notes |
+|---|---|---|---|
+| `user.name` | string | `SetUser(ctx, name)` span attribute; `UserName(name)` slog attribute; `ContextWithUser(ctx, name)` + `WithUserBaggage()` baggage materialization | Login/username of the acting user. Personal data / PII; allowed on traces and logs only, never as a metric label. |
+
+---
+
 ## Logs
 
 All log records pass through the `otelslog` bridge, which applies OTel Log

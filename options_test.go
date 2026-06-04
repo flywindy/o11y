@@ -45,6 +45,38 @@ func TestWithExemplars_OverridesDefault(t *testing.T) {
 	assert.True(t, cfg.exemplars, "WithExemplars(true) must restore the flag")
 }
 
+func TestWithUserBaggage_EnablesUserBaggageMaterialization(t *testing.T) {
+	cfg := defaultConfig()
+	assert.False(t, cfg.userBaggage, "user baggage materialization must default off")
+
+	WithUserBaggage()(cfg)
+
+	assert.True(t, cfg.userBaggage, "WithUserBaggage must enable the opt-in flag")
+}
+
+func TestAppendUserBaggageWarnings_WhenTraceDisabled(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.initWarnings = nil
+	cfg.traceEnabled = false
+	WithUserBaggage()(cfg)
+
+	appendUserBaggageWarnings(cfg)
+
+	require.Len(t, cfg.initWarnings, 1)
+	assert.Contains(t, cfg.initWarnings[0], "WithUserBaggage enabled while trace pillar disabled")
+	assert.Contains(t, cfg.initWarnings[0], "logs only, not spans")
+}
+
+func TestAppendUserBaggageWarnings_WhenTraceEnabled(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.initWarnings = nil
+	WithUserBaggage()(cfg)
+
+	appendUserBaggageWarnings(cfg)
+
+	assert.Empty(t, cfg.initWarnings)
+}
+
 func TestParseBoolEnv_InvalidValue_FallsBackToDefault(t *testing.T) {
 	for _, bad := range []string{"yes", "no", "on", "off", "enabled", "2"} {
 		t.Setenv("O11Y_TEST_BOOL", bad)

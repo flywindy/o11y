@@ -1,7 +1,7 @@
 # ADR 0016 — User Identity Attribute (`user.name`) on Telemetry
 
-**Status**: Accepted — phased rollout, implementation pending (Phase 1 first;
-Phase 2 gated behind an explicit opt-in)
+**Status**: Accepted — implemented as a phased rollout (Phase 1 explicit
+helpers; Phase 2 gated behind an explicit opt-in)
 **Date**: 2026-05-26
 **Relates to**: ADR 0001 (log format — the slog handler is the log-enrichment
 hook), ADR 0003 (global-state policy — any SpanProcessor must be wired into the
@@ -119,8 +119,8 @@ services — each service that wants the field calls the helpers itself.
 Add the "set once, flows everywhere" capability:
 
 - `o11y.ContextWithUser(ctx, name)` — sets the `user.name` baggage member.
-- Extend `OtelSlogHandler.Handle` to copy **whitelisted** baggage members onto
-  every log record.
+- Wrap the SDK logger handler chain with a baggage-aware `slog.Handler` that
+  copies **whitelisted** baggage members onto every log record.
 - Add a `SpanProcessor` whose `OnStart` copies whitelisted baggage onto every
   span, wired into the provider in `internal/trace/trace.go`.
 - A fixed **whitelist** (`user.name` only, to start) bounds baggage header size
@@ -280,16 +280,17 @@ an SDK consumer that does nothing sees no behavior change.
    pinned semconv constant if `semconv/v1.39.0` exposes one, else record a
    documented string-key deviation in `docs/semconv.md` (ADR 0006). Update the
    semconv catalog in the same commit. Unit-test both helpers.
-2. **Phase 2** — `ContextWithUser` + `WithUserBaggage()` option; extend
-   `OtelSlogHandler.Handle` and add the baggage SpanProcessor wired in
-   `internal/trace/trace.go`; the processor and handler share one whitelist
-   constant. `ContextWithUser` must use raw-value baggage construction for
-   application usernames, return errors instead of silently dropping invalid
-   values, and be covered by tests for spaces, Unicode usernames, empty values,
-   and invalid baggage inputs. Unit-test the SpanProcessor and handler enrichment
-   logic, including whitelist filtering, baggage extraction, and attribute
-   setting. No global-state mutation (ADR 0003): the processor goes into the
-   SDK-built provider, not via `otel.SetTracerProvider`.
+2. **Phase 2** — `ContextWithUser` + `WithUserBaggage()` option; wrap the SDK
+   logger handler chain with a baggage-aware handler and add the baggage
+   SpanProcessor wired in `internal/trace/trace.go`; the processor and handler
+   share one whitelist constant. `ContextWithUser` must use raw-value baggage
+   construction for application usernames, return errors instead of silently
+   dropping invalid values, and be covered by tests for spaces, Unicode
+   usernames, empty values, and invalid baggage inputs. Unit-test the
+   SpanProcessor and handler enrichment logic, including whitelist filtering,
+   baggage extraction, and attribute setting. No global-state mutation (ADR
+   0003): the processor goes into the SDK-built provider, not via
+   `otel.SetTracerProvider`.
 3. **Whitelist** — start with `["user.name"]`; expanding it is a conscious change
    (header-size and PII review), not an open door.
 4. **Docs** — README section covering the helper-vs-baggage choice, the ingress/
