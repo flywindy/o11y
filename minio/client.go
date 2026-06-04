@@ -135,7 +135,7 @@ func New(
 		)
 	}
 
-	host, port := splitHostPort(endpoint)
+	host, port := splitHostPort(endpoint, localOpts.Secure)
 
 	return &Client{
 		Client:        mc,
@@ -389,18 +389,25 @@ func drainListChannel(upstream <-chan miniogo.ObjectInfo) {
 
 // splitHostPort parses an endpoint like "minio.internal:9000" into host
 // and numeric port. The endpoint format mirrors miniogo.New: it does not
-// carry a scheme.
-func splitHostPort(endpoint string) (string, int) {
+// carry a scheme. When the endpoint has no explicit port (e.g.
+// "play.min.io" or "s3.amazonaws.com"), the port is defaulted from
+// secure so server.port stays present on every span/metric and the §3
+// label set is consistent across endpoint styles.
+func splitHostPort(endpoint string, secure bool) (string, int) {
 	if endpoint == "" {
 		return "", 0
 	}
+	defaultPort := 80
+	if secure {
+		defaultPort = 443
+	}
 	host, portStr, err := net.SplitHostPort(endpoint)
 	if err != nil {
-		return endpoint, 0
+		return endpoint, defaultPort
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		return host, 0
+		return host, defaultPort
 	}
 	return host, port
 }

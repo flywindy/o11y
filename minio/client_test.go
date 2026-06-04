@@ -42,13 +42,26 @@ func TestNew_Validation(t *testing.T) {
 }
 
 func TestSplitHostPort(t *testing.T) {
-	host, port := splitHostPort("minio.internal:9000")
-	if host != "minio.internal" || port != 9000 {
-		t.Fatalf("got %s:%d, want minio.internal:9000", host, port)
+	cases := []struct {
+		name     string
+		endpoint string
+		secure   bool
+		wantHost string
+		wantPort int
+	}{
+		{name: "host:port", endpoint: "minio.internal:9000", secure: false, wantHost: "minio.internal", wantPort: 9000},
+		{name: "host:port secure", endpoint: "minio.internal:9000", secure: true, wantHost: "minio.internal", wantPort: 9000},
+		{name: "no port insecure", endpoint: "play.min.io", secure: false, wantHost: "play.min.io", wantPort: 80},
+		{name: "no port secure", endpoint: "play.min.io", secure: true, wantHost: "play.min.io", wantPort: 443},
+		{name: "empty", endpoint: "", secure: true, wantHost: "", wantPort: 0},
 	}
-	host, port = splitHostPort("nohost")
-	if host != "nohost" || port != 0 {
-		t.Fatalf("got %s:%d, want nohost:0", host, port)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			host, port := splitHostPort(tc.endpoint, tc.secure)
+			if host != tc.wantHost || port != tc.wantPort {
+				t.Fatalf("got %s:%d, want %s:%d", host, port, tc.wantHost, tc.wantPort)
+			}
+		})
 	}
 }
 
