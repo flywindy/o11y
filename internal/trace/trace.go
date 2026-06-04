@@ -24,7 +24,7 @@ import (
 // the exporter carries the given headers (used for authentication against
 // managed observability backends). sampler is optional; when nil, OTel's
 // environment/default sampler path remains active.
-func InitTracer(ctx context.Context, endpoint string, headers map[string]string, res *resource.Resource, sampler sdktrace.Sampler) (*sdktrace.TracerProvider, propagation.TextMapPropagator, error) {
+func InitTracer(ctx context.Context, endpoint string, headers map[string]string, res *resource.Resource, sampler sdktrace.Sampler, spanProcessors ...sdktrace.SpanProcessor) (*sdktrace.TracerProvider, propagation.TextMapPropagator, error) {
 	// 1. OTLP HTTP trace exporter
 	expOpts := []otlptracehttp.Option{
 		otlptracehttp.WithEndpointURL(endpoint),
@@ -46,14 +46,19 @@ func InitTracer(ctx context.Context, endpoint string, headers map[string]string,
 		}
 	}()
 
-	// 2. TracerProvider with BatchSpanProcessor
+	// 2. TracerProvider with caller-supplied processors and BatchSpanProcessor.
 	tpOpts := []sdktrace.TracerProviderOption{
-		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(res),
 	}
 	if sampler != nil {
 		tpOpts = append(tpOpts, sdktrace.WithSampler(sampler))
 	}
+	for _, processor := range spanProcessors {
+		if processor != nil {
+			tpOpts = append(tpOpts, sdktrace.WithSpanProcessor(processor))
+		}
+	}
+	tpOpts = append(tpOpts, sdktrace.WithBatcher(exporter))
 	tp := sdktrace.NewTracerProvider(tpOpts...)
 
 	// 3. Composite propagator (W3C TraceContext + Baggage)

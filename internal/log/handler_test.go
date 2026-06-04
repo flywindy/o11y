@@ -11,9 +11,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/trace"
 
 	o11ylog "github.com/flywindy/o11y/internal/log"
+	"github.com/flywindy/o11y/internal/userbaggage"
 )
 
 // ---------------------------------------------------------------------------
@@ -118,6 +120,71 @@ func TestEnabled(t *testing.T) {
 			assert.Equal(t, tt.want, h.Enabled(context.Background(), tt.checkLevel))
 		})
 	}
+}
+
+func TestBaggageHandlerInjectsWhitelistedUserName(t *testing.T) {
+	var buf bytes.Buffer
+	base := slog.NewJSONHandler(&buf, nil)
+	logger := slog.New(o11ylog.NewBaggageHandler(base))
+	ctx := baggageContext(t,
+		baggageMember(t, userbaggage.UserNameKey, "a.einstein"),
+		baggageMember(t, "tenant.id", "physics"),
+	)
+
+	logger.InfoContext(ctx, "with baggage")
+
+	var record map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
+	assert.Equal(t, "a.einstein", record[userbaggage.UserNameKey])
+	_, hasTenant := record["tenant.id"]
+	assert.False(t, hasTenant, "non-whitelisted baggage must not be added")
+}
+
+func TestBaggageHandlerKeepsExplicitUserNameAttr(t *testing.T) {
+	var buf bytes.Buffer
+	base := slog.NewJSONHandler(&buf, nil)
+	logger := slog.New(o11ylog.NewBaggageHandler(base))
+	ctx := baggageContext(t, baggageMember(t, userbaggage.UserNameKey, "baggage-user"))
+
+	logger.InfoContext(ctx, "with explicit user", slog.String(userbaggage.UserNameKey, "explicit-user"))
+
+	var record map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
+	assert.Equal(t, "explicit-user", record[userbaggage.UserNameKey])
+}
+
+func TestBaggageHandlerWithAttrsPreservesType(t *testing.T) {
+	var buf bytes.Buffer
+	base := slog.NewJSONHandler(&buf, nil)
+	h := o11ylog.NewBaggageHandler(base)
+	got := h.WithAttrs([]slog.Attr{slog.String("k", "v")})
+	_, ok := got.(*o11ylog.BaggageHandler)
+	assert.True(t, ok, "WithAttrs must return *BaggageHandler")
+}
+
+func TestBaggageHandlerWithGroupPreservesType(t *testing.T) {
+	var buf bytes.Buffer
+	base := slog.NewJSONHandler(&buf, nil)
+	h := o11ylog.NewBaggageHandler(base)
+	got := h.WithGroup("grp")
+	_, ok := got.(*o11ylog.BaggageHandler)
+	assert.True(t, ok, "WithGroup must return *BaggageHandler")
+}
+
+func baggageContext(t *testing.T, members ...baggage.Member) context.Context {
+	t.Helper()
+
+	bag, err := baggage.New(members...)
+	require.NoError(t, err)
+	return baggage.ContextWithBaggage(context.Background(), bag)
+}
+
+func baggageMember(t *testing.T, key, value string) baggage.Member {
+	t.Helper()
+
+	m, err := baggage.NewMemberRaw(key, value)
+	require.NoError(t, err)
+	return m
 }
 
 // ---------------------------------------------------------------------------

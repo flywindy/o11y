@@ -1,7 +1,7 @@
-# ADR 0016 — User Identity Attribute (`user.name`) on Telemetry
+# ADR 0016 - User Identity Attribute (`user.name`) on Telemetry
 
-**Status**: Accepted — phased rollout, implementation pending (Phase 1 first;
-Phase 2 gated behind an explicit opt-in)
+**Status**: Accepted - implemented as a phased rollout (Phase 1 explicit
+helpers; Phase 2 gated behind an explicit opt-in)
 **Date**: 2026-05-26
 **Relates to**: ADR 0001 (log format — the slog handler is the log-enrichment
 hook), ADR 0003 (global-state policy — any SpanProcessor must be wired into the

@@ -22,6 +22,16 @@ adopters can plan their upgrades.
 - Documented trace sampling guidance, including the head-vs-tail sampling split,
   high-throughput producer recommendations, and `OTEL_BSP_*` batch span
   processor environment variables.
+- Added explicit user identity helpers: `SetUser(ctx, name)` records
+  `user.name` on the current span, and `UserName(name)` returns a `slog.Attr`
+  for adding the same semantic-convention key to log records. These Phase 1
+  helpers are in-process only and do not propagate usernames across service
+  boundaries.
+- Added opt-in user identity baggage propagation: `ContextWithUser(ctx, name)`
+  stores `user.name` in W3C Baggage, and `WithUserBaggage()` materializes the
+  whitelisted value onto this service's spans and SDK log records. The feature
+  is off by default because `user.name` is PII and can cross HTTP/NATS
+  boundaries via baggage propagation.
 
 ### Changed
 

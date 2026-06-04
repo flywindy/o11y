@@ -45,6 +45,15 @@ func TestWithExemplars_OverridesDefault(t *testing.T) {
 	assert.True(t, cfg.exemplars, "WithExemplars(true) must restore the flag")
 }
 
+func TestWithUserBaggage_EnablesUserBaggageMaterialization(t *testing.T) {
+	cfg := defaultConfig()
+	assert.False(t, cfg.userBaggage, "user baggage materialization must default off")
+
+	WithUserBaggage()(cfg)
+
+	assert.True(t, cfg.userBaggage, "WithUserBaggage must enable the opt-in flag")
+}
+
 func TestParseBoolEnv_InvalidValue_FallsBackToDefault(t *testing.T) {
 	for _, bad := range []string{"yes", "no", "on", "off", "enabled", "2"} {
 		t.Setenv("O11Y_TEST_BOOL", bad)

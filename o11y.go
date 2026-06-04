@@ -23,6 +23,7 @@ import (
 	"github.com/flywindy/o11y/internal/metrics"
 	"github.com/flywindy/o11y/internal/profiling"
 	"github.com/flywindy/o11y/internal/trace"
+	"github.com/flywindy/o11y/internal/userbaggage"
 	o11ymongo "github.com/flywindy/o11y/mongo"
 	o11yredis "github.com/flywindy/o11y/redis"
 	otelpyroscope "github.com/grafana/otel-profiling-go"
@@ -200,7 +201,11 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	tpShutdown := func(_ context.Context) error { return nil }
 
 	if cfg.traceEnabled {
-		tp, p, initErr := trace.InitTracer(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, res, cfg.sampler)
+		var spanProcessors []sdktrace.SpanProcessor
+		if cfg.userBaggage {
+			spanProcessors = append(spanProcessors, userbaggage.NewSpanProcessor())
+		}
+		tp, p, initErr := trace.InitTracer(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, res, cfg.sampler, spanProcessors...)
 		if initErr != nil {
 			return nil, initErr
 		}
@@ -256,7 +261,10 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	stdoutBase := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: cfg.logLevel,
 	}).WithAttrs(stdoutAttrs)
-	stdoutHandler := o11ylog.NewOTelHandler(stdoutBase)
+	var stdoutHandler slog.Handler = o11ylog.NewOTelHandler(stdoutBase)
+	if cfg.userBaggage {
+		stdoutHandler = o11ylog.NewBaggageHandler(stdoutHandler)
+	}
 
 	// 5. Initialize LoggerProvider and build the dual-output logger.
 	//    When log is disabled, only the stdout handler is active; no OTLP
@@ -287,9 +295,12 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		// Wrap the OTLP handler with a minimum-level gate so that both outputs
 		// honour the same logLevel. Without this, the otelslog bridge would emit
 		// records at all levels regardless of the configured threshold.
-		otelHandler := &leveledHandler{
+		var otelHandler slog.Handler = &leveledHandler{
 			Handler: otelslog.NewHandler("github.com/flywindy/o11y", otelOpts...),
 			min:     cfg.logLevel,
+		}
+		if cfg.userBaggage {
+			otelHandler = o11ylog.NewBaggageHandler(otelHandler)
 		}
 		logger = slog.New(o11ylog.NewMultiHandler(otelHandler, stdoutHandler))
 	} else {
