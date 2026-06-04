@@ -261,10 +261,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	stdoutBase := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: cfg.logLevel,
 	}).WithAttrs(stdoutAttrs)
-	var stdoutHandler slog.Handler = o11ylog.NewOTelHandler(stdoutBase)
-	if cfg.userBaggage {
-		stdoutHandler = o11ylog.NewBaggageHandler(stdoutHandler)
-	}
+	stdoutHandler := o11ylog.NewOTelHandler(stdoutBase)
 
 	// 5. Initialize LoggerProvider and build the dual-output logger.
 	//    When log is disabled, only the stdout handler is active; no OTLP
@@ -295,16 +292,21 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		// Wrap the OTLP handler with a minimum-level gate so that both outputs
 		// honour the same logLevel. Without this, the otelslog bridge would emit
 		// records at all levels regardless of the configured threshold.
-		var otelHandler slog.Handler = &leveledHandler{
+		otelHandler := &leveledHandler{
 			Handler: otelslog.NewHandler("github.com/flywindy/o11y", otelOpts...),
 			min:     cfg.logLevel,
 		}
+		logHandler := o11ylog.NewMultiHandler(otelHandler, stdoutHandler)
 		if cfg.userBaggage {
-			otelHandler = o11ylog.NewBaggageHandler(otelHandler)
+			logHandler = o11ylog.NewBaggageHandler(logHandler)
 		}
-		logger = slog.New(o11ylog.NewMultiHandler(otelHandler, stdoutHandler))
+		logger = slog.New(logHandler)
 	} else {
-		logger = slog.New(stdoutHandler)
+		logHandler := stdoutHandler
+		if cfg.userBaggage {
+			logHandler = o11ylog.NewBaggageHandler(logHandler)
+		}
+		logger = slog.New(logHandler)
 	}
 
 	// Emit diagnostics that could not be logged before the logger existed.

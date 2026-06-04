@@ -54,6 +54,7 @@ func (h *OtelSlogHandler) WithGroup(name string) slog.Handler {
 // members as log record attributes.
 type BaggageHandler struct {
 	slog.Handler
+	hasUserNameAttr bool
 }
 
 // NewBaggageHandler returns a slog handler that copies whitelisted baggage
@@ -65,6 +66,9 @@ func NewBaggageHandler(base slog.Handler) slog.Handler {
 // Handle implements slog.Handler.Handle and adds whitelisted baggage attrs.
 func (h *BaggageHandler) Handle(ctx context.Context, r slog.Record) error {
 	for _, attr := range userbaggage.LogAttrsFromContext(ctx) {
+		if h.hasUserNameAttr && attr.Key == userbaggage.UserNameKey {
+			continue
+		}
 		if recordHasAttr(r, attr.Key) {
 			continue
 		}
@@ -80,12 +84,25 @@ func (h *BaggageHandler) Enabled(ctx context.Context, level slog.Level) bool {
 
 // WithAttrs implements slog.Handler.WithAttrs by delegating to the wrapped handler.
 func (h *BaggageHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &BaggageHandler{Handler: h.Handler.WithAttrs(attrs)}
+	hasUserNameAttr := h.hasUserNameAttr
+	for _, attr := range attrs {
+		if attr.Key == userbaggage.UserNameKey {
+			hasUserNameAttr = true
+			break
+		}
+	}
+	return &BaggageHandler{
+		Handler:         h.Handler.WithAttrs(attrs),
+		hasUserNameAttr: hasUserNameAttr,
+	}
 }
 
 // WithGroup implements slog.Handler.WithGroup by delegating to the wrapped handler.
 func (h *BaggageHandler) WithGroup(name string) slog.Handler {
-	return &BaggageHandler{Handler: h.Handler.WithGroup(name)}
+	return &BaggageHandler{
+		Handler:         h.Handler.WithGroup(name),
+		hasUserNameAttr: h.hasUserNameAttr,
+	}
 }
 
 func recordHasAttr(r slog.Record, key string) bool {

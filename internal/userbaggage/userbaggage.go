@@ -53,11 +53,14 @@ func SpanAttributesFromContext(ctx context.Context) []attribute.KeyValue {
 	if bag.Len() == 0 {
 		return nil
 	}
-	attrs := make([]attribute.KeyValue, 0, len(baggageWhitelist))
+	var attrs []attribute.KeyValue
 	for key, attrKey := range baggageWhitelist {
 		member := bag.Member(key)
 		if member.Key() == "" {
 			continue
+		}
+		if attrs == nil {
+			attrs = make([]attribute.KeyValue, 0, len(baggageWhitelist))
 		}
 		attrs = append(attrs, attrKey.String(member.Value()))
 	}
@@ -70,11 +73,14 @@ func LogAttrsFromContext(ctx context.Context) []slog.Attr {
 	if bag.Len() == 0 {
 		return nil
 	}
-	attrs := make([]slog.Attr, 0, len(baggageWhitelist))
+	var attrs []slog.Attr
 	for key := range baggageWhitelist {
 		member := bag.Member(key)
 		if member.Key() == "" {
 			continue
+		}
+		if attrs == nil {
+			attrs = make([]slog.Attr, 0, len(baggageWhitelist))
 		}
 		attrs = append(attrs, slog.String(key, member.Value()))
 	}
@@ -95,16 +101,22 @@ func (spanProcessor) OnStart(parent context.Context, span sdktrace.ReadWriteSpan
 		return
 	}
 
-	existing := make(map[attribute.Key]struct{}, len(span.Attributes()))
-	for _, attr := range span.Attributes() {
-		existing[attr.Key] = struct{}{}
-	}
+	spanAttrs := span.Attributes()
 	for _, attr := range attrs {
-		if _, ok := existing[attr.Key]; ok {
+		if spanHasAttribute(spanAttrs, attr.Key) {
 			continue
 		}
 		span.SetAttributes(attr)
 	}
+}
+
+func spanHasAttribute(attrs []attribute.KeyValue, key attribute.Key) bool {
+	for _, attr := range attrs {
+		if attr.Key == key {
+			return true
+		}
+	}
+	return false
 }
 
 func (spanProcessor) OnEnd(sdktrace.ReadOnlySpan) {}

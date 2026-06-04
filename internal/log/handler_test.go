@@ -153,6 +153,20 @@ func TestBaggageHandlerKeepsExplicitUserNameAttr(t *testing.T) {
 	assert.Equal(t, "explicit-user", record[userbaggage.UserNameKey])
 }
 
+func TestBaggageHandlerKeepsLoggerWithUserNameAttr(t *testing.T) {
+	var buf bytes.Buffer
+	base := slog.NewJSONHandler(&buf, nil)
+	logger := slog.New(o11ylog.NewBaggageHandler(base)).
+		With(slog.String(userbaggage.UserNameKey, "explicit-user"))
+	ctx := baggageContext(t, baggageMember(t, userbaggage.UserNameKey, "baggage-user"))
+
+	logger.InfoContext(ctx, "with explicit user")
+
+	var record map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
+	assert.Equal(t, "explicit-user", record[userbaggage.UserNameKey])
+}
+
 func TestBaggageHandlerWithAttrsPreservesType(t *testing.T) {
 	var buf bytes.Buffer
 	base := slog.NewJSONHandler(&buf, nil)
