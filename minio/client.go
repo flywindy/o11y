@@ -33,9 +33,6 @@ const (
 	objectStoreObjectSizeKey    = attribute.Key("object_store.object.size")
 	minioErrorKindKey           = attribute.Key("minio.error.kind")
 
-	awsS3BucketKey = attribute.Key("aws.s3.bucket")
-	awsS3KeyKey    = attribute.Key("aws.s3.key")
-
 	objectStoreSystemNameS3 = "s3"
 )
 
@@ -93,6 +90,12 @@ func New(
 
 	cfg := newConfig(opts)
 
+	// Copy caller-supplied options before mutating the transport so
+	// callers can reuse the same *miniogo.Options for other clients
+	// without inheriting our instrumentation (Codex P2). A shallow copy
+	// is sufficient: the fields we touch are top-level on Options.
+	localOpts := *minioOpts
+
 	if cfg.httpChildSpans {
 		// Preserve minio-go's data-plane HTTP semantics: wrap the
 		// caller's transport if set, otherwise wrap minio-go's own
@@ -100,20 +103,20 @@ func New(
 		// http.DefaultTransport (which would re-enable compression
 		// and change pool/timeout behavior). Empty propagator: no
 		// traceparent flows toward the storage backend (ADR 0018 §7).
-		base := minioOpts.Transport
+		base := localOpts.Transport
 		if base == nil {
-			defTransport, err := miniogo.DefaultTransport(minioOpts.Secure)
+			defTransport, err := miniogo.DefaultTransport(localOpts.Secure)
 			if err != nil {
 				return nil, fmt.Errorf("minio new: build default transport: %w", err)
 			}
 			base = defTransport
 		}
-		minioOpts.Transport = o11yhttp.NewTransport(
+		localOpts.Transport = o11yhttp.NewTransport(
 			base, tp, mp, propagation.NewCompositeTextMapPropagator(),
 		)
 	}
 
-	mc, err := miniogo.New(endpoint, minioOpts)
+	mc, err := miniogo.New(endpoint, &localOpts)
 	if err != nil {
 		return nil, fmt.Errorf("minio new: %w", err)
 	}
@@ -163,13 +166,13 @@ func (c *Client) begin(ctx context.Context, operation, bucket, key string, size 
 	if bucket != "" {
 		attrs = append(attrs, objectStoreBucketNameKey.String(bucket))
 		if c.cfg.awsS3CompatAliases {
-			attrs = append(attrs, awsS3BucketKey.String(bucket))
+			attrs = append(attrs, semconv.AWSS3BucketKey.String(bucket))
 		}
 	}
 	if key != "" && c.cfg.objectKeyAttribute {
 		attrs = append(attrs, objectStoreObjectKeyKey.String(key))
 		if c.cfg.awsS3CompatAliases {
-			attrs = append(attrs, awsS3KeyKey.String(key))
+			attrs = append(attrs, semconv.AWSS3KeyKey.String(key))
 		}
 	}
 	// ADR 0018 §4: size only when a real byte count is known. PutObject
@@ -262,7 +265,7 @@ func (c *Client) FPutObject(
 ) (miniogo.UploadInfo, error) {
 	o := c.begin(ctx, "FPutObject", bucketName, objectName, -1)
 	info, err := c.Client.FPutObject(o.ctx, bucketName, objectName, filePath, opts)
-	if err == nil && info.Size > 0 {
+	if err == nil && info.Size >= 0 {
 		o.span.SetAttributes(objectStoreObjectSizeKey.Int64(info.Size))
 	}
 	c.finish(o, err)
@@ -307,7 +310,7 @@ func (c *Client) StatObject(
 ) (miniogo.ObjectInfo, error) {
 	o := c.begin(ctx, "StatObject", bucketName, objectName, -1)
 	info, err := c.Client.StatObject(o.ctx, bucketName, objectName, opts)
-	if err == nil && info.Size > 0 {
+	if err == nil && info.Size >= 0 {
 		o.span.SetAttributes(objectStoreObjectSizeKey.Int64(info.Size))
 	}
 	c.finish(o, err)

@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"strings"
 	"testing"
-	"time"
 
 	miniogo "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -205,10 +204,11 @@ func TestStatObject_404_GeneratesErrorSpan(t *testing.T) {
 	mustAttr(t, attrs, "minio.error.kind", "not_found")
 	mustAttr(t, attrs, "error.type", "NoSuchKey")
 
-	if err := mr.Collect(context.Background(), &metricdataSink); err != nil {
+	var collected sdkmetricdata.ResourceMetrics
+	if err := mr.Collect(context.Background(), &collected); err != nil {
 		t.Fatalf("collect metrics: %v", err)
 	}
-	if !hasMetric(metricdataSink, "minio.client.operation.duration") {
+	if !hasMetric(collected, "minio.client.operation.duration") {
 		t.Errorf("metric minio.client.operation.duration not recorded")
 	}
 }
@@ -253,11 +253,3 @@ func hasMetric(rm sdkmetricdata.ResourceMetrics, name string) bool {
 	}
 	return false
 }
-
-// metricdataSink is a reusable sink shared by tests in this package to
-// avoid the allocation churn of a fresh ResourceMetrics per call.
-var metricdataSink sdkmetricdata.ResourceMetrics
-
-// keep a reference to time so unused-import linters don't trip on optional
-// future uses without breaking the build.
-var _ = time.Now

@@ -687,6 +687,56 @@ Route metrics are opt-in. Use bounded route templates such as
 `/api/orders/{id}`; never put raw URL paths, user IDs, or trace IDs into
 `http.route`.
 
+### MinIO / S3 Object Storage
+
+Use the `minio` sub-package to instrument `github.com/minio/minio-go/v7`
+clients (and any S3-compatible backend). The wrapper produces one
+`SpanKindClient` span per high-level operation
+(`PutObject`/`GetObject`/`StatObject`/…) with the package-local
+`object_store.*` attribute schema and records
+`minio.client.operation.duration`. See ADR 0018 for the full design.
+
+```go
+import (
+    o11yminio "github.com/flywindy/o11y/minio"
+    miniogo "github.com/minio/minio-go/v7"
+    "github.com/minio/minio-go/v7/pkg/credentials"
+)
+
+client, err := o11yminio.New(
+    "minio.internal:9000",
+    &miniogo.Options{
+        Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
+        Secure: false,
+    },
+    obs.TracerProvider(),
+    obs.MeterProvider(),
+    obs.Propagator,
+    o11yminio.WithHTTPChildSpans(true),
+)
+```
+
+Options:
+
+| Option | Default | Effect |
+|---|---|---|
+| `WithHTTPChildSpans(bool)` | `false` | Wrap minio-go's own `DefaultTransport(Secure)` (not `http.DefaultTransport`) with `o11y http.NewTransport`, so every HTTP round-trip (incl. multipart `UploadPart`s) becomes a child span. The transport uses an empty propagator — no `traceparent` flows toward the store. |
+| `WithObjectKeyAttribute(bool)` | `true` | Whether to record `object_store.object.key` on spans. Metric labels never carry the key regardless. |
+| `WithAWSS3CompatAttributes(bool)` | `false` | Dual-emit the experimental `aws.s3.*` keys (`aws.s3.bucket`, `aws.s3.key`) alongside the default `object_store.*` attributes for dashboards keyed on the OTel AWS-S3 semantic conventions. |
+| `WithSpanNameFormatter(...)` | `nil` | Override the default `"{Operation} {bucket}"` span name. |
+
+`GetObject` is wrapped as a thin span only; the caller's original ctx
+is what minio-go stashes on the returned `*Object`, so any lazy `Read`
+HTTP child span parents to whatever caller span was active at
+`GetObject` time, not to the (already-ended) wrapper span. For
+measured downloads use `FGetObject` or read through `WithHTTPChildSpans`
+HTTP children.
+
+`ListObjects` ends its span when the channel closes; the
+drain-or-cancel contract is inherited from minio-go itself — abandoning
+the channel without cancelling the context leaks both the upstream
+producer goroutine and the open span.
+
 ### Using with gin
 
 Use the `gin` sub-package to wire gin's OTel middleware to the SDK-owned
@@ -823,6 +873,23 @@ go run examples/redis/main.go
 The example emits Redis command spans plus `db.client.operation.duration` and
 connection-pool metrics through OTLP metrics push. It runs `PING`, `SET`,
 `GET`, a cache-miss `GET`, and a pipeline every two seconds.
+
+### MinIO
+
+Port-forward MinIO to `localhost:9000`, then run the example:
+
+```bash
+kubectl port-forward -n infra svc/minio 9000:9000
+go run examples/minio/main.go
+```
+
+The example loops every three seconds through `PutObject` → `StatObject`
+→ `GetObject` → `RemoveObject` with `WithHTTPChildSpans(true)`, so each
+logical operation produces a `SpanKindClient` span with HTTP child
+spans for the underlying round-trips and one
+`minio.client.operation.duration` sample per operation. Credentials
+default to `minioadmin`/`minioadmin`; override via `MINIO_ENDPOINT`,
+`MINIO_ACCESS_KEY`, and `MINIO_SECRET_KEY`.
 
 ### Profiling
 
