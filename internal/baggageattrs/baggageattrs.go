@@ -1,5 +1,5 @@
-// Package userbaggage centralizes ADR 0016 user.name baggage handling.
-package userbaggage
+// Package baggageattrs centralizes whitelisted baggage attribute materialization.
+package baggageattrs
 
 import (
 	"context"

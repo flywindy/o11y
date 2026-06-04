@@ -8,7 +8,7 @@ import (
 	"context"
 	"log/slog"
 
-	"github.com/flywindy/o11y/internal/userbaggage"
+	"github.com/flywindy/o11y/internal/baggageattrs"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -65,8 +65,8 @@ func NewBaggageHandler(base slog.Handler) slog.Handler {
 
 // Handle implements slog.Handler.Handle and adds whitelisted baggage attrs.
 func (h *BaggageHandler) Handle(ctx context.Context, r slog.Record) error {
-	for _, attr := range userbaggage.LogAttrsFromContext(ctx) {
-		if h.hasUserNameAttr && attr.Key == userbaggage.UserNameKey {
+	for _, attr := range baggageattrs.LogAttrsFromContext(ctx) {
+		if h.hasUserNameAttr && attr.Key == baggageattrs.UserNameKey {
 			continue
 		}
 		if recordHasAttr(r, attr.Key) {
@@ -86,7 +86,7 @@ func (h *BaggageHandler) Enabled(ctx context.Context, level slog.Level) bool {
 func (h *BaggageHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	hasUserNameAttr := h.hasUserNameAttr
 	for _, attr := range attrs {
-		if attr.Key == userbaggage.UserNameKey {
+		if attr.Key == baggageattrs.UserNameKey {
 			hasUserNameAttr = true
 			break
 		}

@@ -1,10 +1,10 @@
-package userbaggage_test
+package baggageattrs_test
 
 import (
 	"context"
 	"testing"
 
-	"github.com/flywindy/o11y/internal/userbaggage"
+	"github.com/flywindy/o11y/internal/baggageattrs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
@@ -33,38 +33,38 @@ func member(t *testing.T, key, value string) baggage.Member {
 
 func TestSpanAttributesFromContextReturnsWhitelistedUserNameOnly(t *testing.T) {
 	ctx := baggageContext(t,
-		member(t, userbaggage.UserNameKey, "a.einstein"),
+		member(t, baggageattrs.UserNameKey, "a.einstein"),
 		member(t, "tenant.id", "physics"),
 	)
 
-	attrs := userbaggage.SpanAttributesFromContext(ctx)
+	attrs := baggageattrs.SpanAttributesFromContext(ctx)
 
 	assert.Equal(t, []attribute.KeyValue{semconv.UserName("a.einstein")}, attrs)
 }
 
 func TestLogAttrsFromContextReturnsWhitelistedUserNameOnly(t *testing.T) {
 	ctx := baggageContext(t,
-		member(t, userbaggage.UserNameKey, "a.einstein"),
+		member(t, baggageattrs.UserNameKey, "a.einstein"),
 		member(t, "tenant.id", "physics"),
 	)
 
-	attrs := userbaggage.LogAttrsFromContext(ctx)
+	attrs := baggageattrs.LogAttrsFromContext(ctx)
 
 	require.Len(t, attrs, 1)
-	assert.Equal(t, userbaggage.UserNameKey, attrs[0].Key)
+	assert.Equal(t, baggageattrs.UserNameKey, attrs[0].Key)
 	assert.Equal(t, "a.einstein", attrs[0].Value.String())
 }
 
 func TestSpanProcessorCopiesUserBaggageOnStart(t *testing.T) {
 	sr := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithSpanProcessor(userbaggage.NewSpanProcessor()),
+		sdktrace.WithSpanProcessor(baggageattrs.NewSpanProcessor()),
 		sdktrace.WithSpanProcessor(sr),
 	)
 	t.Cleanup(func() {
 		require.NoError(t, tp.Shutdown(context.Background()))
 	})
-	ctx := baggageContext(t, member(t, userbaggage.UserNameKey, "a.einstein"))
+	ctx := baggageContext(t, member(t, baggageattrs.UserNameKey, "a.einstein"))
 
 	_, span := tp.Tracer("test").Start(ctx, "operation")
 	span.End()
@@ -77,13 +77,13 @@ func TestSpanProcessorCopiesUserBaggageOnStart(t *testing.T) {
 func TestSpanProcessorDoesNotOverrideExplicitStartAttribute(t *testing.T) {
 	sr := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithSpanProcessor(userbaggage.NewSpanProcessor()),
+		sdktrace.WithSpanProcessor(baggageattrs.NewSpanProcessor()),
 		sdktrace.WithSpanProcessor(sr),
 	)
 	t.Cleanup(func() {
 		require.NoError(t, tp.Shutdown(context.Background()))
 	})
-	ctx := baggageContext(t, member(t, userbaggage.UserNameKey, "baggage-user"))
+	ctx := baggageContext(t, member(t, baggageattrs.UserNameKey, "baggage-user"))
 
 	_, span := tp.Tracer("test").Start(ctx, "operation", trace.WithAttributes(semconv.UserName("explicit-user")))
 	span.End()

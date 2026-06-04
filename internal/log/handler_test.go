@@ -14,8 +14,8 @@ import (
 	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/flywindy/o11y/internal/baggageattrs"
 	o11ylog "github.com/flywindy/o11y/internal/log"
-	"github.com/flywindy/o11y/internal/userbaggage"
 )
 
 // ---------------------------------------------------------------------------
@@ -127,7 +127,7 @@ func TestBaggageHandlerInjectsWhitelistedUserName(t *testing.T) {
 	base := slog.NewJSONHandler(&buf, nil)
 	logger := slog.New(o11ylog.NewBaggageHandler(base))
 	ctx := baggageContext(t,
-		baggageMember(t, userbaggage.UserNameKey, "a.einstein"),
+		baggageMember(t, baggageattrs.UserNameKey, "a.einstein"),
 		baggageMember(t, "tenant.id", "physics"),
 	)
 
@@ -135,7 +135,7 @@ func TestBaggageHandlerInjectsWhitelistedUserName(t *testing.T) {
 
 	var record map[string]any
 	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
-	assert.Equal(t, "a.einstein", record[userbaggage.UserNameKey])
+	assert.Equal(t, "a.einstein", record[baggageattrs.UserNameKey])
 	_, hasTenant := record["tenant.id"]
 	assert.False(t, hasTenant, "non-whitelisted baggage must not be added")
 }
@@ -144,27 +144,27 @@ func TestBaggageHandlerKeepsExplicitUserNameAttr(t *testing.T) {
 	var buf bytes.Buffer
 	base := slog.NewJSONHandler(&buf, nil)
 	logger := slog.New(o11ylog.NewBaggageHandler(base))
-	ctx := baggageContext(t, baggageMember(t, userbaggage.UserNameKey, "baggage-user"))
+	ctx := baggageContext(t, baggageMember(t, baggageattrs.UserNameKey, "baggage-user"))
 
-	logger.InfoContext(ctx, "with explicit user", slog.String(userbaggage.UserNameKey, "explicit-user"))
+	logger.InfoContext(ctx, "with explicit user", slog.String(baggageattrs.UserNameKey, "explicit-user"))
 
 	var record map[string]any
 	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
-	assert.Equal(t, "explicit-user", record[userbaggage.UserNameKey])
+	assert.Equal(t, "explicit-user", record[baggageattrs.UserNameKey])
 }
 
 func TestBaggageHandlerKeepsLoggerWithUserNameAttr(t *testing.T) {
 	var buf bytes.Buffer
 	base := slog.NewJSONHandler(&buf, nil)
 	logger := slog.New(o11ylog.NewBaggageHandler(base)).
-		With(slog.String(userbaggage.UserNameKey, "explicit-user"))
-	ctx := baggageContext(t, baggageMember(t, userbaggage.UserNameKey, "baggage-user"))
+		With(slog.String(baggageattrs.UserNameKey, "explicit-user"))
+	ctx := baggageContext(t, baggageMember(t, baggageattrs.UserNameKey, "baggage-user"))
 
 	logger.InfoContext(ctx, "with explicit user")
 
 	var record map[string]any
 	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
-	assert.Equal(t, "explicit-user", record[userbaggage.UserNameKey])
+	assert.Equal(t, "explicit-user", record[baggageattrs.UserNameKey])
 }
 
 func TestBaggageHandlerWithAttrsPreservesType(t *testing.T) {

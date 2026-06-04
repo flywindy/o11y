@@ -19,11 +19,11 @@ import (
 	"os"
 	"sync"
 
+	"github.com/flywindy/o11y/internal/baggageattrs"
 	o11ylog "github.com/flywindy/o11y/internal/log"
 	"github.com/flywindy/o11y/internal/metrics"
 	"github.com/flywindy/o11y/internal/profiling"
 	"github.com/flywindy/o11y/internal/trace"
-	"github.com/flywindy/o11y/internal/userbaggage"
 	o11ymongo "github.com/flywindy/o11y/mongo"
 	o11yredis "github.com/flywindy/o11y/redis"
 	otelpyroscope "github.com/grafana/otel-profiling-go"
@@ -203,7 +203,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	if cfg.traceEnabled {
 		var spanProcessors []sdktrace.SpanProcessor
 		if cfg.userBaggage {
-			spanProcessors = append(spanProcessors, userbaggage.NewSpanProcessor())
+			spanProcessors = append(spanProcessors, baggageattrs.NewSpanProcessor())
 		}
 		tp, p, initErr := trace.InitTracer(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, res, cfg.sampler, spanProcessors...)
 		if initErr != nil {
