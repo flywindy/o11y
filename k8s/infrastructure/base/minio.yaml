@@ -10,6 +10,12 @@ spec:
     requests:
       storage: 2Gi
 ---
+# Dev-only credentials for the kind cluster. Production / shared
+# environments MUST override this Secret via a kustomize overlay
+# (k8s/infrastructure/overlays/<env>/minio-credentials.yaml) so
+# real credentials never live in this base manifest. Leaving the
+# default values here keeps `kubectl apply -k k8s/infrastructure/base`
+# self-contained for local development.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -35,6 +41,14 @@ spec:
       labels:
         app: minio
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: minio
         image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
@@ -63,6 +77,18 @@ spec:
             port: api
           initialDelaySeconds: 10
           periodSeconds: 10
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "1"
+            memory: "1Gi"
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
         volumeMounts:
           - name: minio-data
             mountPath: /data
