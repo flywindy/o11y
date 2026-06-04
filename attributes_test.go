@@ -31,6 +31,24 @@ func TestSetUserRecordsUserNameOnCurrentSpan(t *testing.T) {
 	assert.Contains(t, spans[0].Attributes(), semconv.UserName("a.einstein"))
 }
 
+func TestSetUserEmptyNameDoesNotRecordUserName(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	t.Cleanup(func() {
+		require.NoError(t, tp.Shutdown(context.Background()))
+	})
+
+	ctx, span := tp.Tracer("user-test").Start(context.Background(), "operation")
+	o11y.SetUser(ctx, "")
+	span.End()
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	for _, attr := range spans[0].Attributes() {
+		assert.NotEqual(t, semconv.UserNameKey, attr.Key)
+	}
+}
+
 func TestSetUserWithoutCurrentSpanDoesNotPanic(t *testing.T) {
 	assert.NotPanics(t, func() {
 		o11y.SetUser(context.Background(), "a.einstein")
@@ -45,6 +63,10 @@ func TestUserNameReturnsSlogAttribute(t *testing.T) {
 	assert.Equal(t, "a.einstein", attr.Value.String())
 }
 
+func TestUserNameEmptyReturnsEmptyAttr(t *testing.T) {
+	assert.Equal(t, slog.Attr{}, o11y.UserName(""))
+}
+
 func TestContextWithUserStoresUserNameBaggage(t *testing.T) {
 	tests := []struct {
 		name string
@@ -53,7 +75,6 @@ func TestContextWithUserStoresUserNameBaggage(t *testing.T) {
 		{name: "ascii", user: "a.einstein"},
 		{name: "spaces", user: "ada lovelace"},
 		{name: "unicode", user: "\u5c45\u91cc"},
-		{name: "empty", user: ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -65,6 +86,17 @@ func TestContextWithUserStoresUserNameBaggage(t *testing.T) {
 			assert.Equal(t, tt.user, member.Value())
 		})
 	}
+}
+
+func TestContextWithUserEmptyNameNoops(t *testing.T) {
+	ctx := context.Background()
+
+	got, err := o11y.ContextWithUser(ctx, "")
+
+	require.NoError(t, err)
+	assert.Equal(t, ctx, got)
+	member := baggage.FromContext(got).Member(string(semconv.UserNameKey))
+	assert.Empty(t, member.Key())
 }
 
 func TestContextWithUserOverridesExistingUserNameBaggage(t *testing.T) {

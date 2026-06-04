@@ -42,6 +42,14 @@ func TestSpanAttributesFromContextReturnsWhitelistedUserNameOnly(t *testing.T) {
 	assert.Equal(t, []attribute.KeyValue{semconv.UserName("a.einstein")}, attrs)
 }
 
+func TestSpanAttributesFromContextSkipsEmptyUserName(t *testing.T) {
+	ctx := baggageContext(t, member(t, baggageattrs.UserNameKey, ""))
+
+	attrs := baggageattrs.SpanAttributesFromContext(ctx)
+
+	assert.Empty(t, attrs)
+}
+
 func TestLogAttrsFromContextReturnsWhitelistedUserNameOnly(t *testing.T) {
 	ctx := baggageContext(t,
 		member(t, baggageattrs.UserNameKey, "a.einstein"),
@@ -53,6 +61,24 @@ func TestLogAttrsFromContextReturnsWhitelistedUserNameOnly(t *testing.T) {
 	require.Len(t, attrs, 1)
 	assert.Equal(t, baggageattrs.UserNameKey, attrs[0].Key)
 	assert.Equal(t, "a.einstein", attrs[0].Value.String())
+}
+
+func TestLogAttrsFromContextSkipsEmptyUserName(t *testing.T) {
+	ctx := baggageContext(t, member(t, baggageattrs.UserNameKey, ""))
+
+	attrs := baggageattrs.LogAttrsFromContext(ctx)
+
+	assert.Empty(t, attrs)
+}
+
+func TestContextWithUserEmptyNameNoops(t *testing.T) {
+	ctx := baggageContext(t, member(t, "tenant.id", "physics"))
+
+	got, err := baggageattrs.ContextWithUser(ctx, "")
+
+	require.NoError(t, err)
+	assert.Equal(t, ctx, got)
+	assert.Empty(t, baggage.FromContext(got).Member(baggageattrs.UserNameKey).Key())
 }
 
 func TestSpanProcessorCopiesUserBaggageOnStart(t *testing.T) {

@@ -17,13 +17,21 @@ import (
 // same pinned semconv source.
 const UserNameKey = string(semconv.UserNameKey)
 
-var baggageWhitelist = map[string]attribute.Key{
-	UserNameKey: semconv.UserNameKey,
+type whitelistedAttribute struct {
+	baggageKey   string
+	attributeKey attribute.Key
+}
+
+var baggageWhitelist = []whitelistedAttribute{
+	{baggageKey: UserNameKey, attributeKey: semconv.UserNameKey},
 }
 
 // ContextWithUser returns a context carrying the acting user's login name as a
 // whitelisted W3C baggage member.
 func ContextWithUser(ctx context.Context, name string) (context.Context, error) {
+	if name == "" {
+		return ctx, nil
+	}
 	member, err := baggage.NewMemberRaw(UserNameKey, name)
 	if err != nil {
 		return ctx, fmt.Errorf("invalid user.name baggage member: %w", err)
@@ -54,15 +62,15 @@ func SpanAttributesFromContext(ctx context.Context) []attribute.KeyValue {
 		return nil
 	}
 	var attrs []attribute.KeyValue
-	for key, attrKey := range baggageWhitelist {
-		member := bag.Member(key)
-		if member.Key() == "" {
+	for _, item := range baggageWhitelist {
+		member := bag.Member(item.baggageKey)
+		if member.Key() == "" || member.Value() == "" {
 			continue
 		}
 		if attrs == nil {
 			attrs = make([]attribute.KeyValue, 0, len(baggageWhitelist))
 		}
-		attrs = append(attrs, attrKey.String(member.Value()))
+		attrs = append(attrs, item.attributeKey.String(member.Value()))
 	}
 	return attrs
 }
@@ -74,15 +82,15 @@ func LogAttrsFromContext(ctx context.Context) []slog.Attr {
 		return nil
 	}
 	var attrs []slog.Attr
-	for key := range baggageWhitelist {
-		member := bag.Member(key)
-		if member.Key() == "" {
+	for _, item := range baggageWhitelist {
+		member := bag.Member(item.baggageKey)
+		if member.Key() == "" || member.Value() == "" {
 			continue
 		}
 		if attrs == nil {
 			attrs = make([]slog.Attr, 0, len(baggageWhitelist))
 		}
-		attrs = append(attrs, slog.String(key, member.Value()))
+		attrs = append(attrs, slog.String(item.baggageKey, member.Value()))
 	}
 	return attrs
 }

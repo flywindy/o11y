@@ -167,6 +167,24 @@ func TestBaggageHandlerKeepsLoggerWithUserNameAttr(t *testing.T) {
 	assert.Equal(t, "explicit-user", record[baggageattrs.UserNameKey])
 }
 
+func TestBaggageHandlerWithGroupDoesNotInheritUserNameAttr(t *testing.T) {
+	var buf bytes.Buffer
+	base := slog.NewJSONHandler(&buf, nil)
+	logger := slog.New(o11ylog.NewBaggageHandler(base)).
+		With(slog.String(baggageattrs.UserNameKey, "explicit-user")).
+		WithGroup("audit")
+	ctx := baggageContext(t, baggageMember(t, baggageattrs.UserNameKey, "baggage-user"))
+
+	logger.InfoContext(ctx, "with grouped baggage")
+
+	var record map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
+	assert.Equal(t, "explicit-user", record[baggageattrs.UserNameKey])
+	audit, ok := record["audit"].(map[string]any)
+	require.True(t, ok, "grouped log attrs must be nested under audit")
+	assert.Equal(t, "baggage-user", audit[baggageattrs.UserNameKey])
+}
+
 func TestBaggageHandlerWithAttrsPreservesType(t *testing.T) {
 	var buf bytes.Buffer
 	base := slog.NewJSONHandler(&buf, nil)

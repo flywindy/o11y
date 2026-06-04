@@ -183,6 +183,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	if err := configureSampler(cfg); err != nil {
 		return nil, err
 	}
+	appendUserBaggageWarnings(cfg)
 
 	// 1. Build a shared Resource so TracerProvider, MeterProvider, and
 	//    LoggerProvider all carry identical service-identity attributes.
@@ -481,6 +482,14 @@ func configureSampler(cfg *Config) error {
 	}
 	cfg.sampler = sdktrace.ParentBased(sdktrace.TraceIDRatioBased(cfg.samplingRatio))
 	return nil
+}
+
+func appendUserBaggageWarnings(cfg *Config) {
+	if cfg.userBaggage && !cfg.traceEnabled {
+		cfg.initWarnings = append(cfg.initWarnings,
+			"WithUserBaggage enabled while trace pillar disabled; user.name baggage will materialize on logs only, not spans",
+		)
+	}
 }
 
 // validateHistogramBuckets ensures the histogram boundaries are in a state

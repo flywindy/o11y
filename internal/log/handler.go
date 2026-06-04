@@ -100,8 +100,7 @@ func (h *BaggageHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 // WithGroup implements slog.Handler.WithGroup by delegating to the wrapped handler.
 func (h *BaggageHandler) WithGroup(name string) slog.Handler {
 	return &BaggageHandler{
-		Handler:         h.Handler.WithGroup(name),
-		hasUserNameAttr: h.hasUserNameAttr,
+		Handler: h.Handler.WithGroup(name),
 	}
 }
 

@@ -292,7 +292,8 @@ obs.Logger.InfoContext(ctx, "processing request", o11y.UserName("a.einstein"))
 `SetUser` writes `user.name` to the current span only. `UserName` returns a
 `slog.Attr` for the log record where it is supplied. These helpers are explicit
 and in-process: they do not use OTel Baggage, do not add per-service provider
-wiring, and do not propagate usernames across HTTP/NATS boundaries.
+wiring, and do not propagate usernames across HTTP/NATS boundaries. Empty
+usernames are treated as unauthenticated and do not emit `user.name`.
 
 Use opt-in baggage propagation when the product needs to identify the user once
 at the source and have downstream services materialize the same `user.name`
@@ -324,10 +325,10 @@ obs.Logger.InfoContext(ctx, "processing request")
 
 `ContextWithUser` is the source-side opt-in that puts `user.name` into W3C
 Baggage. `WithUserBaggage` is the per-service opt-in that copies whitelisted
-baggage onto that service's spans and SDK log records. Enable it only after
-authenticating the user, ignore or overwrite untrusted inbound baggage at the
-edge, strip baggage before calls to external third parties, and never promote
-`user.name` into metric labels.
+baggage onto that service's spans and SDK log records. Empty usernames leave the
+context unchanged. Enable it only after authenticating the user, ignore or
+overwrite untrusted inbound baggage at the edge, strip baggage before calls to
+external third parties, and never promote `user.name` into metric labels.
 
 ### Logging Guidelines
 

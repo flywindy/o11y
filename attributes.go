@@ -14,8 +14,11 @@ import (
 // SetUser is an explicit, in-process helper: it does not add the field to log
 // records, does not store the value in baggage, and does not propagate it across
 // service boundaries. Use UserName alongside SetUser when the same username
-// should also be present on a slog record.
+// should also be present on a slog record. Empty names are ignored.
 func SetUser(ctx context.Context, name string) {
+	if name == "" {
+		return
+	}
 	trace.SpanFromContext(ctx).SetAttributes(baggageattrs.UserNameSpanAttribute(name))
 }
 
@@ -24,8 +27,12 @@ func SetUser(ctx context.Context, name string) {
 //
 // UserName is an explicit log helper: it only affects the log record where the
 // returned attribute is supplied. It does not record the username on spans and
-// does not propagate it across service boundaries.
+// does not propagate it across service boundaries. Empty names return an empty
+// slog attribute.
 func UserName(name string) slog.Attr {
+	if name == "" {
+		return slog.Attr{}
+	}
 	return baggageattrs.UserNameLogAttr(name)
 }
 
@@ -37,7 +44,8 @@ func UserName(name string) slog.Attr {
 // value can travel across HTTP and NATS boundaries. Use this only after
 // authenticating the user, and strip baggage before egress to untrusted third
 // parties. Services must also opt in with WithUserBaggage to materialize the
-// baggage value onto their own spans and logs.
+// baggage value onto their own spans and logs. Empty names return the original
+// context without adding baggage.
 func ContextWithUser(ctx context.Context, name string) (context.Context, error) {
 	return baggageattrs.ContextWithUser(ctx, name)
 }
