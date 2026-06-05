@@ -169,13 +169,20 @@ Sourced from `ObservedQuery` / `ObservedBatch` / `HostInfo` / `hostMetrics`.
 | `db.cassandra.page.size` | Opt-In | page size when known |
 | `db.cassandra.query.idempotent` | Opt-In | query idempotence flag when known |
 | `db.cassandra.speculative_execution.count` | Opt-In | derived from attempt accounting |
-| `network.peer.address` / `network.peer.port` | Recommended | `HostInfo` of the last contacted node (per the Cassandra semconv "last node on retry" rule) |
+| `server.address` / `server.port` | Recommended | the configured contact point / logical server — the **primary** peer keys, consistent with the Redis (ADR 0013) and Elasticsearch (ADR 0020) integrations and with the `db.client.operation.duration` metric labels |
+| `network.peer.address` / `network.peer.port` | Opt-In | the **actual** contacted coordinator from `HostInfo` (the "last node on retry"). Genuinely useful under token-aware routing, but secondary to `server.*`; kept Opt-In so the package does not lead with non-conformant peer keys (the inverse of the Mongo T2 case, where the upstream contrib lib forces `network.peer.*` — here the package is SDK-owned, so it follows the repo's `server.*` convention by default) |
 | `error.type` | Conditionally Required | set on `ObservedQuery.Err != nil` |
 
-`db.cassandra.*` keys are experimental in semconv; they are emitted at
-Opt-In level so a future stabilization rename is a localized change. The
-connect observer produces connection-attempt spans/metrics keyed by the same
-`network.peer.*` of `ObservedConnect.Host`.
+The `db.cassandra.*` keys use the dotted form emitted by the pinned
+`go.opentelemetry.io/otel/semconv/v1.39.0` Go package (e.g.
+`db.cassandra.consistency.level`, `db.cassandra.page.size`,
+`db.cassandra.query.idempotent`, `db.cassandra.speculative_execution.count`) —
+**not** the underscore form of older semconv majors. The implementation must
+source them from the semconv constants, never hardcoded literals. They are
+experimental in semconv and emitted at Opt-In level so a future stabilization
+rename stays a localized change. The connect observer produces
+connection-attempt spans/metrics keyed by `server.*` (with the actual peer in
+`network.peer.*` Opt-In), matching the query path.
 
 ### 6. Query text is opt-in
 
@@ -206,11 +213,23 @@ emit; the SDK provides `cassandra.MetricViews()` composed into `o11y.Init` via
 pinning histogram buckets to the SDK default set for cross-integration
 consistency and applying an allow-keys filter to bound cardinality.
 
+`server.address` / `server.port` are safe as labels because they are the
+client's configured contact points — a small, fixed set per client instance,
+not per-request peer addresses — so they do not explode label cardinality
+(ADR 0008 §3). They are included (rather than dropped) so metrics remain
+attributable in shared-address topologies such as sidecars, provided the
+contact point parses into host and port.
+
 **B. Retry / speculative-execution counter (v1 or fast-follow, Cassandra-unique)**
 
 | Metric | Type | Source |
 |---|---|---|
-| `db.cassandra.query.attempts` (SDK-owned name, pending a stable semconv equivalent) | counter | `ObservedQuery.Metrics.Attempts` / `Attempt` index |
+| `db.cassandra.query.attempts` (SDK-owned name, pending a stable semconv equivalent) | counter | `ObservedQuery.Attempt` and `ObservedQuery.Metrics.Attempts` |
+
+Both sources are accessible to the observer: `Attempt` and `Metrics` are
+exported fields of `ObservedQuery`, and although the `hostMetrics` type name is
+unexported in gocql v1.7.0, its `Attempts` / `TotalLatency` fields are exported,
+so `q.Metrics.Attempts` compiles and reads correctly from our package.
 
 This is the signal server-side exporters **cannot** provide: client-side
 token-aware routing, retries, and speculative execution are driver decisions
