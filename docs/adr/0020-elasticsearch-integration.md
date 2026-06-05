@@ -45,7 +45,7 @@ cluster id / node name from response headers.
 |---|---|
 | §2.1 ADR 0003 compliance | **Pass (to confirm by source read).** Takes a `trace.TracerProvider` explicitly; falls back to the OTel global only when `nil` is passed. Our facade always passes the SDK provider, so the fallback never fires. |
 | §2.2 Maintenance signal | **Pass.** First-party, maintained by the client vendor itself — the best signal of all. |
-| §2.3 Semconv alignment | **Pass with a documented drift.** Emits Elasticsearch DB attributes, but is expected to use the **deprecated** spellings — the whole `db.elasticsearch.*` namespace was dispersed in the DB stabilization (`node.name` → `elasticsearch.node.name`, `cluster.name` → `db.namespace`, `path_parts.*` → `db.operation.parameter.*`), and the search body uses `db.statement` rather than `db.query.text`. Accepted and documented per §4 (same posture as the Mongo T2 attribute exception). |
+| §2.3 Semconv alignment | **Pass with a documented drift.** The pinned `elastic-transport-go/v8` (≈ v8.8.0 for the consumer's `go-elasticsearch/v8 v8.19.3`) predates DB stabilization and is expected to emit **legacy core** keys — `db.system` and `db.operation` (not `db.system.name` / `db.operation.name`), `db.statement` (not `db.query.text`) — plus the deprecated `db.elasticsearch.*` namespace (`node.name` → `elasticsearch.node.name`, `cluster.name` → `db.namespace`, `path_parts.*` → `db.operation.parameter.*`). Accepted and documented per §4 (same posture as the Mongo T2 attribute exception); a compatibility test pins the exact emitted keys. |
 | §2.4 Configurability | **Pass.** Span behavior and search-body capture are controllable; we do not need a fork. |
 | §2.5 Framework signal access | **Pass.** Endpoint id, index/path parts, and cluster/node identity are populated by the instrumentation. |
 
@@ -84,6 +84,17 @@ func NewClient(
     tp trace.TracerProvider,
     opts ...Option,
 ) (*elasticsearch.Client, error)
+
+// Typed API: go-elasticsearch v8 keeps the typed client behind a separate
+// constructor; it is not reachable from *elasticsearch.Client. The facade
+// offers a parallel constructor so typed-API call sites are not forced back
+// to the low-level API. Both wire the same instrumentation into the shared
+// elastictransport.
+func NewTypedClient(
+    cfg elasticsearch.Config,
+    tp trace.TracerProvider,
+    opts ...Option,
+) (*elasticsearch.TypedClient, error)
 
 type Option func(*config)
 
@@ -131,9 +142,12 @@ Span name follows the DB guidance (`db.operation.name` + target).
 
 **Upstream attribute-drift caveat.** The first-party `elastic-transport-go`
 instrumentation predates this stabilization and is expected to emit the
-**deprecated** spellings — `db.elasticsearch.path_parts.<key>`,
-`db.elasticsearch.node.name`, `db.elasticsearch.cluster.name`, and `db.statement`
-for the search body (current: `db.query.text`). Because the instrumentation sets
+**deprecated** spellings for both the core and ES-specific keys — `db.system`
+(current `db.system.name`), `db.operation` (current `db.operation.name`),
+`db.statement` for the search body (current `db.query.text`),
+`db.elasticsearch.path_parts.<key>` (current `db.operation.parameter.<key>`),
+`db.elasticsearch.node.name` (current `elasticsearch.node.name`), and
+`db.elasticsearch.cluster.name` (current `db.namespace`). Because the instrumentation sets
 these on its own span, the SDK cannot rewrite them without a span-processor hack
 (heavier and fragile). The decision, per the §2.3/§2.4 trade-off:
 

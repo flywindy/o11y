@@ -141,25 +141,36 @@ func WithAttributes(attrs ...attribute.KeyValue) Option
 
 ### 4. Span model
 
-One CLIENT span per observed query, and one per observed batch. Span name
-follows the DB span guidance (`db.operation.name` + target, e.g.
+The gocql v1.7.0 observer seam delivers a **completed-observation snapshot**
+(`Start`/`End` already set), not a live span handle. Verified against the v1.7.0
+tag, `ObservedQuery` and `ObservedBatch` carry **no query/batch identity field**
+(the `Query *Query` / `Batch *Batch` pointers exist only on later gocql trunk).
+The span model is shaped by what that seam can actually deliver:
+
+**Queries.** `ObserveQuery` "gets called on every query to cassandra, including
+all queries in an iterator when paging is enabled" — i.e. **once per query
+execution, and once per page**, *not* once per attempt. Retries are already
+collapsed by the driver into that single call, with the attempt count in
+`Attempt` / `Metrics.Attempts`. So the implementation emits **one span per
+`ObserveQuery` callback**, carrying the retry count as an attribute; there is no
+"open at attempt 0, merge later" model (the seam cannot support one and none is
+needed). A paged read produces one span per page — each page is a real round
+trip — sharing the caller's context so the pages sit under the same parent. Span
+name follows the DB guidance (`db.operation.name` + target, e.g.
 `SELECT messages_by_room`), falling back to the operation name alone when the
-table cannot be determined.
+table cannot be parsed.
 
-`ObservedQuery.Attempt` distinguishes retries and page fetches: attempt 0 opens
-the logical span; subsequent attempts are recorded as events/attributes on the
-same logical operation rather than as separate top-level spans, so a retried
-query is one span with a visible retry count, not N spans.
-
-**Batch callback multiplicity.** gocql's `ObserveBatch` doc comment warns it
-"gets called on every batch query to cassandra. It also gets called once for
-each query in a batch", so a single logical batch can invoke the observer more
-than once. The implementation therefore emits exactly **one** batch span and
-one metric sample per execution, deduplicated by the `ObservedBatch.Batch`
-pointer identity (plus `Start`); the surplus per-statement callbacks are
-collapsed into that one logical span and feed `db.operation.batch.size` (the
-statement count), not extra spans. The exact callback multiplicity for
-gocql v1.7.0 is pinned by a unit test so an upstream change is caught.
+**Batches.** `ObserveBatch` "gets called on every batch query to cassandra. It
+also gets called once for each query in a batch", and v1.7.0 exposes **no batch
+identity** to deduplicate those `(1 + N)` callbacks. Coalescing them into one
+span from the observer payload alone is therefore not reliable. The integration
+resolves this with an **SDK-owned batch-execution seam** — a thin
+`ExecuteBatch(ctx, session, batch)` helper that owns exactly one span per logical
+batch (feeding `db.operation.batch.size` from the statement count) and treats the
+driver's batch-observer callbacks as supplementary timing only. Pure
+observer-only batch instrumentation is **out of scope for v1** precisely because
+the v1.7.0 payload cannot identify the logical batch. The callback multiplicity
+for the pinned gocql version is pinned by a unit test.
 
 ### 5. Span attributes (semconv v1.39.0)
 
@@ -173,12 +184,8 @@ Sourced from `ObservedQuery` / `ObservedBatch` / `HostInfo` / `hostMetrics`.
 | `db.collection.name` | Recommended | parsed table when a single table is addressed |
 | `db.query.text` | Opt-In | `ObservedQuery.Statement`, **only when `WithQueryText(true)`** (§6) |
 | `db.response.returned_rows` | Recommended | `ObservedQuery.Rows` |
-| `cassandra.consistency.level` | Opt-In | query consistency when available |
-| `cassandra.coordinator.id` | Opt-In | `HostInfo` (coordinating node id) |
-| `cassandra.coordinator.dc` | Opt-In | `HostInfo.DataCenter()` |
-| `cassandra.page.size` | Opt-In | page size when known |
-| `cassandra.query.idempotent` | Opt-In | query idempotence flag when known |
-| `cassandra.speculative_execution.count` | Opt-In | derived from attempt accounting |
+| `cassandra.coordinator.id` | Opt-In | `ObservedQuery.Host` (coordinating node id) |
+| `cassandra.coordinator.dc` | Opt-In | `ObservedQuery.Host.DataCenter()` |
 | `server.address` / `server.port` | Recommended | the configured contact point / logical server [1] |
 | `network.peer.address` / `network.peer.port` | Opt-In | the actual contacted coordinator from `HostInfo` [1] |
 | `error.type` | Conditionally Required | set on `ObservedQuery.Err != nil` |
@@ -201,6 +208,16 @@ became `db.collection.name`). The implementation must source them from the
 semconv constants (e.g. `semconv.CassandraConsistencyLevelKey`), never
 hardcoded literals. The connect observer keys its spans/metrics by `server.*`
 (actual peer in `network.peer.*`, Opt-In), matching the query path.
+
+**Not available from the bare gocql v1.7.0 observer seam.**
+`cassandra.consistency.level`, `cassandra.page.size`, `cassandra.query.idempotent`,
+and `cassandra.speculative_execution.count` describe per-query *settings* carried
+on `*gocql.Query` before execution; v1.7.0's `ObservedQuery` does not expose them
+(it has no `Query` field). They are **out of scope for v1** and would require the
+SDK-owned query/batch seam (§4) — or a newer gocql that adds `ObservedQuery.Query`
+— to populate. The table lists only what the v1.7.0 observer payload actually
+exposes; `cassandra.coordinator.*` survive because they come from
+`ObservedQuery.Host`.
 
 ### 6. Query text is opt-in
 
