@@ -45,6 +45,17 @@ Third-party instrumentation is acceptable when it either:
 - emits documented string keys that match the v1.39 catalog and has a local
   compatibility test proving the emitted attributes.
 
+> **Resolving an exact key.** Never assert an attribute-key string from memory,
+> a blog, or a web-search summary — the database conventions were restructured
+> during stabilization (stable in semconv v1.33.0) and whole vendor namespaces
+> moved (`db.cassandra.*` → `cassandra.*`; `db.elasticsearch.node.name` →
+> `elasticsearch.node.name`; `db.elasticsearch.cluster.name` → `db.namespace`;
+> `db.elasticsearch.path_parts.*` → `db.operation.parameter.*`; `db.system` →
+> `db.system.name`; `db.statement` → `db.query.text`). Resolve every key against
+> the `attribute.Key("...")` literal in the pinned package on disk. The
+> [`verify-semconv-attributes`](../../.agents/skills/verify-semconv-attributes/SKILL.md)
+> skill is the procedure and must be used before writing or reviewing any key.
+
 ---
 
 ## Migration Scope
