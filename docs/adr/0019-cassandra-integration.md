@@ -151,6 +151,16 @@ the logical span; subsequent attempts are recorded as events/attributes on the
 same logical operation rather than as separate top-level spans, so a retried
 query is one span with a visible retry count, not N spans.
 
+**Batch callback multiplicity.** gocql's `ObserveBatch` doc comment warns it
+"gets called on every batch query to cassandra. It also gets called once for
+each query in a batch", so a single logical batch can invoke the observer more
+than once. The implementation therefore emits exactly **one** batch span and
+one metric sample per execution, deduplicated by the `ObservedBatch.Batch`
+pointer identity (plus `Start`); the surplus per-statement callbacks are
+collapsed into that one logical span and feed `db.operation.batch.size` (the
+statement count), not extra spans. The exact callback multiplicity for
+gocql v1.7.0 is pinned by a unit test so an upstream change is caught.
+
 ### 5. Span attributes (semconv v1.39.0)
 
 Sourced from `ObservedQuery` / `ObservedBatch` / `HostInfo` / `hostMetrics`.
@@ -163,26 +173,34 @@ Sourced from `ObservedQuery` / `ObservedBatch` / `HostInfo` / `hostMetrics`.
 | `db.collection.name` | Recommended | parsed table when a single table is addressed |
 | `db.query.text` | Opt-In | `ObservedQuery.Statement`, **only when `WithQueryText(true)`** (§6) |
 | `db.response.returned_rows` | Recommended | `ObservedQuery.Rows` |
-| `db.cassandra.consistency.level` | Opt-In | query consistency when available |
-| `db.cassandra.coordinator.id` | Opt-In | `HostInfo` (coordinating node id) |
-| `db.cassandra.coordinator.dc` | Opt-In | `HostInfo.DataCenter()` |
-| `db.cassandra.page.size` | Opt-In | page size when known |
-| `db.cassandra.query.idempotent` | Opt-In | query idempotence flag when known |
-| `db.cassandra.speculative_execution.count` | Opt-In | derived from attempt accounting |
-| `server.address` / `server.port` | Recommended | the configured contact point / logical server — the **primary** peer keys, consistent with the Redis (ADR 0013) and Elasticsearch (ADR 0020) integrations and with the `db.client.operation.duration` metric labels |
-| `network.peer.address` / `network.peer.port` | Opt-In | the **actual** contacted coordinator from `HostInfo` (the "last node on retry"). Genuinely useful under token-aware routing, but secondary to `server.*`; kept Opt-In so the package does not lead with non-conformant peer keys (the inverse of the Mongo T2 case, where the upstream contrib lib forces `network.peer.*` — here the package is SDK-owned, so it follows the repo's `server.*` convention by default) |
+| `cassandra.consistency.level` | Opt-In | query consistency when available |
+| `cassandra.coordinator.id` | Opt-In | `HostInfo` (coordinating node id) |
+| `cassandra.coordinator.dc` | Opt-In | `HostInfo.DataCenter()` |
+| `cassandra.page.size` | Opt-In | page size when known |
+| `cassandra.query.idempotent` | Opt-In | query idempotence flag when known |
+| `cassandra.speculative_execution.count` | Opt-In | derived from attempt accounting |
+| `server.address` / `server.port` | Recommended | the configured contact point / logical server [1] |
+| `network.peer.address` / `network.peer.port` | Opt-In | the actual contacted coordinator from `HostInfo` [1] |
 | `error.type` | Conditionally Required | set on `ObservedQuery.Err != nil` |
 
-The `db.cassandra.*` keys use the dotted form emitted by the pinned
-`go.opentelemetry.io/otel/semconv/v1.39.0` Go package (e.g.
-`db.cassandra.consistency.level`, `db.cassandra.page.size`,
-`db.cassandra.query.idempotent`, `db.cassandra.speculative_execution.count`) —
-**not** the underscore form of older semconv majors. The implementation must
-source them from the semconv constants, never hardcoded literals. They are
-experimental in semconv and emitted at Opt-In level so a future stabilization
-rename stays a localized change. The connect observer produces
-connection-attempt spans/metrics keyed by `server.*` (with the actual peer in
-`network.peer.*` Opt-In), matching the query path.
+**[1] `server.*` vs `network.peer.*`.** `server.address`/`server.port` are the
+primary peer keys, consistent with the Redis (ADR 0013) and Elasticsearch
+(ADR 0020) integrations and the `db.client.operation.duration` metric labels
+(§7). `network.peer.*` captures the *actual* contacted coordinator (useful
+under token-aware routing) but is kept Opt-In so the SDK-owned package leads
+with the repo's conformant `server.*` convention — the inverse of the Mongo T2
+case, where the upstream contrib library forces `network.peer.*`.
+
+**Cassandra-specific key namespace.** In the pinned
+`go.opentelemetry.io/otel/semconv/v1.39.0` Go package these keys live in the
+**`cassandra.*`** namespace — `cassandra.consistency.level`,
+`cassandra.coordinator.dc` / `.id`, `cassandra.page.size`,
+`cassandra.query.idempotent`, `cassandra.speculative_execution.count` — **not**
+the old `db.cassandra.*` prefix, which is deprecated (and `db.cassandra.table`
+became `db.collection.name`). The implementation must source them from the
+semconv constants (e.g. `semconv.CassandraConsistencyLevelKey`), never
+hardcoded literals. The connect observer keys its spans/metrics by `server.*`
+(actual peer in `network.peer.*`, Opt-In), matching the query path.
 
 ### 6. Query text is opt-in
 
@@ -224,7 +242,7 @@ contact point parses into host and port.
 
 | Metric | Type | Source |
 |---|---|---|
-| `db.cassandra.query.attempts` (SDK-owned name, pending a stable semconv equivalent) | counter | `ObservedQuery.Attempt` and `ObservedQuery.Metrics.Attempts` |
+| `cassandra.query.attempts` (SDK-owned name, pending a stable semconv equivalent) | counter | `ObservedQuery.Attempt` and `ObservedQuery.Metrics.Attempts` |
 
 Both sources are accessible to the observer: `Attempt` and `Metrics` are
 exported fields of `ObservedQuery`, and although the `hostMetrics` type name is
