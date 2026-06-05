@@ -258,23 +258,25 @@ other ADR is modified by this document**:
 
 ## References
 
-- OpenTelemetry — Semantic conventions for messaging spans (span links as the
-  default correlation; message creation context attached to the message,
-  ideally not changeable by intermediaries):
-  https://opentelemetry.io/docs/specs/semconv/messaging/messaging-spans/
-- CloudEvents — Distributed Tracing Extension v1.0.2 (`traceparent`/`tracestate`
-  on the event envelope as historical/creation-time data; not intended to
-  replace transport headers):
-  https://github.com/cloudevents/spec/blob/v1.0.2/cloudevents/extensions/distributed-tracing.md
-- W3C — Trace Context (`traceparent` / `tracestate` format):
-  https://www.w3.org/TR/trace-context/
-- Chris Richardson — Pattern: Transactional outbox (canonical definition):
-  https://microservices.io/patterns/data/transactional-outbox.html
-- Debezium — Distributed Tracing (trace metadata in a dedicated outbox column,
-  resumed by the Event Router SMT, injected into message headers for the
-  consumer):
-  https://debezium.io/documentation/reference/stable/integrations/tracing.html
-- Coding Militia — Transactional outbox pattern meets distributed tracing and
-  OpenTelemetry (practitioner walkthrough of storing serialized trace context in
-  the outbox record):
-  https://blog.codingmilitia.com/2024/06/17/transactional-outbox-pattern-meets-distributed-tracing-and-opentelemetry/
+- [OpenTelemetry — Semantic conventions for messaging spans][OTel] (span links
+  as the default correlation; message creation context attached to the message,
+  ideally not changeable by intermediaries)
+- [CloudEvents — Distributed Tracing Extension v1.0.2][CloudEvents]
+  (`traceparent`/`tracestate` on the event envelope as historical/creation-time
+  data; not intended to replace transport headers)
+- [W3C — Trace Context][W3C] (`traceparent` / `tracestate` format)
+- [Chris Richardson — Pattern: Transactional outbox][Richardson] (canonical
+  definition)
+- [Debezium — Distributed Tracing][Debezium] (trace metadata in a dedicated
+  outbox column, resumed by the Event Router SMT, injected into message headers
+  for the consumer)
+- [Coding Militia — Transactional outbox pattern meets distributed tracing and
+  OpenTelemetry][Coding Militia] (practitioner walkthrough of storing serialized
+  trace context in the outbox record)
+
+[OTel]: https://opentelemetry.io/docs/specs/semconv/messaging/messaging-spans/
+[CloudEvents]: https://github.com/cloudevents/spec/blob/v1.0.2/cloudevents/extensions/distributed-tracing.md
+[W3C]: https://www.w3.org/TR/trace-context/
+[Richardson]: https://microservices.io/patterns/data/transactional-outbox.html
+[Debezium]: https://debezium.io/documentation/reference/stable/integrations/tracing.html
+[Coding Militia]: https://blog.codingmilitia.com/2024/06/17/transactional-outbox-pattern-meets-distributed-tracing-and-opentelemetry/
