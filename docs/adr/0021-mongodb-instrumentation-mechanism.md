@@ -66,6 +66,16 @@ unused" — and therefore unblocks ADR 0014 Option B.
 5. **Asynchronous trace context** is directed to the outbox / message-envelope
    approach (see "Asynchronous tracing direction"); the full design is out of
    scope for this ADR and, if pursued, belongs in a separate ADR.
+6. **Expose an instrumentation entry point for application-built clients.**
+   Beyond a URI-only `Connect`, the package MUST let an application that builds
+   its own `*options.ClientOptions` (for `SetAuth`, pool sizing, read/write
+   concerns, …) attach o11y instrumentation **without surrendering client
+   construction** — via an `Instrument(opts, tp, mp, prop)` decorator and/or a
+   `NewMonitor(tp, mp) *event.CommandMonitor` builder. This is required because
+   a URI-only `Connect` cannot express credentials passed through
+   `options.Credential` (the common case), and it keeps integration a one-line
+   change for services that already centralize client construction. See
+   "Adoption surface" below.
 
 ---
 
@@ -183,6 +193,47 @@ scope here and, if pursued, warrants its own ADR.
 
 ---
 
+## Adoption surface — instrumenting an application-built client
+
+The mechanism must support the common downstream shape: a service that already
+centralizes MongoDB client construction in one helper and types all of its
+repositories against the plain `go.mongodb.org/mongo-driver/v2` types.
+
+A representative public example is **`github.com/hmchangw/chat`** (a Go
+microservice monorepo, already on driver v2 v2.5.0, **no change streams**):
+every service obtains its client from a single
+`pkg/mongoutil.Connect(...)` that builds `*options.ClientOptions` (including
+`SetAuth`) and returns a plain `*mongo.Client`; all repositories
+(`store_mongo.go`, `history-service/internal/mongorepo/*`, …) are typed on
+`*mongo.Database` / `*mongo.Collection`.
+
+Under this ADR such a project integrates with **no repository or business-code
+changes**:
+
+- The single client-builder calls `o11ymongo.Instrument(opts, tp, mp, prop)`
+  before `mongo.Connect(opts)` — one line; auth and pool options untouched.
+- The returned `*mongo.Client` is unchanged in type, so every repository keeps
+  compiling as-is. This is exactly the property the wrapper approach could
+  **not** provide: Marz's `Database()` returns a wrapped type that does not
+  match a `*mongo.Database` parameter, which would force either signature
+  churn across every repo or an unwrap that loses spans.
+- `o11ymongo.MetricViews()` is composed into the MeterProvider once at startup.
+
+Net effect for `chat`: edits confined to `pkg/mongoutil` (one line) and
+provider sourcing at each `main.go`; the ~dozen repositories and all query code
+are untouched. Document propagation is irrelevant here (no change streams), so
+nothing is lost by dropping it.
+
+The only non-MongoDB friction is provider sourcing: such projects often rely on
+OpenTelemetry **globals** (e.g. `chat`'s `pkg/otelutil` calls
+`otel.SetTracerProvider`), whereas o11y supplies **explicit** providers
+(ADR 0003). Bridging that — passing `obs.TracerProvider()` /
+`obs.MeterProvider()` / `obs.Propagator`, or setting the globals once at
+bootstrap — is a cross-cutting integration step, not a MongoDB-specific one.
+
+This case is the motivating reason Decision point 6 requires an
+instrument/monitor entry point rather than a URI-only `Connect`.
+
 ## Alternatives considered
 
 - **Keep Marz + add `type Database = …` aliases in `o11y/mongo`** (so callers
@@ -244,7 +295,10 @@ other ADR is modified by this document**:
 
 - `mongo/client.go`: replace the Marz wrapper with the contrib monitor emitting
   spans + metrics; return a plain `*mongo.Client`; drop
-  `WithDocumentTracePropagation`.
+  `WithDocumentTracePropagation`. Add the `Instrument(opts, tp, mp, prop)`
+  decorator and `NewMonitor(tp, mp) *event.CommandMonitor` builder (Decision
+  point 6) so applications that build their own client options (auth/pool) can
+  attach instrumentation without a URI-only `Connect`.
 - Tests / `examples/mongodb` / README: drop `_oteltrace` usage
   (`examples/mongodb/main.go`, `mongo/client_test.go`) and simplify call sites.
 - `mongo/doc.go`: update the Tier annotation (single maintained-lib T2).
