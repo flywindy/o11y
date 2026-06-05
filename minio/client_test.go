@@ -3,6 +3,7 @@ package minio
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -224,6 +225,95 @@ func TestStatObject_404_GeneratesErrorSpan(t *testing.T) {
 	}
 	if !hasMetric(collected, "minio.client.operation.duration") {
 		t.Errorf("metric minio.client.operation.duration not recorded")
+	}
+}
+
+// TestPutObject_UnknownLength_RecordsSizeFromUploadInfo verifies that
+// when a caller passes objectSize = -1 (stream of unknown length), the
+// wrapper folds the resolved byte count from UploadInfo.Size back onto
+// the span on success — matching the FPutObject / StatObject paths so
+// observers see a real size regardless of whether the caller knew it
+// up front (ADR 0018 §4).
+func TestPutObject_UnknownLength_RecordsSizeFromUploadInfo(t *testing.T) {
+	const fakeETag = `"d41d8cd98f00b204e9800998ecf8427e"`
+	// minio-go's PutObject with objectSize=-1 forces a multipart upload.
+	// Implement the three endpoints it dials so the call can complete and
+	// surface a real UploadInfo.Size.
+	initBody := `<?xml version="1.0" encoding="UTF-8"?>` +
+		`<InitiateMultipartUploadResult><Bucket>media</Bucket>` +
+		`<Key>stream</Key><UploadId>UPLOAD-1</UploadId></InitiateMultipartUploadResult>`
+	completeBody := `<?xml version="1.0" encoding="UTF-8"?>` +
+		`<CompleteMultipartUploadResult><Location>http://x/media/stream</Location>` +
+		`<Bucket>media</Bucket><Key>stream</Key><ETag>` + fakeETag + `</ETag>` +
+		`</CompleteMultipartUploadResult>`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("x-amz-request-id", "TEST")
+		if r.Body != nil {
+			_, _ = io.Copy(io.Discard, r.Body)
+			_ = r.Body.Close()
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Has("location"):
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><LocationConstraint></LocationConstraint>`))
+		case r.Method == http.MethodPost && r.URL.Query().Has("uploads"):
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(initBody))
+		case r.Method == http.MethodPost && r.URL.Query().Get("uploadId") != "":
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(completeBody))
+		case r.Method == http.MethodPut:
+			w.Header().Set("ETag", fakeETag)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	mr := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(mr))
+
+	client, err := New(stripScheme(server.URL), &miniogo.Options{
+		Creds:  credentials.NewStaticV4("key", "secret", ""),
+		Secure: false,
+	}, tp, mp, propagation.NewCompositeTextMapPropagator())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	payload := strings.Repeat("a", 1024)
+	info, err := client.PutObject(context.Background(), "media", "stream", strings.NewReader(payload),
+		-1, miniogo.PutObjectOptions{PartSize: 5 * 1024 * 1024})
+	if err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+	if info.Size <= 0 {
+		t.Fatalf("expected UploadInfo.Size > 0, got %d", info.Size)
+	}
+
+	spans := recorder.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want 1", len(spans))
+	}
+	attrs := spans[0].Attributes()
+	var sizeAttr *attribute.KeyValue
+	for i := range attrs {
+		if string(attrs[i].Key) == "object_store.object.size" {
+			sizeAttr = &attrs[i]
+			break
+		}
+	}
+	if sizeAttr == nil {
+		t.Fatalf("missing object_store.object.size on span; got %v", attrs)
+	}
+	if got := sizeAttr.Value.AsInt64(); got != info.Size {
+		t.Errorf("object_store.object.size = %d, want %d (UploadInfo.Size)", got, info.Size)
 	}
 }
 
