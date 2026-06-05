@@ -51,11 +51,14 @@ unused" — and therefore unblocks ADR 0014 Option B.
    `db.client.operation.duration` from one maintained library, wired via
    `clientOptions.SetMonitor(...)` with a real `TracerProvider` and
    `MeterProvider`. This is ADR 0014 §Q1 **Option B**, now unblocked.
-2. **Drop the Marz wrapper.** `mongo.Connect` returns a plain driver
-   `*mongo.Client` (or a thin struct embedding it that adds nothing to the call
-   surface), so application code uses **plain `go.mongodb.org/mongo-driver/v2`
-   types end-to-end** — no wrapper types threaded through signatures, no
-   wrapped result types, and no "unwrap loses spans" foot-gun.
+2. **Drop the Marz wrapper.** `mongo.Connect` returns a **plain driver
+   `*mongo.Client`** (not a wrapper type), so application code uses **plain
+   `go.mongodb.org/mongo-driver/v2` types end-to-end** — no wrapper types
+   threaded through signatures, no wrapped result types, and no "unwrap loses
+   spans" foot-gun. Any teardown that instrumentation needs (the Phase 2 pool
+   observable) is handled by a returned cleanup func, **not** by reintroducing a
+   wrapper type to host a `Disconnect` override — see point 6 and "Pool-metric
+   lifecycle".
 3. **Withdraw document trace propagation from this package** (supersedes
    ADR 0005 §4). `_oteltrace` injection, the `WithDocumentTracePropagation`
    option, and the synthetic delivery tracer are removed.
@@ -70,12 +73,35 @@ unused" — and therefore unblocks ADR 0014 Option B.
    Beyond a URI-only `Connect`, the package MUST let an application that builds
    its own `*options.ClientOptions` (for `SetAuth`, pool sizing, read/write
    concerns, …) attach o11y instrumentation **without surrendering client
-   construction** — via an `Instrument(opts, tp, mp, prop)` decorator and/or a
-   `NewMonitor(tp, mp) *event.CommandMonitor` builder. This is required because
-   a URI-only `Connect` cannot express credentials passed through
+   construction** — via an `Instrument(opts, tp, mp, prop) (func(context.Context) error, error)`
+   decorator and/or a `NewMonitor(tp, mp) *event.CommandMonitor` builder. This is
+   required because a URI-only `Connect` cannot express credentials passed through
    `options.Credential` (the common case), and it keeps integration a one-line
-   change for services that already centralize client construction. See
-   "Adoption surface" below.
+   change for services that already centralize client construction. Two
+   semantics are normative:
+   - **Monitor composition, not overwrite.** `*options.ClientOptions` holds
+     exactly one `CommandMonitor` slot and `SetMonitor` replaces it. `Instrument`
+     MUST detect an existing monitor and **fan out** (compose into one monitor
+     that dispatches `Started`/`Succeeded`/`Failed` to both) rather than clobber
+     it. The docs MUST also warn that calling `SetMonitor` *after* `Instrument`
+     reverses the problem and drops o11y's monitor.
+   - **Returned cleanup func (Option A lifecycle).** `Instrument` returns a
+     cleanup `func` the caller invokes at shutdown. In Phase 1 it is a **no-op**
+     (the `CommandMonitor` is a passive struct with nothing to unregister); in
+     Phase 2 it unregisters the pool observable. Returning it from the start
+     keeps adding Phase 2 non-breaking. See "Pool-metric lifecycle".
+
+   See "Adoption surface" below.
+7. **Command spans are always-on, governed solely by the sampler.** The two
+   Marz env gates — `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` and
+   `OTEL_MONGO_TRACING_ENABLED` — are **dropped**, not reproduced. Command spans
+   are emitted unconditionally and their volume is controlled by the
+   `TracerProvider`'s sampler (ADR 0015), exactly like every other span in the
+   SDK. Rationale: gating telemetry behind bespoke env vars is an upstream
+   Marz-ism, inconsistent with the always-on metric (ADR 0014) and with how o11y
+   centralizes sampling/export in `Init`. This is a behaviour change for any
+   caller that relied on the gate to suppress spans; acceptable pre-1.0 and
+   called out in the CHANGELOG.
 
 ---
 
@@ -83,12 +109,16 @@ unused" — and therefore unblocks ADR 0014 Option B.
 
 ADR 0005's choice of the Marz wrapper over a command monitor rested on a single
 premise: that we wanted document-level trace propagation — the one capability a
-`CommandMonitor` structurally cannot provide. We have since decided that
-propagating trace context **into business documents is an anti-pattern we will
-not adopt** (it mutates the system-of-record; the forced `$set._oteltrace` on
-every update corrupts update semantics; and trace and document lifetimes
-diverge), and that asynchronous trace context belongs on an **outbox / message
-envelope**, not the business entity.
+`CommandMonitor` structurally cannot provide. We have since decided that the
+**automatic, hidden mutation of business entities by the SDK** is an
+anti-pattern we will not adopt (it mutates the system-of-record; the forced
+`$set._oteltrace` on every update corrupts update semantics; and trace and
+document lifetimes diverge), and that asynchronous trace context belongs on an
+**outbox / message envelope**, not the business entity. (To be precise about
+scope: the rejected thing is the SDK silently stamping arbitrary business
+documents — *not* persisting trace context in general. A deliberately modelled
+outbox/event record may itself be a MongoDB document or sub-document and is
+explicitly **not** what we reject; see "Asynchronous tracing direction".)
 
 With that premise removed, the wrapper provides **no capability the official
 contrib `otelmongo` CommandMonitor does not** — so we are paying the wrapper's
@@ -135,6 +165,31 @@ off the shelf, which ADR 0014 already relies on for metrics.
 
 ---
 
+## Acceptance criteria — audit before this ADR is Accepted
+
+This reversal hinges on the premise that document propagation is unused, so that
+premise must be verified, not assumed. The following MUST hold before flipping
+this ADR to Accepted:
+
+1. **No consumer reads/writes `_oteltrace`.** Grep every consumer service (and
+   this repo) for `_oteltrace` / `TraceMetadataKey` / `WithDocumentTracePropagation`
+   — no production dependency. (In-tree, only `examples/mongodb/main.go` and
+   `mongo/client_test.go` reference it; both are ours and are removed by the
+   implementing PR. As one downstream data point, `github.com/hmchangw/chat`
+   uses no change streams and no `_oteltrace`.)
+2. **No consumer depends on Marz wrapper types** (`marzmongo.*` / the wrapped
+   `Database`/`Collection`/result types).
+3. **No consumer relies on the Marz env-gate semantics** being the thing that
+   turns command spans on/off (relevant to Decision point 7).
+4. **Named owner sign-off** for removing the public `WithDocumentTracePropagation`
+   option and changing span shape (breaking, pre-1.0).
+
+If any of (1)–(3) fails for a real consumer, that consumer's async needs are
+re-evaluated against the outbox/envelope direction before removal, or the
+removal is staged behind a deprecation.
+
+---
+
 ## Why document propagation into business documents is an anti-pattern
 
 This is **not** an internal stylistic preference; it diverges from established
@@ -164,9 +219,16 @@ async-tracing practice across every normative and reference source.
   trace from there — never in the business entity. [Richardson] [Debezium]
 
 Across every source, the approved carrier is the message envelope / outbox event
-record / transport headers. None is the business document. Marz's
+record / transport headers. None is the business entity. Marz's
 `_oteltrace`-in-document mechanism is therefore a deviation from established
 practice, which is why we **decline** it rather than merely disable it.
+
+**What is in scope.** The objection is specifically the SDK *automatically and
+invisibly mutating the business entity*. It is not a ban on persisting trace
+context: an outbox/event record is itself a stored document (often in the same
+MongoDB), and putting `traceparent` there is correct — because that record is a
+deliberately modelled envelope, not the business entity, and the application,
+not a hidden SDK hook, decides to write it.
 
 **Honest limit of these citations.** No specification literally says "do not
 write `traceparent` into a business MongoDB document"; that is the contrapositive
@@ -234,6 +296,56 @@ bootstrap — is a cross-cutting integration step, not a MongoDB-specific one.
 This case is the motivating reason Decision point 6 requires an
 instrument/monitor entry point rather than a URI-only `Connect`.
 
+## Span-shape migration (Marz → contrib)
+
+Span shape changes; this is the principal operational cost. Dashboards, Tempo
+queries, and alerts keyed on the Marz shapes must be migrated. Verified against
+the pinned contrib version (`config.go` / `mongo.go`) and Marz `semconv.go`;
+re-verify if the contrib pin is bumped.
+
+| Aspect | Marz (current) | Contrib `otelmongo` (0021) |
+|---|---|---|
+| Span name | `"<op> <collection>"` (space, *logical* op): `insert messages`, `find messages`, `aggregate messages` (Watch→`aggregate`) | `"<collection>.<command>"` (dot, *wire command*): `messages.insert`, `messages.find`, `messages.getMore`; `<command>` if no collection |
+| Operation vocabulary | logical: insert/find/update/delete/aggregate/distinct/bulkWrite | wire commands, incl. `getMore`/`createIndexes`/`listIndexes`/`ping`/… |
+| Granularity | one span per application call | one span per wire command (Find+getMore → multiple; bulkWrite / transactions split) |
+| Span kind | Client (+ optional Consumer "deliver" spans) | Client only |
+| Address attrs | `server.address` / `server.port` | `network.peer.address` / `network.peer.port` |
+| Other attrs | `db.system.name`, `db.namespace`, `db.collection.name`, `db.operation.name` | same + `network.transport=tcp` |
+| `db.query.text` | not emitted | **not emitted by default** (`CommandAttributeDisabled` defaults `true` in the pin); opt-in via `WithCommandAttributeDisabled(false)` |
+| Error | `RecordError` + `SetStatus(Error)` | `SetStatus(Error, msg)` on `Failed`; `error.type` is on the **metric**, not the span |
+| Env gate | `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` + `OTEL_MONGO_TRACING_ENABLED` | none — sampler-governed (Decision point 7) |
+
+Migration checklist for consumers: update span-name queries
+(`insert messages` → `messages.insert`), swap `server.*` → `network.peer.*` in
+attribute filters, and expect additional `getMore` spans on cursor-heavy reads.
+
+---
+
+## Pool-metric lifecycle (ADR 0014 Phase 2)
+
+ADR 0014 Phase 2 planned to unregister the pool observable via a `Disconnect`
+override on the **wrapper** `*mongo.Client`. Returning a plain `*mongo.Client`
+removes that host, so this ADR fixes the lifecycle as **Option A**:
+
+- `Instrument(...)` attaches the `CommandMonitor` (Phase 1) and, in Phase 2, the
+  `PoolMonitor` plus the observable registered on the `MeterProvider`. It returns
+  a **cleanup func** that calls `registration.Unregister()`. The application
+  invokes it at shutdown (typically alongside its existing `client.Disconnect`).
+- Phase 1 cleanup is a no-op; the signature is fixed now so Phase 2 is additive.
+- **Rejected — tie to `MeterProvider` shutdown:** zero app code, but it couples
+  each client's pool state to the provider's lifetime and **leaks callbacks** for
+  short-lived/repeated clients (tests, reconnect loops) until `obs.Shutdown()`.
+  May be offered later as an opt-in convenience for single-long-lived-client
+  apps, but not the default.
+- **Rejected — thin wrapper struct with `Disconnect()`:** reintroduces a
+  non-plain return type, undoing the core ergonomic win of Decision point 2
+  (`func(*mongo.Client)` parameters would not accept it).
+- `reset-on-`ConnectionPoolCleared`/`ConnectionPoolClosed`` (ADR 0014) still
+  applies so a disconnected-but-not-yet-cleaned client reports zeros, not stale
+  counters.
+
+---
+
 ## Alternatives considered
 
 - **Keep Marz + add `type Database = …` aliases in `o11y/mongo`** (so callers
@@ -267,17 +379,15 @@ instrument/monitor entry point rather than a URI-only `Connect`.
 - **We give up the ability to enable document propagation through this package.**
   Accepted: we have decided against it; async needs go through the outbox
   envelope instead.
-- **Span shape changes** (e.g. `network.peer.*` attributes, formatter-based span
-  names, per-wire-command granularity). ADR 0014 §Q1 already classified this as
-  a "trace rewrite / high" blast-radius change: existing Tempo queries,
-  dashboards, and alerts that depend on Marz span names/attributes must be
-  migrated. This is the principal cost of the reversal.
-- **Command-span gating changes.** Marz gated spans behind
-  `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` + `OTEL_MONGO_TRACING_ENABLED`
-  (ADR 0005); the contrib monitor reads no such env vars (ADR 0014). If gated
-  command spans are still wanted, the gate must be reproduced in this package
-  (e.g. swap in a noop tracer when disabled — the same mechanism ADR 0014
-  already uses), otherwise spans become always-on.
+- **Span shape changes** (span names, `server.*` → `network.peer.*`,
+  per-wire-command granularity). ADR 0014 §Q1 classified this as a
+  "trace rewrite / high" blast-radius change: existing Tempo queries, dashboards,
+  and alerts that depend on Marz span names/attributes must be migrated. This is
+  the principal cost of the reversal — see "Span-shape migration" for the full
+  matrix and consumer checklist.
+- **Command spans become always-on** (Decision point 7): the two Marz env gates
+  are dropped, so a process that previously left them unset and got no command
+  spans will now emit them (subject to the sampler). Documented in the CHANGELOG.
 - **Parent-span linkage** now relies on the v2 driver propagating the operation
   `context.Context` into the monitor callbacks (the contrib monitor opens the
   span from that ctx). This is the expected v2 behavior but should be verified
@@ -295,10 +405,15 @@ other ADR is modified by this document**:
 
 - `mongo/client.go`: replace the Marz wrapper with the contrib monitor emitting
   spans + metrics; return a plain `*mongo.Client`; drop
-  `WithDocumentTracePropagation`. Add the `Instrument(opts, tp, mp, prop)`
-  decorator and `NewMonitor(tp, mp) *event.CommandMonitor` builder (Decision
-  point 6) so applications that build their own client options (auth/pool) can
-  attach instrumentation without a URI-only `Connect`.
+  `WithDocumentTracePropagation`. Add `Instrument(opts, tp, mp, prop) (func(context.Context) error, error)`
+  (composing/fanning-out with any existing `CommandMonitor`, not overwriting it;
+  returning a cleanup func — no-op in Phase 1) and a
+  `NewMonitor(tp, mp) *event.CommandMonitor` builder (Decision point 6).
+- Give the contrib monitor a real `TracerProvider` (no noop) and **do not**
+  reproduce the `OTEL_*_ENABLED` gates (Decision point 7); confirm `error.type`
+  lands on the metric and parent-span linkage works end-to-end on driver v2.
+- ADR 0014: cross-update the Phase 2 lifecycle from a wrapper `Disconnect`
+  override to the cleanup func returned by `Instrument` (Pool-metric lifecycle).
 - Tests / `examples/mongodb` / README: drop `_oteltrace` usage
   (`examples/mongodb/main.go`, `mongo/client_test.go`) and simplify call sites.
 - `mongo/doc.go`: update the Tier annotation (single maintained-lib T2).
