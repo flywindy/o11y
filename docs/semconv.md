@@ -287,7 +287,7 @@ provides the dual-emit mechanism.
 | `object_store.operation.name` | string | Logical operation: `PutObject`, `FPutObject`, `FGetObject`, `GetObject`, `StatObject`, `RemoveObject`, `CopyObject`, `ListObjects`. |
 | `object_store.bucket.name` | string | Bucket the operation targets. |
 | `object_store.object.key` | string | Object key. Controlled by `minio.WithObjectKeyAttribute` (default on). Span attribute only — never a metric label. |
-| `object_store.object.size` | int | Bytes. Set only when a real byte count is known: PutObject when caller-supplied size `>= 0` (a `-1` "unknown stream" is omitted, not recorded as `-1`); FPutObject from `UploadInfo.Size`; StatObject from `ObjectInfo.Size`. Downloads do not populate this in v1. |
+| `object_store.object.size` | int | Bytes. Set only when a real byte count is known: PutObject from caller-supplied size `>= 0`, or from `UploadInfo.Size` after a successful unknown-length upload (`-1` is never recorded as bytes); FPutObject from `UploadInfo.Size`; StatObject from `ObjectInfo.Size`. Downloads do not populate this in v1. |
 | `error.type` | string | Go type name (e.g. `context.DeadlineExceeded`, `*net.OpError`) or the S3 wire code from `minio.ToErrorResponse(err).Code` (e.g. `NoSuchKey`). |
 | `minio.error.kind` | string | SDK-owned closed enum: `client_canceled`, `client_timeout`, `not_found`, `access_denied`, `precondition`, `throttled`, `transport`, `server_error`, `unknown`. Span-only — never a metric label. |
 | `aws.s3.bucket` | string | Opt-in via `minio.WithAWSS3CompatAttributes(true)`; dual-emitted alongside `object_store.bucket.name`. Sourced from `semconv.AWSS3BucketKey`. |

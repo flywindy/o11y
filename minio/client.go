@@ -252,6 +252,9 @@ func (c *Client) PutObject(
 ) (miniogo.UploadInfo, error) {
 	o := c.begin(ctx, "PutObject", bucketName, objectName, objectSize)
 	info, err := c.Client.PutObject(o.ctx, bucketName, objectName, reader, objectSize, opts)
+	if err == nil && objectSize < 0 && info.Size >= 0 {
+		o.span.SetAttributes(objectStoreObjectSizeKey.Int64(info.Size))
+	}
 	c.finish(o, err)
 	return info, err
 }
