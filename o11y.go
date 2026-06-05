@@ -24,6 +24,7 @@ import (
 	"github.com/flywindy/o11y/internal/metrics"
 	"github.com/flywindy/o11y/internal/profiling"
 	"github.com/flywindy/o11y/internal/trace"
+	o11yminio "github.com/flywindy/o11y/minio"
 	o11ymongo "github.com/flywindy/o11y/mongo"
 	o11yredis "github.com/flywindy/o11y/redis"
 	otelpyroscope "github.com/grafana/otel-profiling-go"
@@ -233,14 +234,17 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 
 	if cfg.metricsEnabled {
 		mp, closer, initErr := metrics.InitMeter(ctx, metrics.Config{
-			Resource:                res,
-			MetricsOTLPEndpoint:     cfg.metricsOTLPEndpoint,
-			OTLPHeaders:             cfg.otlpHeaders,
-			MetricsAddr:             cfg.metricsAddr,
-			RuntimeMetrics:          cfg.runtimeMetrics,
-			HistogramBuckets:        cfg.histogramBuckets,
-			DisableDefaultViews:     cfg.disableDefaultViews,
-			ExtraViews:              append(o11yredis.MetricViews(cfg.histogramBuckets), o11ymongo.MetricViews(cfg.histogramBuckets)...),
+			Resource:            res,
+			MetricsOTLPEndpoint: cfg.metricsOTLPEndpoint,
+			OTLPHeaders:         cfg.otlpHeaders,
+			MetricsAddr:         cfg.metricsAddr,
+			RuntimeMetrics:      cfg.runtimeMetrics,
+			HistogramBuckets:    cfg.histogramBuckets,
+			DisableDefaultViews: cfg.disableDefaultViews,
+			ExtraViews: append(
+				append(o11yredis.MetricViews(cfg.histogramBuckets), o11ymongo.MetricViews(cfg.histogramBuckets)...),
+				o11yminio.MetricViews(cfg.histogramBuckets)...,
+			),
 			MaxUniqueRoutes:         cfg.maxUniqueRoutes,
 			ExtraHTTPServerAttrKeys: cfg.extraHTTPServerAttrKeys,
 			Exemplars:               cfg.exemplars,

@@ -15,7 +15,7 @@ import (
 	"strings"
 )
 
-var integrationDirs = []string{"http", "nats", "mongo", "gin", "resty", "redis"}
+var integrationDirs = []string{"http", "nats", "mongo", "gin", "resty", "redis", "minio"}
 
 const otelModulePath = "go.opentelemetry.io/otel"
 
@@ -79,6 +79,7 @@ func instrumentationModules(path string) ([]string, error) {
 		module := fields[0]
 		if strings.HasPrefix(module, "go.opentelemetry.io/contrib/instrumentation/") ||
 			strings.HasPrefix(module, "github.com/Marz32onE/instrumentation-go/") ||
+			module == "github.com/minio/minio-go/v7" ||
 			module == "github.com/grafana/pyroscope-go" ||
 			module == "github.com/grafana/otel-profiling-go" {
 			modules = append(modules, module)

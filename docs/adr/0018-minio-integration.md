@@ -241,6 +241,26 @@ child-span layer; exposing a half-capable entry point invites the
 "why are my part spans missing" support load. Callers construct
 through `minio.New`.
 
+**Behavioral contracts** that fall out of the API but matter to
+callers:
+
+- **`prop` is accepted but intentionally unconsumed by the wrapper.**
+  Per §7 no trace context flows toward the storage backend; the
+  optional HTTP child-span layer constructs its own empty propagator.
+  `prop` is in the signature only for shape-parity with the other
+  o11y wrapper constructors (resty / mongo / redis), so application
+  code can pass `obs.Propagator` uniformly. Callers may pass a no-op
+  propagator with no behavioral difference.
+- **`New` never mutates the caller's `*miniogo.Options`.** Before
+  installing the instrumented transport, the wrapper takes a shallow
+  copy of `*minioOpts` and operates on the copy. The same
+  `*Options` value can therefore be reused for additional o11y
+  clients without inheriting an already-wrapped transport (which
+  would emit nested duplicate HTTP child spans / metrics), and reuse
+  for a raw `miniogo.New` client stays unaffected. A shallow copy is
+  sufficient because the only field the wrapper touches
+  (`Options.Transport`) is a top-level reference.
+
 ### 3. Metrics
 
 One histogram is created at `New` time:
@@ -341,8 +361,8 @@ mode, so cardinality is constant.
   | `object_store.operation.name` | `"PutObject"`, `"GetObject"`, … | always | `db.operation.name`, `messaging.operation.name`, `gen_ai.operation.name` (all use the `.operation.name` form) |
   | `object_store.bucket.name` | bucket | always | `messaging.destination.name`, `db.collection.name` (named container the operation targets) |
   | `object_store.object.key` | object key | controlled by `WithObjectKeyAttribute` (default on) | retains the S3 term-of-art "key" rather than overloading "name"; high cardinality, span-only |
-  | `object_store.object.size` | bytes (int) | only when a real byte count is known | **Uploads:** `PutObject`'s caller-supplied size is set only when `size >= 0`. minio-go uses `size = -1` to mean "stream of unknown length, read until EOF"; in that case the attribute is **omitted** rather than recorded as `-1`, which would be misleading. `FPutObject` reads the size from the returned `UploadInfo.Size` after the call succeeds (always known). **Downloads:** the wrapper has no observable response — `FGetObject` returns only `error`, and `GetObject` is lazy (§5) — so download size is not populated in v1. A caller that needs download-size visibility issues a `StatObject` first. |
-  | `server.address`, `server.port` | endpoint host/port | always | stable HTTP/network semconv — carries the truthful backend identity (e.g. `minio.internal:9000`), so no `cloud.provider` is set |
+  | `object_store.object.size` | bytes (int) | only when a real byte count is known | **Uploads:** `PutObject` sets the caller-supplied size when `size >= 0`. minio-go uses `size = -1` to mean "stream of unknown length, read until EOF"; in that case the wrapper omits the attribute at span start rather than recording `-1`, then fills it from `UploadInfo.Size` after a successful upload. `FPutObject` reads the size from the returned `UploadInfo.Size` after the call succeeds (always known). **Downloads:** the wrapper has no observable response — `FGetObject` returns only `error`, and `GetObject` is lazy (§5) — so download size is not populated in v1. A caller that needs download-size visibility issues a `StatObject` first. |
+  | `server.address`, `server.port` | endpoint host/port | always | stable HTTP/network semconv — carries the truthful backend identity (e.g. `minio.internal:9000`), so no `cloud.provider` is set. When the caller-supplied endpoint omits a port (e.g. `play.min.io`, `s3.amazonaws.com`), `server.port` is defaulted to **443 if `Options.Secure` is true, otherwise 80**, matching what minio-go actually dials; this keeps the §3 label set populated and bounded regardless of endpoint style. |
 
   Naming follows the OTel naming guide: dots as namespace
   separators, snake_case within a segment (e.g.

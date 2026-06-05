@@ -21,3 +21,5 @@ images:
     newName: internal-registry.example.com/grafana/alloy
   - name: prom/prometheus
     newName: internal-registry.example.com/prom/prometheus
+  - name: quay.io/minio/minio
+    newName: internal-registry.example.com/minio/minio

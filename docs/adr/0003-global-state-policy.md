@@ -144,6 +144,7 @@ Before introducing any `github.com/<vendor>/otel-<thing>` library, verify:
 | `go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin` | v0.68.0 | ✅ | Reads globals as fallback only; safe when `WithTracerProvider`, `WithMeterProvider`, and `WithPropagators` are supplied. | See ADR 0010 |
 | `github.com/gin-gonic/gin` | v1.12.0 | ✅ | Pure HTTP framework; no OpenTelemetry provider globals. | See ADR 0010 |
 | `github.com/go-resty/resty/v2` | v2.17.2 | ✅ | Pure HTTP client; does not import OpenTelemetry or mutate provider globals. The SDK-owned `resty` wrapper wires providers explicitly. | See ADR 0011 |
+| `github.com/minio/minio-go/v7` | v7.2.0 | ✅ | Pure S3 client; does not import OpenTelemetry or mutate provider globals. The SDK-owned `minio` wrapper wires providers explicitly and only uses the public `Options.Transport` seam. | See ADR 0018 |
 
 When a new library is added or an existing one bumped, update this table
 in the same PR as the version change.
