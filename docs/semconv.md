@@ -262,6 +262,61 @@ the whitelisted baggage value onto this service's spans and SDK log records.
 
 ---
 
+## Object Storage - MinIO / S3 (package `github.com/flywindy/o11y/minio`)
+
+Spans and metrics are emitted by the SDK-owned `minio` wrapper for
+`github.com/minio/minio-go/v7`. The wrapper does not import any OTel
+contrib instrumentation; per-operation spans and the duration histogram
+come directly from this package. See ADR 0018 for the design and the
+ADR 0008 §2 evaluation that justifies the T3 sourcing.
+
+OTel object-store conventions are at status **Development** (only the
+AWS S3 page exists, under the AWS-SDK framing), so the schema below is
+package-local under the `object_store.*` namespace and shaped to mirror
+current OTel naming (`db.system.name` client-perceived-dialect model,
+`*.operation.name` form, snake_case-within-segment). When OTel mints a
+vendor-neutral object-store convention, the migration is expected to be
+a key rename, and the existing `WithAWSS3CompatAttributes` option
+provides the dual-emit mechanism.
+
+### Span Attributes
+
+| Key | Type | Notes |
+|---|---|---|
+| `object_store.system.name` | string | Constant `"s3"` — the client-perceived dialect (parallel to `db.system.name="postgresql"` when pgx connects to CockroachDB). The actual backend identity comes from `server.address`, not from this key. |
+| `object_store.operation.name` | string | Logical operation: `PutObject`, `FPutObject`, `FGetObject`, `GetObject`, `StatObject`, `RemoveObject`, `CopyObject`, `ListObjects`. |
+| `object_store.bucket.name` | string | Bucket the operation targets. |
+| `object_store.object.key` | string | Object key. Controlled by `minio.WithObjectKeyAttribute` (default on). Span attribute only — never a metric label. |
+| `object_store.object.size` | int | Bytes. Set only when a real byte count is known: PutObject when caller-supplied size `>= 0` (a `-1` "unknown stream" is omitted, not recorded as `-1`); FPutObject from `UploadInfo.Size`; StatObject from `ObjectInfo.Size`. Downloads do not populate this in v1. |
+| `error.type` | string | Go type name (e.g. `context.DeadlineExceeded`, `*net.OpError`) or the S3 wire code from `minio.ToErrorResponse(err).Code` (e.g. `NoSuchKey`). |
+| `minio.error.kind` | string | SDK-owned closed enum: `client_canceled`, `client_timeout`, `not_found`, `access_denied`, `precondition`, `throttled`, `transport`, `server_error`, `unknown`. Span-only — never a metric label. |
+| `aws.s3.bucket` | string | Opt-in via `minio.WithAWSS3CompatAttributes(true)`; dual-emitted alongside `object_store.bucket.name`. Sourced from `semconv.AWSS3BucketKey`. |
+| `aws.s3.key` | string | Opt-in alias of `object_store.object.key`. Sourced from `semconv.AWSS3KeyKey`. |
+| `server.address` | string | MinIO/S3 endpoint host from the caller-supplied endpoint. |
+| `server.port` | int | Endpoint port; defaulted from `Options.Secure` (443/80) when the endpoint omits a port. |
+
+### Instruments
+
+| Name | Kind | Unit | Attributes |
+|---|---|---|---|
+| `minio.client.operation.duration` | Float64Histogram | `s` | `object_store.operation.name`, `object_store.bucket.name`, `server.address`, `server.port`, `error.type` |
+
+Cardinality is bounded by the `MetricViews()` allowlist installed via
+`o11y.Init`'s `ExtraViews` (mirrors the redis/mongo pattern). Services
+that build their own MeterProvider must register the same views via
+`sdkmetric.WithView(...)` at construction.
+
+### Explicitly NOT Emitted
+
+| Key | Reason |
+|---|---|
+| `cloud.provider` | The backend is not AWS; setting `aws` would be a lie. The endpoint host carries truthful backend identity. |
+| `rpc.system=aws-api` / `Service.Operation` span name | The AWS-SDK RPC framing from the experimental AWS-S3 semconv is rejected — minio-go is not the AWS SDK. The compat option (§4) is scoped to attribute-key aliasing only. |
+| `otel.status_code` metric label | Semconv defines values `OK`/`ERROR` only, with the attribute absent when status is `UNSET`; success/failure is encoded by the presence of `error.type` instead. |
+| `object_store.multipart.upload_id` / `object_store.multipart.part_number` | Not emitted in v1: `minio-go`'s `UploadInfo` does not surface them and the optional HTTP child-span layer uses generic `otelhttp` with no S3-URL parser. Tracked under ADR 0018 Open Questions. |
+
+---
+
 ## Logs
 
 All log records pass through the `otelslog` bridge, which applies OTel Log
@@ -286,6 +341,8 @@ Data Model attributes automatically.
 | MongoDB operation metric `network.peer.*` labels | contrib `otelmongo` CommandMonitor | The maintained contrib instrumentation emits `network.peer.address` / `network.peer.port` for `db.client.operation.duration`; the SDK keeps those labels and filters out `network.transport` rather than forking the T2 dependency. See ADR 0014. |
 | `redis.error.kind` | `redis` wrapper | Redis-specific bounded error class that distinguishes pool exhaustion from caller cancellation/deadline without using it as a metric label. |
 | `resty.error.kind`, `resty.retry.exhausted` | `resty` wrapper | Resty-specific bounded failure class and retry-budget marker. Standard `error.type` remains present; these keys preserve operator-facing retry and transport semantics without adding metric cardinality. |
+| `object_store.*` namespace (`system.name`, `operation.name`, `bucket.name`, `object.key`, `object.size`) | `minio` wrapper | OTel object-store semconv is at status Development and only the AWS-S3 page exists, framed as AWS-SDK / `rpc.system=aws-api`. The SDK-owned `object_store.*` namespace is package-local but shaped to mirror current OTel naming patterns; future migration to a blessed convention is expected to be a key rename. See ADR 0018 §4 and References. |
+| `minio.error.kind`, `minio.client.operation.duration` | `minio` wrapper | MinIO-specific bounded SRE classification (span-only) and per-operation duration histogram. No stable OTel object-store metric exists, so the instrument name stays package-local; standard `error.type` is co-emitted on spans and as the metric failure label. |
 
 Any new deviation must list:
 
