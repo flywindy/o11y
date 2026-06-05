@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 
@@ -223,6 +224,179 @@ func TestStatObject_404_GeneratesErrorSpan(t *testing.T) {
 	}
 	if !hasMetric(collected, "minio.client.operation.duration") {
 		t.Errorf("metric minio.client.operation.duration not recorded")
+	}
+}
+
+// TestWrappedMethods_EmitOperationSpan covers the remaining exported
+// wrapper methods (PutObject, FPutObject, FGetObject, GetObject,
+// RemoveObject, CopyObject, ListObjects). It uses one in-process
+// S3-shaped server that returns minimal-but-parseable responses, then
+// asserts that each invocation produces a single logical span with the
+// documented name and object_store.operation.name attribute, and that
+// the minio.client.operation.duration histogram is recorded — the
+// telemetry contract the wrapper owns.
+func TestWrappedMethods_EmitOperationSpan(t *testing.T) {
+	listBody := `<?xml version="1.0" encoding="UTF-8"?>` +
+		`<ListBucketResult><Name>media</Name>` +
+		`<Prefix></Prefix><KeyCount>0</KeyCount>` +
+		`<IsTruncated>false</IsTruncated></ListBucketResult>`
+	copyBody := `<?xml version="1.0" encoding="UTF-8"?>` +
+		`<CopyObjectResult><ETag>"abc123"</ETag>` +
+		`<LastModified>2026-06-04T00:00:00.000Z</LastModified></CopyObjectResult>`
+	const fakeETag = `"d41d8cd98f00b204e9800998ecf8427e"`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("x-amz-request-id", "TEST")
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("ETag", fakeETag)
+			w.Header().Set("Content-Length", "0")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			// List buckets responses come back via list-type query.
+			if strings.Contains(r.URL.RawQuery, "list-type=") {
+				w.Header().Set("Content-Type", "application/xml")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(listBody))
+				return
+			}
+			w.Header().Set("ETag", fakeETag)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("payload"))
+		case http.MethodPut:
+			// CopyObject sends x-amz-copy-source; reply with XML.
+			if r.Header.Get("X-Amz-Copy-Source") != "" {
+				w.Header().Set("Content-Type", "application/xml")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(copyBody))
+				return
+			}
+			w.Header().Set("ETag", fakeETag)
+			w.WriteHeader(http.StatusOK)
+		case http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	tmpDir := t.TempDir()
+	uploadPath := tmpDir + "/upload.bin"
+	if err := os.WriteFile(uploadPath, []byte("payload"), 0o600); err != nil {
+		t.Fatalf("seed upload file: %v", err)
+	}
+	downloadPath := tmpDir + "/download.bin"
+
+	cases := []struct {
+		name     string
+		wantSpan string
+		wantOp   string
+		invoke   func(t *testing.T, c *Client, ctx context.Context)
+	}{
+		{
+			name: "PutObject", wantSpan: "PutObject media", wantOp: "PutObject",
+			invoke: func(t *testing.T, c *Client, ctx context.Context) {
+				t.Helper()
+				_, _ = c.PutObject(ctx, "media", "key", strings.NewReader("payload"),
+					int64(len("payload")), miniogo.PutObjectOptions{})
+			},
+		},
+		{
+			name: "FPutObject", wantSpan: "FPutObject media", wantOp: "FPutObject",
+			invoke: func(t *testing.T, c *Client, ctx context.Context) {
+				t.Helper()
+				_, _ = c.FPutObject(ctx, "media", "key", uploadPath, miniogo.PutObjectOptions{})
+			},
+		},
+		{
+			name: "FGetObject", wantSpan: "FGetObject media", wantOp: "FGetObject",
+			invoke: func(t *testing.T, c *Client, ctx context.Context) {
+				t.Helper()
+				_ = c.FGetObject(ctx, "media", "key", downloadPath, miniogo.GetObjectOptions{})
+			},
+		},
+		{
+			name: "GetObject", wantSpan: "GetObject media", wantOp: "GetObject",
+			invoke: func(t *testing.T, c *Client, ctx context.Context) {
+				t.Helper()
+				obj, _ := c.GetObject(ctx, "media", "key", miniogo.GetObjectOptions{})
+				if obj != nil {
+					_ = obj.Close()
+				}
+			},
+		},
+		{
+			name: "RemoveObject", wantSpan: "RemoveObject media", wantOp: "RemoveObject",
+			invoke: func(t *testing.T, c *Client, ctx context.Context) {
+				t.Helper()
+				_ = c.RemoveObject(ctx, "media", "key", miniogo.RemoveObjectOptions{})
+			},
+		},
+		{
+			name: "CopyObject", wantSpan: "CopyObject dst", wantOp: "CopyObject",
+			invoke: func(t *testing.T, c *Client, ctx context.Context) {
+				t.Helper()
+				_, _ = c.CopyObject(ctx,
+					miniogo.CopyDestOptions{Bucket: "dst", Object: "destkey"},
+					miniogo.CopySrcOptions{Bucket: "media", Object: "key"})
+			},
+		},
+		{
+			name: "ListObjects", wantSpan: "ListObjects media", wantOp: "ListObjects",
+			invoke: func(t *testing.T, c *Client, ctx context.Context) {
+				t.Helper()
+				ch := c.ListObjects(ctx, "media", miniogo.ListObjectsOptions{})
+				for range ch { //nolint:revive // empty body is the idiomatic Go drain
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := tracetest.NewSpanRecorder()
+			tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+			mr := sdkmetric.NewManualReader()
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(mr))
+
+			client, err := New(stripScheme(server.URL), &miniogo.Options{
+				Creds:  credentials.NewStaticV4("key", "secret", ""),
+				Secure: false,
+			}, tp, mp, propagation.NewCompositeTextMapPropagator())
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+
+			tc.invoke(t, client, context.Background())
+
+			spans := recorder.Ended()
+			var match sdktrace.ReadOnlySpan
+			for i := range spans {
+				if spans[i].Name() == tc.wantSpan {
+					match = spans[i]
+					break
+				}
+			}
+			if match == nil {
+				names := make([]string, 0, len(spans))
+				for _, s := range spans {
+					names = append(names, s.Name())
+				}
+				t.Fatalf("want span %q, got %v", tc.wantSpan, names)
+			}
+			attrs := attrMap(match.Attributes())
+			mustAttr(t, attrs, "object_store.system.name", "s3")
+			mustAttr(t, attrs, "object_store.operation.name", tc.wantOp)
+
+			var collected sdkmetricdata.ResourceMetrics
+			if err := mr.Collect(context.Background(), &collected); err != nil {
+				t.Fatalf("collect metrics: %v", err)
+			}
+			if !hasMetric(collected, "minio.client.operation.duration") {
+				t.Errorf("metric minio.client.operation.duration not recorded")
+			}
+		})
 	}
 }
 
