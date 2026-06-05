@@ -130,15 +130,35 @@ stabilization, exactly as `db.cassandra.*` was (ADR 0019):
 |---|---|---|
 | `db.system.name` = `elasticsearch` | Required | constant (assert the emitted value — see caveat) |
 | `db.operation.name` | Recommended | endpoint id (e.g. `search`, `bulk`, `index`) |
-| `db.collection.name` | Recommended | index, when the endpoint addresses one |
+| `db.collection.name` | Recommended | **NOT emitted by upstream** — see ‡ |
 | `db.namespace` | Conditionally Required | ES cluster name — **replaces deprecated `db.elasticsearch.cluster.name`** |
 | `db.operation.parameter.<key>` | Conditionally Required | dynamic URL path segments mapped to names — **replaces deprecated `db.elasticsearch.path_parts.<key>`** |
 | `elasticsearch.node.name` | Recommended | node/instance the request was routed to (Elastic Cloud) — **replaces deprecated `db.elasticsearch.node.name`** (no `db.` prefix) |
 | `url.full` / `server.address` / `server.port` | Recommended | request target |
 | `http.request.method` | Recommended | underlying HTTP method |
-| `error.type` | Conditionally Required | on failed requests |
+| `error.type` | Conditionally Required | **NOT emitted by upstream** — see † |
 
 Span name follows the DB guidance (`db.operation.name` + target).
+
+**† `error.type` is not set by the pinned instrumentation.** Verified against
+`elastic-transport-go/v8 v8.8.0` (`elastictransport/instrumentation.go`):
+`RecordError` does only `span.SetStatus(codes.Error, …)` + `span.RecordError(err)`
+— it records an exception event and sets the span status, but sets **no**
+`error.type` attribute (no such constant exists in the package). A failed request
+is therefore observable via span **status = Error** and the recorded exception,
+not via an `error.type` attribute. Per the (a) Mongo-T2 posture the SDK accepts
+this rather than adding a normalization span-processor in v1; the compatibility
+test asserts *status-Error-without-`error.type`*, and `docs/semconv.md` records
+the gap. (A backend that needs `error.type` for ES is the trigger to add an
+SDK-owned normalization seam — same escalation path as the deferred metrics, §6.)
+
+**‡ `db.collection.name` is not set by the pinned instrumentation either.** The
+index is recorded **only** through `RecordPathPart` as the dynamic path variable
+`db.elasticsearch.path_parts.index` (current-semconv `db.operation.parameter.index`);
+the transport never emits `db.collection.name`. It is listed as the *semconv
+target* for completeness, but collection-keyed dashboards/queries will not match
+ES spans in v1 unless an SDK-owned seam derives `db.collection.name` from the
+`index` path part — out of scope for v1 (same accept-and-document stance as †).
 
 **Upstream attribute-drift caveat.** The first-party `elastic-transport-go`
 instrumentation predates this stabilization and is expected to emit the
@@ -258,7 +278,9 @@ command and outcome) before this ADR moves to Accepted, per ADR 0003.
   `db.operation.parameter.*`) for an index-addressing endpoint.
 - Search-body attribute is absent by default and present under
   `WithSearchBody(true)`.
-- A failed request sets `error.type` / records the span error.
+- A failed request sets span **status = Error** and records the exception
+  (via the upstream `RecordError`); the test asserts there is **no** `error.type`
+  attribute, matching the pinned `elastic-transport-go/v8 v8.8.0` behavior (§4 †).
 - Provider wiring: the facade passes the SDK `TracerProvider` (assert spans land
   on the supplied provider, not the global) and never calls `otel.SetX`.
 - A compatibility test pins the **exact attribute keys** the upstream emits

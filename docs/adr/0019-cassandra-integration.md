@@ -117,7 +117,6 @@ This mirrors `mongo.Connect` (the SDK builds the client) rather than
 // package cassandra (import as o11ycassandra "github.com/flywindy/o11y/cassandra")
 
 func NewSession(
-    ctx context.Context,
     cluster *gocql.ClusterConfig,
     tp trace.TracerProvider,
     mp metric.MeterProvider,
@@ -138,6 +137,18 @@ func WithAttributes(attrs ...attribute.KeyValue) Option
 - No `propagation.TextMapPropagator` parameter: Cassandra is a client-only
   database protocol with no inbound trace context to extract or outbound headers
   to inject (unlike NATS/Mongo document propagation).
+- **No `context.Context` parameter** (matching `redis.Wrap`, ADR 0013 §3, and
+  for a driver-specific reason). gocql v1.7.0's `NewSession(cfg ClusterConfig)`
+  takes no context and builds its session context from `context.TODO()`
+  internally (`session.go`: `ctx, cancel := context.WithCancel(context.TODO())`,
+  with the upstream comment *"TODO: we should take a context in here at some
+  point"*); the initial connection setup in `s.init()` runs under that context,
+  not a caller-supplied one. Accepting a `ctx` here would therefore be a **false
+  cancellation guarantee** — it could not cancel or deadline the initial dial.
+  Dial bounds come from the `ClusterConfig` (`ConnectTimeout` / `Timeout`)
+  instead. `NewSession` is a one-shot startup bootstrap, not a request-path call.
+  (If a future gocql adds a context-aware constructor, a cancellable seam is an
+  amendment then.)
 
 ### 4. Span model
 
@@ -147,18 +158,40 @@ tag, `ObservedQuery` and `ObservedBatch` carry **no query/batch identity field**
 (the `Query *Query` / `Batch *Batch` pointers exist only on later gocql trunk).
 The span model is shaped by what that seam can actually deliver:
 
-**Queries.** `ObserveQuery` "gets called on every query to cassandra, including
-all queries in an iterator when paging is enabled" — i.e. **once per query
-execution, and once per page**, *not* once per attempt. Retries are already
-collapsed by the driver into that single call, with the attempt count in
-`Attempt` / `Metrics.Attempts`. So the implementation emits **one span per
-`ObserveQuery` callback**, carrying the retry count as an attribute; there is no
-"open at attempt 0, merge later" model (the seam cannot support one and none is
-needed). A paged read produces one span per page — each page is a real round
-trip — sharing the caller's context so the pages sit under the same parent. Span
-name follows the DB guidance (`db.operation.name` + target, e.g.
+**Queries — `ObserveQuery` fires once per *attempt*, and once per page.**
+Verified against the v1.7.0 source, not the doc-comment summary alone:
+`queryExecutor.do` runs the retry/next-host loop and calls `attemptQuery` for
+each attempt; `attemptQuery` calls `qry.attempt(...)` after **every** driver
+attempt; and `(*Query).attempt` immediately invokes `q.observer.ObserveQuery(...)`
+(`query_executor.go` lines 55–63, 129–196; `session.go` `(*Query).attempt`).
+`ObservedQuery.Attempt` is documented as *"the index of attempt at executing this
+query. The first attempt is number zero and any retries have non-zero attempt
+number"* — i.e. retried and speculative executions deliver **multiple** callbacks,
+one per attempt, each a completed `Start`/`End` snapshot for the host actually
+contacted. The earlier "retries are collapsed into one callback" claim was wrong.
+
+Two seam-honest options follow, and v1 takes (a):
+
+- **(a) One CLIENT span per `ObserveQuery` callback** = one span per attempt and
+  per page. This is exactly what the historical `otelgocql` contrib emitted, and
+  it is the only model the bare observer can implement faithfully: each callback
+  is a standalone completed snapshot with no shared identity and no way to mutate
+  the caller's context for the next attempt. A retried/speculative query thus
+  produces **sibling attempt spans**, each carrying its `cassandra.coordinator.*`
+  host and its `Attempt` index, so retries and token-aware host changes are
+  *visible* rather than hidden. A paged read likewise produces one span per page
+  (each page is a real round trip), all sharing the caller's context.
+- **(b) One logical-operation span spanning all attempts** would require an
+  **SDK-owned query seam** (a wrapper that opens the parent span before execution
+  and threads it through retries), because the observer payload carries no query
+  identity and the callback cannot reach forward to later attempts. Deferred — it
+  is the same seam §4 introduces for batches, and is out of scope for v1.
+
+Span name follows the DB guidance (`db.operation.name` + target, e.g.
 `SELECT messages_by_room`), falling back to the operation name alone when the
-table cannot be parsed.
+table cannot be parsed. A unit test pins the callback/span multiplicity for the
+pinned gocql version (one span per attempt and per page, not one per logical
+query).
 
 **Batches.** `ObserveBatch` "gets called on every batch query to cassandra. It
 also gets called once for each query in a batch", and v1.7.0 exposes **no batch
@@ -259,12 +292,26 @@ contact point parses into host and port.
 
 | Metric | Type | Source |
 |---|---|---|
-| `cassandra.query.attempts` (SDK-owned name, pending a stable semconv equivalent) | counter | `ObservedQuery.Attempt` and `ObservedQuery.Metrics.Attempts` |
+| `cassandra.query.attempts` (SDK-owned name, pending a stable semconv equivalent) | counter | **`+1` per `ObserveQuery` callback** (each callback = exactly one attempt) |
 
-Both sources are accessible to the observer: `Attempt` and `Metrics` are
+**Increment by a fixed `1` per callback — do *not* add `Metrics.Attempts`.**
+Because `ObserveQuery` fires once per attempt (§4) and `(*Query).attempt` calls
+`q.metrics.attempt(1, ...)`, each callback represents exactly **one** attempt, so
+a plain `counter.Add(ctx, 1)` per callback yields the true attempt total. By
+contrast `ObservedQuery.Metrics.Attempts` (and `ObservedQuery.Attempt`) is a
+**cumulative per-host snapshot** — `queryMetrics.attempt` does
+`updateHostMetrics.Attempts += addAttempts` and returns a copy, and the field is
+documented as *"count of how many times this query has been attempted for this
+host"* (incremented by retries **and** by fetching the next page). Adding that
+snapshot on every callback would record `1 + 2 + 3 = 6` for a 3-attempt
+same-host query instead of `3`, corrupting the retry metric. The cumulative
+`Metrics.Attempts` is therefore used only as an *attribute* on the per-attempt
+span (current driver-side attempt index), never summed into the counter.
+
+These fields are reachable from our package: `Attempt` and `Metrics` are
 exported fields of `ObservedQuery`, and although the `hostMetrics` type name is
 unexported in gocql v1.7.0, its `Attempts` / `TotalLatency` fields are exported,
-so `q.Metrics.Attempts` compiles and reads correctly from our package.
+so `q.Metrics.Attempts` compiles and reads correctly.
 
 This is the signal server-side exporters **cannot** provide: client-side
 token-aware routing, retries, and speculative execution are driver decisions
@@ -346,12 +393,16 @@ without a live cluster by constructing synthetic `ObservedQuery` /
 - A failed `ObservedQuery` sets `error.type` and records the span error.
 - `db.query.text` is absent by default and present (statement only, no bound
   values) under `WithQueryText(true)`.
-- A multi-attempt `ObservedQuery` sequence produces one logical span with the
-  expected retry/speculative count, not N spans.
+- A multi-attempt `ObservedQuery` sequence produces **one span per attempt**
+  (sibling attempt spans, each with its `Attempt` index and coordinator host),
+  matching the gocql per-attempt callback semantics — not one collapsed span and
+  not a fabricated single logical span (§4 option (a)).
 - `db.client.operation.duration` is recorded with the documented labels and the
   SDK default histogram buckets; `MetricViews()` drops keys outside the
   allow-set.
-- The attempts counter reflects `ObservedQuery.Metrics.Attempts`.
+- The attempts counter increments by exactly `1` per `ObserveQuery` callback; a
+  3-attempt same-host sequence records `3` (verifying the counter does **not**
+  sum the cumulative `ObservedQuery.Metrics.Attempts` snapshot, §7.B).
 - Batch path mirrors the query path.
 - Integration test (build-tagged, `testcontainers-go` Cassandra, matching the
   consumer's own test posture) for the healthy path; kept out of default
