@@ -35,8 +35,9 @@ func NewOtelInstrumentation(provider trace.TracerProvider, captureSearchBody boo
 ```
 
 It is actively maintained (v8.x, updated 2026), emits `db.elasticsearch.*`
-semantic-convention attributes with `SpanKindClient`, captures dynamic URL path
-parts, and extracts Elastic Cloud cluster id / node name from response headers.
+semantic-convention attributes (the now-deprecated namespace — see §4) with
+`SpanKindClient`, captures dynamic URL path parts, and extracts Elastic Cloud
+cluster id / node name from response headers.
 
 ### ADR 0008 §2 evaluation — passes T2
 
@@ -44,7 +45,7 @@ parts, and extracts Elastic Cloud cluster id / node name from response headers.
 |---|---|
 | §2.1 ADR 0003 compliance | **Pass (to confirm by source read).** Takes a `trace.TracerProvider` explicitly; falls back to the OTel global only when `nil` is passed. Our facade always passes the SDK provider, so the fallback never fires. |
 | §2.2 Maintenance signal | **Pass.** First-party, maintained by the client vendor itself — the best signal of all. |
-| §2.3 Semconv alignment | **Pass with one caveat.** Emits the Elasticsearch DB semconv (`db.elasticsearch.path_parts.*`, `db.system`). The search-body attribute uses the legacy key `db.statement` rather than the current `db.query.text` — see §4. |
+| §2.3 Semconv alignment | **Pass with a documented drift.** Emits Elasticsearch DB attributes, but is expected to use the **deprecated** spellings — the whole `db.elasticsearch.*` namespace was dispersed in the DB stabilization (`node.name` → `elasticsearch.node.name`, `cluster.name` → `db.namespace`, `path_parts.*` → `db.operation.parameter.*`), and the search body uses `db.statement` rather than `db.query.text`. Accepted and documented per §4 (same posture as the Mongo T2 attribute exception). |
 | §2.4 Configurability | **Pass.** Span behavior and search-body capture are controllable; we do not need a fork. |
 | §2.5 Framework signal access | **Pass.** Endpoint id, index/path parts, and cluster/node identity are populated by the instrumentation. |
 
@@ -108,37 +109,45 @@ accepts a `TracerProvider`. Forcing an unused `mp`/`prop` through the facade
 would misrepresent what the integration does. The divergence is documented on
 the constructor and in this ADR.
 
-### 4. Span attributes (semconv v1.39.0) and the `db.statement` caveat
+### 4. Span attributes (semconv v1.39.0) and the upstream attribute-drift caveat
 
-Populated by the first-party instrumentation:
+The **target** (current v1.39.0) keys are below. Note that the whole
+`db.elasticsearch.*` namespace was deprecated and dispersed in the DB semconv
+stabilization, exactly as `db.cassandra.*` was (ADR 0019):
 
-| Attribute | Level | Notes |
+| Target attribute (v1.39.0) | Level | Notes / deprecated predecessor |
 |---|---|---|
-| `db.system.name` = `elasticsearch` | Required | constant (the SDK target key; see caveat below) |
+| `db.system.name` = `elasticsearch` | Required | constant (assert the emitted value — see caveat) |
 | `db.operation.name` | Recommended | endpoint id (e.g. `search`, `bulk`, `index`) |
 | `db.collection.name` | Recommended | index, when the endpoint addresses one |
-| `db.namespace` | — | not generally applicable to ES |
-| `db.elasticsearch.path_parts.<key>` | Conditionally Required | dynamic URL path segments mapped to names from the ES endpoint schema |
-| `db.elasticsearch.node.name` | Recommended | from response headers (Elastic Cloud) |
+| `db.namespace` | Conditionally Required | ES cluster name — **replaces deprecated `db.elasticsearch.cluster.name`** |
+| `db.operation.parameter.<key>` | Conditionally Required | dynamic URL path segments mapped to names — **replaces deprecated `db.elasticsearch.path_parts.<key>`** |
+| `elasticsearch.node.name` | Recommended | node/instance the request was routed to (Elastic Cloud) — **replaces deprecated `db.elasticsearch.node.name`** (no `db.` prefix) |
 | `url.full` / `server.address` / `server.port` | Recommended | request target |
 | `http.request.method` | Recommended | underlying HTTP method |
 | `error.type` | Conditionally Required | on failed requests |
 
 Span name follows the DB guidance (`db.operation.name` + target).
 
-**`db.statement` vs `db.query.text` caveat.** The upstream search-body attribute
-uses the legacy key `db.statement`; current semconv uses `db.query.text`. Two
-options, settled at implementation time against the pinned version:
+**Upstream attribute-drift caveat.** The first-party `elastic-transport-go`
+instrumentation predates this stabilization and is expected to emit the
+**deprecated** spellings — `db.elasticsearch.path_parts.<key>`,
+`db.elasticsearch.node.name`, `db.elasticsearch.cluster.name`, and `db.statement`
+for the search body (current: `db.query.text`). Because the instrumentation sets
+these on its own span, the SDK cannot rewrite them without a span-processor hack
+(heavier and fragile). The decision, per the §2.3/§2.4 trade-off:
 
-- **(a) Accept the upstream key** and document the drift in `docs/semconv.md`
-  (lowest blast radius; inherits an upstream fix for free when Elastic renames).
-- **(b) Normalize at the SDK boundary** — but the instrumentation sets the
-  attribute on its own span, so the SDK cannot rewrite span attributes without a
-  span-processor hack; this is heavier and fragile.
+- **(a) Accept the upstream keys** and document the drift in `docs/semconv.md`,
+  inheriting an upstream fix for free when Elastic catches up — **recommended**
+  (lowest blast radius), consistent with the Mongo T2 stance on attributes we
+  cannot override.
+- **(b) Normalize at the SDK boundary** via a span processor — rejected for v1
+  as disproportionate.
 
-Recommendation: **(a)**, and likewise verify whether the pinned version emits
-`db.system` vs `db.system.name` and record the exact emitted set (ADR 0006
-catch-up item) rather than assuming.
+A compatibility test (§Testing) pins the **exact** keys the pinned version
+emits — including `db.system` vs `db.system.name` and each `db.elasticsearch.*`
+vs its replacement — so this drift is recorded as fact, not assumed, and any
+upstream change is caught (ADR 0006).
 
 ### 5. Search-body capture is opt-in
 
@@ -230,8 +239,9 @@ command and outcome) before this ADR moves to Accepted, per ADR 0003.
 - `NewClient` rejects nil `tp`.
 - A request against a stub/`httptest` ES endpoint emits one CLIENT span with
   `db.system.name=elasticsearch` (or the upstream's emitted key — assert the
-  actual value, §4), `db.operation.name`, and `db.elasticsearch.path_parts.*`
-  for an index-addressing endpoint.
+  actual value, §4), `db.operation.name`, and the path-parts attribute the
+  upstream actually emits (deprecated `db.elasticsearch.path_parts.*` or current
+  `db.operation.parameter.*`) for an index-addressing endpoint.
 - Search-body attribute is absent by default and present under
   `WithSearchBody(true)`.
 - A failed request sets `error.type` / records the span error.
