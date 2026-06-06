@@ -101,21 +101,32 @@ re-instrumentation.
 Add to `nats/`:
 
 ```go
-// Respond replies to msg while preserving trace context, injecting the
-// active span context from ctx into the reply headers before sending.
-// It returns an error if msg is nil or if msg.Reply is empty, matching the
-// up-front validation the facade already does in Subscribe / QueueSubscribe.
+// Respond replies to msg over the traced publish path, preserving trace
+// context end to end. It returns an error if msg is nil or if msg.Reply is
+// empty, matching the up-front validation the facade already does in
+// Subscribe / QueueSubscribe.
 // Use this instead of msg.Respond, which routes through the raw NATS
 // connection and drops trace context (ADR 0004 §5).
 func (c *Conn) Respond(ctx context.Context, msg *natsgo.Msg, data []byte) error
 ```
 
-It is built **entirely from existing o11y primitives** — `Inject`
-(`nats/middleware.go`) to write headers, then `msg.RespondMsg`. No Marz API
-is touched, and it is not self-written instrumentation. It is a small T2
-ergonomic helper (ADR 0008 §T2: "framework-specific signal the upstream lib
-doesn't expose"). This structurally fixes the `msg.Respond` footgun that
-ADR 0004 §5 only documented — and that chat's `natsutil.ReplyJSON` /
+**Mechanism — route through the traced publish path, not `RespondMsg`.**
+`Respond` must be specified as *validation* (`msg != nil`, non-empty
+`msg.Reply`) followed by the **existing traced publish**, i.e.
+`c.Publish(ctx, msg.Reply, data)` (or an exactly equivalent helper) — which
+is precisely the workaround ADR 0004 §5 already recommends.
+
+It must **not** be `Inject` + raw `msg.RespondMsg`: `RespondMsg` bottoms out
+in raw `nats.Conn.PublishMsg`, so although headers would be carried, that
+path bypasses the o11y/Marz traced publish — **no producer send span, no
+`Nats-Trace-Dest`, no `TracingEnabled()` gate, no span error recording**.
+Going through `Publish` reuses the upstream's producer instrumentation
+(injection included) instead of re-implementing a lesser version of it.
+
+This stays a small T2 ergonomic helper (ADR 0008 §T2: "framework-specific
+signal the upstream lib doesn't expose"): no Marz API is forked and it is not
+self-written instrumentation. It structurally fixes the `msg.Respond` footgun
+that ADR 0004 §5 only documented — and that chat's `natsutil.ReplyJSON` /
 `natsrouter` currently trip (replies carry no trace context today).
 
 ### 2. The request/reply router stays in chat — NOT in o11y (HOLE ① option a)
@@ -243,10 +254,10 @@ This ADR is docs-only. The implementing work is intended to land as two PRs:
 - ADR 0003 / 0004 cross-references; CHANGELOG entry on implementation.
 - Decide the exact `Msg` method surface and whether `PushConsumer` is in or
   out of the first wrapper cut.
-- Document, in `docs/semconv.md`, the NATS attributes emitted by the upstream
-  library that are defined in the SDK's pinned Go `semconv` package — in
-  particular `messaging.operation.type` and `messaging.operation.name` (see
-  ADR 0004 §"Semconv Alignment").
+- `docs/semconv.md` already catalogs the emitted NATS attributes (including
+  `messaging.operation.type` and `messaging.operation.name`); verify and
+  update that catalog **if** the JetStream wrapper changes the emitted
+  attribute set, rather than treating it as new documentation.
 
 ---
 
