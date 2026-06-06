@@ -188,6 +188,13 @@ If any of (1)–(3) fails for a real consumer, that consumer's async needs are
 re-evaluated against the outbox/envelope direction before removal, or the
 removal is staged behind a deprecation.
 
+**Audit outcome (2026-06-06): satisfied.** The owner confirmed there are no
+other consumers — nothing outside this repo depends on `_oteltrace`, the Marz
+wrapper types, or the env-gate semantics (criteria 1–3). With owner sign-off
+(criterion 4), the gate is met and the ADR is Accepted. The only in-tree
+references (`examples/mongodb/main.go`, `mongo/client_test.go`) are ours and are
+removed by the implementing PR.
+
 ---
 
 ## Why document propagation into business documents is an anti-pattern
