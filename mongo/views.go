@@ -22,7 +22,7 @@ import (
 // duplicate, conflicting stream when both wrappers are active in the same
 // process.
 func MetricViews(histogramBuckets []float64) []sdkmetric.View {
-	return []sdkmetric.View{
+	views := []sdkmetric.View{
 		sdkmetric.NewView(
 			sdkmetric.Instrument{
 				Name:  "db.client.operation.duration",
@@ -42,4 +42,71 @@ func MetricViews(histogramBuckets []float64) []sdkmetric.View {
 			},
 		),
 	}
+
+	poolAttrs := attribute.NewAllowKeysFilter(
+		semconv.DBSystemNameKey,
+		semconv.DBClientConnectionPoolNameKey,
+		semconv.ServerAddressKey,
+		semconv.ServerPortKey,
+	)
+	views = append(views,
+		sdkmetric.NewView(
+			sdkmetric.Instrument{
+				Name:  "db.client.connection.count",
+				Scope: instrumentation.Scope{Name: instrumentationName},
+			},
+			sdkmetric.Stream{
+				AttributeFilter: attribute.NewAllowKeysFilter(
+					semconv.DBSystemNameKey,
+					semconv.DBClientConnectionPoolNameKey,
+					semconv.DBClientConnectionStateKey,
+					semconv.ServerAddressKey,
+					semconv.ServerPortKey,
+				),
+			},
+		),
+		sdkmetric.NewView(
+			sdkmetric.Instrument{
+				Name:  "db.client.connection.create_time",
+				Scope: instrumentation.Scope{Name: instrumentationName},
+			},
+			sdkmetric.Stream{
+				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
+					Boundaries: histogramBuckets,
+				},
+				AttributeFilter: poolAttrs,
+			},
+		),
+	)
+
+	for _, name := range []string{
+		"db.client.connection.idle.min",
+		"db.client.connection.max",
+		"db.client.connection.pending_requests",
+		"db.client.connection.timeouts",
+	} {
+		views = append(views, sdkmetric.NewView(
+			sdkmetric.Instrument{
+				Name:  name,
+				Scope: instrumentation.Scope{Name: instrumentationName},
+			},
+			sdkmetric.Stream{AttributeFilter: poolAttrs},
+		))
+	}
+
+	for _, name := range []string{
+		"db.client.connection.idle.max",
+		"db.client.connection.use_time",
+		"db.client.connection.wait_time",
+	} {
+		views = append(views, sdkmetric.NewView(
+			sdkmetric.Instrument{
+				Name:  name,
+				Scope: instrumentation.Scope{Name: instrumentationName},
+			},
+			sdkmetric.Stream{Aggregation: sdkmetric.AggregationDrop{}},
+		))
+	}
+
+	return views
 }

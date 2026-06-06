@@ -1,6 +1,7 @@
 # ADR 0021 — MongoDB Instrumentation Mechanism: replace the Marz wrapper with the contrib CommandMonitor
 
-**Status**: Accepted — implementation pending (separate PR)
+**Status**: Accepted — implemented; ADR 0014 Phase 2 pool lifecycle implemented
+as a follow-up.
 **Date**: 2026-06-05
 **Supersedes parts of**: ADR 0005 (§2 instrumentation mechanism, §4 document
 trace propagation)
@@ -86,10 +87,10 @@ unused" — and therefore unblocks ADR 0014 Option B.
      it. The docs MUST also warn that calling `SetMonitor` *after* `Instrument`
      reverses the problem and drops o11y's monitor.
    - **Returned cleanup func (Option A lifecycle).** `Instrument` returns a
-     cleanup `func` the caller invokes at shutdown. In Phase 1 it is a **no-op**
-     (the `CommandMonitor` is a passive struct with nothing to unregister); in
-     Phase 2 it unregisters the pool observable. Returning it from the start
-     keeps adding Phase 2 non-breaking. See "Pool-metric lifecycle".
+     cleanup `func` the caller invokes at shutdown. Phase 1 returned a no-op
+     because the `CommandMonitor` is a passive struct with nothing to
+     unregister; after ADR 0014 Phase 2 it unregisters the SDK-owned pool
+     observable. See "Pool-metric lifecycle".
 
    See "Adoption surface" below.
 7. **Command spans are always-on, governed solely by the sampler.** The two
@@ -339,7 +340,11 @@ removes that host, so this ADR fixes the lifecycle as **Option A**:
   `PoolMonitor` plus the observable registered on the `MeterProvider`. It returns
   a **cleanup func** that calls `registration.Unregister()`. The application
   invokes it at shutdown (typically alongside its existing `client.Disconnect`).
-- Phase 1 cleanup is a no-op; the signature is fixed now so Phase 2 is additive.
+- Phase 2 now uses the cleanup function to unregister the SDK-owned pool
+  observable. The `Connect(...)` helper unregisters automatically after the
+  driver emits `ConnectionPoolClosed` for the last known pool, preserving the
+  plain `*mongo.Client` return type without accumulating callbacks across
+  repeated connect/disconnect flows.
 - **Rejected — tie to `MeterProvider` shutdown:** zero app code, but it couples
   each client's pool state to the provider's lifetime and **leaks callbacks** for
   short-lived/repeated clients (tests, reconnect loops) until `obs.Shutdown()`.
@@ -348,9 +353,9 @@ removes that host, so this ADR fixes the lifecycle as **Option A**:
 - **Rejected — thin wrapper struct with `Disconnect()`:** reintroduces a
   non-plain return type, undoing the core ergonomic win of Decision point 2
   (`func(*mongo.Client)` parameters would not accept it).
-- Reset on `ConnectionPoolCleared` / `ConnectionPoolClosed` (ADR 0014) still
-  applies so a disconnected-but-not-yet-cleaned client reports zeros, not stale
-  counters.
+- Reset on `ConnectionPoolCleared` applies so cleared pools report zeros
+  instead of stale counters. `ConnectionPoolClosed` unregisters after the last
+  known pool closes.
 
 ---
 
@@ -406,16 +411,15 @@ removes that host, so this ADR fixes the lifecycle as **Option A**:
 
 ---
 
-## Follow-up (not part of this Proposed ADR)
+## Implementation follow-up
 
-Tracked here for the implementing PR once this ADR is Accepted; **no code or
-other ADR is modified by this document**:
+Tracked here for the implementing PRs after this ADR was accepted:
 
 - `mongo/client.go`: replace the Marz wrapper with the contrib monitor emitting
   spans + metrics; return a plain `*mongo.Client`; drop
   `WithDocumentTracePropagation`. Add `Instrument(opts, tp, mp, prop) (func(context.Context) error, error)`
   (composing/fanning-out with any existing `CommandMonitor`, not overwriting it;
-  returning a cleanup func — no-op in Phase 1) and a
+  returning a cleanup func) and a
   `NewMonitor(tp, mp) *event.CommandMonitor` builder (Decision point 6).
 - Give the contrib monitor a real `TracerProvider` (no noop) and **do not**
   reproduce the `OTEL_*_ENABLED` gates (Decision point 7); confirm `error.type`

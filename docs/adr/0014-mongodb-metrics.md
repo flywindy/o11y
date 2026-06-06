@@ -1,13 +1,20 @@
 # ADR 0014 — MongoDB Metrics
 
-**Status**: Accepted — Phase 1 (operation duration) implemented; Phase 2
-(connection pool metrics) pending (Option A; dual tier annotation at Phase 2)
+**Status**: Accepted — Phase 1 (operation duration) and Phase 2
+(connection pool metrics) implemented; ADR 0021 supersedes the original
+Phase 1 span mechanism and pool cleanup host.
 **Date**: 2026-05-25
 **Relates to**: ADR 0005 (MongoDB integration), ADR 0008 (sourcing policy),
 ADR 0013 (Redis/Valkey integration — reference for the pool-metric pattern)
 **Superseded in part by**: ADR 0021 (resolves the deferred Q1 Option B — spans
 move to the contrib monitor; Phase 2 pool-metric lifecycle moves from a wrapper
 `Disconnect` override to the cleanup func returned by `Instrument`)
+
+**Implementation note (2026-06-06)**: Phase 2 is implemented as an SDK-owned
+`event.PoolMonitor` in `mongo/`, emitting the connection-pool metrics below
+under the SDK's pinned semantic conventions. ADR 0021 means command spans and
+operation-duration metrics now both come from the official contrib monitor,
+while the pool metrics remain the justified T3 portion of this ADR.
 
 ---
 
@@ -123,8 +130,12 @@ go-redis's `PoolStats()`.
 Superseded by ADR 0021: because `mongo.Connect` now returns a plain driver
 `*mongo.Client` instead of a wrapper with a `Disconnect` override, pool-metric
 registration is cleaned up through the cleanup function returned by
-`mongo.Instrument(...)`. Phase 1 cleanup is a no-op; Phase 2 will use the same
-function to call `reg.Unregister()` for the pool observable.
+`mongo.Instrument(...)`. Phase 2 uses that function to call `reg.Unregister()`
+for the pool observable. The `mongo.Connect(...)` helper cannot return that
+cleanup function without changing its ergonomic contract, so its observer
+unregisters itself when the driver emits `ConnectionPoolClosed` for the last
+known pool. Services that need a last zero-value pool snapshot should use
+`Instrument(...)` directly and run cleanup after their final metrics flush.
 
 ---
 
@@ -151,19 +162,19 @@ func Connect(ctx, uri string, tp trace.TracerProvider, mp metric.MeterProvider,
 
 - Phase 1 metric → **T2** (contrib lib). Phase 2 pool metrics → **justified
   T3** (no candidate implements a pool observer).
-- `mongo/doc.go` Tier line must be updated to reflect the mixed sourcing once
-  Phase 2 lands (T2 facade for spans + duration; T3 for the SDK-owned pool
-  observer, justified in this ADR per §2). Use a **dual annotation**
+- `mongo/doc.go` Tier line reflects the mixed sourcing after Phase 2
+  (T2 facade for spans + duration; T3 for the SDK-owned pool observer,
+  justified in this ADR per §2). Use a **dual annotation**
   (`// Tier: T2` + `// Tier: T3`) — the CI gate (ADR 0008 §7.2) accepts both
   lines, as decided in Q3 below; no gate change is required.
 - **ADR 0003**: add the contrib `otelmongo` module to the Approved-integrations
   table (global-state grep + semconv row), per ADR 0008 §4 / §7.1.
 - **ADR 0005**: cross-reference this ADR; note metrics now augment the trace
   facade.
-- **CHANGELOG**: `[Unreleased]` entry for the new `mp` param, `mongo` metrics,
-  and `WithPoolName`.
+- **CHANGELOG**: `[Unreleased]` entries for the `mp` param, MongoDB metrics,
+  pool metrics, and `WithPoolName`.
 - **README / examples/mongodb**: update the `Connect` call to pass
-  `obs.MeterProvider()`.
+  `obs.MeterProvider()` and document pool metrics.
 
 ---
 

@@ -32,6 +32,12 @@ adopters can plan their upgrades.
   whitelisted value onto this service's spans and SDK log records. The feature
   is off by default because `user.name` is PII and can cross HTTP/NATS
   boundaries via baggage propagation.
+- Added MongoDB connection-pool metrics for ADR 0014 Phase 2:
+  `db.client.connection.count`, `db.client.connection.max`,
+  `db.client.connection.idle.min`, `db.client.connection.pending_requests`,
+  `db.client.connection.timeouts`, and `db.client.connection.create_time`.
+- Added `mongo.WithPoolName` to set `db.client.connection.pool.name` on
+  SDK-owned MongoDB pool metrics.
 
 ### Changed
 
@@ -68,8 +74,9 @@ adopters can plan their upgrades.
 - Services that build their own `*options.ClientOptions` should call
   `mongo.Instrument(opts, obs.TracerProvider(), obs.MeterProvider(),
   obs.Propagator)` before the driver's `mongo.Connect(opts)`. The returned
-  cleanup function is currently a no-op and should be deferred so future
-  pool-metric cleanup can remain non-breaking.
+  cleanup function unregisters the SDK-owned MongoDB pool metric callback and
+  should be deferred near the client's `Disconnect`, after the final metrics
+  flush when a last zero-value pool snapshot is required.
 
 ---
 

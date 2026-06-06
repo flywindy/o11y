@@ -1,5 +1,5 @@
-// Package main demonstrates MongoDB tracing and operation metrics through the
-// o11y MongoDB facade.
+// Package main demonstrates MongoDB tracing, operation metrics, and pool
+// metrics through the o11y MongoDB facade.
 package main
 
 import (
@@ -63,6 +63,7 @@ func run() error {
 		obs.TracerProvider(),
 		obs.MeterProvider(),
 		obs.Propagator,
+		o11ymongo.WithPoolName("mongodb-example"),
 	)
 	if err != nil {
 		return fmt.Errorf("create MongoDB client: %w", err)
