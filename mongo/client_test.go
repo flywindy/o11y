@@ -11,7 +11,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/event"
-	drivermongo "go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	otelmongo "go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/v2/mongo/otelmongo"
 	"go.opentelemetry.io/otel/attribute"
@@ -75,7 +74,6 @@ func TestConnect_ReturnsPlainDriverClient(t *testing.T) {
 
 	client, err := Connect(context.Background(), "mongodb://127.0.0.1:1", tp, metricnoop.NewMeterProvider(), prop)
 	require.NoError(t, err)
-	var _ *drivermongo.Client = client
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()

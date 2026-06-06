@@ -573,6 +573,7 @@ defer func() { _ = cleanup(context.Background()) }()
 client, err := mongo.Connect(opts)
 ```
 
+Here, `mongo.Connect` is the MongoDB driver's `go.mongodb.org/mongo-driver/v2/mongo.Connect`.
 `Instrument` composes with an existing `CommandMonitor` instead of replacing it.
 Calling `opts.SetMonitor(...)` after `Instrument` replaces the composed monitor
 and drops o11y instrumentation.

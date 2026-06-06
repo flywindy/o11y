@@ -274,8 +274,8 @@ client, err := o11ymongo.Connect(ctx, mongoURI, sdk.TracerProvider(), sdk.MeterP
 ```
 
 Applications that build their own `*options.ClientOptions` must call
-`o11ymongo.Instrument(...)` before `mongo.Connect(...)` and defer the returned
-cleanup function.
+`o11ymongo.Instrument(...)` before the MongoDB driver's `mongo.Connect(...)`
+and defer the returned cleanup function.
 
 ---
 

@@ -49,6 +49,9 @@ func Connect(
 	}
 
 	clientOptions := options.Client().ApplyURI(uri)
+	// TODO(ADR 0014 Phase 2): if Instrument starts registering pool-metric
+	// observables, surface that cleanup lifecycle from Connect instead of
+	// leaving it available only to application-built client options.
 	if _, err := Instrument(clientOptions, tp, mp, prop); err != nil {
 		return nil, fmt.Errorf("mongo connect: %w", err)
 	}

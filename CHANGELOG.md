@@ -67,9 +67,9 @@ adopters can plan their upgrades.
   on an outbox/event envelope and message headers instead.
 - Services that build their own `*options.ClientOptions` should call
   `mongo.Instrument(opts, obs.TracerProvider(), obs.MeterProvider(),
-  obs.Propagator)` before `mongo.Connect(opts)`. The returned cleanup function
-  is currently a no-op and should be deferred so future pool-metric cleanup can
-  remain non-breaking.
+  obs.Propagator)` before the driver's `mongo.Connect(opts)`. The returned
+  cleanup function is currently a no-op and should be deferred so future
+  pool-metric cleanup can remain non-breaking.
 
 ---
 
