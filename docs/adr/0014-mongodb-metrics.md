@@ -5,6 +5,9 @@
 **Date**: 2026-05-25
 **Relates to**: ADR 0005 (MongoDB integration), ADR 0008 (sourcing policy),
 ADR 0013 (Redis/Valkey integration — reference for the pool-metric pattern)
+**Superseded in part by**: ADR 0021 (resolves the deferred Q1 Option B — spans
+move to the contrib monitor; Phase 2 pool-metric lifecycle moves from a wrapper
+`Disconnect` override to the cleanup func returned by `Instrument`)
 
 ---
 
