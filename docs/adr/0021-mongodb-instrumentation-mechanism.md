@@ -1,6 +1,6 @@
 # ADR 0021 — MongoDB Instrumentation Mechanism: replace the Marz wrapper with the contrib CommandMonitor
 
-**Status**: Proposed
+**Status**: Accepted — implementation pending (separate PR)
 **Date**: 2026-06-05
 **Supersedes parts of**: ADR 0005 (§2 instrumentation mechanism, §4 document
 trace propagation)

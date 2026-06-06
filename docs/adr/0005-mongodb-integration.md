@@ -3,6 +3,8 @@
 **Status**: Accepted (implemented through local wrapper)
 **Date**: 2026-04-22
 **Updated**: 2026-05-26
+**Superseded in part by**: ADR 0021 (§2 instrumentation mechanism → contrib
+`otelmongo` CommandMonitor; §4 document trace propagation withdrawn)
 
 ---
 
