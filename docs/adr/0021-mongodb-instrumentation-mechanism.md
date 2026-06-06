@@ -280,7 +280,8 @@ Under this ADR such a project integrates with **no repository or business-code
 changes**:
 
 - The single client-builder calls `o11ymongo.Instrument(opts, tp, mp, prop)`
-  before `mongo.Connect(opts)` — one line; auth and pool options untouched.
+  before the MongoDB driver's `mongo.Connect(opts)` — one line; auth and pool
+  options untouched.
 - The returned `*mongo.Client` is unchanged in type, so every repository keeps
   compiling as-is. This is exactly the property the wrapper approach could
   **not** provide: Marz's `Database()` returns a wrapped type that does not

@@ -187,7 +187,7 @@ upstream change is caught (ADR 0006).
 
 `captureSearchBody` is exposed as `WithSearchBody(enabled bool)`, **default
 false**, consistent with `redis.WithCommandTextEnabled`,
-`mongo.WithDocumentTracePropagation`, and `cassandra.WithQueryText` (ADR 0019).
+and `cassandra.WithQueryText` (ADR 0019).
 Search query bodies can be large and may contain user-supplied search terms
 (PII); they are captured only on explicit opt-in, and only for the search-family
 endpoints the upstream instrumentation supports.

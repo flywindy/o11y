@@ -32,8 +32,8 @@ decided and documented now.
 
 - **Span count = event count.** The Marz `otel-nats` facade emits a span per
   inbound/outbound message (`nats/conn.go` is a thin wrapper; spans come from
-  the upstream lib). The Marz `otel-mongo` facade emits a span per command, and
-  a change stream issues `getMore` continuously. At thousands of events/sec this
+  the upstream lib). MongoDB command monitoring emits a span per command, and a
+  change stream issues `getMore` continuously. At thousands of events/sec this
   is thousands of spans/sec.
 - **Per-span allocation.** Each recording span allocates the span object plus an
   attribute map. At high frequency this is dominated by **GC pressure → CPU

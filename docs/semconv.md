@@ -160,12 +160,9 @@ payload.
 
 ## Database - MongoDB
 
-Spans are emitted by
-`github.com/Marz32onE/instrumentation-go/otel-mongo/v2`, wrapped by
-`github.com/flywindy/o11y/mongo`. The upstream module is pinned to the
-`otel-mongo/v2/v0.2.11` tag commit through a Go pseudo-version. Operation
-duration metrics are emitted by the official contrib `otelmongo`
-CommandMonitor in metrics-only mode. See ADR 0005 and ADR 0014.
+Spans and operation-duration metrics are emitted by the official contrib
+`go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/v2/mongo/otelmongo`
+CommandMonitor, wrapped by `github.com/flywindy/o11y/mongo`. See ADR 0021.
 
 ### Instruments
 
@@ -180,12 +177,11 @@ CommandMonitor in metrics-only mode. See ADR 0005 and ADR 0014.
 | `db.system.name` | string | Constant `"mongodb"`. |
 | `db.namespace` | string | Database name. |
 | `db.collection.name` | string | Collection name. |
-| `db.operation.name` | string | Operation name (`insert`, `find`, `update`, ...). |
-| `db.operation.batch.size` | int | Batch size for multi-document operations, when applicable. |
-| `db.response.status_code` | string | MongoDB error code, when available. |
-| `error.type` | string | MongoDB error code or `_OTHER`, when an operation fails. |
-| `server.address` | string | MongoDB host. |
-| `server.port` | int | MongoDB port, omitted for default port 27017 by upstream. |
+| `db.operation.name` | string | Wire command name (`insert`, `find`, `getMore`, `createIndexes`, ...). |
+| `network.peer.address` | string | MongoDB peer address reported by the driver connection ID. |
+| `network.peer.port` | int | MongoDB port parsed from the connection ID, defaulting to 27017 when omitted. |
+| `network.transport` | string | Constant `"tcp"` on command spans; filtered out of the metric view. |
+| `error.type` | string | Present on `db.client.operation.duration` when an operation fails. |
 
 ### Explicitly NOT Emitted by Default
 
@@ -196,10 +192,10 @@ CommandMonitor in metrics-only mode. See ADR 0005 and ADR 0014.
 
 ### Document Trace Propagation
 
-`otel-mongo/v2` supports `_oteltrace` document injection through
-`WithTracePropagationEnabled(bool)` and `OTEL_MONGO_PROPAGATION_ENABLED`.
-The o11y wrapper defaults this off unless an application explicitly opts in
-through `mongo.WithDocumentTracePropagation(true)`.
+The MongoDB facade does not inject `_oteltrace` into persisted business
+documents. ADR 0021 directs asynchronous MongoDB-sourced workflows to carry
+trace context on an explicitly modelled outbox/event envelope and message
+headers instead.
 
 ---
 

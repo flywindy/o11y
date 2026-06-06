@@ -35,15 +35,41 @@ adopters can plan their upgrades.
 
 ### Changed
 
+- MongoDB instrumentation now uses the official contrib `otelmongo`
+  `CommandMonitor` for both command spans and `db.client.operation.duration`
+  metrics. Command spans are always-on and controlled by the SDK sampler; the
+  old Marz `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` /
+  `OTEL_MONGO_TRACING_ENABLED` gates are no longer read by the o11y MongoDB
+  facade. Span shape changes from Marz logical operation spans to contrib wire
+  command spans (for example, `insert orders` becomes `orders.insert`, address
+  attributes move from `server.*` to `network.peer.*`, and cursor reads may add
+  `getMore` spans).
+
 ### Deprecated
 
 ### Removed
+
+- Removed the Marz MongoDB wrapper dependency and `_oteltrace` document
+  propagation support from the o11y MongoDB package.
 
 ### Fixed
 
 ### Security
 
 ### Breaking Changes (Migration Guide)
+
+- `mongo.Connect` now returns a plain
+  `*go.mongodb.org/mongo-driver/v2/mongo.Client` instead of the o11y wrapper
+  client. Standard driver `Database`, `Collection`, and result types flow
+  through application code without wrapper types.
+- `mongo.WithDocumentTracePropagation` was removed. The SDK no longer writes
+  `_oteltrace` into persisted business documents; model async trace continuity
+  on an outbox/event envelope and message headers instead.
+- Services that build their own `*options.ClientOptions` should call
+  `mongo.Instrument(opts, obs.TracerProvider(), obs.MeterProvider(),
+  obs.Propagator)` before the driver's `mongo.Connect(opts)`. The returned
+  cleanup function is currently a no-op and should be deferred so future
+  pool-metric cleanup can remain non-breaking.
 
 ---
 
