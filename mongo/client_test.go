@@ -164,6 +164,8 @@ func TestInstrument_ComposesExistingCommandMonitor(t *testing.T) {
 	assert.NotEmpty(t, histogram.DataPoints)
 }
 
+// TestInstrument_ComposesExistingPoolMonitorAndRecordsPoolMetrics verifies
+// existing PoolMonitor composition and SDK-owned MongoDB pool metric emission.
 func TestInstrument_ComposesExistingPoolMonitorAndRecordsPoolMetrics(t *testing.T) {
 	tp, prop, _ := newTestProviders()
 	reader := sdkmetric.NewManualReader()
@@ -245,6 +247,8 @@ func TestInstrument_ComposesExistingPoolMonitorAndRecordsPoolMetrics(t *testing.
 	assert.NoError(t, cleanup(context.Background()))
 }
 
+// TestInstrument_PoolMetricsDefaultPoolNameAndOmitUnboundedMax verifies
+// fallback pool-name derivation and omission of unbounded max pool size.
 func TestInstrument_PoolMetricsDefaultPoolNameAndOmitUnboundedMax(t *testing.T) {
 	tp, prop, _ := newTestProviders()
 	reader := sdkmetric.NewManualReader()
@@ -264,9 +268,10 @@ func TestInstrument_PoolMetricsDefaultPoolNameAndOmitUnboundedMax(t *testing.T) 
 	})
 
 	rm := collectMongoMetrics(t, reader)
+	expectedPoolName := defaultPoolName(opts, "")
 	attrs := []attribute.KeyValue{
 		semconv.DBSystemNameMongoDB,
-		semconv.DBClientConnectionPoolName("mongo-db-primary"),
+		semconv.DBClientConnectionPoolName(expectedPoolName),
 		semconv.ServerAddress("db-primary"),
 		semconv.ServerPort(27018),
 	}
@@ -274,6 +279,8 @@ func TestInstrument_PoolMetricsDefaultPoolNameAndOmitUnboundedMax(t *testing.T) 
 	assertMetricAbsentOrEmpty(t, rm, "db.client.connection.max")
 }
 
+// TestInstrument_PoolMetricsResetAndCleanup verifies pool clear, close, and
+// explicit cleanup behavior for SDK-owned MongoDB pool metrics.
 func TestInstrument_PoolMetricsResetAndCleanup(t *testing.T) {
 	tp, prop, _ := newTestProviders()
 	reader := sdkmetric.NewManualReader()
@@ -287,31 +294,80 @@ func TestInstrument_PoolMetricsResetAndCleanup(t *testing.T) {
 	require.NoError(t, err)
 
 	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolCreated, "mongo-a:27017", 0, &event.MonitorPoolOptions{MaxPoolSize: 10})
-	emitPoolEvent(opts.PoolMonitor, event.ConnectionReady, "mongo-a:27017", time.Millisecond, nil)
-	emitPoolEvent(opts.PoolMonitor, event.ConnectionCheckedOut, "mongo-a:27017", 0, nil)
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, "mongo-a:27017", 1, time.Millisecond, nil)
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionCheckOutStarted, "mongo-a:27017", 0, nil)
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionCheckedOut, "mongo-a:27017", 1, 0, nil)
 	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolCleared, "mongo-a:27017", 0, nil)
 
 	rm := collectMongoMetrics(t, reader)
+	expectedPoolName := defaultPoolName(opts, "")
+	poolAttrs := []attribute.KeyValue{
+		semconv.DBSystemNameMongoDB,
+		semconv.DBClientConnectionPoolName(expectedPoolName),
+		semconv.ServerAddress("mongo-a"),
+		semconv.ServerPort(27017),
+	}
 	usedAttrs := []attribute.KeyValue{
 		semconv.DBSystemNameMongoDB,
-		semconv.DBClientConnectionPoolName("mongo-mongo-a"),
+		semconv.DBClientConnectionPoolName(expectedPoolName),
 		semconv.ServerAddress("mongo-a"),
 		semconv.ServerPort(27017),
 		semconv.DBClientConnectionStateUsed,
 	}
+	assert.Equal(t, int64(1), int64MetricValue(t, findMetric(t, rm, "db.client.connection.count"), usedAttrs...))
+	assert.Equal(t, int64(10), int64MetricValue(t, findMetric(t, rm, "db.client.connection.max"), poolAttrs...))
+
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionClosed, "mongo-a:27017", 1, 0, nil)
+	rm = collectMongoMetrics(t, reader)
 	assert.Equal(t, int64(0), int64MetricValue(t, findMetric(t, rm, "db.client.connection.count"), usedAttrs...))
-	assertMetricAbsentOrEmpty(t, rm, "db.client.connection.max")
 
 	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolClosed, "mongo-a:27017", 0, nil)
 	rm = collectMongoMetrics(t, reader)
-	assertMetricAbsentOrEmpty(t, rm, "db.client.connection.count")
+	assert.Equal(t, int64(0), int64MetricValue(t, findMetric(t, rm, "db.client.connection.max"), poolAttrs...))
 
 	assert.NoError(t, cleanup(context.Background()))
 	emitPoolEvent(opts.PoolMonitor, event.ConnectionReady, "mongo-a:27017", time.Millisecond, nil)
 	rm = collectMongoMetrics(t, reader)
-	assertMetricAbsentOrEmpty(t, rm, "db.client.connection.pending_requests")
+	assert.Equal(t, int64(0), int64MetricValue(t, findMetric(t, rm, "db.client.connection.max"), poolAttrs...))
 }
 
+// TestInstrument_PoolMetricsContinueAfterPoolClosedAndRecreated verifies that
+// topology churn does not permanently disable pool metric handling.
+func TestInstrument_PoolMetricsContinueAfterPoolClosedAndRecreated(t *testing.T) {
+	tp, prop, _ := newTestProviders()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithView(MetricViews(testHistogramBuckets)...),
+	)
+	opts := options.Client().ApplyURI("mongodb://mongo-a:27017")
+
+	cleanup, err := Instrument(opts, tp, provider, prop)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, cleanup(context.Background())) }()
+
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolCreated, "mongo-a:27017", 0, &event.MonitorPoolOptions{MaxPoolSize: 5})
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, "mongo-a:27017", 1, time.Millisecond, nil)
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolClosed, "mongo-a:27017", 0, nil)
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolCreated, "mongo-a:27017", 0, &event.MonitorPoolOptions{MaxPoolSize: 7})
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, "mongo-a:27017", 2, time.Millisecond, nil)
+
+	rm := collectMongoMetrics(t, reader)
+	expectedPoolName := defaultPoolName(opts, "")
+	poolAttrs := []attribute.KeyValue{
+		semconv.DBSystemNameMongoDB,
+		semconv.DBClientConnectionPoolName(expectedPoolName),
+		semconv.ServerAddress("mongo-a"),
+		semconv.ServerPort(27017),
+	}
+	idleAttrs := append(append([]attribute.KeyValue{}, poolAttrs...), semconv.DBClientConnectionStateIdle)
+
+	assert.Equal(t, int64(1), int64MetricValue(t, findMetric(t, rm, "db.client.connection.count"), idleAttrs...))
+	assert.Equal(t, int64(7), int64MetricValue(t, findMetric(t, rm, "db.client.connection.max"), poolAttrs...))
+}
+
+// BenchmarkPoolMonitorCheckoutCycle measures the event-monitor hot path used by
+// high-throughput applications that frequently check out MongoDB connections.
 func BenchmarkPoolMonitorCheckoutCycle(b *testing.B) {
 	opts := options.Client().ApplyURI("mongodb://mongo-a:27017")
 	monitor, cleanup, err := newPoolMonitor(opts, metricnoop.NewMeterProvider(), "bench-mongo")
@@ -320,16 +376,20 @@ func BenchmarkPoolMonitorCheckoutCycle(b *testing.B) {
 	}
 	defer func() { _ = cleanup(context.Background()) }()
 
+	ready := &event.PoolEvent{Type: event.ConnectionReady, Address: "mongo-a:27017", ConnectionID: 1}
 	started := &event.PoolEvent{Type: event.ConnectionCheckOutStarted, Address: "mongo-a:27017"}
-	checkedOut := &event.PoolEvent{Type: event.ConnectionCheckedOut, Address: "mongo-a:27017"}
-	checkedIn := &event.PoolEvent{Type: event.ConnectionCheckedIn, Address: "mongo-a:27017"}
+	checkedOut := &event.PoolEvent{Type: event.ConnectionCheckedOut, Address: "mongo-a:27017", ConnectionID: 1}
+	checkedIn := &event.PoolEvent{Type: event.ConnectionCheckedIn, Address: "mongo-a:27017", ConnectionID: 1}
+	closed := &event.PoolEvent{Type: event.ConnectionClosed, Address: "mongo-a:27017", ConnectionID: 1}
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		monitor.Event(ready)
 		monitor.Event(started)
 		monitor.Event(checkedOut)
 		monitor.Event(checkedIn)
+		monitor.Event(closed)
 	}
 }
 
@@ -557,6 +617,23 @@ func emitPoolEvent(
 		Address:     address,
 		Duration:    duration,
 		PoolOptions: poolOptions,
+	})
+}
+
+func emitPoolEventWithConnectionID(
+	monitor *event.PoolMonitor,
+	eventType string,
+	address string,
+	connectionID int64,
+	duration time.Duration,
+	poolOptions *event.MonitorPoolOptions,
+) {
+	monitor.Event(&event.PoolEvent{
+		Type:         eventType,
+		Address:      address,
+		ConnectionID: connectionID,
+		Duration:     duration,
+		PoolOptions:  poolOptions,
 	})
 }
 

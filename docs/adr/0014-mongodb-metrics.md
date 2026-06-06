@@ -99,7 +99,7 @@ attached on the `*options.ClientOptions` we already build, before handing it to
 
 Attach an **SDK-owned `event.PoolMonitor`** via
 `clientOptions.SetPoolMonitor(...)` that maintains per-server-address counters
-and feeds an async observable callback registered on `mp`. This is the
+and emits synchronous metric deltas through SDK-owned instruments. This is the
 genuinely custom part; it mirrors `redis/metrics.go` but is **event-stream
 based** (deltas) because the Go driver exposes **no pool-stats snapshot** like
 go-redis's `PoolStats()`.
@@ -108,20 +108,28 @@ go-redis's `PoolStats()`.
 
 | Metric | Type | Source (driver `event.PoolEvent` / options) |
 |---|---|---|
-| `db.client.connection.count` `{state=used\|idle}` | observable up-down counter | running counters: `ConnectionReady`−`ConnectionClosed` = total; `ConnectionCheckedOut`−`ConnectionCheckedIn` = used; idle = total−used |
-| `db.client.connection.max` | observable up-down counter | `PoolOptions.MaxPoolSize` (from `ConnectionPoolCreated`/`Ready`); omit if 0 (unbounded) — same rule we just applied to redis |
-| `db.client.connection.idle.min` | observable up-down counter | `PoolOptions.MinPoolSize` |
+| `db.client.connection.count` `{state=used\|idle}` | up-down counter | running counters: `ConnectionReady`−`ConnectionClosed` = total; `ConnectionCheckedOut`−`ConnectionCheckedIn` = used; idle = total−used |
+| `db.client.connection.max` | up-down counter | `PoolOptions.MaxPoolSize` (from `ConnectionPoolCreated`/`Ready`); omit if 0 (unbounded) |
+| `db.client.connection.idle.min` | up-down counter | `PoolOptions.MinPoolSize` |
 | `db.client.connection.idle.max` | — | **omit**; MongoDB has no max-idle concept |
-| `db.client.connection.timeouts` | observable counter | count of `ConnectionCheckOutFailed` with `Reason == event.ReasonTimedOut` |
+| `db.client.connection.timeouts` | counter | count of `ConnectionCheckOutFailed` with `Reason == event.ReasonTimedOut` |
 | `db.client.connection.create_time` | histogram (s) | `ConnectionReady.Duration` |
-| `db.client.connection.pending_requests` | observable up-down counter | `ConnectionCheckOutStarted` − (`ConnectionCheckedOut` + `ConnectionCheckOutFailed`) |
+| `db.client.connection.pending_requests` | up-down counter | `ConnectionCheckOutStarted` − (`ConnectionCheckedOut` + `ConnectionCheckOutFailed`) |
+
+Implementation note: the merged Phase 2 implementation follows the synchronous
+instrument kinds in OTel semconv v1.39.0: `count`, `max`, `idle.min`, and
+`pending_requests` are `Int64UpDownCounter`, `timeouts` is `Int64Counter`, and
+`create_time` remains `Float64Histogram`.
 
 - **Attributes**: `db.system.name=mongodb`, `db.client.connection.pool.name`
   (synthesized like redis, or `WithPoolName`), `server.address` + `server.port`
   parsed from `PoolEvent.Address`. Bounded by topology size (replica set /
   shards), so cardinality is naturally small.
-- **State reset** on `ConnectionPoolCleared` / `ConnectionPoolClosed` to avoid
-  drift after a pool is torn down.
+- **Pool clear** keeps checked-out connections visible and preserves pool
+  sizing until the driver emits the corresponding close events.
+- **Pool close** emits zeroing deltas and removes that pool state without
+  disabling the tracker, because the driver can close and recreate pools during
+  topology changes.
 - `wait_time` / `use_time` deferred (not cleanly derivable from v2 events;
   dropped by `MetricViews` like redis does).
 
@@ -130,12 +138,11 @@ go-redis's `PoolStats()`.
 Superseded by ADR 0021: because `mongo.Connect` now returns a plain driver
 `*mongo.Client` instead of a wrapper with a `Disconnect` override, pool-metric
 registration is cleaned up through the cleanup function returned by
-`mongo.Instrument(...)`. Phase 2 uses that function to call `reg.Unregister()`
-for the pool observable. The `mongo.Connect(...)` helper cannot return that
-cleanup function without changing its ergonomic contract, so its observer
-unregisters itself when the driver emits `ConnectionPoolClosed` for the last
-known pool. Services that need a last zero-value pool snapshot should use
-`Instrument(...)` directly and run cleanup after their final metrics flush.
+`mongo.Instrument(...)`. Phase 2 uses that function to disable SDK-owned pool
+event handling after the application's final metrics flush. `ConnectionPoolClosed`
+only zeroes and removes the closed pool state; it does not disable the tracker,
+because the driver may recreate pools for the same client during topology
+changes.
 
 ---
 
@@ -188,7 +195,7 @@ func Connect(ctx, uri string, tp trace.TracerProvider, mp metric.MeterProvider,
   assert provider wiring rejects nil `mp`.
 - **Phase 2**: unit-testable without a real server — `event.PoolMonitor` and
   `event.CommandMonitor` are plain structs of funcs, so feed synthetic
-  `*event.PoolEvent` sequences and assert the observable callback reports the
+  `*event.PoolEvent` sequences and assert the exported metrics report the
   expected `count{used,idle}`, `timeouts`, `create_time`, and that
   `idle.max` is omitted and `max` is omitted when `MaxPoolSize==0`.
 - Integration test (build-tagged, `testcontainers-go`) for the healthy path,
@@ -361,7 +368,7 @@ implementing PRs:
    `OTEL_MONGO_TRACING_ENABLED` gates are dropped. Command spans are always-on
    and sampler-governed.
 6. **Pool cleanup (Phase 2; superseded by ADR 0021)** — use the cleanup function
-   returned by `mongo.Instrument(...)` to unregister the pool observable. Pool
-   counters are updated from concurrent driver goroutines, so per-address state
-   must be atomic and tolerate transient negative `used` (clamp at 0) between
-   `CheckedOut`/`CheckedIn` ordering.
+   returned by `mongo.Instrument(...)` to stop SDK-owned pool event handling
+   after the final metrics flush. Pool counters are updated from concurrent
+   driver goroutines, so per-address state must tolerate duplicate, missing, or
+   reordered connection lifecycle events without emitting negative counts.

@@ -31,8 +31,9 @@ type config struct {
 // connection-pool metrics.
 //
 // When unset, the SDK derives a bounded name from the first configured MongoDB
-// host. The option only affects SDK-owned pool metrics; command spans and
-// db.client.operation.duration metrics come from otelmongo.
+// host and the ClientOptions instance identity. The option only affects
+// SDK-owned pool metrics; command spans and db.client.operation.duration
+// metrics come from otelmongo.
 func WithPoolName(name string) Option {
 	return func(cfg *config) {
 		cfg.poolName = strings.TrimSpace(name)
@@ -106,10 +107,10 @@ func Connect(
 // opts.SetMonitor after Instrument replaces the composed monitor and drops o11y
 // instrumentation.
 //
-// The returned cleanup function unregisters the SDK-owned pool metrics
-// callback. Applications that build their own ClientOptions should defer it
-// near client.Disconnect, after the application's final metrics flush if it
-// needs to export a last zero-value pool snapshot.
+// The returned cleanup function disables SDK-owned pool metrics handling for
+// these ClientOptions. Applications that build their own ClientOptions should
+// defer it near client.Disconnect, after the application's final metrics flush
+// if it needs to export a last zero-value pool snapshot.
 func Instrument(
 	opts *options.ClientOptions,
 	tp trace.TracerProvider,

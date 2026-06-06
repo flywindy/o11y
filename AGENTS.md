@@ -283,8 +283,8 @@ client, err := o11ymongo.Connect(
 
 Applications that build their own `*options.ClientOptions` must call
 `o11ymongo.Instrument(...)` before the MongoDB driver's `mongo.Connect(...)`
-and defer the returned cleanup function near `client.Disconnect` so the
-SDK-owned pool observable is unregistered.
+and defer the returned cleanup function near `client.Disconnect` so SDK-owned
+pool event handling stops after the final metrics flush.
 
 ---
 

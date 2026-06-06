@@ -585,11 +585,11 @@ instead of replacing them.
 Calling `opts.SetMonitor(...)` after `Instrument` replaces the composed monitor
 and drops o11y instrumentation.
 Calling `opts.SetPoolMonitor(...)` after `Instrument` similarly drops o11y's
-pool metrics. The cleanup function unregisters the SDK-owned pool observable;
+pool metrics. The cleanup function disables SDK-owned pool event handling;
 defer it for app-built options near `client.Disconnect`, after the final
-metrics flush if the service needs a last zero-value pool snapshot. The
-`Connect` helper unregisters automatically when the driver closes the last
-known pool, avoiding callback buildup in repeated connect/disconnect flows.
+metrics flush if the service needs a last zero-value pool snapshot.
+`ConnectionPoolClosed` events zero the closed pool and remove its state while
+leaving the tracker ready for a later pool recreation on the same client.
 
 Document trace propagation into persisted business documents is intentionally
 not supported. For async MongoDB-sourced workflows, model trace context on an

@@ -171,11 +171,11 @@ See ADR 0014 and ADR 0021.
 | Name | Kind | Unit | Attributes |
 |---|---|---|---|
 | `db.client.operation.duration` | Float64Histogram | `s` | `db.system.name`, `db.operation.name`, `network.peer.address`, `network.peer.port`, `error.type` |
-| `db.client.connection.count` | Int64ObservableUpDownCounter | `{connection}` | `db.system.name`, `db.client.connection.pool.name`, `db.client.connection.state`, `server.address`, `server.port` |
-| `db.client.connection.idle.min` | Int64ObservableUpDownCounter | `{connection}` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
-| `db.client.connection.max` | Int64ObservableUpDownCounter | `{connection}` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
-| `db.client.connection.pending_requests` | Int64ObservableUpDownCounter | `{request}` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
-| `db.client.connection.timeouts` | Int64ObservableCounter | `{timeout}` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
+| `db.client.connection.count` | Int64UpDownCounter | `{connection}` | `db.system.name`, `db.client.connection.pool.name`, `db.client.connection.state`, `server.address`, `server.port` |
+| `db.client.connection.idle.min` | Int64UpDownCounter | `{connection}` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
+| `db.client.connection.max` | Int64UpDownCounter | `{connection}` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
+| `db.client.connection.pending_requests` | Int64UpDownCounter | `{request}` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
+| `db.client.connection.timeouts` | Int64Counter | `{timeout}` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
 | `db.client.connection.create_time` | Float64Histogram | `s` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
 
 ### Expected Attributes
@@ -190,7 +190,7 @@ See ADR 0014 and ADR 0021.
 | `network.peer.port` | int | MongoDB port parsed from the connection ID, defaulting to 27017 when omitted. |
 | `network.transport` | string | Constant `"tcp"` on command spans; filtered out of the metric view. |
 | `error.type` | string | Present on `db.client.operation.duration` when an operation fails. |
-| `db.client.connection.pool.name` | string | Pool grouping label, derived from the first configured host or set by `mongo.WithPoolName`. |
+| `db.client.connection.pool.name` | string | Pool grouping label, derived from the first configured host plus the `ClientOptions` instance identity, or set by `mongo.WithPoolName`. |
 | `db.client.connection.state` | string | Present only on `db.client.connection.count`; values are `used` or `idle`. |
 | `server.address` | string | MongoDB pool server address parsed from `event.PoolEvent.Address`. |
 | `server.port` | int | MongoDB pool server port parsed from `event.PoolEvent.Address`, when present. |

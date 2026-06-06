@@ -57,7 +57,7 @@ unused" — and therefore unblocks ADR 0014 Option B.
    `go.mongodb.org/mongo-driver/v2` types end-to-end** — no wrapper types
    threaded through signatures, no wrapped result types, and no "unwrap loses
    spans" foot-gun. Any teardown that instrumentation needs (the Phase 2 pool
-   observable) is handled by a returned cleanup func, **not** by reintroducing a
+   event tracker) is handled by a returned cleanup func, **not** by reintroducing a
    wrapper type to host a `Disconnect` override — see point 6 and "Pool-metric
    lifecycle".
 3. **Withdraw document trace propagation from this package** (supersedes
@@ -89,8 +89,8 @@ unused" — and therefore unblocks ADR 0014 Option B.
    - **Returned cleanup func (Option A lifecycle).** `Instrument` returns a
      cleanup `func` the caller invokes at shutdown. Phase 1 returned a no-op
      because the `CommandMonitor` is a passive struct with nothing to
-     unregister; after ADR 0014 Phase 2 it unregisters the SDK-owned pool
-     observable. See "Pool-metric lifecycle".
+     unregister; after ADR 0014 Phase 2 it disables SDK-owned pool event
+     handling. See "Pool-metric lifecycle".
 
    See "Adoption surface" below.
 7. **Command spans are always-on, governed solely by the sampler.** The two
@@ -332,19 +332,18 @@ attribute filters, and expect additional `getMore` spans on cursor-heavy reads.
 
 ## Pool-metric lifecycle (ADR 0014 Phase 2)
 
-ADR 0014 Phase 2 planned to unregister the pool observable via a `Disconnect`
+ADR 0014 Phase 2 originally planned to unregister pool metric handling via a `Disconnect`
 override on the **wrapper** `*mongo.Client`. Returning a plain `*mongo.Client`
 removes that host, so this ADR fixes the lifecycle as **Option A**:
 
 - `Instrument(...)` attaches the `CommandMonitor` (Phase 1) and, in Phase 2, the
-  `PoolMonitor` plus the observable registered on the `MeterProvider`. It returns
-  a **cleanup func** that calls `registration.Unregister()`. The application
-  invokes it at shutdown (typically alongside its existing `client.Disconnect`).
-- Phase 2 now uses the cleanup function to unregister the SDK-owned pool
-  observable. The `Connect(...)` helper unregisters automatically after the
-  driver emits `ConnectionPoolClosed` for the last known pool, preserving the
-  plain `*mongo.Client` return type without accumulating callbacks across
-  repeated connect/disconnect flows.
+  SDK-owned `PoolMonitor` that emits synchronous pool-metric deltas through the
+  provided `MeterProvider`. It returns a **cleanup func** that disables
+  SDK-owned pool event handling after the application's final metrics flush.
+- `ConnectionPoolClosed` zeroes and removes the closed pool state but does not
+  disable the tracker. MongoDB can close and recreate pools during topology
+  changes, and the same instrumented client must keep reporting the recreated
+  pool.
 - **Rejected — tie to `MeterProvider` shutdown:** zero app code, but it couples
   each client's pool state to the provider's lifetime and **leaks callbacks** for
   short-lived/repeated clients (tests, reconnect loops) until `obs.Shutdown()`.
@@ -353,9 +352,9 @@ removes that host, so this ADR fixes the lifecycle as **Option A**:
 - **Rejected — thin wrapper struct with `Disconnect()`:** reintroduces a
   non-plain return type, undoing the core ergonomic win of Decision point 2
   (`func(*mongo.Client)` parameters would not accept it).
-- Reset on `ConnectionPoolCleared` applies so cleared pools report zeros
-  instead of stale counters. `ConnectionPoolClosed` unregisters after the last
-  known pool closes.
+- `ConnectionPoolCleared` does not immediately zero counts or sizing. The driver
+  closes affected connections asynchronously; checked-out work stays visible
+  until the corresponding `ConnectionClosed` events reconcile the counters.
 
 ---
 
