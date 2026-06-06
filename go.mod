@@ -3,7 +3,6 @@ module github.com/flywindy/o11y
 go 1.25.0
 
 require (
-	github.com/Marz32onE/instrumentation-go/otel-mongo/v2 v2.0.0-20260501090829-1aa6610b53de
 	github.com/Marz32onE/instrumentation-go/otel-nats v0.2.11
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-resty/resty/v2 v2.17.2

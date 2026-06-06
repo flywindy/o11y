@@ -120,11 +120,11 @@ go-redis's `PoolStats()`.
 
 #### Lifecycle
 
-- Register the observable callback at `Connect`; **unregister on `Disconnect`**.
-  Our `mongo.Client` embeds `*otelmongo.Client` (which already overrides
-  `Disconnect`); we add our own `Disconnect` that calls through and then
-  `reg.Unregister()`. No weak-pointer/idempotency machinery (unlike redis Wrap)
-  is needed — the client is constructed by us and has a single owner.
+Superseded by ADR 0021: because `mongo.Connect` now returns a plain driver
+`*mongo.Client` instead of a wrapper with a `Disconnect` override, pool-metric
+registration is cleaned up through the cleanup function returned by
+`mongo.Instrument(...)`. Phase 1 cleanup is a no-op; Phase 2 will use the same
+function to call `reg.Unregister()` for the pool observable.
 
 ---
 
@@ -279,7 +279,7 @@ pinned contrib `otelmongo` `mongo.go` and the local repo):
 
 | | **Phase 1 only first** | **Phase 1 + 2 together** |
 |---|---|---|
-| Reviewability | small, T2, one breaking API | large: T2 + justified-T3 + stateful event tracking + `Disconnect` override |
+| Reviewability | small, T2, one breaking API | large: T2 + justified-T3 + stateful event tracking + cleanup lifecycle |
 | Risk isolation | risky stateful pool observer bakes separately | easy win blocked if pool design iterates |
 | Releases | two `[Unreleased]` entries | one |
 | ADR dependency | T2 needs only the ADR 0003 row | T3 needs **this ADR Accepted** before merge (gate) |
@@ -344,16 +344,13 @@ implementing PRs:
    redis's custom sentinel/reflection mapping (`redis/hook.go errorType`). We
    cannot override it without forking, so mongo and redis `error.type` values
    will differ in style. Accepted T2 trade-off; note it in package docs.
-5. **Metrics-without-spans deployment posture (accepted)** — because the contrib
-   monitor reads no env gate while Marz spans are gated behind
-   `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` + `OTEL_MONGO_TRACING_ENABLED`
-   (ADR 0005), a process that omits those env vars gets **operation metrics but
-   no command spans**. This is acceptable (metrics should not hide behind a
-   tracing flag) but must be documented so the asymmetry is not mistaken for a
-   bug.
-6. **`Disconnect` override (Phase 2)** — defining `Disconnect` on our `*Client`
-   shadows the embedded `*otelmongo.Client.Disconnect`; the override must call
-   `c.Client.Disconnect(ctx)` through and then `reg.Unregister()` the pool
-   observable. Pool counters are updated from concurrent driver goroutines, so
-   per-address state must be atomic and tolerate transient negative `used`
-   (clamp at 0) between `CheckedOut`/`CheckedIn` ordering.
+5. **Metrics-without-spans deployment posture (superseded by ADR 0021)** — the
+   asymmetry disappears because spans also move to the contrib monitor and the
+   Marz `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` +
+   `OTEL_MONGO_TRACING_ENABLED` gates are dropped. Command spans are always-on
+   and sampler-governed.
+6. **Pool cleanup (Phase 2; superseded by ADR 0021)** — use the cleanup function
+   returned by `mongo.Instrument(...)` to unregister the pool observable. Pool
+   counters are updated from concurrent driver goroutines, so per-address state
+   must be atomic and tolerate transient negative `used` (clamp at 0) between
+   `CheckedOut`/`CheckedIn` ordering.

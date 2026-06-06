@@ -1,4 +1,5 @@
-// Package main demonstrates MongoDB tracing through the o11y MongoDB wrapper.
+// Package main demonstrates MongoDB tracing and operation metrics through the
+// o11y MongoDB facade.
 package main
 
 import (
@@ -40,6 +41,7 @@ func run() error {
 		o11y.WithEnvironment("development"),
 		o11y.WithServiceNamespace("platform"),
 		o11y.WithOTLPEndpoint("http://localhost:4318"),
+		o11y.WithMetricsOTLPEndpoint("http://localhost:4318"),
 		o11y.WithLogLevel(slog.LevelInfo),
 	)
 	if err != nil {
@@ -55,22 +57,12 @@ func run() error {
 
 	logger := obs.Logger
 	mongoURI := envOrDefault("MONGODB_URI", defaultMongoURI)
-	documentTracePropagation := exampleOptInEnabled("O11Y_MONGO_DOCUMENT_TRACE_PROPAGATION")
-
-	if !upstreamEnvEnabled("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED") || !upstreamEnvEnabled("OTEL_MONGO_TRACING_ENABLED") {
-		logger.WarnContext(ctx, "MongoDB command spans are disabled until upstream tracing gates are enabled",
-			slog.String("required_env_1", "OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true"),
-			slog.String("required_env_2", "OTEL_MONGO_TRACING_ENABLED=true"),
-		)
-	}
-
 	client, err := o11ymongo.Connect(
 		ctx,
 		mongoURI,
 		obs.TracerProvider(),
 		obs.MeterProvider(),
 		obs.Propagator,
-		o11ymongo.WithDocumentTracePropagation(documentTracePropagation),
 	)
 	if err != nil {
 		return fmt.Errorf("create MongoDB client: %w", err)
@@ -96,7 +88,6 @@ func run() error {
 	logger.InfoContext(opCtx, "connected to MongoDB",
 		slog.String("db.namespace", databaseName),
 		slog.String("db.collection.name", collectionName),
-		slog.Bool("document_trace_propagation", documentTracePropagation),
 	)
 
 	collection := client.Database(databaseName).Collection(collectionName)
@@ -140,30 +131,4 @@ func envOrDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
-}
-
-func upstreamEnvEnabled(key string) bool {
-	v, ok := os.LookupEnv(key)
-	if !ok {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
-	}
-}
-
-func exampleOptInEnabled(key string) bool {
-	v, ok := os.LookupEnv(key)
-	if !ok {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
-	}
 }
