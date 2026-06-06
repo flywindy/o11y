@@ -340,7 +340,7 @@ removes that host, so this ADR fixes the lifecycle as **Option A**:
 - **Rejected — thin wrapper struct with `Disconnect()`:** reintroduces a
   non-plain return type, undoing the core ergonomic win of Decision point 2
   (`func(*mongo.Client)` parameters would not accept it).
-- `reset-on-`ConnectionPoolCleared`/`ConnectionPoolClosed`` (ADR 0014) still
+- Reset on `ConnectionPoolCleared` / `ConnectionPoolClosed` (ADR 0014) still
   applies so a disconnected-but-not-yet-cleaned client reports zeros, not stale
   counters.
 
