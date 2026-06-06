@@ -103,6 +103,8 @@ Add to `nats/`:
 ```go
 // Respond replies to msg while preserving trace context, injecting the
 // active span context from ctx into the reply headers before sending.
+// It returns an error if msg is nil or if msg.Reply is empty, matching the
+// up-front validation the facade already does in Subscribe / QueueSubscribe.
 // Use this instead of msg.Respond, which routes through the raw NATS
 // connection and drops trace context (ADR 0004 §5).
 func (c *Conn) Respond(ctx context.Context, msg *natsgo.Msg, data []byte) error
@@ -137,7 +139,7 @@ Rationale:
   o11y later" open; baking the router in now is hard to reverse. Revisit if
   and when a second consumer validates the pattern.
 
-### 3. JetStream typed wrapper in `nats/` — closes HOLE ② (方針 2)
+### 3. JetStream typed wrapper in `nats/` — closes HOLE ② (Option 2)
 
 `conn.JetStream()` today returns the Marz `oteljetstream.JetStream`
 interface, so every caller still imports Marz. Instead, o11y provides its
@@ -241,6 +243,10 @@ This ADR is docs-only. The implementing work is intended to land as two PRs:
 - ADR 0003 / 0004 cross-references; CHANGELOG entry on implementation.
 - Decide the exact `Msg` method surface and whether `PushConsumer` is in or
   out of the first wrapper cut.
+- Document, in `docs/semconv.md`, the NATS attributes emitted by the upstream
+  library that are defined in the SDK's pinned Go `semconv` package — in
+  particular `messaging.operation.type` and `messaging.operation.name` (see
+  ADR 0004 §"Semconv Alignment").
 
 ---
 
@@ -249,6 +255,6 @@ This ADR is docs-only. The implementing work is intended to land as two PRs:
 1. Confirm `Proposed` status before any implementing PR.
 2. The HOLE ① decision: ship the `Respond` primitive and keep the router in
    chat (option a), rather than absorbing the router into o11y.
-3. The JetStream wrapper boundary: typed wrapper in `nats/` (方針 2) with
+3. The JetStream wrapper boundary: typed wrapper in `nats/` (Option 2) with
    config types passed through `nats.go/jetstream`, and the deferral of
    `PushConsumer` / ordered consumers.
