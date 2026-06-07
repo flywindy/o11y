@@ -129,6 +129,11 @@ self-written instrumentation. It structurally fixes the `msg.Respond` footgun
 that ADR 0004 §5 only documented — and that chat's `natsutil.ReplyJSON` /
 `natsrouter` currently trip (replies carry no trace context today).
 
+**Caller contract.** `Respond` returns its error rather than swallowing it: a
+failed reply leaves the requester blocked until its own timeout, which reads
+as "the responder is slow" and is painful to diagnose. Callers (the router
+included) must log and count reply failures, not discard them.
+
 ### 2. The request/reply router stays in chat — NOT in o11y (HOLE ① option a)
 
 o11y ships the `Respond` *primitive*; it does **not** absorb the router.
@@ -157,10 +162,13 @@ interface, so every caller still imports Marz. Instead, o11y provides its
 **own** JetStream types in the `nats/` package (same package as the core
 facade — short import path, consistent with `Connect` / `MsgHandler`):
 
-- A consumer handler shaped as **`func(ctx context.Context, msg Msg)`**,
+- A consumer handler shaped as **`func(ctx context.Context, msg jetstream.Msg)`**,
   mirroring the core `MsgHandler`, where the wrapper flattens
-  `oteljetstream.Msg` → `(ctx, jetstream.Msg)`. Consistency: a caller writes
-  the same `(ctx, msg)` shape for core subscribe and JetStream consume.
+  `oteljetstream.Msg` → `(ctx, jetstream.Msg)`. The handler receives the
+  **native `jetstream.Msg`** (no o11y-owned `Msg` type), so `Ack` / `Nak` /
+  `Term` / `InProgress` / `Metadata` come for free and the only thing the
+  wrapper adds is the trace-carrying `ctx`. A caller writes the same
+  `(ctx, msg)` shape for core subscribe and JetStream consume.
 - **Configuration types pass through `nats.go/jetstream`** (`StreamConfig`,
   `ConsumerConfig`, `AckExplicitPolicy`, `PubAck`, …). These are already
   aliases in `oteljetstream`, so sourcing them from `nats.go/jetstream` is
@@ -180,11 +188,42 @@ Tier: **T2**, unchanged. `nats/doc.go` keeps its `// Tier: T2` annotation.
 #### Surface to wrap
 
 - Stream/consumer management used by chat: `CreateOrUpdateStream`, `Stream`,
-  `CreateOrUpdateConsumer`, `Publish`.
+  `CreateOrUpdateConsumer`.
+- **`Publish` with publish-option pass-through** —
+  `Publish(ctx, subj, data, opts ...jetstream.PublishOpt)`. Required, not
+  cosmetic: chat's `pkg/natsutil/canonical_dedup.go` relies on
+  `jetstream.WithMsgID()` (the `Nats-Msg-Id` header + the stream duplicate
+  window) for idempotent publishes. A wrapper that dropped the options would
+  **silently disable JetStream dedup** — a reliability regression, not an
+  ergonomics one.
 - The three new-API pull consume modes for parity: `Consume`, `Messages`,
-  `Fetch` (each yielding `(ctx, msg)`).
+  `Fetch`, each delivering the handler `(ctx, jetstream.Msg)`. `Consume` must
+  **return the `ConsumeContext`** (callers need `Stop()` for graceful
+  shutdown) and **pass through `jetstream.PullConsumeOpt`**, including the
+  **`ConsumeErrHandler`** — consumer-side failures (connection loss, pull
+  errors, heartbeat misses) surface only through that handler, so a wrapper
+  that swallowed it would turn a broken consumer into a silent stall.
 - **Deferred:** `PushConsumer` and the ordered-consumer surface — wrap only
   when a consumer needs them, to keep the initial surface auditable.
+
+### 4. Metrics stay out of scope (unchanged from ADR 0004)
+
+Adding a JetStream type surface must not be read as adding NATS metrics. The
+facade remains **trace-only** per the ADR 0004 amendment (2026-05-25):
+operational signals — consumer lag (`NumPending` / `NumAckPending` /
+`NumRedelivered`), throughput, JetStream storage — come from
+`prometheus-nats-exporter` scraped by the OTel Collector, not from this
+wrapper. This subsection exists to stop the wider type surface from creating a
+false impression of metrics coverage (the same risk ADR 0004 amendment §3
+flagged, replayed on the JetStream types).
+
+Honest nuance for the record: the new `Consume` / `Msg` seam *would* lower the
+cost of a future per-message consume-metric layer (ADR 0004 assumed no such
+seam existed, since `nats.go` has no per-message hook). It does **not** change
+today's decision — the high-value signal (consumer lag) is not a per-message
+quantity, is already exposed server-side, and messaging-metrics semconv is
+still Development. Any revisit stays governed by ADR 0004 amendment §5's
+triggers.
 
 ---
 
@@ -221,6 +260,23 @@ This ADR is docs-only. The implementing work is intended to land as two PRs:
 
 ---
 
+## Rollout & rollback
+
+- **Mixed-version fleet is safe.** During a phased rollout some services run
+  the old stack (Marz direct + globals) and some the new (o11y + explicit
+  providers). Both inject the same W3C `traceparent` into NATS headers via the
+  same propagator, so the **on-the-wire format is unchanged** and traces keep
+  linking across the boundary — there is no flag-day requirement.
+- **Rollback is a revert.** The change is import-level with no wire or schema
+  change, so reverting the integration PR restores prior behavior with no data
+  migration and no consumer reset.
+- **Do not leave a service half-migrated.** A service still on the old stack
+  relies on the OTel globals; the new stack does not read them. A service that
+  has o11y wiring but still has code reading `otel.GetTracerProvider()` would
+  get a noop provider for that code path (see Global-state section).
+
+---
+
 ## Consequences
 
 **Positive**
@@ -236,7 +292,8 @@ This ADR is docs-only. The implementing work is intended to land as two PRs:
 **Negative / Trade-offs**
 
 - o11y owns a larger NATS surface to maintain, version, and document
-  (JetStream management + three consume modes + a `Msg` wrapper).
+  (JetStream management + three consume modes). The handler delivers the
+  native `jetstream.Msg`, so there is no o11y `Msg` type to maintain.
 - The request/reply router remains duplicated per consumer until a second
   consumer justifies promoting it; cross-service envelope/middleware
   consistency is not centrally owned yet.
@@ -252,8 +309,19 @@ This ADR is docs-only. The implementing work is intended to land as two PRs:
 - `nats/doc.go` Tier annotation stays `T2` (re-confirm under ADR 0008 §7 CI
   gate).
 - ADR 0003 / 0004 cross-references; CHANGELOG entry on implementation.
-- Decide the exact `Msg` method surface and whether `PushConsumer` is in or
-  out of the first wrapper cut.
+- Decide whether `PushConsumer` / ordered consumers are in or out of the
+  first wrapper cut (the consume handler already settles on native
+  `jetstream.Msg`, so no o11y `Msg` method surface needs deciding).
+- Tests (ADR 0008 §"Accepted clarifications" — T2 facades test
+  provider/propagator wiring): assert the reply carries `traceparent` and the
+  requester links back to the responder span; `Respond` errors on nil `msg` /
+  empty `Reply`; the JetStream consumer span links to the publisher span; and
+  `Publish` option pass-through preserves `WithMsgID` dedup.
+- Open question: whether `Respond` needs a header-carrying variant
+  (`RespondMsg(ctx, msg, *nats.Msg)`). Today `Publish(ctx, subj, data)` sets
+  no custom reply headers; chat's `ReplyJSON` puts status in the JSON
+  envelope, so the byte form suffices for now — but echoing `request_id` /
+  content-type on the reply would need the variant. Decide at implementation.
 - `docs/semconv.md` already catalogs the emitted NATS attributes (including
   `messaging.operation.type` and `messaging.operation.name`); verify and
   update that catalog **if** the JetStream wrapper changes the emitted
@@ -267,5 +335,8 @@ This ADR is docs-only. The implementing work is intended to land as two PRs:
 2. The HOLE ① decision: ship the `Respond` primitive and keep the router in
    chat (option a), rather than absorbing the router into o11y.
 3. The JetStream wrapper boundary: typed wrapper in `nats/` (Option 2) with
-   config types passed through `nats.go/jetstream`, and the deferral of
-   `PushConsumer` / ordered consumers.
+   config types passed through `nats.go/jetstream`; the handler delivering the
+   native `jetstream.Msg`; `Publish` / `Consume` passing through their options
+   (notably `WithMsgID` dedup and `ConsumeErrHandler`) and `Consume` returning
+   the `ConsumeContext`; and the deferral of `PushConsumer` / ordered
+   consumers.
