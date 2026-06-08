@@ -253,23 +253,23 @@ func (s *poolState) setOptions(ctx context.Context, metrics *poolMetrics, opts *
 		s.createdMax = opts.MaxPoolSize
 	}
 
-	min := int64(opts.MinPoolSize)
-	if delta := min - s.emittedMin; delta != 0 {
+	minSize := int64(opts.MinPoolSize)
+	if delta := minSize - s.emittedMin; delta != 0 {
 		metrics.idleMin.Add(ctx, delta, s.poolAddOpt...)
-		s.emittedMin = min
+		s.emittedMin = minSize
 	}
 
-	max := int64(opts.MaxPoolSize)
-	if max == 0 {
+	maxSize := int64(opts.MaxPoolSize)
+	if maxSize == 0 {
 		if s.emittedMax != 0 {
 			metrics.max.Add(ctx, -s.emittedMax, s.poolAddOpt...)
 			s.emittedMax = 0
 		}
 		return
 	}
-	if delta := max - s.emittedMax; delta != 0 {
+	if delta := maxSize - s.emittedMax; delta != 0 {
 		metrics.max.Add(ctx, delta, s.poolAddOpt...)
-		s.emittedMax = max
+		s.emittedMax = maxSize
 	}
 }
 
