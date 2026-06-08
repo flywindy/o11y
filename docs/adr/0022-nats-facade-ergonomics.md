@@ -206,24 +206,31 @@ Tier: **T2**, unchanged. `nats/doc.go` keeps its `// Tier: T2` annotation.
   window) for idempotent publishes. A wrapper that dropped the options would
   **silently disable JetStream dedup** — a reliability regression, not an
   ergonomics one.
-- The three new-API pull consume modes, each wrapped in its **native shape** —
-  do **not** collapse them all to a handler; only `Consume` is handler-based in
-  `nats.go` v1.50.0:
+- The new-API pull consume surface, each wrapped in its **native shape** — do
+  **not** collapse them to a single handler; in `nats.go` v1.50.0 only
+  `Consume` is handler-based:
   - **`Consume(handler, ...)`** — handler `(ctx, jetstream.Msg)`; must
-    **return the `ConsumeContext`** (callers need `Stop()` for graceful
-    shutdown) and **pass through `jetstream.PullConsumeOpt`**, including the
-    **`ConsumeErrHandler`** — consumer-side failures (connection loss, pull
-    errors, heartbeat misses) surface only through that handler, so a wrapper
-    that swallowed it would turn a broken consumer into a silent stall.
-  - **`Messages(...)`** — returns a traced iterator (`MessagesContext`-shaped)
-    whose `Next()` yields `(ctx, jetstream.Msg)`; iterator semantics and
-    `Stop()` preserved.
+    **return a `ConsumeContext` preserving the full native contract**
+    (`Stop()` **and** `Drain()` **and** `Closed()`), ideally by returning the
+    native `jetstream.ConsumeContext` — a context exposing only `Stop()` would
+    break drain-and-wait shutdown paths. Must also **pass through
+    `jetstream.PullConsumeOpt`**, including the **`ConsumeErrHandler`** —
+    consumer-side failures (connection loss, pull errors, heartbeat misses)
+    surface only through that handler, so a wrapper that swallowed it would
+    turn a broken consumer into a silent stall.
+  - **`Messages(...)`** — returns a traced iterator whose `Next()` yields
+    `(ctx, jetstream.Msg)`, preserving the native `MessagesContext` contract
+    (`Next` / `Stop` / `Drain`).
+  - **`Next(...)`** — the single-message pull convenience on
+    `jetstream.Consumer` (Marz wraps it to return `(ctx, jetstream.Msg, error)`).
+    Include a traced `Next`; omitting it leaves single-message pull callers
+    unable to drop their Marz import, defeating the ADR's goal.
   - **`Fetch` / `FetchBytes` / `FetchNoWait`** — return a traced `MessageBatch`
     exposing the per-message trace `ctx`; the batch/channel contract preserved.
 
-  This mirrors what Marz `oteljetstream` already does (iterator/batch shapes
-  kept, `ctx` added), so existing iterator/batch call sites migrate without
-  behavior changes.
+  This mirrors what Marz `oteljetstream` already does (iterator / batch / `Next`
+  shapes kept, `ctx` added), so existing call sites migrate without behavior
+  changes.
 - **Deferred:** `PushConsumer` and the ordered-consumer surface — wrap only
   when a consumer needs them, to keep the initial surface auditable.
 
@@ -348,10 +355,15 @@ This ADR is docs-only. The implementing work is intended to land as two PRs:
   no custom reply headers; chat's `ReplyJSON` puts status in the JSON
   envelope, so the byte form suffices for now — but echoing `request_id` /
   content-type on the reply would need the variant. Decide at implementation.
-- `docs/semconv.md` already catalogs the emitted NATS attributes (including
-  `messaging.operation.type` and `messaging.operation.name`); verify and
-  update that catalog **if** the JetStream wrapper changes the emitted
-  attribute set, rather than treating it as new documentation.
+- `docs/semconv.md` catalogs most emitted NATS attributes
+  (`messaging.operation.type` / `.name`, etc.), but it does **not** list
+  `messaging.consumer.name`, which Marz `oteljetstream` hardcodes on JetStream
+  consumer spans (`Next` / `Consume` / `Messages` / `Fetch`) and which is **not**
+  a key in the pinned semconv v1.39.0 (the catalog only carries
+  `messaging.consumer.group.name`). Phase 2 must add an explicit
+  catalog/deviation entry for `messaging.consumer.name` — an already-emitted,
+  currently-undocumented attribute, not something conditional on the wrapper
+  changing the emitted set.
 
 ---
 
