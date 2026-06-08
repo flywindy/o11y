@@ -134,6 +134,15 @@ failed reply leaves the requester blocked until its own timeout, which reads
 as "the responder is slow" and is painful to diagnose. Callers (the router
 included) must log and count reply failures, not discard them.
 
+**Header propagation ≠ requester-side span linkage.** `Respond` guarantees the
+reply *carries* `traceparent` (the responder's context on the reply headers).
+It does **not**, by itself, create a requester-side receive span that links
+back to the responder: `otelnats.Conn.Request` waits on
+`RequestMsgWithContext` and returns the reply without extracting reply headers
+or starting a receive span. Closing that link would require extending
+`Request` (or a `RequestTraced` helper) and is **out of Phase 1 scope** —
+tracked as an open question in Follow-up.
+
 ### 2. The request/reply router stays in chat — NOT in o11y (HOLE ① option a)
 
 o11y ships the `Respond` *primitive*; it does **not** absorb the router.
@@ -162,13 +171,14 @@ interface, so every caller still imports Marz. Instead, o11y provides its
 **own** JetStream types in the `nats/` package (same package as the core
 facade — short import path, consistent with `Connect` / `MsgHandler`):
 
-- A consumer handler shaped as **`func(ctx context.Context, msg jetstream.Msg)`**,
-  mirroring the core `MsgHandler`, where the wrapper flattens
-  `oteljetstream.Msg` → `(ctx, jetstream.Msg)`. The handler receives the
-  **native `jetstream.Msg`** (no o11y-owned `Msg` type), so `Ack` / `Nak` /
-  `Term` / `InProgress` / `Metadata` come for free and the only thing the
-  wrapper adds is the trace-carrying `ctx`. A caller writes the same
-  `(ctx, msg)` shape for core subscribe and JetStream consume.
+- For the **`Consume`** mode, a handler shaped as
+  **`func(ctx context.Context, msg jetstream.Msg)`**, mirroring the core
+  `MsgHandler`: the wrapper flattens `oteljetstream.Msg` → `(ctx, jetstream.Msg)`
+  per delivery. The handler receives the **native `jetstream.Msg`** (no
+  o11y-owned `Msg` type), so `Ack` / `Nak` / `Term` / `InProgress` /
+  `Metadata` come for free and the only thing the wrapper adds is the
+  trace-carrying `ctx`. (`Messages` and `Fetch` are **not** handler-based —
+  they keep their native iterator/batch shapes; see "Surface to wrap".)
 - **Configuration types pass through `nats.go/jetstream`** (`StreamConfig`,
   `ConsumerConfig`, `AckExplicitPolicy`, `PubAck`, …). These are already
   aliases in `oteljetstream`, so sourcing them from `nats.go/jetstream` is
@@ -196,13 +206,24 @@ Tier: **T2**, unchanged. `nats/doc.go` keeps its `// Tier: T2` annotation.
   window) for idempotent publishes. A wrapper that dropped the options would
   **silently disable JetStream dedup** — a reliability regression, not an
   ergonomics one.
-- The three new-API pull consume modes for parity: `Consume`, `Messages`,
-  `Fetch`, each delivering the handler `(ctx, jetstream.Msg)`. `Consume` must
-  **return the `ConsumeContext`** (callers need `Stop()` for graceful
-  shutdown) and **pass through `jetstream.PullConsumeOpt`**, including the
-  **`ConsumeErrHandler`** — consumer-side failures (connection loss, pull
-  errors, heartbeat misses) surface only through that handler, so a wrapper
-  that swallowed it would turn a broken consumer into a silent stall.
+- The three new-API pull consume modes, each wrapped in its **native shape** —
+  do **not** collapse them all to a handler; only `Consume` is handler-based in
+  `nats.go` v1.50.0:
+  - **`Consume(handler, ...)`** — handler `(ctx, jetstream.Msg)`; must
+    **return the `ConsumeContext`** (callers need `Stop()` for graceful
+    shutdown) and **pass through `jetstream.PullConsumeOpt`**, including the
+    **`ConsumeErrHandler`** — consumer-side failures (connection loss, pull
+    errors, heartbeat misses) surface only through that handler, so a wrapper
+    that swallowed it would turn a broken consumer into a silent stall.
+  - **`Messages(...)`** — returns a traced iterator (`MessagesContext`-shaped)
+    whose `Next()` yields `(ctx, jetstream.Msg)`; iterator semantics and
+    `Stop()` preserved.
+  - **`Fetch` / `FetchBytes` / `FetchNoWait`** — return a traced `MessageBatch`
+    exposing the per-message trace `ctx`; the batch/channel contract preserved.
+
+  This mirrors what Marz `oteljetstream` already does (iterator/batch shapes
+  kept, `ctx` added), so existing iterator/batch call sites migrate without
+  behavior changes.
 - **Deferred:** `PushConsumer` and the ordered-consumer surface — wrap only
   when a consumer needs them, to keep the initial surface auditable.
 
@@ -313,10 +334,15 @@ This ADR is docs-only. The implementing work is intended to land as two PRs:
   first wrapper cut (the consume handler already settles on native
   `jetstream.Msg`, so no o11y `Msg` method surface needs deciding).
 - Tests (ADR 0008 §"Accepted clarifications" — T2 facades test
-  provider/propagator wiring): assert the reply carries `traceparent` and the
-  requester links back to the responder span; `Respond` errors on nil `msg` /
-  empty `Reply`; the JetStream consumer span links to the publisher span; and
+  provider/propagator wiring): assert the reply **carries `traceparent`**
+  (header propagation only — *not* requester-side span linkage, which is out
+  of Phase 1 scope, see Decision 1); `Respond` errors on nil `msg` / empty
+  `Reply`; the JetStream consumer span links to the publisher span; and
   `Publish` option pass-through preserves `WithMsgID` dedup.
+- Open question: a requester-side receive span that links to the responder (so
+  the requester's trace shows the reply as a linked span, not just propagated
+  headers). Needs `Request` to extract reply headers and start a span;
+  deferred beyond Phase 1.
 - Open question: whether `Respond` needs a header-carrying variant
   (`RespondMsg(ctx, msg, *nats.Msg)`). Today `Publish(ctx, subj, data)` sets
   no custom reply headers; chat's `ReplyJSON` puts status in the JSON
