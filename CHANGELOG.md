@@ -15,6 +15,24 @@ adopters can plan their upgrades.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+### Breaking Changes (Migration Guide)
+
+---
+
+## [0.4.0] - 2026-06-08
+
+### Added
+
 - Added `WithSamplingRatio` and `WithTraceSampler` so services can configure
   SDK-side head sampling explicitly while preserving OpenTelemetry
   `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` support when no typed
