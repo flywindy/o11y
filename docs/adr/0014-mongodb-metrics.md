@@ -1,13 +1,20 @@
 # ADR 0014 — MongoDB Metrics
 
-**Status**: Accepted — Phase 1 (operation duration) implemented; Phase 2
-(connection pool metrics) pending (Option A; dual tier annotation at Phase 2)
+**Status**: Accepted — Phase 1 (operation duration) and Phase 2
+(connection pool metrics) implemented; ADR 0021 supersedes the original
+Phase 1 span mechanism and pool cleanup host.
 **Date**: 2026-05-25
 **Relates to**: ADR 0005 (MongoDB integration), ADR 0008 (sourcing policy),
 ADR 0013 (Redis/Valkey integration — reference for the pool-metric pattern)
 **Superseded in part by**: ADR 0021 (resolves the deferred Q1 Option B — spans
 move to the contrib monitor; Phase 2 pool-metric lifecycle moves from a wrapper
 `Disconnect` override to the cleanup func returned by `Instrument`)
+
+**Implementation note (2026-06-06)**: Phase 2 is implemented as an SDK-owned
+`event.PoolMonitor` in `mongo/`, emitting the connection-pool metrics below
+under the SDK's pinned semantic conventions. ADR 0021 means command spans and
+operation-duration metrics now both come from the official contrib monitor,
+while the pool metrics remain the justified T3 portion of this ADR.
 
 ---
 
@@ -92,7 +99,7 @@ attached on the `*options.ClientOptions` we already build, before handing it to
 
 Attach an **SDK-owned `event.PoolMonitor`** via
 `clientOptions.SetPoolMonitor(...)` that maintains per-server-address counters
-and feeds an async observable callback registered on `mp`. This is the
+and emits synchronous metric deltas through SDK-owned instruments. This is the
 genuinely custom part; it mirrors `redis/metrics.go` but is **event-stream
 based** (deltas) because the Go driver exposes **no pool-stats snapshot** like
 go-redis's `PoolStats()`.
@@ -101,20 +108,28 @@ go-redis's `PoolStats()`.
 
 | Metric | Type | Source (driver `event.PoolEvent` / options) |
 |---|---|---|
-| `db.client.connection.count` `{state=used\|idle}` | observable up-down counter | running counters: `ConnectionReady`−`ConnectionClosed` = total; `ConnectionCheckedOut`−`ConnectionCheckedIn` = used; idle = total−used |
-| `db.client.connection.max` | observable up-down counter | `PoolOptions.MaxPoolSize` (from `ConnectionPoolCreated`/`Ready`); omit if 0 (unbounded) — same rule we just applied to redis |
-| `db.client.connection.idle.min` | observable up-down counter | `PoolOptions.MinPoolSize` |
+| `db.client.connection.count` `{state=used\|idle}` | up-down counter | running counters: `ConnectionReady`−`ConnectionClosed` = total; `ConnectionCheckedOut`−`ConnectionCheckedIn` = used; idle = total−used |
+| `db.client.connection.max` | up-down counter | `PoolOptions.MaxPoolSize` (from `ConnectionPoolCreated`/`Ready`); omit if 0 (unbounded) |
+| `db.client.connection.idle.min` | up-down counter | `PoolOptions.MinPoolSize` |
 | `db.client.connection.idle.max` | — | **omit**; MongoDB has no max-idle concept |
-| `db.client.connection.timeouts` | observable counter | count of `ConnectionCheckOutFailed` with `Reason == event.ReasonTimedOut` |
+| `db.client.connection.timeouts` | counter | count of `ConnectionCheckOutFailed` with `Reason == event.ReasonTimedOut` |
 | `db.client.connection.create_time` | histogram (s) | `ConnectionReady.Duration` |
-| `db.client.connection.pending_requests` | observable up-down counter | `ConnectionCheckOutStarted` − (`ConnectionCheckedOut` + `ConnectionCheckOutFailed`) |
+| `db.client.connection.pending_requests` | up-down counter | `ConnectionCheckOutStarted` − (`ConnectionCheckedOut` + `ConnectionCheckOutFailed`) |
+
+Implementation note: the merged Phase 2 implementation follows the synchronous
+instrument kinds in OTel semconv v1.39.0: `count`, `max`, `idle.min`, and
+`pending_requests` are `Int64UpDownCounter`, `timeouts` is `Int64Counter`, and
+`create_time` remains `Float64Histogram`.
 
 - **Attributes**: `db.system.name=mongodb`, `db.client.connection.pool.name`
   (synthesized like redis, or `WithPoolName`), `server.address` + `server.port`
   parsed from `PoolEvent.Address`. Bounded by topology size (replica set /
   shards), so cardinality is naturally small.
-- **State reset** on `ConnectionPoolCleared` / `ConnectionPoolClosed` to avoid
-  drift after a pool is torn down.
+- **Pool clear** keeps checked-out connections visible and preserves pool
+  sizing until the driver emits the corresponding close events.
+- **Pool close** emits zeroing deltas and removes that pool state without
+  disabling the tracker, because the driver can close and recreate pools during
+  topology changes.
 - `wait_time` / `use_time` deferred (not cleanly derivable from v2 events;
   dropped by `MetricViews` like redis does).
 
@@ -123,8 +138,11 @@ go-redis's `PoolStats()`.
 Superseded by ADR 0021: because `mongo.Connect` now returns a plain driver
 `*mongo.Client` instead of a wrapper with a `Disconnect` override, pool-metric
 registration is cleaned up through the cleanup function returned by
-`mongo.Instrument(...)`. Phase 1 cleanup is a no-op; Phase 2 will use the same
-function to call `reg.Unregister()` for the pool observable.
+`mongo.Instrument(...)`. Phase 2 uses that function to disable SDK-owned pool
+event handling after the application's final metrics flush. `ConnectionPoolClosed`
+only zeroes and removes the closed pool state; it does not disable the tracker,
+because the driver may recreate pools for the same client during topology
+changes.
 
 ---
 
@@ -151,19 +169,19 @@ func Connect(ctx, uri string, tp trace.TracerProvider, mp metric.MeterProvider,
 
 - Phase 1 metric → **T2** (contrib lib). Phase 2 pool metrics → **justified
   T3** (no candidate implements a pool observer).
-- `mongo/doc.go` Tier line must be updated to reflect the mixed sourcing once
-  Phase 2 lands (T2 facade for spans + duration; T3 for the SDK-owned pool
-  observer, justified in this ADR per §2). Use a **dual annotation**
+- `mongo/doc.go` Tier line reflects the mixed sourcing after Phase 2
+  (T2 facade for spans + duration; T3 for the SDK-owned pool observer,
+  justified in this ADR per §2). Use a **dual annotation**
   (`// Tier: T2` + `// Tier: T3`) — the CI gate (ADR 0008 §7.2) accepts both
   lines, as decided in Q3 below; no gate change is required.
 - **ADR 0003**: add the contrib `otelmongo` module to the Approved-integrations
   table (global-state grep + semconv row), per ADR 0008 §4 / §7.1.
 - **ADR 0005**: cross-reference this ADR; note metrics now augment the trace
   facade.
-- **CHANGELOG**: `[Unreleased]` entry for the new `mp` param, `mongo` metrics,
-  and `WithPoolName`.
+- **CHANGELOG**: `[Unreleased]` entries for the `mp` param, MongoDB metrics,
+  pool metrics, and `WithPoolName`.
 - **README / examples/mongodb**: update the `Connect` call to pass
-  `obs.MeterProvider()`.
+  `obs.MeterProvider()` and document pool metrics.
 
 ---
 
@@ -177,7 +195,7 @@ func Connect(ctx, uri string, tp trace.TracerProvider, mp metric.MeterProvider,
   assert provider wiring rejects nil `mp`.
 - **Phase 2**: unit-testable without a real server — `event.PoolMonitor` and
   `event.CommandMonitor` are plain structs of funcs, so feed synthetic
-  `*event.PoolEvent` sequences and assert the observable callback reports the
+  `*event.PoolEvent` sequences and assert the exported metrics report the
   expected `count{used,idle}`, `timeouts`, `create_time`, and that
   `idle.max` is omitted and `max` is omitted when `MaxPoolSize==0`.
 - Integration test (build-tagged, `testcontainers-go`) for the healthy path,
@@ -336,9 +354,12 @@ implementing PRs:
    Q1 wart); document it on `MetricViews`.
 3. **Default pool name (confirmed)** — redis derives `redis-%x` from the client
    pointer; our `mongo.Connect` builds the client, so synthesize
-   `mongo-<primary-host>` from the parsed URI and let `WithPoolName` override.
-   The pool observer keys samples by `server.address` regardless, so the name is
-   a grouping label, not an identity key.
+   `mongo-<primary-host>-<n>` from the parsed URI, where `<n>` is a process-local
+   sequence that keeps separate clients on the same host from collapsing into one
+   stream, and let `WithPoolName` override. (A monotonic sequence is used rather
+   than the `ClientOptions` pointer address so the name stays stable and readable
+   across runs.) The pool observer keys samples by `server.address` regardless,
+   so the name is a grouping label, not an identity key.
 4. **`error.type` style divergence (accepted)** — the contrib metric derives
    `error.type` via `semconv.ErrorType(evt.Failure)`, which will not match
    redis's custom sentinel/reflection mapping (`redis/hook.go errorType`). We
@@ -350,7 +371,7 @@ implementing PRs:
    `OTEL_MONGO_TRACING_ENABLED` gates are dropped. Command spans are always-on
    and sampler-governed.
 6. **Pool cleanup (Phase 2; superseded by ADR 0021)** — use the cleanup function
-   returned by `mongo.Instrument(...)` to unregister the pool observable. Pool
-   counters are updated from concurrent driver goroutines, so per-address state
-   must be atomic and tolerate transient negative `used` (clamp at 0) between
-   `CheckedOut`/`CheckedIn` ordering.
+   returned by `mongo.Instrument(...)` to stop SDK-owned pool event handling
+   after the final metrics flush. Pool counters are updated from concurrent
+   driver goroutines, so per-address state must tolerate duplicate, missing, or
+   reordered connection lifecycle events without emitting negative counts.

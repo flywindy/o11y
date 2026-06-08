@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/event"
 	drivermongo "go.mongodb.org/mongo-driver/v2/mongo"
@@ -18,6 +19,36 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
+
+// Option configures MongoDB instrumentation behavior.
+type Option func(*config)
+
+type config struct {
+	poolName string
+}
+
+// WithPoolName sets the db.client.connection.pool.name attribute for MongoDB
+// connection-pool metrics.
+//
+// When unset, the SDK derives a bounded name from the first configured MongoDB
+// host and the ClientOptions instance identity. The option only affects
+// SDK-owned pool metrics; command spans and db.client.operation.duration
+// metrics come from otelmongo.
+func WithPoolName(name string) Option {
+	return func(cfg *config) {
+		cfg.poolName = strings.TrimSpace(name)
+	}
+}
+
+func newConfig(opts []Option) config {
+	cfg := config{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+	return cfg
+}
 
 // Connect establishes an instrumented MongoDB client.
 //
@@ -37,6 +68,7 @@ func Connect(
 	tp trace.TracerProvider,
 	mp metric.MeterProvider,
 	prop propagation.TextMapPropagator,
+	opts ...Option,
 ) (*drivermongo.Client, error) {
 	if ctx == nil {
 		return nil, errors.New("mongo connect: context must not be nil")
@@ -49,22 +81,21 @@ func Connect(
 	}
 
 	clientOptions := options.Client().ApplyURI(uri)
-	// TODO(ADR 0014 Phase 2): if Instrument starts registering pool-metric
-	// observables, surface that cleanup lifecycle from Connect instead of
-	// leaving it available only to application-built client options.
-	if _, err := Instrument(clientOptions, tp, mp, prop); err != nil {
+	cleanup, err := Instrument(clientOptions, tp, mp, prop, opts...)
+	if err != nil {
 		return nil, fmt.Errorf("mongo connect: %w", err)
 	}
 
 	client, err := drivermongo.Connect(clientOptions)
 	if err != nil {
+		_ = cleanup(context.Background())
 		return nil, fmt.Errorf("mongo connect: %w", err)
 	}
 	return client, nil
 }
 
-// Instrument attaches o11y MongoDB tracing and operation-duration metrics to
-// opts without taking over client construction.
+// Instrument attaches o11y MongoDB tracing, operation-duration metrics, and
+// connection-pool metrics to opts without taking over client construction.
 //
 // opts, tp, mp, and prop are required. prop is accepted to keep the integration
 // surface aligned with other o11y facades and to reserve the explicit
@@ -76,14 +107,16 @@ func Connect(
 // opts.SetMonitor after Instrument replaces the composed monitor and drops o11y
 // instrumentation.
 //
-// The returned cleanup function is a no-op in the current phase. It exists so a
-// future pool-metric observer can unregister its callback without changing this
-// API.
+// The returned cleanup function disables SDK-owned pool metrics handling for
+// these ClientOptions. Applications that build their own ClientOptions should
+// defer it near client.Disconnect, after the application's final metrics flush
+// if it needs to export a last zero-value pool snapshot.
 func Instrument(
 	opts *options.ClientOptions,
 	tp trace.TracerProvider,
 	mp metric.MeterProvider,
 	prop propagation.TextMapPropagator,
+	instrumentOpts ...Option,
 ) (func(context.Context) error, error) {
 	if opts == nil {
 		return nil, errors.New("client options must not be nil")
@@ -98,8 +131,16 @@ func Instrument(
 		return nil, errors.New("propagator must not be nil")
 	}
 
+	cfg := newConfig(instrumentOpts)
+	poolMonitor, cleanup, err := newPoolMonitor(opts, mp, cfg.poolName)
+	if err != nil {
+		return nil, err
+	}
+
 	opts.SetMonitor(composeCommandMonitors(opts.Monitor, NewMonitor(tp, mp)))
-	return func(context.Context) error { return nil }, nil
+	opts.SetPoolMonitor(composePoolMonitors(opts.PoolMonitor, poolMonitor))
+
+	return cleanup, nil
 }
 
 // NewMonitor creates the MongoDB CommandMonitor used by this package.
@@ -149,6 +190,26 @@ func composeCommandMonitors(first, second *event.CommandMonitor) *event.CommandM
 				}
 				if second.Failed != nil {
 					second.Failed(ctx, evt)
+				}
+			},
+		}
+	}
+}
+
+func composePoolMonitors(first, second *event.PoolMonitor) *event.PoolMonitor {
+	switch {
+	case first == nil:
+		return second
+	case second == nil:
+		return first
+	default:
+		return &event.PoolMonitor{
+			Event: func(evt *event.PoolEvent) {
+				if first.Event != nil {
+					first.Event(evt)
+				}
+				if second.Event != nil {
+					second.Event(evt)
 				}
 			},
 		}

@@ -44,7 +44,7 @@ so that every log entry is automatically enriched with `traceId` and `spanId`.
 | `http/` | T2 facade over `otelhttp` for server and client HTTP instrumentation |
 | `gin/` | T2 facade over `otelgin` plus typed gin error recording |
 | `nats/` | T2 facade over NATS Core and JetStream instrumentation |
-| `mongo/` | T2 facade over MongoDB driver instrumentation |
+| `mongo/` | T2 facade over MongoDB driver instrumentation plus SDK-owned pool metrics |
 | `redis/` | SDK-owned Redis/Valkey instrumentation over go-redis/v9 |
 | `internal/` | SDK-owned logging, tracing, metrics, and test utilities |
 | `examples/` | Runnable examples for supported integrations |
@@ -197,7 +197,7 @@ Full ADR documents live in [`docs/adr/`](docs/adr/).
 | Metrics strategy | Prometheus pull (default `:2112`) + OTLP push opt-in (`WithMetricsOTLPEndpoint`) | Prometheus pull requires zero Collector config; OTLP push covers serverless. Exemplars enabled by default (OTel SDK `SampledFilter`). See [ADR 0002](docs/adr/0002-metrics-strategy.md) |
 | Global state policy | SDK packages must not mutate OTel globals; third-party instrumentation libraries are verified per-version before adoption | See [ADR 0003](docs/adr/0003-global-state-policy.md) |
 | NATS integration | `github.com/Marz32onE/instrumentation-go/otel-nats` — verified at v0.2.11 not to mutate globals; wrapped by the `nats/` package | Covers NATS Core + all JetStream consumer patterns with OTel semconv v1.39.0. See [ADR 0004](docs/adr/0004-nats-integration.md) |
-| MongoDB integration | `go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/v2/mongo/otelmongo` — wrapped by the `mongo/` package | Wires SDK providers explicitly through a driver `CommandMonitor`, emits command spans and operation metrics, and does not inject `_oteltrace` into persisted documents. See [ADR 0021](docs/adr/0021-mongodb-instrumentation-mechanism.md) |
+| MongoDB integration | `go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/v2/mongo/otelmongo` — wrapped by the `mongo/` package | Wires SDK providers explicitly through a driver `CommandMonitor`, emits command spans and operation metrics, adds SDK-owned connection-pool metrics through `PoolMonitor`, and does not inject `_oteltrace` into persisted documents. See [ADR 0014](docs/adr/0014-mongodb-metrics.md) and [ADR 0021](docs/adr/0021-mongodb-instrumentation-mechanism.md) |
 | Semconv version policy | Pin v1.39.0; upgrade only when concrete triggers fire | Single SDK-owned pin avoids cognitive cost and dashboard breakage. Upgrade triggers and process documented to keep version moves deliberate. See [ADR 0006](docs/adr/0006-semconv-upgrade-strategy.md) |
 | HTTP integration | `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` — wrapped by the `http/` package | Provides `NewServerHandler` and `NewTransport` with SDK providers and propagator wired explicitly. See [ADR 0009](docs/adr/0009-replace-http-with-otelhttp.md) |
 | Gin integration | `go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin` — wrapped by the `gin/` package | Provides canonical middleware ordering and typed `gin.error.type` events for `c.Errors`. See [ADR 0010](docs/adr/0010-gin-integration.md) |
@@ -261,7 +261,8 @@ When replying to a message inside a `Subscribe` handler, do **not** use `msg.Res
 
 All MongoDB clients must go through `github.com/flywindy/o11y/mongo` so that
 the SDK's `TracerProvider` and `MeterProvider` are wired into official
-`otelmongo` instrumentation without reading global OpenTelemetry state.
+`otelmongo` instrumentation and SDK-owned pool metrics without reading global
+OpenTelemetry state.
 Command spans are always-on and sampler-governed; there are no Mongo-specific
 env gates.
 
@@ -270,12 +271,20 @@ documents. For asynchronous workflows, propagate trace context through an
 outbox or event envelope instead of mutating MongoDB documents.
 
 ```go
-client, err := o11ymongo.Connect(ctx, mongoURI, sdk.TracerProvider(), sdk.MeterProvider(), sdk.Propagator)
+client, err := o11ymongo.Connect(
+    ctx,
+    mongoURI,
+    sdk.TracerProvider(),
+    sdk.MeterProvider(),
+    sdk.Propagator,
+    o11ymongo.WithPoolName("app-mongo"),
+)
 ```
 
 Applications that build their own `*options.ClientOptions` must call
 `o11ymongo.Instrument(...)` before the MongoDB driver's `mongo.Connect(...)`
-and defer the returned cleanup function.
+and defer the returned cleanup function near `client.Disconnect` so SDK-owned
+pool event handling stops after the final metrics flush.
 
 ---
 

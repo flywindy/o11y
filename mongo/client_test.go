@@ -3,6 +3,7 @@ package mongo
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -162,6 +163,255 @@ func TestInstrument_ComposesExistingCommandMonitor(t *testing.T) {
 	histogram, ok := metric.Data.(metricdata.Histogram[float64])
 	require.True(t, ok, "expected MongoDB operation duration histogram")
 	assert.NotEmpty(t, histogram.DataPoints)
+}
+
+// TestInstrument_ComposesExistingPoolMonitorAndRecordsPoolMetrics verifies
+// existing PoolMonitor composition and SDK-owned MongoDB pool metric emission.
+func TestInstrument_ComposesExistingPoolMonitorAndRecordsPoolMetrics(t *testing.T) {
+	tp, prop, _ := newTestProviders()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithView(MetricViews(testHistogramBuckets)...),
+	)
+
+	var existingEvents []string
+	opts := options.Client().
+		ApplyURI("mongodb://mongo-a:27017").
+		SetPoolMonitor(&event.PoolMonitor{
+			Event: func(evt *event.PoolEvent) {
+				existingEvents = append(existingEvents, evt.Type)
+			},
+		})
+
+	cleanup, err := Instrument(opts, tp, provider, prop, WithPoolName("chat-mongo"))
+	require.NoError(t, err)
+	require.NotNil(t, cleanup)
+	require.NotNil(t, opts.PoolMonitor)
+
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolCreated, "mongo-a:27017", 0, &event.MonitorPoolOptions{
+		MaxPoolSize: 12,
+		MinPoolSize: 2,
+	})
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionReady, "mongo-a:27017", 150*time.Millisecond, nil)
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionCheckOutStarted, "mongo-a:27017", 0, nil)
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionCheckOutStarted, "mongo-a:27017", 0, nil)
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionCheckedOut, "mongo-a:27017", 0, nil)
+	emitPoolEventWithReason(opts.PoolMonitor, event.ConnectionCheckOutFailed, "mongo-a:27017", event.ReasonTimedOut)
+
+	assert.Equal(t, []string{
+		event.ConnectionPoolCreated,
+		event.ConnectionReady,
+		event.ConnectionCheckOutStarted,
+		event.ConnectionCheckOutStarted,
+		event.ConnectionCheckedOut,
+		event.ConnectionCheckOutFailed,
+	}, existingEvents)
+
+	rm := collectMongoMetrics(t, reader)
+	usedAttrs := []attribute.KeyValue{
+		semconv.DBSystemNameMongoDB,
+		semconv.DBClientConnectionPoolName("chat-mongo"),
+		semconv.ServerAddress("mongo-a"),
+		semconv.ServerPort(27017),
+		semconv.DBClientConnectionStateUsed,
+	}
+	idleAttrs := []attribute.KeyValue{
+		semconv.DBSystemNameMongoDB,
+		semconv.DBClientConnectionPoolName("chat-mongo"),
+		semconv.ServerAddress("mongo-a"),
+		semconv.ServerPort(27017),
+		semconv.DBClientConnectionStateIdle,
+	}
+	poolAttrs := []attribute.KeyValue{
+		semconv.DBSystemNameMongoDB,
+		semconv.DBClientConnectionPoolName("chat-mongo"),
+		semconv.ServerAddress("mongo-a"),
+		semconv.ServerPort(27017),
+	}
+
+	assert.Equal(t, int64(1), int64MetricValue(t, findMetric(t, rm, "db.client.connection.count"), usedAttrs...))
+	assert.Equal(t, int64(0), int64MetricValue(t, findMetric(t, rm, "db.client.connection.count"), idleAttrs...))
+	assert.Equal(t, int64(2), int64MetricValue(t, findMetric(t, rm, "db.client.connection.idle.min"), poolAttrs...))
+	assert.Equal(t, int64(12), int64MetricValue(t, findMetric(t, rm, "db.client.connection.max"), poolAttrs...))
+	assert.Equal(t, int64(0), int64MetricValue(t, findMetric(t, rm, "db.client.connection.pending_requests"), poolAttrs...))
+	assert.Equal(t, int64(1), int64MetricValue(t, findMetric(t, rm, "db.client.connection.timeouts"), poolAttrs...))
+
+	createTime := findMetric(t, rm, "db.client.connection.create_time")
+	histogram, ok := createTime.Data.(metricdata.Histogram[float64])
+	require.True(t, ok)
+	require.Len(t, histogram.DataPoints, 1)
+	assert.Equal(t, uint64(1), histogram.DataPoints[0].Count)
+	assert.InDelta(t, 0.15, histogram.DataPoints[0].Sum, 0.0001)
+	assert.Equal(t, testHistogramBuckets, histogram.DataPoints[0].Bounds)
+
+	assert.NoError(t, cleanup(context.Background()))
+}
+
+// TestInstrument_PoolMetricsDefaultPoolNameAndOmitUnboundedMax verifies
+// fallback pool-name derivation and omission of unbounded max pool size.
+func TestInstrument_PoolMetricsDefaultPoolNameAndOmitUnboundedMax(t *testing.T) {
+	tp, prop, _ := newTestProviders()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithView(MetricViews(testHistogramBuckets)...),
+	)
+	opts := options.Client().ApplyURI("mongodb://db-primary:27018")
+
+	cleanup, err := Instrument(opts, tp, provider, prop)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, cleanup(context.Background())) }()
+
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolCreated, "db-primary:27018", 0, &event.MonitorPoolOptions{
+		MinPoolSize: 3,
+		MaxPoolSize: 0,
+	})
+
+	rm := collectMongoMetrics(t, reader)
+	// Assert the public contract (host-prefixed default name) rather than
+	// comparing against defaultPoolName, which would just mirror the production
+	// logic and hide a regression in the naming algorithm.
+	idAttrs := []attribute.KeyValue{
+		semconv.DBSystemNameMongoDB,
+		semconv.ServerAddress("db-primary"),
+		semconv.ServerPort(27018),
+	}
+	idleMin := findMetric(t, rm, "db.client.connection.idle.min")
+	assert.Equal(t, int64(3), int64MetricValue(t, idleMin, idAttrs...))
+	poolName := poolNameValue(t, idleMin, idAttrs...)
+	assert.Truef(t, strings.HasPrefix(poolName, "mongo-db-primary-"),
+		"default pool name %q should be derived as mongo-<host>-<n>", poolName)
+	assertMetricAbsentOrEmpty(t, rm, "db.client.connection.max")
+}
+
+// TestDefaultPoolName_UniquePerClientOptions verifies the fallback pool name is
+// host-prefixed and distinct for separate ClientOptions instances, so two
+// clients pointed at the same host do not collapse into one metric stream, and
+// that WithPoolName still overrides the derivation.
+func TestDefaultPoolName_UniquePerClientOptions(t *testing.T) {
+	optsA := options.Client().ApplyURI("mongodb://mongo-a:27017")
+	optsB := options.Client().ApplyURI("mongodb://mongo-a:27017")
+
+	nameA := defaultPoolName(optsA, "")
+	nameB := defaultPoolName(optsB, "")
+
+	assert.Truef(t, strings.HasPrefix(nameA, "mongo-mongo-a-"), "got %q", nameA)
+	assert.Truef(t, strings.HasPrefix(nameB, "mongo-mongo-a-"), "got %q", nameB)
+	assert.NotEqual(t, nameA, nameB, "distinct ClientOptions must yield distinct pool names")
+	assert.Equal(t, "custom", defaultPoolName(optsA, "custom"), "override must win")
+}
+
+// TestInstrument_PoolMetricsResetAndCleanup verifies pool clear, close, and
+// explicit cleanup behavior for SDK-owned MongoDB pool metrics.
+func TestInstrument_PoolMetricsResetAndCleanup(t *testing.T) {
+	tp, prop, _ := newTestProviders()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithView(MetricViews(testHistogramBuckets)...),
+	)
+	opts := options.Client().ApplyURI("mongodb://mongo-a:27017")
+
+	cleanup, err := Instrument(opts, tp, provider, prop)
+	require.NoError(t, err)
+
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolCreated, "mongo-a:27017", 0, &event.MonitorPoolOptions{MaxPoolSize: 10})
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, "mongo-a:27017", 1, time.Millisecond, nil)
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionCheckOutStarted, "mongo-a:27017", 0, nil)
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionCheckedOut, "mongo-a:27017", 1, 0, nil)
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolCleared, "mongo-a:27017", 0, nil)
+
+	rm := collectMongoMetrics(t, reader)
+	// Match points by the stable server identity; the default pool name is
+	// asserted as a contract in TestInstrument_PoolMetricsDefaultPoolName... and
+	// TestDefaultPoolName_UniquePerClientOptions instead of being hard-coded here.
+	poolAttrs := []attribute.KeyValue{
+		semconv.DBSystemNameMongoDB,
+		semconv.ServerAddress("mongo-a"),
+		semconv.ServerPort(27017),
+	}
+	usedAttrs := []attribute.KeyValue{
+		semconv.DBSystemNameMongoDB,
+		semconv.ServerAddress("mongo-a"),
+		semconv.ServerPort(27017),
+		semconv.DBClientConnectionStateUsed,
+	}
+	assert.Equal(t, int64(1), int64MetricValue(t, findMetric(t, rm, "db.client.connection.count"), usedAttrs...))
+	assert.Equal(t, int64(10), int64MetricValue(t, findMetric(t, rm, "db.client.connection.max"), poolAttrs...))
+
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionClosed, "mongo-a:27017", 1, 0, nil)
+	rm = collectMongoMetrics(t, reader)
+	assert.Equal(t, int64(0), int64MetricValue(t, findMetric(t, rm, "db.client.connection.count"), usedAttrs...))
+
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolClosed, "mongo-a:27017", 0, nil)
+	rm = collectMongoMetrics(t, reader)
+	assert.Equal(t, int64(0), int64MetricValue(t, findMetric(t, rm, "db.client.connection.max"), poolAttrs...))
+
+	assert.NoError(t, cleanup(context.Background()))
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionReady, "mongo-a:27017", time.Millisecond, nil)
+	rm = collectMongoMetrics(t, reader)
+	assert.Equal(t, int64(0), int64MetricValue(t, findMetric(t, rm, "db.client.connection.max"), poolAttrs...))
+}
+
+// TestInstrument_PoolMetricsContinueAfterPoolClosedAndRecreated verifies that
+// topology churn does not permanently disable pool metric handling.
+func TestInstrument_PoolMetricsContinueAfterPoolClosedAndRecreated(t *testing.T) {
+	tp, prop, _ := newTestProviders()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithView(MetricViews(testHistogramBuckets)...),
+	)
+	opts := options.Client().ApplyURI("mongodb://mongo-a:27017")
+
+	cleanup, err := Instrument(opts, tp, provider, prop)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, cleanup(context.Background())) }()
+
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolCreated, "mongo-a:27017", 0, &event.MonitorPoolOptions{MaxPoolSize: 5})
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, "mongo-a:27017", 1, time.Millisecond, nil)
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolClosed, "mongo-a:27017", 0, nil)
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolCreated, "mongo-a:27017", 0, &event.MonitorPoolOptions{MaxPoolSize: 7})
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, "mongo-a:27017", 2, time.Millisecond, nil)
+
+	rm := collectMongoMetrics(t, reader)
+	poolAttrs := []attribute.KeyValue{
+		semconv.DBSystemNameMongoDB,
+		semconv.ServerAddress("mongo-a"),
+		semconv.ServerPort(27017),
+	}
+	idleAttrs := append(append([]attribute.KeyValue{}, poolAttrs...), semconv.DBClientConnectionStateIdle)
+
+	assert.Equal(t, int64(1), int64MetricValue(t, findMetric(t, rm, "db.client.connection.count"), idleAttrs...))
+	assert.Equal(t, int64(7), int64MetricValue(t, findMetric(t, rm, "db.client.connection.max"), poolAttrs...))
+}
+
+// BenchmarkPoolMonitorCheckoutCycle measures the event-monitor hot path used by
+// high-throughput applications that frequently check out MongoDB connections.
+func BenchmarkPoolMonitorCheckoutCycle(b *testing.B) {
+	opts := options.Client().ApplyURI("mongodb://mongo-a:27017")
+	monitor, cleanup, err := newPoolMonitor(opts, metricnoop.NewMeterProvider(), "bench-mongo")
+	if err != nil {
+		b.Fatalf("create pool monitor: %v", err)
+	}
+	defer func() { _ = cleanup(context.Background()) }()
+
+	ready := &event.PoolEvent{Type: event.ConnectionReady, Address: "mongo-a:27017", ConnectionID: 1}
+	started := &event.PoolEvent{Type: event.ConnectionCheckOutStarted, Address: "mongo-a:27017"}
+	checkedOut := &event.PoolEvent{Type: event.ConnectionCheckedOut, Address: "mongo-a:27017", ConnectionID: 1}
+	checkedIn := &event.PoolEvent{Type: event.ConnectionCheckedIn, Address: "mongo-a:27017", ConnectionID: 1}
+	closed := &event.PoolEvent{Type: event.ConnectionClosed, Address: "mongo-a:27017", ConnectionID: 1}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		monitor.Event(ready)
+		monitor.Event(started)
+		monitor.Event(checkedOut)
+		monitor.Event(checkedIn)
+		monitor.Event(closed)
+	}
 }
 
 func TestNewMonitor_EmitsAlwaysOnCommandSpanWithParentContext(t *testing.T) {
@@ -376,6 +626,46 @@ func commandFailedEvent(command, database string, requestID int64, failure error
 	}
 }
 
+func emitPoolEvent(
+	monitor *event.PoolMonitor,
+	eventType string,
+	address string,
+	duration time.Duration,
+	poolOptions *event.MonitorPoolOptions,
+) {
+	monitor.Event(&event.PoolEvent{
+		Type:        eventType,
+		Address:     address,
+		Duration:    duration,
+		PoolOptions: poolOptions,
+	})
+}
+
+func emitPoolEventWithConnectionID(
+	monitor *event.PoolMonitor,
+	eventType string,
+	address string,
+	connectionID int64,
+	duration time.Duration,
+	poolOptions *event.MonitorPoolOptions,
+) {
+	monitor.Event(&event.PoolEvent{
+		Type:         eventType,
+		Address:      address,
+		ConnectionID: connectionID,
+		Duration:     duration,
+		PoolOptions:  poolOptions,
+	})
+}
+
+func emitPoolEventWithReason(monitor *event.PoolMonitor, eventType, address, reason string) {
+	monitor.Event(&event.PoolEvent{
+		Type:    eventType,
+		Address: address,
+		Reason:  reason,
+	})
+}
+
 func findSpanWithName(spans []sdktrace.ReadOnlySpan, name string) sdktrace.ReadOnlySpan {
 	for _, span := range spans {
 		if span.Name() == name {
@@ -393,18 +683,23 @@ func collectMongoMetrics(t *testing.T, reader *sdkmetric.ManualReader) metricdat
 	return rm
 }
 
-func findMetric(t *testing.T, rm metricdata.ResourceMetrics, name string) metricdata.Metrics {
-	t.Helper()
-
+func metricByName(rm metricdata.ResourceMetrics, name string) *metricdata.Metrics {
 	for i := range rm.ScopeMetrics {
 		for j := range rm.ScopeMetrics[i].Metrics {
 			if rm.ScopeMetrics[i].Metrics[j].Name == name {
-				return rm.ScopeMetrics[i].Metrics[j]
+				return &rm.ScopeMetrics[i].Metrics[j]
 			}
 		}
 	}
-	require.Failf(t, "metric not found", "metric %q not found", name)
-	return metricdata.Metrics{}
+	return nil
+}
+
+func findMetric(t *testing.T, rm metricdata.ResourceMetrics, name string) metricdata.Metrics {
+	t.Helper()
+
+	metric := metricByName(rm, name)
+	require.NotNilf(t, metric, "metric %q not found", name)
+	return *metric
 }
 
 func assertHasAttributeKey(t *testing.T, attrs []attribute.KeyValue, key attribute.Key) {
@@ -426,5 +721,81 @@ func assertMissingAttributeKey(t *testing.T, attrs []attribute.KeyValue, key att
 			assert.Failf(t, "attribute present", "attribute key %q unexpectedly present in %v", key, attrs)
 			return
 		}
+	}
+}
+
+func int64MetricValue(t *testing.T, metric metricdata.Metrics, attrs ...attribute.KeyValue) int64 {
+	t.Helper()
+
+	var points []metricdata.DataPoint[int64]
+	switch data := metric.Data.(type) {
+	case metricdata.Sum[int64]:
+		points = data.DataPoints
+	case metricdata.Gauge[int64]:
+		points = data.DataPoints
+	default:
+		t.Fatalf("unsupported int64 metric data type %T for %s", metric.Data, metric.Name)
+	}
+	for _, point := range points {
+		if attributesContain(point.Attributes, attrs...) {
+			return point.Value
+		}
+	}
+	t.Fatalf("metric %s missing point with attrs %v", metric.Name, attrs)
+	return 0
+}
+
+func attributesContain(set attribute.Set, attrs ...attribute.KeyValue) bool {
+	for _, attr := range attrs {
+		got, ok := set.Value(attr.Key)
+		if !ok || got != attr.Value {
+			return false
+		}
+	}
+	return true
+}
+
+// poolNameValue returns the db.client.connection.pool.name attribute of the
+// first int64 data point in metric whose attributes contain all of attrs.
+func poolNameValue(t *testing.T, metric metricdata.Metrics, attrs ...attribute.KeyValue) string {
+	t.Helper()
+
+	var points []metricdata.DataPoint[int64]
+	switch data := metric.Data.(type) {
+	case metricdata.Sum[int64]:
+		points = data.DataPoints
+	case metricdata.Gauge[int64]:
+		points = data.DataPoints
+	default:
+		t.Fatalf("unsupported int64 metric data type %T for %s", metric.Data, metric.Name)
+	}
+	for _, point := range points {
+		if !attributesContain(point.Attributes, attrs...) {
+			continue
+		}
+		value, ok := point.Attributes.Value(semconv.DBClientConnectionPoolNameKey)
+		require.Truef(t, ok, "metric %s point missing pool name", metric.Name)
+		return value.AsString()
+	}
+	t.Fatalf("metric %s missing point with attrs %v", metric.Name, attrs)
+	return ""
+}
+
+func assertMetricAbsentOrEmpty(t *testing.T, rm metricdata.ResourceMetrics, name string) {
+	t.Helper()
+
+	metric := metricByName(rm, name)
+	if metric == nil {
+		return
+	}
+	switch data := metric.Data.(type) {
+	case metricdata.Sum[int64]:
+		assert.Empty(t, data.DataPoints)
+	case metricdata.Gauge[int64]:
+		assert.Empty(t, data.DataPoints)
+	case metricdata.Histogram[float64]:
+		assert.Empty(t, data.DataPoints)
+	default:
+		t.Fatalf("unsupported metric data type %T for %s", metric.Data, metric.Name)
 	}
 }

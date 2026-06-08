@@ -162,13 +162,21 @@ payload.
 
 Spans and operation-duration metrics are emitted by the official contrib
 `go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/v2/mongo/otelmongo`
-CommandMonitor, wrapped by `github.com/flywindy/o11y/mongo`. See ADR 0021.
+CommandMonitor, wrapped by `github.com/flywindy/o11y/mongo`. Connection-pool
+metrics are emitted by the SDK-owned PoolMonitor observer accepted in ADR 0014.
+See ADR 0014 and ADR 0021.
 
 ### Instruments
 
 | Name | Kind | Unit | Attributes |
 |---|---|---|---|
 | `db.client.operation.duration` | Float64Histogram | `s` | `db.system.name`, `db.operation.name`, `network.peer.address`, `network.peer.port`, `error.type` |
+| `db.client.connection.count` | Int64UpDownCounter | `{connection}` | `db.system.name`, `db.client.connection.pool.name`, `db.client.connection.state`, `server.address`, `server.port` |
+| `db.client.connection.idle.min` | Int64UpDownCounter | `{connection}` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
+| `db.client.connection.max` | Int64UpDownCounter | `{connection}` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
+| `db.client.connection.pending_requests` | Int64UpDownCounter | `{request}` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
+| `db.client.connection.timeouts` | Int64Counter | `{timeout}` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
+| `db.client.connection.create_time` | Float64Histogram | `s` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
 
 ### Expected Attributes
 
@@ -182,6 +190,10 @@ CommandMonitor, wrapped by `github.com/flywindy/o11y/mongo`. See ADR 0021.
 | `network.peer.port` | int | MongoDB port parsed from the connection ID, defaulting to 27017 when omitted. |
 | `network.transport` | string | Constant `"tcp"` on command spans; filtered out of the metric view. |
 | `error.type` | string | Present on `db.client.operation.duration` when an operation fails. |
+| `db.client.connection.pool.name` | string | Pool grouping label, derived as `mongo-<primary-host>-<n>` where `<n>` is a process-local sequence that keeps separate clients on the same host distinct, or set by `mongo.WithPoolName`. |
+| `db.client.connection.state` | string | Present only on `db.client.connection.count`; values are `used` or `idle`. |
+| `server.address` | string | MongoDB pool server address parsed from `event.PoolEvent.Address`. |
+| `server.port` | int | MongoDB pool server port parsed from `event.PoolEvent.Address`, when present. |
 
 ### Explicitly NOT Emitted by Default
 
@@ -189,6 +201,9 @@ CommandMonitor, wrapped by `github.com/flywindy/o11y/mongo`. See ADR 0021.
 |---|---|
 | `db.query.text` | Query documents routinely contain PII and secrets. Future opt-in must carry an explicit warning. |
 | Response document contents | Same rationale. |
+| `db.client.connection.idle.max` | MongoDB exposes no max-idle pool option. |
+| `db.client.connection.wait_time` | Not cleanly derivable from MongoDB v2 pool events. |
+| `db.client.connection.use_time` | Not cleanly derivable from MongoDB v2 pool events. |
 
 ### Document Trace Propagation
 
