@@ -139,21 +139,24 @@ func newPoolMonitor(
 	return monitor, cleanup, nil
 }
 
+// defaultPoolNameSeq makes fallback pool names unique per Instrument call so two
+// clients pointed at the same host do not collapse into one metric stream. A
+// process-local sequence is preferred over the ClientOptions pointer address
+// because it is stable and readable across runs.
+var defaultPoolNameSeq atomic.Uint64
+
 func defaultPoolName(opts *options.ClientOptions, override string) string {
 	if override != "" {
 		return override
 	}
-	suffix := "unknown"
-	if opts != nil {
-		suffix = fmt.Sprintf("%p", opts)
-	}
+	seq := defaultPoolNameSeq.Add(1)
 	if opts != nil && len(opts.Hosts) > 0 {
 		parsed := parseAddress(opts.Hosts[0])
 		if parsed.host != "" {
-			return "mongo-" + parsed.host + "-" + suffix
+			return fmt.Sprintf("mongo-%s-%d", parsed.host, seq)
 		}
 	}
-	return "mongo-" + suffix
+	return fmt.Sprintf("mongo-%d", seq)
 }
 
 func (t *poolTracker) handle(evt *event.PoolEvent) {

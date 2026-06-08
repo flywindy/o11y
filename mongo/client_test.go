@@ -3,6 +3,7 @@ package mongo
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -268,15 +269,37 @@ func TestInstrument_PoolMetricsDefaultPoolNameAndOmitUnboundedMax(t *testing.T) 
 	})
 
 	rm := collectMongoMetrics(t, reader)
-	expectedPoolName := defaultPoolName(opts, "")
-	attrs := []attribute.KeyValue{
+	// Assert the public contract (host-prefixed default name) rather than
+	// comparing against defaultPoolName, which would just mirror the production
+	// logic and hide a regression in the naming algorithm.
+	idAttrs := []attribute.KeyValue{
 		semconv.DBSystemNameMongoDB,
-		semconv.DBClientConnectionPoolName(expectedPoolName),
 		semconv.ServerAddress("db-primary"),
 		semconv.ServerPort(27018),
 	}
-	assert.Equal(t, int64(3), int64MetricValue(t, findMetric(t, rm, "db.client.connection.idle.min"), attrs...))
+	idleMin := findMetric(t, rm, "db.client.connection.idle.min")
+	assert.Equal(t, int64(3), int64MetricValue(t, idleMin, idAttrs...))
+	poolName := poolNameValue(t, idleMin, idAttrs...)
+	assert.Truef(t, strings.HasPrefix(poolName, "mongo-db-primary-"),
+		"default pool name %q should be derived as mongo-<host>-<n>", poolName)
 	assertMetricAbsentOrEmpty(t, rm, "db.client.connection.max")
+}
+
+// TestDefaultPoolName_UniquePerClientOptions verifies the fallback pool name is
+// host-prefixed and distinct for separate ClientOptions instances, so two
+// clients pointed at the same host do not collapse into one metric stream, and
+// that WithPoolName still overrides the derivation.
+func TestDefaultPoolName_UniquePerClientOptions(t *testing.T) {
+	optsA := options.Client().ApplyURI("mongodb://mongo-a:27017")
+	optsB := options.Client().ApplyURI("mongodb://mongo-a:27017")
+
+	nameA := defaultPoolName(optsA, "")
+	nameB := defaultPoolName(optsB, "")
+
+	assert.Truef(t, strings.HasPrefix(nameA, "mongo-mongo-a-"), "got %q", nameA)
+	assert.Truef(t, strings.HasPrefix(nameB, "mongo-mongo-a-"), "got %q", nameB)
+	assert.NotEqual(t, nameA, nameB, "distinct ClientOptions must yield distinct pool names")
+	assert.Equal(t, "custom", defaultPoolName(optsA, "custom"), "override must win")
 }
 
 // TestInstrument_PoolMetricsResetAndCleanup verifies pool clear, close, and
@@ -300,16 +323,16 @@ func TestInstrument_PoolMetricsResetAndCleanup(t *testing.T) {
 	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolCleared, "mongo-a:27017", 0, nil)
 
 	rm := collectMongoMetrics(t, reader)
-	expectedPoolName := defaultPoolName(opts, "")
+	// Match points by the stable server identity; the default pool name is
+	// asserted as a contract in TestInstrument_PoolMetricsDefaultPoolName... and
+	// TestDefaultPoolName_UniquePerClientOptions instead of being hard-coded here.
 	poolAttrs := []attribute.KeyValue{
 		semconv.DBSystemNameMongoDB,
-		semconv.DBClientConnectionPoolName(expectedPoolName),
 		semconv.ServerAddress("mongo-a"),
 		semconv.ServerPort(27017),
 	}
 	usedAttrs := []attribute.KeyValue{
 		semconv.DBSystemNameMongoDB,
-		semconv.DBClientConnectionPoolName(expectedPoolName),
 		semconv.ServerAddress("mongo-a"),
 		semconv.ServerPort(27017),
 		semconv.DBClientConnectionStateUsed,
@@ -353,10 +376,8 @@ func TestInstrument_PoolMetricsContinueAfterPoolClosedAndRecreated(t *testing.T)
 	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, "mongo-a:27017", 2, time.Millisecond, nil)
 
 	rm := collectMongoMetrics(t, reader)
-	expectedPoolName := defaultPoolName(opts, "")
 	poolAttrs := []attribute.KeyValue{
 		semconv.DBSystemNameMongoDB,
-		semconv.DBClientConnectionPoolName(expectedPoolName),
 		semconv.ServerAddress("mongo-a"),
 		semconv.ServerPort(27017),
 	}
@@ -732,6 +753,32 @@ func attributesContain(set attribute.Set, attrs ...attribute.KeyValue) bool {
 		}
 	}
 	return true
+}
+
+// poolNameValue returns the db.client.connection.pool.name attribute of the
+// first int64 data point in metric whose attributes contain all of attrs.
+func poolNameValue(t *testing.T, metric metricdata.Metrics, attrs ...attribute.KeyValue) string {
+	t.Helper()
+
+	var points []metricdata.DataPoint[int64]
+	switch data := metric.Data.(type) {
+	case metricdata.Sum[int64]:
+		points = data.DataPoints
+	case metricdata.Gauge[int64]:
+		points = data.DataPoints
+	default:
+		t.Fatalf("unsupported int64 metric data type %T for %s", metric.Data, metric.Name)
+	}
+	for _, point := range points {
+		if !attributesContain(point.Attributes, attrs...) {
+			continue
+		}
+		value, ok := point.Attributes.Value(semconv.DBClientConnectionPoolNameKey)
+		require.Truef(t, ok, "metric %s point missing pool name", metric.Name)
+		return value.AsString()
+	}
+	t.Fatalf("metric %s missing point with attrs %v", metric.Name, attrs)
+	return ""
 }
 
 func assertMetricAbsentOrEmpty(t *testing.T, rm metricdata.ResourceMetrics, name string) {

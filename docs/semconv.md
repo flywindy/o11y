@@ -190,7 +190,7 @@ See ADR 0014 and ADR 0021.
 | `network.peer.port` | int | MongoDB port parsed from the connection ID, defaulting to 27017 when omitted. |
 | `network.transport` | string | Constant `"tcp"` on command spans; filtered out of the metric view. |
 | `error.type` | string | Present on `db.client.operation.duration` when an operation fails. |
-| `db.client.connection.pool.name` | string | Pool grouping label, derived from the first configured host plus the `ClientOptions` instance identity, or set by `mongo.WithPoolName`. |
+| `db.client.connection.pool.name` | string | Pool grouping label, derived as `mongo-<primary-host>-<n>` where `<n>` is a process-local sequence that keeps separate clients on the same host distinct, or set by `mongo.WithPoolName`. |
 | `db.client.connection.state` | string | Present only on `db.client.connection.count`; values are `used` or `idle`. |
 | `server.address` | string | MongoDB pool server address parsed from `event.PoolEvent.Address`. |
 | `server.port` | int | MongoDB pool server port parsed from `event.PoolEvent.Address`, when present. |

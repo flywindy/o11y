@@ -354,9 +354,12 @@ implementing PRs:
    Q1 wart); document it on `MetricViews`.
 3. **Default pool name (confirmed)** — redis derives `redis-%x` from the client
    pointer; our `mongo.Connect` builds the client, so synthesize
-   `mongo-<primary-host>` from the parsed URI and let `WithPoolName` override.
-   The pool observer keys samples by `server.address` regardless, so the name is
-   a grouping label, not an identity key.
+   `mongo-<primary-host>-<n>` from the parsed URI, where `<n>` is a process-local
+   sequence that keeps separate clients on the same host from collapsing into one
+   stream, and let `WithPoolName` override. (A monotonic sequence is used rather
+   than the `ClientOptions` pointer address so the name stays stable and readable
+   across runs.) The pool observer keys samples by `server.address` regardless,
+   so the name is a grouping label, not an identity key.
 4. **`error.type` style divergence (accepted)** — the contrib metric derives
    `error.type` via `semconv.ErrorType(evt.Failure)`, which will not match
    redis's custom sentinel/reflection mapping (`redis/hook.go errorType`). We
