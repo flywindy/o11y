@@ -47,7 +47,8 @@ so that every log entry is automatically enriched with `traceId` and `spanId`.
 | `mongo/` | T2 facade over MongoDB driver instrumentation plus SDK-owned pool metrics |
 | `redis/` | SDK-owned Redis/Valkey instrumentation over go-redis/v9 |
 | `internal/` | SDK-owned logging, tracing, metrics, and test utilities |
-| `examples/` | Runnable examples for supported integrations |
+| `examples/` | Runnable examples for supported integrations; `examples/README.md` documents how to run each |
+| `docs/guide.md` | Developer Guide — structured logging, sampling, profiling, and per-integration sub-package usage |
 
 ---
 
@@ -161,7 +162,7 @@ For changes that affect live infrastructure behavior, verify against the kind cl
 - Prefer `errors.New` / `fmt.Errorf` with `%w` for wrapping
 - JSON log output is the default format (structured, machine-parseable)
 - Do not introduce new external dependencies without discussion
-- Update `README.md` whenever public-facing API, usage patterns, or examples change — README is the first point of contact for SDK users and must stay in sync with actual code
+- Keep user-facing docs in sync with the code whenever public-facing API, usage patterns, or examples change — README is the first point of contact for SDK users. Init options and feature toggles live in `README.md`; per-integration usage lives in `docs/guide.md`; example run instructions live in `examples/README.md`
 
 ---
 
