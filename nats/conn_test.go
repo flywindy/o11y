@@ -180,6 +180,78 @@ func TestQueueSubscribe(t *testing.T) {
 	}
 }
 
+// TestRespond_TracePropagation verifies the headline guarantee of Conn.Respond:
+// a reply sent from inside a handler carries the W3C trace context, unlike a
+// raw msg.Respond. The responder replies via conn.Respond and the requester
+// asserts the reply message headers contain a traceparent.
+func TestRespond_TracePropagation(t *testing.T) {
+	enableNATSTracing(t)
+
+	_, url := startTestServer(t)
+	tp, prop, _ := newTestProviders()
+
+	responder, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer responder.Close()
+
+	requester, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer requester.Close()
+
+	subject := "test.reqreply"
+
+	_, err = responder.Subscribe(context.Background(), subject, func(ctx context.Context, msg *nats.Msg) {
+		// Reply over the traced path so the response carries trace context.
+		_ = responder.Respond(ctx, msg, []byte("pong"))
+	})
+	require.NoError(t, err)
+	require.NoError(t, responder.NatsConn().FlushTimeout(2*time.Second))
+
+	// Start a root span so there is a valid trace ID to propagate.
+	tracer := tp.Tracer("test")
+	reqCtx, span := tracer.Start(context.Background(), "test-request")
+	defer span.End()
+
+	reply, err := requester.Request(reqCtx, subject, []byte("ping"), 2*time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+	assert.Equal(t, "pong", string(reply.Data))
+
+	// The reply must carry the responder's trace context in its headers; this is
+	// exactly what raw msg.Respond would drop.
+	require.NotNil(t, reply.Header, "reply must carry headers")
+	assert.NotEmpty(t, reply.Header.Get("traceparent"),
+		"reply should carry a traceparent header injected by Respond")
+}
+
+// TestRespond_Validation locks down the registration-time guards on
+// Conn.Respond: a nil message and a message with no reply subject both return
+// an error rather than panicking or silently publishing nowhere.
+func TestRespond_Validation(t *testing.T) {
+	_, url := startTestServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	cases := []struct {
+		name    string
+		msg     *nats.Msg
+		wantErr string
+	}{
+		{"nil msg", nil, "msg must not be nil"},
+		{"empty reply", &nats.Msg{Subject: "test.subject"}, "no reply subject"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := conn.Respond(context.Background(), tc.msg, []byte("data"))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
 func TestJetStream_NotNil(t *testing.T) {
 	_, url := startJetStreamServer(t)
 	tp, prop, _ := newTestProviders()

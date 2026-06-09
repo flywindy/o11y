@@ -17,6 +17,11 @@ adopters can plan their upgrades.
 
 - ADR 0023: cross-package span-naming convention
   `{system.name}.{operation} {target}` for data-store integrations.
+- Added `nats.Conn.Respond(ctx, msg, data)`, a traced reply primitive for
+  request/reply handlers. It validates the message (non-nil, non-empty reply
+  subject) and routes the reply through the traced publish path so the response
+  carries trace context in its headers — unlike raw `msg.Respond`, which skips
+  header injection and breaks the distributed trace (ADR 0004 §5, ADR 0022).
 
 ### Changed
 
