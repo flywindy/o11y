@@ -202,7 +202,9 @@ func TestRespond_TracePropagation(t *testing.T) {
 
 	_, err = responder.Subscribe(context.Background(), subject, func(ctx context.Context, msg *nats.Msg) {
 		// Reply over the traced path so the response carries trace context.
-		_ = responder.Respond(ctx, msg, []byte("pong"))
+		// Use assert (not require): this runs on a subscription goroutine, where
+		// FailNow must not be called, but a reply failure should still surface.
+		assert.NoError(t, responder.Respond(ctx, msg, []byte("pong")))
 	})
 	require.NoError(t, err)
 	require.NoError(t, responder.NatsConn().FlushTimeout(2*time.Second))
