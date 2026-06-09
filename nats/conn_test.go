@@ -188,7 +188,7 @@ func TestRespond_TracePropagation(t *testing.T) {
 	enableNATSTracing(t)
 
 	_, url := startTestServer(t)
-	tp, prop, _ := newTestProviders()
+	tp, prop, sr := newTestProviders()
 
 	responder, err := o11ynats.Connect(context.Background(), url, tp, prop)
 	require.NoError(t, err)
@@ -200,7 +200,12 @@ func TestRespond_TracePropagation(t *testing.T) {
 
 	subject := "test.reqreply"
 
+	// The responder publishes the reply to msg.Reply (a dynamic inbox). Capture
+	// that subject so the test can locate the reply's producer span below.
+	replySubjectCh := make(chan string, 1)
+
 	_, err = responder.Subscribe(context.Background(), subject, func(ctx context.Context, msg *nats.Msg) {
+		replySubjectCh <- msg.Reply
 		// Reply over the traced path so the response carries trace context.
 		// Use assert (not require): this runs on a subscription goroutine, where
 		// FailNow must not be called, but a reply failure should still surface.
@@ -224,6 +229,36 @@ func TestRespond_TracePropagation(t *testing.T) {
 	require.NotNil(t, reply.Header, "reply must carry headers")
 	assert.NotEmpty(t, reply.Header.Get("traceparent"),
 		"reply should carry a traceparent header injected by Respond")
+
+	// Span-level proof that Respond routed through the traced publish path (not a
+	// raw msg.Respond): a producer "send" span must be recorded for the reply,
+	// addressed to the dynamic reply inbox.
+	var replySubject string
+	select {
+	case replySubject = <-replySubjectCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not run")
+	}
+	require.NotEmpty(t, replySubject, "reply subject (inbox) must be set")
+
+	assert.Eventually(t, func() bool {
+		for _, s := range sr.Ended() {
+			var destMatch, isSend bool
+			for _, a := range s.Attributes() {
+				switch string(a.Key) {
+				case "messaging.destination.name":
+					destMatch = a.Value.AsString() == replySubject
+				case "messaging.operation.type":
+					isSend = a.Value.AsString() == "send"
+				}
+			}
+			if destMatch && isSend {
+				return true
+			}
+		}
+		return false
+	}, 2*time.Second, 10*time.Millisecond,
+		"a producer send span should be recorded for the reply publish, proving Respond uses the traced Publish path")
 }
 
 // TestRespond_Validation locks down the registration-time guards on

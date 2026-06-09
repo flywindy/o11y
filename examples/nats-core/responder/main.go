@@ -1,5 +1,8 @@
-// Package main demonstrates a NATS Core subscriber instrumented with the o11y SDK.
-// Run together with examples/nats-core/publisher to see distributed trace correlation.
+// Package main demonstrates a NATS Core request/reply responder instrumented
+// with the o11y SDK. It replies with conn.Respond, which routes the reply
+// through the traced publish path so the response carries trace context —
+// unlike raw msg.Respond, which would break the request → reply correlation.
+// Run together with examples/nats-core/requester to see the trace in Tempo.
 package main
 
 import (
@@ -7,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,16 +20,15 @@ import (
 )
 
 const (
-	subject = "o11y.events"
+	subject = "o11y.rpc.greet"
 	natsURL = nats.DefaultURL
 )
 
-func metricsAddr(ctx context.Context) string {
-	_ = ctx
+func metricsAddr() string {
 	if v := os.Getenv("METRICS_ADDR"); v != "" {
 		return v
 	}
-	return ":2113"
+	return ":2116"
 }
 
 func main() {
@@ -34,11 +37,11 @@ func main() {
 
 	// 1. Initialise the o11y SDK.
 	obs, err := o11y.Init(ctx,
-		o11y.WithServiceName("nats-core-subscriber"),
+		o11y.WithServiceName("nats-core-responder"),
 		o11y.WithServiceVersion("0.1.0"),
 		o11y.WithEnvironment("development"),
 		o11y.WithServiceNamespace("platform"),
-		o11y.WithMetricsAddr(metricsAddr(ctx)),
+		o11y.WithMetricsAddr(metricsAddr()),
 	)
 	if err != nil {
 		slog.Error("failed to initialise o11y SDK", slog.Any("error", err))
@@ -64,37 +67,41 @@ func main() {
 
 	logger.InfoContext(ctx, "connected to NATS", slog.String("url", natsURL))
 
-	tracer := obs.Tracer("nats-core-subscriber")
+	tracer := obs.Tracer("nats-core-responder")
 
-	// 3. Subscribe. The MsgHandler receives a ctx carrying a consumer span
-	//    created by the otelnats layer. That consumer span holds a span link to
-	//    the publisher's trace, enabling cross-service correlation in Tempo.
-	//    Any span started from ctx is a child of the consumer span, and any
-	//    slog call with ctx will include the correct traceId and spanId.
+	// 3. Subscribe and reply with conn.Respond. The handler's ctx already holds a
+	//    consumer span linked to the requester's trace; Respond routes the reply
+	//    through the traced publish path, injecting that context into the reply
+	//    headers. Using raw msg.Respond here would drop the trace and break the
+	//    request → reply correlation in Tempo.
 	_, err = conn.Subscribe(ctx, subject, func(msgCtx context.Context, msg *nats.Msg) {
-		msgCtx, span := tracer.Start(msgCtx, "process-event")
+		msgCtx, span := tracer.Start(msgCtx, "handle-greet")
 		defer span.End()
 
-		logger.InfoContext(msgCtx, "event received",
+		name := strings.TrimSpace(string(msg.Data))
+		if name == "" {
+			name = "world"
+		}
+
+		logger.InfoContext(msgCtx, "request received",
 			slog.String("subject", msg.Subject),
-			slog.String("payload", string(msg.Data)),
+			slog.String("name", name),
 		)
 
-		// This is a fire-and-forget subscriber, so it does not reply. To reply
-		// while preserving trace context, use conn.Respond(ctx, msg, data) (see
-		// examples/nats-core/responder) instead of msg.Respond, which routes
-		// through the raw NATS connection and drops trace headers.
+		if err := conn.Respond(msgCtx, msg, []byte("hello, "+name)); err != nil {
+			logger.ErrorContext(msgCtx, "respond failed", slog.Any("error", err))
+		}
 	})
 	if err != nil {
 		logger.ErrorContext(ctx, "subscribe failed", slog.Any("error", err))
 		os.Exit(1)
 	}
 
-	logger.InfoContext(ctx, "subscriber ready", slog.String("subject", subject))
+	logger.InfoContext(ctx, "responder ready", slog.String("subject", subject))
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	logger.InfoContext(ctx, "shutting down subscriber")
+	logger.InfoContext(ctx, "shutting down responder")
 }
