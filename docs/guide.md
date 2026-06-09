@@ -1,8 +1,14 @@
 # o11y SDK Developer Guide
 
-This guide covers the deeper, task-driven parts of the o11y SDK: structured
-logging, trace sampling, continuous profiling, and the per-integration
-sub-packages (NATS, MongoDB, Redis/Valkey, HTTP, Resty, MinIO, gin).
+This guide is organized in two parts:
+
+1. **[The Four Pillars](#the-four-pillars)** — Tracing, Logging, Metrics, and
+   Profiling. These apply to every service, regardless of which libraries it
+   uses.
+2. **[Integrations](#integrations)** — per-library sub-packages, grouped by
+   [OpenTelemetry semantic-convention](semconv.md) domain (HTTP, Databases,
+   Messaging, Object Storage). Read only the sections for the libraries your
+   service actually uses.
 
 For project setup, the `Init` options reference, and feature toggles, see the
 [README](../README.md). For running the bundled examples, see
@@ -10,41 +16,39 @@ For project setup, the `Init` options reference, and feature toggles, see the
 
 ## Contents
 
-- [Structured Logging with Trace Correlation](#structured-logging-with-trace-correlation)
-- [User Identity Attributes](#user-identity-attributes)
-- [Logging Guidelines](#logging-guidelines)
-- [Trace Sampling](#trace-sampling)
-- [Continuous Profiling](#continuous-profiling)
-- [Distributed Tracing over NATS](#distributed-tracing-over-nats)
-- [MongoDB](#mongodb)
-- [Redis / Valkey](#redis--valkey)
-- [Prometheus Metrics & HTTP](#prometheus-metrics--http)
-- [Resty HTTP Client](#resty-http-client)
-- [MinIO / S3 Object Storage](#minio--s3-object-storage)
-- [Using with gin](#using-with-gin)
+- [The Four Pillars](#the-four-pillars)
+  - [Tracing](#tracing)
+    - [User Identity Attributes](#user-identity-attributes)
+    - [Trace Sampling](#trace-sampling)
+  - [Logging](#logging)
+    - [Logging Guidelines](#logging-guidelines)
+  - [Metrics](#metrics)
+  - [Profiling](#profiling)
+- [Integrations](#integrations)
+  - [HTTP](#http)
+    - [net/http server & client](#nethttp-server--client)
+    - [gin](#gin)
+    - [Resty HTTP client](#resty-http-client)
+  - [Databases](#databases)
+    - [MongoDB](#mongodb)
+    - [Redis / Valkey](#redis--valkey)
+  - [Messaging](#messaging)
+    - [NATS](#nats)
+  - [Object Storage](#object-storage)
+    - [MinIO / S3](#minio--s3)
 
-## Structured Logging with Trace Correlation
+---
 
-Use `obs.Logger` instead of the global `slog` package. Every log record is written to two destinations automatically:
+# The Four Pillars
 
-- **OTLP → Loki**: Full OTel Log Data Model. `service.name` and `deployment.environment` live in the OTel Resource (not per-record attributes). `traceId`, `spanId`, and `trace_flags` are extracted from the context by the `otelslog` bridge.
-- **stdout (JSON)**: Human-readable output for local development. Includes `service.name`, `environment`, `traceId`, and `spanId` as flat JSON fields.
-- When `WithLogEnabled(false)` is set, only the stdout destination is active.
+## Tracing
 
-```go
-// Without a span — no trace fields in either destination
-obs.Logger.Info("service started")
+For obtaining a tracer and creating spans, see
+[Creating Spans](../README.md#creating-spans) in the README. The subsections
+below cover the advanced tracing topics: attaching user identity to spans, and
+controlling span volume with sampling.
 
-// With an active span — trace context included automatically
-ctx, span := obs.Tracer("my-tracer").Start(ctx, "my-operation")
-defer span.End()
-
-obs.Logger.InfoContext(ctx, "processing request", slog.String("user_id", "42"))
-// stdout: {"time":"...","level":"INFO","msg":"processing request","service.name":"my-service","traceId":"4bf92f...","spanId":"00f067...","user_id":"42"}
-// Loki:   OTel Log Record — Body="processing request", TraceId=4bf92f..., SpanId=00f067..., Attributes={user_id: "42"}, Resource={service.name: "my-service", ...}
-```
-
-## User Identity Attributes
+### User Identity Attributes
 
 Use the explicit user helpers when a service has authenticated the acting user
 and needs the login name on a specific span or log record:
@@ -98,34 +102,7 @@ context unchanged. Enable it only after authenticating the user, ignore or
 overwrite untrusted inbound baggage at the edge, strip baggage before calls to
 external third parties, and never promote `user.name` into metric labels.
 
-## Logging Guidelines
-
-The dual-output logger forwards every record to two backends. Treat both as
-shared, queryable infrastructure — anything you log is searchable by every
-engineer with cluster access.
-
-- **Never log secrets**: API tokens, session cookies, signed URLs, full
-  `Authorization` headers, internal IPs, JWTs, raw OAuth state, encryption
-  keys. Redact before passing to `slog`. The `WithOTLPHeaders` option
-  intentionally does not log header values for the same reason.
-- **Hash or truncate user identifiers**: prefer `slog.String("user_id", hash(uid))`
-  over the raw email/phone. `traceId` already lets you correlate a single user's
-  request across logs without storing PII.
-- **Never log raw request bodies**: a malicious client can plant `\n{"level":"INFO",...}`
-  inside a body field and inject a synthetic log line into your stdout JSON
-  pipeline. If you must record body shape, log only the field count or a
-  schema hash.
-- **Use `*Context` variants**: `Logger.InfoContext(ctx, ...)` (not `Info(...)`)
-  so that `traceId` and `spanId` are populated. A log without trace correlation
-  is operationally a needle in a haystack.
-- **Pre-validate attribute keys**: `slog.String(userInput, ...)` lets the
-  attacker control the log's field name. Use a fixed key and put untrusted
-  data in the value.
-- **Watch attribute size**: `slog.Any` happily serializes arbitrary structs.
-  A 10 MB struct logged at 1 kHz overruns both stdout and the OTLP exporter's
-  batch queue. Cap or summarise large payloads before logging.
-
-## Trace Sampling
+### Trace Sampling
 
 The SDK default remains OpenTelemetry's `ParentBased(AlwaysSample)`, so local
 development and normal services get 100% trace visibility and full
@@ -187,7 +164,83 @@ root spans to be non-recording. The unsampled `traceparent` then flows through
 JetStream, and downstream workers using `ParentBased` also avoid recording
 those traces, thinning the whole pipeline from the source.
 
-## Continuous Profiling
+## Logging
+
+Use `obs.Logger` instead of the global `slog` package. Every log record is written to two destinations automatically:
+
+- **OTLP → Loki**: Full OTel Log Data Model. `service.name` and `deployment.environment` live in the OTel Resource (not per-record attributes). `traceId`, `spanId`, and `trace_flags` are extracted from the context by the `otelslog` bridge.
+- **stdout (JSON)**: Human-readable output for local development. Includes `service.name`, `environment`, `traceId`, and `spanId` as flat JSON fields.
+- When `WithLogEnabled(false)` is set, only the stdout destination is active.
+
+```go
+// Without a span — no trace fields in either destination
+obs.Logger.Info("service started")
+
+// With an active span — trace context included automatically
+ctx, span := obs.Tracer("my-tracer").Start(ctx, "my-operation")
+defer span.End()
+
+obs.Logger.InfoContext(ctx, "processing request", slog.String("user_id", "42"))
+// stdout: {"time":"...","level":"INFO","msg":"processing request","service.name":"my-service","traceId":"4bf92f...","spanId":"00f067...","user_id":"42"}
+// Loki:   OTel Log Record — Body="processing request", TraceId=4bf92f..., SpanId=00f067..., Attributes={user_id: "42"}, Resource={service.name: "my-service", ...}
+```
+
+### Logging Guidelines
+
+The dual-output logger forwards every record to two backends. Treat both as
+shared, queryable infrastructure — anything you log is searchable by every
+engineer with cluster access.
+
+- **Never log secrets**: API tokens, session cookies, signed URLs, full
+  `Authorization` headers, internal IPs, JWTs, raw OAuth state, encryption
+  keys. Redact before passing to `slog`. The `WithOTLPHeaders` option
+  intentionally does not log header values for the same reason.
+- **Hash or truncate user identifiers**: prefer `slog.String("user_id", hash(uid))`
+  over the raw email/phone. `traceId` already lets you correlate a single user's
+  request across logs without storing PII.
+- **Never log raw request bodies**: a malicious client can plant `\n{"level":"INFO",...}`
+  inside a body field and inject a synthetic log line into your stdout JSON
+  pipeline. If you must record body shape, log only the field count or a
+  schema hash.
+- **Use `*Context` variants**: `Logger.InfoContext(ctx, ...)` (not `Info(...)`)
+  so that `traceId` and `spanId` are populated. A log without trace correlation
+  is operationally a needle in a haystack.
+- **Pre-validate attribute keys**: `slog.String(userInput, ...)` lets the
+  attacker control the log's field name. Use a fixed key and put untrusted
+  data in the value.
+- **Watch attribute size**: `slog.Any` happily serializes arbitrary structs.
+  A 10 MB struct logged at 1 kHz overruns both stdout and the OTLP exporter's
+  batch queue. Cap or summarise large payloads before logging.
+
+## Metrics
+
+By default the SDK exposes a `/metrics` endpoint on `:2112` for Prometheus to scrape. Every series carries `service_namespace`, `service_name`, `service_version`, and `deployment_environment_name` as constant labels.
+
+```bash
+curl http://localhost:2112/metrics   # inspect raw output
+```
+
+Set `WithMetricsAddr(":9090")` to move the listener, or `WithMetricsOTLPEndpoint(url)`
+to switch from the Prometheus pull model to OTLP push (useful for serverless
+deployments that cannot be scraped). See the
+[options reference](../README.md#using-the-sdk) for the full metrics option set.
+
+**Exemplars** are enabled automatically (OTel SDK default trace-based filter). When Prometheus is deployed with `--enable-feature=exemplar-storage` (included in `../k8s/infrastructure/base/prometheus.yaml`), Grafana can navigate from a histogram bucket directly to the correlated trace in Tempo. The measurement context must contain an active sampled span; exemplar trace IDs are stored as exemplar metadata (`trace_id` / `span_id`), not as metric labels, so they do not create high-cardinality time series.
+
+**Kubernetes pods** must opt in to scraping with the annotation:
+
+```yaml
+metadata:
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "2112"   # optional; 2112 is the default
+```
+
+HTTP request metrics (`http.server.request.duration`, `http.client.request.duration`)
+are emitted by the HTTP integrations; see [HTTP](#http) for route-cardinality
+controls.
+
+## Profiling
 
 Profiling is opt-in and **doubly gated**: it requires both a non-empty
 `WithProfilingEndpoint` AND `WithProfilingEnabled(true)` (or
@@ -227,40 +280,136 @@ Important caveats:
   goroutine is captured in the service-level profile, but it is not linked to
   the span unless the application propagates pprof labels explicitly.
 
-## Distributed Tracing over NATS
+---
 
-Use `obs.Propagator` together with the `nats` sub-package to propagate trace context across NATS messages.
+# Integrations
+
+The sub-packages below are grouped by their OpenTelemetry semantic-convention
+domain. Each is a thin facade that wires the upstream instrumentation to the
+SDK-owned TracerProvider, MeterProvider, and Propagator — application code
+should use these facades rather than importing the upstream instrumentation
+directly. Read only the sections for the libraries your service uses.
+
+## HTTP
+
+Spans and metrics in this group follow the OTel
+[HTTP semantic conventions](semconv.md) (`http.*`,
+`http.server.request.duration`, `http.client.request.duration`).
+
+### net/http server & client
+
+HTTP handler instrumentation is provided by the `github.com/flywindy/o11y/http` package:
+
+```go
+import o11yhttp "github.com/flywindy/o11y/http"
+
+mux := http.NewServeMux()
+mux.HandleFunc("GET /api/orders/{id}", handleOrder)
+
+// Wrap the mux. The SDK passes TracerProvider, MeterProvider, and Propagator
+// explicitly, so otelhttp never reads OpenTelemetry globals.
+handler := o11yhttp.NewServerHandler(
+    mux,
+    obs.TracerProvider(),
+    obs.MeterProvider(),
+    obs.Propagator,
+)
+```
+
+For Go 1.22+ `http.ServeMux`, route patterns become bounded span names such
+as `GET /api/orders/{id}` and bounded `http.route` metric labels. For routers
+such as chi or echo, use their route pattern as an otelhttp label or span-name
+formatter at the router edge; keep raw URL paths out of metric labels.
+`WithMaxUniqueRoutes` rewrites excess exported server routes to
+`http_route="other"` while the OTel SDK's own cardinality limit protects
+in-process aggregators from attacker-controlled attribute sets. If the separate
+SDK guard trips, metrics are preserved under `otel_metric_overflow="true"`
+with route detail intentionally dropped.
+
+### gin
+
+Use the `gin` sub-package to wire gin's OTel middleware to the SDK-owned
+TracerProvider, MeterProvider, and Propagator. Register the returned chain
+before `gin.Recovery()` so panics recovered by gin still produce complete HTTP
+status attributes and metrics.
 
 ```go
 import (
-    o11ynats "github.com/flywindy/o11y/nats"
-    gonats "github.com/nats-io/nats.go"
+    "errors"
+    "net/http"
+
+    o11ygin "github.com/flywindy/o11y/gin"
+    "github.com/gin-gonic/gin"
 )
 
-conn, err := o11ynats.Connect(ctx, natsURL, obs.TracerProvider(), obs.Propagator)
+router := gin.New()
+router.Use(o11ygin.Middleware(
+    "orders-api",
+    obs.TracerProvider(),
+    obs.MeterProvider(),
+    obs.Propagator,
+)...)
+router.Use(gin.Recovery())
 
-// Publisher: trace context is injected into message headers automatically.
-if err := conn.Publish(ctx, "orders.created", payload); err != nil {
-    obs.Logger.ErrorContext(ctx, "publish failed", slog.Any("error", err))
-}
-
-// Subscriber: ctx in the handler already carries the publisher's trace.
-// Subscribe returns (*nats.Subscription, error) — capture both: the error
-// surfaces invalid input (empty subject, nil handler, cancelled ctx) and the
-// Subscription handle is what you call Unsubscribe()/Drain() on at shutdown.
-sub, err := conn.Subscribe(ctx, "orders.created", func(ctx context.Context, msg *gonats.Msg) {
-    ctx, span := obs.Tracer("consumer").Start(ctx, "orders.created")
-    defer span.End()
-    obs.Logger.InfoContext(ctx, "order received") // traceId and spanId injected automatically
+router.GET("/orders/:id", func(c *gin.Context) {
+    c.JSON(http.StatusOK, gin.H{"status": "ok"})
 })
-if err != nil {
-    obs.Logger.ErrorContext(ctx, "subscribe failed", slog.Any("error", err))
-    return
-}
-defer func() { _ = sub.Drain() }() // gracefully drain on shutdown
+router.GET("/fail", func(c *gin.Context) {
+    err := errors.New("simulated failure")
+    c.AbortWithError(http.StatusInternalServerError, err).SetType(gin.ErrorTypePublic)
+})
 ```
 
-## MongoDB
+`ErrorRecorder` adds typed `gin.error.type` span events for errors pushed via
+`c.Error` / `c.AbortWithError`. The metric label set remains governed by the
+SDK's HTTP metric views and does not include gin error types. gin's
+`http.server.request.duration` histogram participates in the same exemplar and
+route-cardinality behavior described under [Metrics](#metrics).
+
+### Resty HTTP client
+
+Use the `resty` sub-package to instrument `github.com/go-resty/resty/v2`
+clients. The wrapper creates one client span per attempt, injects
+`traceparent` on every attempt, and records `http.client.request.duration`.
+
+```go
+import (
+    "context"
+    "net/http"
+
+    o11yresty "github.com/flywindy/o11y/resty"
+    restyclient "github.com/go-resty/resty/v2"
+)
+
+type routeKey struct{}
+
+client := o11yresty.NewClient(
+    obs.TracerProvider(),
+    obs.MeterProvider(),
+    obs.Propagator,
+    o11yresty.WithRouteFromContext(routeKey{}),
+    o11yresty.WithMetricRouteEnabled(true),
+)
+client.SetRetryCount(1).AddRetryCondition(func(resp *restyclient.Response, _ error) bool {
+    return resp != nil && resp.StatusCode() == http.StatusServiceUnavailable
+})
+
+ctx := context.WithValue(parentCtx, routeKey{}, "/api/orders/{id}")
+resp, err := client.R().SetContext(ctx).Get("http://orders:8080/api/orders/123")
+```
+
+Route metrics are opt-in. Use bounded route templates such as
+`/api/orders/{id}`; never put raw URL paths, user IDs, or trace IDs into
+`http.route`.
+
+## Databases
+
+Spans and metrics in this group follow the OTel
+[database semantic conventions](semconv.md) (`db.*`,
+`db.client.operation.duration`, `db.client.connection.*`). Spans are always-on
+and governed by the SDK's sampler, just like HTTP, gin, and NATS spans.
+
+### MongoDB
 
 Use the `mongo` sub-package to wire MongoDB tracing, operation-duration
 metrics, and connection-pool metrics to the SDK-owned TracerProvider,
@@ -294,8 +443,7 @@ MongoDB command spans and `db.client.operation.duration` metrics are emitted by
 the official contrib `otelmongo` CommandMonitor. The SDK also owns the
 `db.client.connection.*` pool metrics from ADR 0014, including connection
 counts, configured min/max size, pending requests, check-out timeouts, and
-connection create time. Spans are always-on and are governed by the SDK's
-sampler, just like HTTP, gin, NATS, and Redis spans.
+connection create time.
 
 For services that already build `*options.ClientOptions` themselves (for
 `SetAuth`, pool sizing, read/write concerns, or deployment-specific settings),
@@ -336,7 +484,7 @@ Document trace propagation into persisted business documents is intentionally
 not supported. For async MongoDB-sourced workflows, model trace context on an
 outbox/event envelope and propagate it through message headers; see ADR 0021.
 
-## Redis / Valkey
+### Redis / Valkey
 
 Use the `redis` sub-package to instrument `github.com/redis/go-redis/v9`
 clients. The wrapper supports Redis and Valkey servers through go-redis and
@@ -380,79 +528,53 @@ _, err := o11yredis.Wrap(rdb, obs.TracerProvider(), obs.MeterProvider(),
 )
 ```
 
-## Prometheus Metrics & HTTP
+## Messaging
 
-By default the SDK exposes a `/metrics` endpoint on `:2112` for Prometheus to scrape. Every series carries `service_namespace`, `service_name`, `service_version`, and `deployment_environment_name` as constant labels.
+Spans and propagation in this group follow the OTel
+[messaging semantic conventions](semconv.md) (`messaging.*`). Trace context is
+carried in message headers, so a consumer's handler context continues the
+producer's trace.
 
-```bash
-curl http://localhost:2112/metrics   # inspect raw output
-```
+### NATS
 
-HTTP handler instrumentation is provided by the `github.com/flywindy/o11y/http` package:
-
-```go
-import o11yhttp "github.com/flywindy/o11y/http"
-
-mux := http.NewServeMux()
-mux.HandleFunc("GET /api/orders/{id}", handleOrder)
-
-// Wrap the mux. The SDK passes TracerProvider, MeterProvider, and Propagator
-// explicitly, so otelhttp never reads OpenTelemetry globals.
-handler := o11yhttp.NewServerHandler(
-    mux,
-    obs.TracerProvider(),
-    obs.MeterProvider(),
-    obs.Propagator,
-)
-```
-
-For Go 1.22+ `http.ServeMux`, route patterns become bounded span names such
-as `GET /api/orders/{id}` and bounded `http.route` metric labels. For routers
-such as chi or echo, use their route pattern as an otelhttp label or span-name
-formatter at the router edge; keep raw URL paths out of metric labels.
-`WithMaxUniqueRoutes` rewrites excess exported server routes to
-`http_route="other"` while the OTel SDK's own cardinality limit protects
-in-process aggregators from attacker-controlled attribute sets. If the separate
-SDK guard trips, metrics are preserved under `otel_metric_overflow="true"`
-with route detail intentionally dropped.
-
-## Resty HTTP Client
-
-Use the `resty` sub-package to instrument `github.com/go-resty/resty/v2`
-clients. The wrapper creates one client span per attempt, injects
-`traceparent` on every attempt, and records `http.client.request.duration`.
+Use `obs.Propagator` together with the `nats` sub-package to propagate trace context across NATS messages.
 
 ```go
 import (
-    "context"
-    "net/http"
-
-    o11yresty "github.com/flywindy/o11y/resty"
-    restyclient "github.com/go-resty/resty/v2"
+    o11ynats "github.com/flywindy/o11y/nats"
+    gonats "github.com/nats-io/nats.go"
 )
 
-type routeKey struct{}
+conn, err := o11ynats.Connect(ctx, natsURL, obs.TracerProvider(), obs.Propagator)
 
-client := o11yresty.NewClient(
-    obs.TracerProvider(),
-    obs.MeterProvider(),
-    obs.Propagator,
-    o11yresty.WithRouteFromContext(routeKey{}),
-    o11yresty.WithMetricRouteEnabled(true),
-)
-client.SetRetryCount(1).AddRetryCondition(func(resp *restyclient.Response, _ error) bool {
-    return resp != nil && resp.StatusCode() == http.StatusServiceUnavailable
+// Publisher: trace context is injected into message headers automatically.
+if err := conn.Publish(ctx, "orders.created", payload); err != nil {
+    obs.Logger.ErrorContext(ctx, "publish failed", slog.Any("error", err))
+}
+
+// Subscriber: ctx in the handler already carries the publisher's trace.
+// Subscribe returns (*nats.Subscription, error) — capture both: the error
+// surfaces invalid input (empty subject, nil handler, cancelled ctx) and the
+// Subscription handle is what you call Unsubscribe()/Drain() on at shutdown.
+sub, err := conn.Subscribe(ctx, "orders.created", func(ctx context.Context, msg *gonats.Msg) {
+    ctx, span := obs.Tracer("consumer").Start(ctx, "orders.created")
+    defer span.End()
+    obs.Logger.InfoContext(ctx, "order received") // traceId and spanId injected automatically
 })
-
-ctx := context.WithValue(parentCtx, routeKey{}, "/api/orders/{id}")
-resp, err := client.R().SetContext(ctx).Get("http://orders:8080/api/orders/123")
+if err != nil {
+    obs.Logger.ErrorContext(ctx, "subscribe failed", slog.Any("error", err))
+    return
+}
+defer func() { _ = sub.Drain() }() // gracefully drain on shutdown
 ```
 
-Route metrics are opt-in. Use bounded route templates such as
-`/api/orders/{id}`; never put raw URL paths, user IDs, or trace IDs into
-`http.route`.
+## Object Storage
 
-## MinIO / S3 Object Storage
+Spans in this group use the package-local `object_store.*` attribute schema,
+with optional dual-emit of the experimental OTel `aws.s3.*` keys for dashboards
+keyed on the AWS-S3 semantic conventions.
+
+### MinIO / S3
 
 Use the `minio` sub-package to instrument `github.com/minio/minio-go/v7`
 clients (and any S3-compatible backend). The wrapper produces one
@@ -501,52 +623,3 @@ HTTP children.
 drain-or-cancel contract is inherited from minio-go itself — abandoning
 the channel without cancelling the context leaks both the upstream
 producer goroutine and the open span.
-
-## Using with gin
-
-Use the `gin` sub-package to wire gin's OTel middleware to the SDK-owned
-TracerProvider, MeterProvider, and Propagator. Register the returned chain
-before `gin.Recovery()` so panics recovered by gin still produce complete HTTP
-status attributes and metrics.
-
-```go
-import (
-    "errors"
-    "net/http"
-
-    o11ygin "github.com/flywindy/o11y/gin"
-    "github.com/gin-gonic/gin"
-)
-
-router := gin.New()
-router.Use(o11ygin.Middleware(
-    "orders-api",
-    obs.TracerProvider(),
-    obs.MeterProvider(),
-    obs.Propagator,
-)...)
-router.Use(gin.Recovery())
-
-router.GET("/orders/:id", func(c *gin.Context) {
-    c.JSON(http.StatusOK, gin.H{"status": "ok"})
-})
-router.GET("/fail", func(c *gin.Context) {
-    err := errors.New("simulated failure")
-    c.AbortWithError(http.StatusInternalServerError, err).SetType(gin.ErrorTypePublic)
-})
-```
-
-`ErrorRecorder` adds typed `gin.error.type` span events for errors pushed via
-`c.Error` / `c.AbortWithError`. The metric label set remains governed by the
-SDK's HTTP metric views and does not include gin error types.
-
-**Exemplars** are enabled automatically (OTel SDK default trace-based filter). When Prometheus is deployed with `--enable-feature=exemplar-storage` (included in `k8s/infrastructure/base/prometheus.yaml`), Grafana can navigate from a histogram bucket directly to the correlated trace in Tempo. The measurement context must contain an active sampled span; exemplar trace IDs are stored as exemplar metadata (`trace_id` / `span_id`), not as metric labels, so they do not create high-cardinality time series.
-
-**Kubernetes pods** must opt in to scraping with the annotation:
-
-```yaml
-metadata:
-  annotations:
-    prometheus.io/scrape: "true"
-    prometheus.io/port: "2112"   # optional; 2112 is the default
-```
