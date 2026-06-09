@@ -7,5 +7,3 @@ nodes:
     hostPort: 4318
   - containerPort: 30001
     hostPort: 4223
-  - containerPort: 30002
-    hostPort: 4040
