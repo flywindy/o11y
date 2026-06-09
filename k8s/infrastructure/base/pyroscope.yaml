@@ -71,9 +71,11 @@ metadata:
   name: pyroscope
   namespace: infra
 spec:
+  type: NodePort
   selector:
     app: pyroscope
   ports:
   - name: http
     port: 4040
     targetPort: http
+    nodePort: 30002
