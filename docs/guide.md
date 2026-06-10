@@ -555,6 +555,13 @@ producer's trace.
 
 Use `obs.Propagator` together with the `nats` sub-package to propagate trace context across NATS messages.
 
+> **Tracing must be enabled.** The underlying `otel-nats` gates all NATS trace
+> propagation behind two environment variables — set **both**
+> `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true` and
+> `OTEL_NATS_TRACING_ENABLED=true`. When they are unset, `Publish`, `Subscribe`,
+> and `Respond` fall back to raw NATS paths that inject no `traceparent`, so
+> messages flow but carry no trace context.
+
 ```go
 import (
     o11ynats "github.com/flywindy/o11y/nats"
