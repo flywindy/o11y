@@ -301,11 +301,13 @@ Redis / HTTP / Resty / MinIO / gin sub-packages — see the
 
 ## Examples
 
-Runnable programs for each pillar and integration live in
-[`examples/`](examples/). See **[`examples/README.md`](examples/README.md)** for
-the prerequisites (port-forwards) and the `go run` command for each example
-(basic, NATS Core, JetStream, metrics, gin, Resty, Redis, MinIO, profiling,
-MongoDB, and a browser WebSocket trace-propagation demo).
+Runnable programs live in [`examples/`](examples/), organized like the
+[Developer Guide](docs/guide.md): the four pillars first (basic spans + logs,
+metrics, profiling), then integrations grouped by semantic-convention domain
+(HTTP: gin, Resty; Databases: MongoDB, Redis; Messaging: NATS Core, JetStream,
+browser WebSocket; Object Storage: MinIO). See
+**[`examples/README.md`](examples/README.md)** for the prerequisites
+(port-forwards) and the `go run` command for each one.
 
 ## Core Principles
 
