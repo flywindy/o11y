@@ -14,6 +14,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
 	o11ynats "github.com/flywindy/o11y/nats"
@@ -245,11 +246,11 @@ func TestRespond_TracePropagation(t *testing.T) {
 		for _, s := range sr.Ended() {
 			var destMatch, isSend bool
 			for _, a := range s.Attributes() {
-				switch string(a.Key) {
-				case "messaging.destination.name":
+				switch a.Key {
+				case semconv.MessagingDestinationNameKey:
 					destMatch = a.Value.AsString() == replySubject
-				case "messaging.operation.type":
-					isSend = a.Value.AsString() == "send"
+				case semconv.MessagingOperationTypeKey:
+					isSend = a.Value.AsString() == semconv.MessagingOperationTypeSend.Value.AsString()
 				}
 			}
 			if destMatch && isSend {

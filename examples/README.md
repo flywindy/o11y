@@ -140,7 +140,14 @@ go run examples/nats-core/publisher/main.go
 
 ### NATS Core request/reply (two terminals)
 
+`otel-nats` gates trace propagation behind two env vars; export them in **both**
+terminals or no `traceparent` is injected and you will see replies without
+NATS trace correlation:
+
 ```bash
+export OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true
+export OTEL_NATS_TRACING_ENABLED=true
+
 # Terminal 1 — start responder first
 go run examples/nats-core/responder/main.go
 
