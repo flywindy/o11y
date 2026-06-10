@@ -225,7 +225,7 @@ to switch from the Prometheus pull model to OTLP push (useful for serverless
 deployments that cannot be scraped). See the
 [options reference](../README.md#using-the-sdk) for the full metrics option set.
 
-**Exemplars** are enabled automatically (OTel SDK default trace-based filter). When Prometheus is deployed with `--enable-feature=exemplar-storage` (included in `../k8s/infrastructure/base/prometheus.yaml`), Grafana can navigate from a histogram bucket directly to the correlated trace in Tempo. The measurement context must contain an active sampled span; exemplar trace IDs are stored as exemplar metadata (`trace_id` / `span_id`), not as metric labels, so they do not create high-cardinality time series.
+**Exemplars** are enabled automatically (OTel SDK default trace-based filter). When Prometheus is deployed with `--enable-feature=exemplar-storage` (included in [`k8s/infrastructure/base/prometheus.yaml`](../k8s/infrastructure/base/prometheus.yaml)), Grafana can navigate from a histogram bucket directly to the correlated trace in Tempo. The measurement context must contain an active sampled span; exemplar trace IDs are stored as exemplar metadata (`trace_id` / `span_id`), not as metric labels, so they do not create high-cardinality time series.
 
 **Kubernetes pods** must opt in to scraping with the annotation:
 
@@ -325,6 +325,22 @@ formatter at the router edge; keep raw URL paths out of metric labels.
 in-process aggregators from attacker-controlled attribute sets. If the separate
 SDK guard trips, metrics are preserved under `otel_metric_overflow="true"`
 with route detail intentionally dropped.
+
+For outbound calls over the standard library client, wrap any
+`http.RoundTripper` with `o11yhttp.NewTransport`. It emits one client span per
+request, records `http.client.request.duration`, and injects `traceparent` so
+the trace continues into the downstream service:
+
+```go
+client := &http.Client{
+    Transport: o11yhttp.NewTransport(
+        http.DefaultTransport,
+        obs.TracerProvider(),
+        obs.MeterProvider(),
+        obs.Propagator,
+    ),
+}
+```
 
 ### gin
 

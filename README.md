@@ -5,7 +5,7 @@ A lightweight Go SDK for standardized observability, integrating OpenTelemetry (
 ## Documentation
 
 - **README** (this file) — project overview, infrastructure setup, SDK initialization, and the full `Init` options reference.
-- **[Developer Guide](docs/guide.md)** — task-driven guide for structured logging, trace sampling, continuous profiling, and the per-integration sub-packages (NATS, MongoDB, Redis/Valkey, HTTP, Resty, MinIO, gin).
+- **[Developer Guide](docs/guide.md)** — the four pillars (Tracing, Logging, Metrics, Profiling) in depth, plus per-integration sub-packages grouped by semantic-convention domain (HTTP, Databases, Messaging, Object Storage).
 - **[Examples](examples/README.md)** — runnable programs for each pillar and integration.
 - **[Architecture Decision Records](docs/adr/)** — the "why" behind key design choices.
 - **[Semantic Conventions](docs/semconv.md)** — pinned OTel semconv reference.
@@ -97,9 +97,9 @@ Open `http://localhost:3000` (default credentials: `admin` / `admin`).
 ## Using the SDK
 
 This section covers initialization, the full options reference, and feature
-toggles. For structured logging, trace sampling, profiling, and the
-per-integration sub-packages (NATS, MongoDB, Redis, HTTP, Resty, MinIO, gin),
-see the **[Developer Guide](docs/guide.md)**.
+toggles. For the four pillars in depth (Tracing, Logging, Metrics, Profiling)
+and the per-integration sub-packages (HTTP, Databases, Messaging, Object
+Storage), see the **[Developer Guide](docs/guide.md)**.
 
 ### Initialization
 
