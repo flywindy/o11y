@@ -138,7 +138,13 @@ stabilization, exactly as `db.cassandra.*` was (ADR 0019):
 | `http.request.method` | Recommended | underlying HTTP method |
 | `error.type` | Conditionally Required | **NOT emitted by upstream** — see † |
 
-Span name follows the DB guidance (`db.operation.name` + target).
+Span name is emitted by the upstream `elastic-transport-go` instrumentation
+and is **not** under facade control: a T2 facade only wires providers and has
+no span-name seam (unlike `otelmongo`, which exposes `WithSpanNameFormatter`).
+The cross-package convention `{db.system.name}.{operation} {target}` (ADR 0023)
+therefore **does not apply** to Elasticsearch in v1; this is a recorded,
+accepted divergence (the same class as the §4 legacy-attribute drift). Revisit
+if upstream adds a span-name formatter or the facade is promoted to a T3 seam.
 
 **† `error.type` is not set by the pinned instrumentation.** Verified against
 `elastic-transport-go/v8 v8.8.0` (`elastictransport/instrumentation.go`):

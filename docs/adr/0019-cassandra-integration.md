@@ -187,11 +187,13 @@ Two seam-honest options follow, and v1 takes (a):
   identity and the callback cannot reach forward to later attempts. Deferred — it
   is the same seam §4 introduces for batches, and is out of scope for v1.
 
-Span name follows the DB guidance (`db.operation.name` + target, e.g.
-`SELECT messages_by_room`), falling back to the operation name alone when the
-table cannot be parsed. A unit test pins the callback/span multiplicity for the
-pinned gocql version (one span per attempt and per page, not one per logical
-query).
+Span name follows the cross-package convention (ADR 0023):
+`{db.system.name}.{db.operation.name} {target}`, e.g.
+`cassandra.SELECT messages_by_room`, falling back to `cassandra.{operation}`
+when the table cannot be parsed. Because this is a T3 SDK-owned seam, the
+wrapper sets the span name directly and conforms without an upstream
+formatter. A unit test pins the callback/span multiplicity for the pinned
+gocql version (one span per attempt and per page, not one per logical query).
 
 **Batches.** `ObserveBatch` "gets called on every batch query to cassandra. It
 also gets called once for each query in a batch", and v1.7.0 exposes **no batch

@@ -15,7 +15,20 @@ adopters can plan their upgrades.
 
 ### Added
 
+- ADR 0023: cross-package span-naming convention
+  `{system.name}.{operation} {target}` for data-store integrations.
+
 ### Changed
+
+- **Span names** for the `mongo` and `minio` integrations now follow the
+  unified convention `{system.name}.{operation} {target}` (ADR 0023):
+  - `mongo`: `users.find` → `mongodb.find users` (commands with no
+    collection, e.g. `ping`, are `mongodb.ping`).
+  - `minio`: `PutObject media` → `s3.PutObject media`.
+  - `redis` was already `redis.GET` / `redis.pipeline` and is unchanged.
+  Span/metric **attributes** are unchanged; only the human-facing span name
+  moved. A caller-supplied `WithSpanNameFormatter` is still used verbatim
+  (the system prefix is part of the default name only).
 
 ### Deprecated
 
@@ -26,6 +39,16 @@ adopters can plan their upgrades.
 ### Security
 
 ### Breaking Changes (Migration Guide)
+
+- **Data-store span names changed (`mongo`, `minio`).** Any trace-search
+  query (e.g. Tempo TraceQL `{ name = "users.find" }`), saved Jaeger
+  operation filter, or `spanmetrics` connector keyed on the old span names
+  must be updated:
+  - `"<collection>.<command>"` → `"mongodb.<command> <collection>"`
+  - `"<Operation> <bucket>"` → `"s3.<Operation> <bucket>"`
+  `redis` span names are unchanged. Span/metric attributes are unchanged, so
+  any dashboard aggregating on `db.operation.name`, `db.collection.name`,
+  `object_store.operation.name`, etc. is unaffected.
 
 ---
 

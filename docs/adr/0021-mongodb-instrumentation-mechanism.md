@@ -314,7 +314,7 @@ re-verify if the contrib pin is bumped.
 
 | Aspect | Marz (current) | Contrib `otelmongo` (0021) |
 |---|---|---|
-| Span name | `"<op> <collection>"` (space, *logical* op): `insert messages`, `find messages`, `aggregate messages` (Watch→`aggregate`) | `"<collection>.<command>"` (dot, *wire command*): `messages.insert`, `messages.find`, `messages.getMore`; `<command>` if no collection |
+| Span name | `"<op> <collection>"` (space, *logical* op): `insert messages`, `find messages`, `aggregate messages` (Watch→`aggregate`) | upstream default is `"<collection>.<command>"` (dot, *wire command*), but the o11y facade overrides it via `WithSpanNameFormatter` to `"mongodb.<command> <collection>"` per the cross-package convention (ADR 0023): `mongodb.insert messages`, `mongodb.find messages`, `mongodb.getMore`; `mongodb.<command>` if no collection |
 | Operation vocabulary | logical: insert/find/update/delete/aggregate/distinct/bulkWrite | wire commands, incl. `getMore`/`createIndexes`/`listIndexes`/`ping`/… |
 | Granularity | one span per application call | one span per wire command (Find+getMore → multiple; bulkWrite / transactions split) |
 | Span kind | Client (+ optional Consumer "deliver" spans) | Client only |

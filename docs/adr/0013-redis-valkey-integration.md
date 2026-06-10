@@ -319,7 +319,10 @@ Keys **not** emitted (intentionally diverging from what
 
 Span name: `redis.<METHOD>` for single commands (e.g.
 `redis.GET`), `redis.pipeline` for batches. Low cardinality; the
-command name is the operation, not the argument.
+command name is the operation, not the argument. This is already the
+`{system.name}.{operation}` shape later standardized across all data-store
+integrations in ADR 0023 (redis has no target — the key is high-cardinality),
+so no change was needed here.
 
 ### 6. Command text (`db.query.text`) is opt-in, default off
 

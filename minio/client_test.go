@@ -205,8 +205,8 @@ func TestStatObject_404_GeneratesErrorSpan(t *testing.T) {
 		t.Fatalf("got %d spans, want 1", len(spans))
 	}
 	s := spans[0]
-	if s.Name() != "StatObject media" {
-		t.Errorf("span name = %q, want %q", s.Name(), "StatObject media")
+	if s.Name() != "s3.StatObject media" {
+		t.Errorf("span name = %q, want %q", s.Name(), "s3.StatObject media")
 	}
 	if s.Status().Code != codes.Error {
 		t.Errorf("span status = %v, want Error", s.Status().Code)
@@ -385,7 +385,7 @@ func TestWrappedMethods_EmitOperationSpan(t *testing.T) {
 		invoke   func(t *testing.T, c *Client, ctx context.Context)
 	}{
 		{
-			name: "PutObject", wantSpan: "PutObject media", wantOp: "PutObject",
+			name: "PutObject", wantSpan: "s3.PutObject media", wantOp: "PutObject",
 			invoke: func(t *testing.T, c *Client, ctx context.Context) {
 				t.Helper()
 				_, _ = c.PutObject(ctx, "media", "key", strings.NewReader("payload"),
@@ -393,21 +393,21 @@ func TestWrappedMethods_EmitOperationSpan(t *testing.T) {
 			},
 		},
 		{
-			name: "FPutObject", wantSpan: "FPutObject media", wantOp: "FPutObject",
+			name: "FPutObject", wantSpan: "s3.FPutObject media", wantOp: "FPutObject",
 			invoke: func(t *testing.T, c *Client, ctx context.Context) {
 				t.Helper()
 				_, _ = c.FPutObject(ctx, "media", "key", uploadPath, miniogo.PutObjectOptions{})
 			},
 		},
 		{
-			name: "FGetObject", wantSpan: "FGetObject media", wantOp: "FGetObject",
+			name: "FGetObject", wantSpan: "s3.FGetObject media", wantOp: "FGetObject",
 			invoke: func(t *testing.T, c *Client, ctx context.Context) {
 				t.Helper()
 				_ = c.FGetObject(ctx, "media", "key", downloadPath, miniogo.GetObjectOptions{})
 			},
 		},
 		{
-			name: "GetObject", wantSpan: "GetObject media", wantOp: "GetObject",
+			name: "GetObject", wantSpan: "s3.GetObject media", wantOp: "GetObject",
 			invoke: func(t *testing.T, c *Client, ctx context.Context) {
 				t.Helper()
 				obj, _ := c.GetObject(ctx, "media", "key", miniogo.GetObjectOptions{})
@@ -417,14 +417,14 @@ func TestWrappedMethods_EmitOperationSpan(t *testing.T) {
 			},
 		},
 		{
-			name: "RemoveObject", wantSpan: "RemoveObject media", wantOp: "RemoveObject",
+			name: "RemoveObject", wantSpan: "s3.RemoveObject media", wantOp: "RemoveObject",
 			invoke: func(t *testing.T, c *Client, ctx context.Context) {
 				t.Helper()
 				_ = c.RemoveObject(ctx, "media", "key", miniogo.RemoveObjectOptions{})
 			},
 		},
 		{
-			name: "CopyObject", wantSpan: "CopyObject dst", wantOp: "CopyObject",
+			name: "CopyObject", wantSpan: "s3.CopyObject dst", wantOp: "CopyObject",
 			invoke: func(t *testing.T, c *Client, ctx context.Context) {
 				t.Helper()
 				_, _ = c.CopyObject(ctx,
@@ -433,7 +433,7 @@ func TestWrappedMethods_EmitOperationSpan(t *testing.T) {
 			},
 		},
 		{
-			name: "ListObjects", wantSpan: "ListObjects media", wantOp: "ListObjects",
+			name: "ListObjects", wantSpan: "s3.ListObjects media", wantOp: "ListObjects",
 			invoke: func(t *testing.T, c *Client, ctx context.Context) {
 				t.Helper()
 				ch := c.ListObjects(ctx, "media", miniogo.ListObjectsOptions{})

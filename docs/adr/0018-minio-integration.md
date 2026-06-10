@@ -216,8 +216,8 @@ type Option func(*config)
 //     explicitly to keep enabling child spans behavior-neutral.
 func WithHTTPChildSpans(enabled bool) Option
 
-// WithSpanNameFormatter overrides the default "{Operation} {bucket}"
-// span name.
+// WithSpanNameFormatter overrides the default "s3.{Operation} {bucket}"
+// span name. A non-empty return is used verbatim (no forced "s3." prefix).
 func WithSpanNameFormatter(func(op, bucket, key string) string) Option
 
 // WithObjectKeyAttribute controls whether the (potentially high-
@@ -342,9 +342,11 @@ mode, so cardinality is constant.
 - One span per logical operation, kind `SpanKindClient`, tracer name
   `"github.com/flywindy/o11y/minio"`, schema URL pinned to the SDK
   semconv version (v1.39.0, ADR 0006).
-- Default span name: `"{Operation} {bucket}"` (e.g. `PutObject media`).
-  Operation and bucket are low/bounded cardinality; the **object key is
-  never in the span name** (it is an attribute).
+- Default span name: `"s3.{Operation} {bucket}"` (e.g. `s3.PutObject media`).
+  The `s3.` prefix is the `object_store.system.name` value, applied per the
+  cross-package span-naming convention (ADR 0023). Operation and bucket are
+  low/bounded cardinality; the **object key is never in the span name** (it
+  is an attribute).
 - Attributes set before delegation — **default schema:
   package-local `object_store.*` namespace** (vendor-neutral).
   OTel has no stable, vendor-neutral object-store convention; only
@@ -625,7 +627,7 @@ Resulting trace (the parent HTTP-server span from gin/echo is omitted
 for brevity; the logical span is its direct child via `ctx`):
 
 ```text
-PutObject media                                                client
+s3.PutObject media                                             client
 │  object_store.system.name      = "s3"
 │  object_store.operation.name   = "PutObject"
 │  object_store.bucket.name      = "media"
@@ -668,7 +670,7 @@ The compat flag dual-emits the experimental `aws.s3.*` keys
 alongside the generic ones; the generic schema is unchanged.
 
 ```text
-PutObject media                                                client
+s3.PutObject media                                             client
 │  object_store.system.name      = "s3"
 │  object_store.operation.name   = "PutObject"
 │  object_store.bucket.name      = "media"
