@@ -116,6 +116,10 @@ go run examples/basic/main.go
 go run examples/nats-core/subscriber/main.go
 go run examples/nats-core/publisher/main.go
 
+# Run the NATS Core request/reply examples (two terminals; responder replies via conn.Respond)
+go run examples/nats-core/responder/main.go
+go run examples/nats-core/requester/main.go
+
 # Run the JetStream examples (two terminals; NATS must have JetStream enabled)
 # Start publisher first — it creates the JetStream stream; then start the subscriber
 go run examples/jetstream/publisher/main.go   # creates the stream and publishes

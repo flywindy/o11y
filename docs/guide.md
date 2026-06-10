@@ -584,6 +584,27 @@ if err != nil {
 defer func() { _ = sub.Drain() }() // gracefully drain on shutdown
 ```
 
+For **request/reply**, reply with `conn.Respond` from inside the handler so the
+reply carries trace context. Do not use `msg.Respond` — it routes through the
+raw NATS connection, skips header injection, and breaks the trace.
+
+```go
+// Responder: Respond validates the reply subject (non-nil msg, non-empty
+// msg.Reply) and routes through the same traced publish path as conn.Publish.
+_, err = conn.Subscribe(ctx, "orders.get", func(ctx context.Context, msg *gonats.Msg) {
+    if err := conn.Respond(ctx, msg, []byte("ok")); err != nil {
+        obs.Logger.ErrorContext(ctx, "respond failed", slog.Any("error", err))
+    }
+})
+
+// Requester: conn.Request injects the active trace into the request headers;
+// the reply (sent via conn.Respond) carries trace context back.
+reply, err := conn.Request(ctx, "orders.get", []byte("42"), 2*time.Second)
+```
+
+`Respond` guarantees the reply carries trace context; it does not create a
+requester-side span that links back to the responder (see ADR 0022).
+
 ## Object Storage
 
 Spans in this group use the package-local `object_store.*` attribute schema,

@@ -138,6 +138,21 @@ go run examples/nats-core/subscriber/main.go
 go run examples/nats-core/publisher/main.go
 ```
 
+### NATS Core request/reply (two terminals)
+
+```bash
+# Terminal 1 — start responder first
+go run examples/nats-core/responder/main.go
+
+# Terminal 2 — requester sends a request every 3 seconds and logs the reply
+go run examples/nats-core/requester/main.go
+```
+
+The responder replies with `conn.Respond`, which routes the reply through the
+traced publish path so it carries trace context (unlike raw `msg.Respond`); the
+requester uses `conn.Request`. In Tempo the request and reply appear in one
+correlated trace.
+
 ### JetStream (two terminals; requires JetStream-enabled NATS server)
 
 ```bash
