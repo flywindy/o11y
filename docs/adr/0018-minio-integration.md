@@ -698,7 +698,7 @@ _, err := client.StatObject(ctx, "media",
 ```
 
 ```text
-StatObject media                                               client  ERROR
+s3.StatObject media                                            client  ERROR
    object_store.system.name      = "s3"
    object_store.operation.name   = "StatObject"
    object_store.bucket.name      = "media"

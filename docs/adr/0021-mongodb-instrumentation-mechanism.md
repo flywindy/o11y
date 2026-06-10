@@ -325,7 +325,8 @@ re-verify if the contrib pin is bumped.
 | Env gate | `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` + `OTEL_MONGO_TRACING_ENABLED` | none — sampler-governed (Decision point 7) |
 
 Migration checklist for consumers: update span-name queries
-(`insert messages` → `messages.insert`), swap `server.*` → `network.peer.*` in
+(`insert messages` → `mongodb.insert messages`, per the ADR 0023 convention;
+`mongodb.<command>` when no collection), swap `server.*` → `network.peer.*` in
 attribute filters, and expect additional `getMore` spans on cursor-heavy reads.
 
 ---

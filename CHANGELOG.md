@@ -27,8 +27,10 @@ adopters can plan their upgrades.
   - `minio`: `PutObject media` → `s3.PutObject media`.
   - `redis` was already `redis.GET` / `redis.pipeline` and is unchanged.
   Span/metric **attributes** are unchanged; only the human-facing span name
-  moved. A caller-supplied `WithSpanNameFormatter` is still used verbatim
-  (the system prefix is part of the default name only).
+  moved. For `minio`, which exposes a public `WithSpanNameFormatter`, a
+  caller-supplied formatter is still used verbatim (the system prefix is part
+  of the default name only); `mongo` wires its formatter into the otelmongo
+  monitor and does not accept a user-provided one.
 
 ### Deprecated
 
