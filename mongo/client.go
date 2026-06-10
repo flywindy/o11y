@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/event"
 	drivermongo "go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -157,7 +158,58 @@ func NewMonitor(tp trace.TracerProvider, mp metric.MeterProvider) *event.Command
 	return otelmongo.NewMonitor(
 		otelmongo.WithTracerProvider(tp),
 		otelmongo.WithMeterProvider(mp),
+		otelmongo.WithSpanNameFormatter(spanName),
 	)
+}
+
+// mongoSystemName is the db.system.name value this package emits (see
+// docs/semconv.md). It also prefixes span names so every o11y data-store
+// span shares the "{system}.{operation} {target}" shape (redis.GET,
+// s3.PutObject media, mongodb.find users).
+const mongoSystemName = "mongodb"
+
+// spanName renders a MongoDB command as "mongodb.{operation} {collection}"
+// (e.g. "mongodb.find users"). Commands that target no collection — ping,
+// hello, getMore, and admin commands — omit the target: "mongodb.ping".
+//
+// This replaces otelmongo's default "{collection}.{operation}" so the
+// operation leads and the system is identifiable without opening the span.
+func spanName(evt *event.CommandStartedEvent) string {
+	if evt == nil {
+		return mongoSystemName
+	}
+	if collection := commandCollection(evt); collection != "" {
+		return mongoSystemName + "." + evt.CommandName + " " + collection
+	}
+	return mongoSystemName + "." + evt.CommandName
+}
+
+// commandCollection extracts the target collection from a command event.
+//
+// It deliberately mirrors otelmongo's own (unexported) extractCollection:
+// the formatter callback receives only the raw CommandStartedEvent, not the
+// collection otelmongo resolves internally, so we re-derive it here. In the
+// MongoDB wire protocol the command document's first element carries the
+// command name as its key and the collection as its string value
+// (e.g. {"find": "users", ...}); commands without a collection put a
+// non-string there (e.g. {"getMore": <int64>}, {"ping": 1}), which yields
+// an empty result. This is stable wire-format structure, but if upstream
+// ever changes how it resolves collections, keep this in sync so the span
+// name and db.collection.name attribute agree.
+func commandCollection(evt *event.CommandStartedEvent) string {
+	elt, err := evt.Command.IndexErr(0)
+	if err != nil {
+		return ""
+	}
+	key, err := elt.KeyErr()
+	if err != nil || key != evt.CommandName {
+		return ""
+	}
+	val, err := elt.ValueErr()
+	if err != nil || val.Type != bson.TypeString {
+		return ""
+	}
+	return val.StringValue()
 }
 
 func composeCommandMonitors(first, second *event.CommandMonitor) *event.CommandMonitor {

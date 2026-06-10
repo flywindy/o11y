@@ -429,7 +429,7 @@ func TestNewMonitor_EmitsAlwaysOnCommandSpanWithParentContext(t *testing.T) {
 	spans := sr.Ended()
 	require.Len(t, spans, 2)
 
-	commandSpan := findSpanWithName(spans, "events.insert")
+	commandSpan := findSpanWithName(spans, "mongodb.insert events")
 	require.NotNil(t, commandSpan, "MongoDB insert span should be recorded")
 	parentSpan := findSpanWithName(spans, "parent")
 	require.NotNil(t, parentSpan)
@@ -581,6 +581,34 @@ func TestNewMonitor_RecordsFailureErrorType(t *testing.T) {
 	assert.Contains(t, attrs, semconv.NetworkPeerAddress("127.0.0.1"))
 	assert.Contains(t, attrs, semconv.NetworkPeerPort(27017))
 	assertHasAttributeKey(t, attrs, semconv.ErrorTypeKey)
+}
+
+func TestSpanName(t *testing.T) {
+	tests := []struct {
+		name       string
+		command    string
+		collection string
+		want       string
+	}{
+		{name: "find with collection", command: "find", collection: "users", want: "mongodb.find users"},
+		{name: "insert with collection", command: "insert", collection: "events", want: "mongodb.insert events"},
+		{name: "collection with dot", command: "find", collection: "a.b", want: "mongodb.find a.b"},
+		{name: "no collection (admin)", command: "ping", collection: "", want: "mongodb.ping"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			evt := commandStartedEvent(t, tc.command, "o11y_test", tc.collection, 1)
+			if got := spanName(evt); got != tc.want {
+				t.Errorf("spanName() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("nil event", func(t *testing.T) {
+		if got := spanName(nil); got != "mongodb" {
+			t.Errorf("spanName(nil) = %q, want %q", got, "mongodb")
+		}
+	})
 }
 
 func commandStartedEvent(t *testing.T, command, database, collection string, requestID int64) *event.CommandStartedEvent {

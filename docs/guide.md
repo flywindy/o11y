@@ -626,7 +626,7 @@ Options:
 | `WithHTTPChildSpans(bool)` | `false` | Wrap minio-go's own `DefaultTransport(Secure)` (not `http.DefaultTransport`) with `o11yhttp.NewTransport`, so every HTTP round-trip (incl. multipart `UploadPart`s) becomes a child span. The transport uses an empty propagator — no `traceparent` flows toward the store. |
 | `WithObjectKeyAttribute(bool)` | `true` | Whether to record `object_store.object.key` on spans. Metric labels never carry the key regardless. |
 | `WithAWSS3CompatAttributes(bool)` | `false` | Dual-emit the experimental `aws.s3.*` keys (`aws.s3.bucket`, `aws.s3.key`) alongside the default `object_store.*` attributes for dashboards keyed on the OTel AWS-S3 semantic conventions. |
-| `WithSpanNameFormatter(...)` | `nil` | Override the default `"{Operation} {bucket}"` span name. |
+| `WithSpanNameFormatter(...)` | `nil` | Override the default `"s3.{Operation} {bucket}"` span name. A non-empty return is used verbatim (the `s3.` prefix is part of the default only). |
 
 `GetObject` is wrapped as a thin span only; the caller's original ctx
 is what minio-go stashes on the returned `*Object`, so any lazy `Read`

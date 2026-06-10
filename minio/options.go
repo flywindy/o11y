@@ -72,23 +72,27 @@ func WithAWSS3CompatAttributes(enabled bool) Option {
 }
 
 // WithSpanNameFormatter overrides the default span name
-// "{Operation} {bucket}" with the caller-supplied formatter.
+// "s3.{Operation} {bucket}" with the caller-supplied formatter.
 //
 // The formatter receives the logical operation name (e.g. "PutObject"),
 // the bucket, and the object key (which may be empty for operations that
 // do not target a single object). Returning an empty string falls back to
-// the default name.
+// the default name. A non-empty return is used verbatim — the "s3." system
+// prefix is part of the default only and is not forced onto custom names.
 func WithSpanNameFormatter(f func(operation, bucket, key string) string) Option {
 	return func(cfg *config) {
 		cfg.spanNameFormatter = f
 	}
 }
 
-// defaultSpanName matches ADR 0018 §4: "{Operation} {bucket}" with the
-// object key intentionally absent (high cardinality, span attribute only).
+// defaultSpanName renders "{object_store.system.name}.{Operation} {bucket}"
+// (e.g. "s3.PutObject media"), the data-store span shape shared with the
+// redis and mongo wrappers. The object key is intentionally absent (high
+// cardinality, span attribute only). A caller-supplied WithSpanNameFormatter
+// replaces this verbatim and is not re-prefixed.
 func defaultSpanName(operation, bucket string) string {
 	if bucket == "" {
-		return operation
+		return objectStoreSystemNameS3 + "." + operation
 	}
-	return operation + " " + bucket
+	return objectStoreSystemNameS3 + "." + operation + " " + bucket
 }
