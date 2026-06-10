@@ -117,6 +117,8 @@ go run examples/nats-core/subscriber/main.go
 go run examples/nats-core/publisher/main.go
 
 # Run the NATS Core request/reply examples (two terminals; responder replies via conn.Respond)
+# Export both gates first, or otel-nats v0.2.11 injects no traceparent (replies work but untraced):
+export OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true OTEL_NATS_TRACING_ENABLED=true
 go run examples/nats-core/responder/main.go
 go run examples/nats-core/requester/main.go
 
