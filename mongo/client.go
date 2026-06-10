@@ -175,6 +175,9 @@ const mongoSystemName = "mongodb"
 // This replaces otelmongo's default "{collection}.{operation}" so the
 // operation leads and the system is identifiable without opening the span.
 func spanName(evt *event.CommandStartedEvent) string {
+	if evt == nil {
+		return mongoSystemName
+	}
 	if collection := commandCollection(evt); collection != "" {
 		return mongoSystemName + "." + evt.CommandName + " " + collection
 	}

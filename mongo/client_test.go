@@ -603,6 +603,12 @@ func TestSpanName(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("nil event", func(t *testing.T) {
+		if got := spanName(nil); got != "mongodb" {
+			t.Errorf("spanName(nil) = %q, want %q", got, "mongodb")
+		}
+	})
 }
 
 func commandStartedEvent(t *testing.T, command, database, collection string, requestID int64) *event.CommandStartedEvent {
