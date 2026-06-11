@@ -15,6 +15,24 @@ adopters can plan their upgrades.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+### Breaking Changes (Migration Guide)
+
+---
+
+## [0.5.0] - 2026-06-11
+
+### Added
+
 - ADR 0023: cross-package span-naming convention
   `{system.name}.{operation} {target}` for data-store integrations.
 
