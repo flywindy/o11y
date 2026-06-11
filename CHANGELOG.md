@@ -13,6 +13,10 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+---
+
+## [0.5.0] - 2026-06-11
+
 ### Added
 
 - ADR 0023: cross-package span-naming convention
