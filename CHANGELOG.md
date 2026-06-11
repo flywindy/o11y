@@ -13,20 +13,6 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
-### Added
-
-### Changed
-
-### Deprecated
-
-### Removed
-
-### Fixed
-
-### Security
-
-### Breaking Changes (Migration Guide)
-
 ---
 
 ## [0.5.0] - 2026-06-11
