@@ -1,0 +1,66 @@
+# o11y context-lifecycle lint rules (semgrep).
+#
+# Catches the pattern that took down a production service: a request-scoped
+# context (canceled when the handler returns) threaded into work that outlives
+# the request. Run from the repo root:
+#
+#   semgrep --config tools/lint/o11y-context.yml ./...
+#
+# Expected workflow (TDD): run it on the current code (should report findings on
+# the offending background work), fix each finding with
+# github.com/flywindy/o11y/obsctx (Detach / DetachWithTimeout / Go), then run it
+# again until it reports zero findings. Adopt it in CI afterwards.
+#
+# These are heuristics: they catch the common shapes (a goroutine capturing a
+# request context or *gin.Context). They do not prove semantic safety on their
+# own — pair them with a deterministic test (see package o11ytest).
+rules:
+  - id: o11y-request-context-in-goroutine
+    languages: [go]
+    severity: ERROR
+    message: >-
+      This goroutine captures a request-scoped context (e.g. c.Request.Context()
+      or r.Context()), which is canceled when the handler returns. Background
+      work will be aborted mid-flight ("context canceled" / dropped DB
+      connections). Use obsctx.Detach / DetachWithTimeout / Go so the work keeps
+      the trace context but is not canceled with the request.
+    patterns:
+      - pattern-either:
+          - pattern: |
+              go func(...) {
+                ...
+                $REQ.Request.Context()
+                ...
+              }(...)
+          - pattern: |
+              go func(...) {
+                ...
+                $R.Context()
+                ...
+              }(...)
+      # Don't flag code that already detached.
+      - pattern-not-inside: |
+          go func(...) {
+            ...
+            obsctx.Detach(...)
+            ...
+          }(...)
+
+  - id: o11y-gin-context-escapes-handler
+    languages: [go]
+    severity: ERROR
+    message: >-
+      *gin.Context must not be used inside a goroutine or stored beyond the
+      handler: gin reuses it via sync.Pool after the handler returns, so it gets
+      reset (and may belong to another request). Call c.Copy() for the gin side
+      and obsctx.Detach(c.Request.Context()) for the standard context.
+    patterns:
+      - pattern: |
+          go func(...) {
+            ...
+            $C.$METHOD(...)
+            ...
+          }(...)
+      - metavariable-type:
+          metavariable: $C
+          type: "*gin.Context"
