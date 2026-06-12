@@ -76,7 +76,7 @@ func TestGo_SurvivesRequestEnd(t *testing.T) {
 	}
 }
 
-func TestGo_RecoversPanic(t *testing.T) {
+func TestGo_RecoversPanic(_ *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	// A panic in fire-and-forget work must not crash the process.

@@ -56,7 +56,7 @@ envelope, not on a path that changes business behavior).
    via `o11ytest` (`github.com/flywindy/o11y/o11ytest`):
    - `CanceledRequestContext() (ctx, endRequest)` mimics an in-flight request and
      its end.
-   - `RequireNotCanceled(t, ctx)` asserts background work was detached.
+   - `RequireNotCanceled(ctx, t)` asserts background work was detached.
    This turns the production heisenbug into a CI-friendly red/green test.
 4. **Ship a self-audit lint ruleset** (`tools/lint/o11y-context.yml`, semgrep)
    that flags goroutines capturing a request context or `*gin.Context`. Intended

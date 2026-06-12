@@ -25,5 +25,5 @@ func TestRequireNotCanceled_PassesForDetachedContext(t *testing.T) {
 
 	// This is the assertion application background work should make. It passes
 	// because the work was detached; it would fail on a raw request context.
-	o11ytest.RequireNotCanceled(t, detached)
+	o11ytest.RequireNotCanceled(detached, t)
 }

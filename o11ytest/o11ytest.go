@@ -25,7 +25,7 @@ func CanceledRequestContext() (ctx context.Context, endRequest func()) {
 // RequireNotCanceled fails the test if ctx is already canceled. Call it from the
 // background operation (after the request has ended) to assert the work was
 // detached from the request context rather than inheriting its cancelation.
-func RequireNotCanceled(t testing.TB, ctx context.Context) {
+func RequireNotCanceled(ctx context.Context, t testing.TB) {
 	t.Helper()
 	if err := ctx.Err(); err != nil {
 		t.Fatalf("context is canceled (%v): background work inherited the request's "+
