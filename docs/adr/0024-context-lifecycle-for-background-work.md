@@ -59,9 +59,13 @@ envelope, not on a path that changes business behavior).
    - `RequireNotCanceled(ctx, t)` asserts background work was detached.
    This turns the production heisenbug into a CI-friendly red/green test.
 4. **Ship a self-audit lint ruleset** (`tools/lint/o11y-context.yml`, semgrep)
-   that flags goroutines capturing a request context or `*gin.Context`. Intended
-   workflow: run it to find offending sites, fix with `obsctx`, re-run until
-   clean; adopt in CI afterwards.
+   that flags goroutines/`go` calls capturing a request context or `*gin.Context`.
+   It is a **heuristic first pass**, not a proof: it can miss aliased contexts
+   (`reqCtx := r.Context(); go ...`) and false-positive on safely copied gin
+   contexts (`c.Copy()`), so it is an advisory aid rather than a complete CI
+   gate. The deterministic `o11ytest` assertion (item 3) is the authoritative
+   check. Workflow: run it to surface candidate sites, fix real ones with
+   `obsctx`, suppress false positives with `// nosemgrep`, and re-run.
 5. **Principle, recorded for future integrations**: telemetry must be
    non-load-bearing. Any instrumentation change that alters cancelation,
    deadlines, or lifetimes is a smell; prefer span links and detached contexts.

@@ -1,29 +1,34 @@
-# o11y context-lifecycle lint rules (semgrep).
+# o11y context-lifecycle lint rules (semgrep) — a best-effort, heuristic
+# first-pass check.
 #
-# Catches the pattern that took down a production service: a request-scoped
-# context (canceled when the handler returns) threaded into work that outlives
-# the request. Run from the repo root:
+# It flags the common shapes of the bug that took down a production service: a
+# request-scoped context (canceled when the handler returns) threaded into work
+# that outlives the request. Run from the repo root:
 #
 #   semgrep --config tools/lint/o11y-context.yml ./...
 #
-# Expected workflow (TDD): run it on the current code (should report findings on
-# the offending background work), fix each finding with
-# github.com/flywindy/o11y/obsctx (Detach / DetachWithTimeout / Go), then run it
-# again until it reports zero findings. Adopt it in CI afterwards.
+# Suggested workflow: run it to surface candidate sites, fix each real one with
+# github.com/flywindy/o11y/obsctx (Detach / DetachWithTimeout / Go), and re-run.
 #
-# These are heuristics: they catch the common shapes (a goroutine capturing a
-# request context or *gin.Context). They do not prove semantic safety on their
-# own — pair them with a deterministic test (see package o11ytest).
+# IMPORTANT — this is a heuristic, not a proof:
+#   - It can MISS cases, e.g. a request context aliased to a variable before the
+#     goroutine: `reqCtx := r.Context(); go func() { repo.Write(reqCtx) }()`.
+#   - It can FALSE-POSITIVE, e.g. a safely copied gin context:
+#     `cc := c.Copy(); go func() { cc.Get(...) }()`. Suppress those with a
+#     `// nosemgrep: <rule-id>` line comment.
+# The authoritative gate is the deterministic test (see package o11ytest):
+# assert that background work survives request cancelation. Treat this ruleset
+# as an advisory aid, not a complete CI gate.
 rules:
   - id: o11y-request-context-in-goroutine
     languages: [go]
     severity: ERROR
     message: >-
-      This goroutine captures a request-scoped context (e.g. c.Request.Context()
-      or r.Context()), which is canceled when the handler returns. Background
-      work will be aborted mid-flight ("context canceled" / dropped DB
-      connections). Use obsctx.Detach / DetachWithTimeout / Go so the work keeps
-      the trace context but is not canceled with the request.
+      A request-scoped context (e.g. c.Request.Context() or r.Context()) is used
+      in background work, which is canceled when the handler returns. The work
+      will be aborted mid-flight ("context canceled" / dropped DB connections).
+      Use obsctx.Detach / DetachWithTimeout / Go so the work keeps the trace
+      context but is not canceled with the request.
     patterns:
       - pattern-either:
           - pattern: |
@@ -38,11 +43,14 @@ rules:
                 $R.Context()
                 ...
               }(...)
-      # Don't flag code that already detached.
+          - pattern: go $FUNC(..., $REQ.Request.Context(), ...)
+          - pattern: go $FUNC(..., $R.Context(), ...)
+      # Don't flag goroutines that already detach via obsctx (Detach,
+      # DetachWithTimeout, or Go).
       - pattern-not-inside: |
           go func(...) {
             ...
-            obsctx.Detach(...)
+            obsctx.$F(...)
             ...
           }(...)
 
@@ -50,17 +58,20 @@ rules:
     languages: [go]
     severity: ERROR
     message: >-
-      *gin.Context must not be used inside a goroutine or stored beyond the
-      handler: gin reuses it via sync.Pool after the handler returns, so it gets
+      *gin.Context must not be used inside a goroutine or passed to background
+      work: gin reuses it via sync.Pool after the handler returns, so it gets
       reset (and may belong to another request). Call c.Copy() for the gin side
-      and obsctx.Detach(c.Request.Context()) for the standard context.
+      and obsctx.Detach(c.Request.Context()) for the standard context. (A safely
+      copied context still trips this heuristic — suppress with // nosemgrep.)
     patterns:
-      - pattern: |
-          go func(...) {
-            ...
-            $C.$METHOD(...)
-            ...
-          }(...)
+      - pattern-either:
+          - pattern: |
+              go func(...) {
+                ...
+                $C.$METHOD(...)
+                ...
+              }(...)
+          - pattern: go $FUNC(..., $C, ...)
       - metavariable-type:
           metavariable: $C
           type: "*gin.Context"

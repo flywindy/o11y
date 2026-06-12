@@ -22,11 +22,21 @@ func CanceledRequestContext() (ctx context.Context, endRequest func()) {
 	return context.WithCancel(context.Background())
 }
 
-// RequireNotCanceled fails the test if ctx is already canceled. Call it from the
-// background operation (after the request has ended) to assert the work was
-// detached from the request context rather than inheriting its cancelation.
+// RequireNotCanceled fails the test if ctx is already canceled. Capture the
+// context your background work received (for example by sending it over a
+// channel), end the request, then call this from the test goroutine to assert
+// the work was detached rather than inheriting the request's cancelation.
+//
+// Like testify's require, it calls t.Fatalf, which is only safe on the test
+// goroutine. Do not call it from inside the background goroutine: a failure
+// there terminates that goroutine (via runtime.Goexit), which can hang the test
+// (e.g. a done channel never signaled) instead of reporting cleanly.
 func RequireNotCanceled(ctx context.Context, t testing.TB) {
 	t.Helper()
+	if ctx == nil {
+		t.Fatal("RequireNotCanceled: context is nil")
+		return
+	}
 	if err := ctx.Err(); err != nil {
 		t.Fatalf("context is canceled (%v): background work inherited the request's "+
 			"cancelation. Use obsctx.Detach / DetachWithTimeout / Go for work that "+

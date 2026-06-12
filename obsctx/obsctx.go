@@ -58,6 +58,9 @@ func DetachWithTimeout(ctx context.Context, timeout time.Duration) (context.Cont
 // extract what you need before calling Go. fn receives the detached context and
 // must use it for all downstream calls (DB, HTTP, ...).
 func Go(reqCtx context.Context, timeout time.Duration, fn func(ctx context.Context)) {
+	if fn == nil {
+		return
+	}
 	ctx, cancel := DetachWithTimeout(reqCtx, timeout)
 	go func() {
 		defer cancel()
