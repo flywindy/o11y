@@ -59,24 +59,31 @@ func TestDetachWithTimeout_SurvivesParentButHonorsDeadline(t *testing.T) {
 // context is canceled), and the background work must NOT see that cancelation.
 func TestGo_SurvivesRequestEnd(t *testing.T) {
 	reqCtx, endRequest := o11ytest.CanceledRequestContext()
-	gotCtx := make(chan context.Context, 1)
+	started := make(chan struct{})
+	released := make(chan struct{})
+	errc := make(chan error, 1)
 
 	obsctx.Go(reqCtx, time.Second, func(ctx context.Context) {
-		gotCtx <- ctx
+		close(started)
+		<-released        // keep fn running across endRequest()
+		errc <- ctx.Err() // read the background context's state, after the request ended but before fn returns
 	})
 
+	<-started
+	endRequest() // the request ends while the background work is still running
+	close(released)
+
+	// Deterministic: errc carries ctx.Err() read strictly after endRequest and
+	// before fn returns (so before Go's own defer cancel()). A correct detach
+	// reads nil; a raw request context would read context.Canceled and fail —
+	// regardless of goroutine scheduling.
 	select {
-	case bg := <-gotCtx:
-		// Capture the context the background work received, THEN end the
-		// request, and only then assert. This is deterministic: it fails even
-		// if the goroutine was scheduled first, because the assertion runs
-		// after cancelation. (Asserting ctx.Err() inside the goroutine would be
-		// timing-dependent — a raw request context read before endRequest still
-		// reads nil and would wrongly pass.)
-		endRequest()
-		o11ytest.RequireNotCanceled(bg, t)
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("background work inherited the request cancelation: %v", err)
+		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("background work did not run")
+		t.Fatal("background work did not finish")
 	}
 }
 
