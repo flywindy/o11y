@@ -2,6 +2,7 @@ package gin
 
 import (
 	"net/http"
+	"strings"
 
 	ginframework "github.com/gin-gonic/gin"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
@@ -51,19 +52,21 @@ func WithMetricAttributesFn(f func(*http.Request) []attribute.KeyValue) Option {
 	})
 }
 
-// DefaultSkipPaths is the list of exact paths excluded from tracing by
-// [WithSkipPaths]. It covers the most common Kubernetes liveness, readiness,
-// and metrics scrape endpoints. Export allows callers to inspect or extend the
-// list before passing it to [WithFilter].
-var DefaultSkipPaths = []string{
-	"/health",
-	"/healthz",
-	"/livez",
-	"/readyz",
-	"/metrics",
-	"/ping",
-	"/ready",
-	"/live",
+// DefaultSkipPaths returns the default list of exact paths excluded from
+// tracing by [WithSkipPaths]. It covers the most common Kubernetes liveness,
+// readiness, and metrics scrape endpoints. Callers may inspect or extend the
+// slice before passing individual paths to [WithFilter].
+func DefaultSkipPaths() []string {
+	return []string{
+		"/health",
+		"/healthz",
+		"/livez",
+		"/readyz",
+		"/metrics",
+		"/ping",
+		"/ready",
+		"/live",
+	}
 }
 
 // SkipPathsOption configures [WithSkipPaths].
@@ -105,8 +108,9 @@ func WithSkipPaths(opts ...SkipPathsOption) Option {
 	for _, o := range opts {
 		o.applySkipPaths(cfg)
 	}
-	exact := make(map[string]struct{}, len(DefaultSkipPaths))
-	for _, p := range DefaultSkipPaths {
+	defaults := DefaultSkipPaths()
+	exact := make(map[string]struct{}, len(defaults))
+	for _, p := range defaults {
 		exact[p] = struct{}{}
 	}
 	prefixes := cfg.prefixes
@@ -116,7 +120,7 @@ func WithSkipPaths(opts ...SkipPathsOption) Option {
 			return false
 		}
 		for _, prefix := range prefixes {
-			if len(p) >= len(prefix) && p[:len(prefix)] == prefix {
+			if strings.HasPrefix(p, prefix) {
 				return false
 			}
 		}

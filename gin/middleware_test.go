@@ -166,7 +166,7 @@ func TestMiddleware_MatrixRow10_InvertedRecoveryOrderProducesIncompleteSpan(t *t
 }
 
 func TestWithSkipPaths_DefaultExactPaths(t *testing.T) {
-	for _, path := range o11ygin.DefaultSkipPaths {
+	for _, path := range o11ygin.DefaultSkipPaths() {
 		t.Run(path, func(t *testing.T) {
 			env := newTestEnv(t)
 			router := ginframework.New()
