@@ -53,10 +53,14 @@ func DetachWithTimeout(ctx context.Context, timeout time.Duration) (context.Cont
 // request handler: fn keeps reqCtx's trace context (so its spans stay in the
 // same trace) but is not canceled when the request ends.
 //
-// Panics in fn are recovered and logged via slog so a background failure cannot
-// crash the process. Do not capture *gin.Context or the *http.Request inside fn;
-// extract what you need before calling Go. fn receives the detached context and
-// must use it for all downstream calls (DB, HTTP, ...).
+// Panics in fn are recovered and logged so a background failure cannot crash
+// the process. The panic is logged through the process default slog logger
+// (slog.Default), which is not necessarily the SDK-managed logger and does not
+// guarantee trace correlation; applications that need correlated panic logs
+// should configure slog.SetDefault at startup or log explicitly inside fn. Do
+// not capture *gin.Context or the *http.Request inside fn; extract what you
+// need before calling Go. fn receives the detached context and must use it for
+// all downstream calls (DB, HTTP, ...).
 func Go(reqCtx context.Context, timeout time.Duration, fn func(ctx context.Context)) {
 	if fn == nil {
 		return
