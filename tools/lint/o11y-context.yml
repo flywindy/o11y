@@ -5,7 +5,7 @@
 # request-scoped context (canceled when the handler returns) threaded into work
 # that outlives the request. Run from the repo root:
 #
-#   semgrep --config tools/lint/o11y-context.yml ./...
+#   semgrep --config tools/lint/o11y-context.yml .
 #
 # Suggested workflow: run it to surface candidate sites, fix each real one with
 # github.com/flywindy/o11y/obsctx (Detach / DetachWithTimeout / Go), and re-run.
