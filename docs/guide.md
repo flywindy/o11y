@@ -382,6 +382,34 @@ SDK's HTTP metric views and does not include gin error types. gin's
 `http.server.request.duration` histogram participates in the same exemplar and
 route-cardinality behavior described under [Metrics](#metrics).
 
+**Excluding infra endpoints from tracing**
+
+`WithSkipPaths` excludes common Kubernetes probe and metrics-scrape paths from
+tracing. By default it exact-matches the paths returned by `DefaultSkipPaths()`
+(`/health`, `/healthz`, `/livez`, `/readyz`, `/metrics`, `/ping`, `/ready`,
+`/live`). Use `WithSkipPathPrefixes` to also skip sub-path conventions such as
+`/health/probe` or `/health/live`:
+
+```go
+// exact default list only
+router.Use(o11ygin.Middleware(
+    "orders-api",
+    obs.TracerProvider(),
+    obs.MeterProvider(),
+    obs.Propagator,
+    o11ygin.WithSkipPaths(),
+)...)
+
+// exact list + prefix opt-in for /health/* sub-paths
+router.Use(o11ygin.Middleware(
+    "orders-api",
+    obs.TracerProvider(),
+    obs.MeterProvider(),
+    obs.Propagator,
+    o11ygin.WithSkipPaths(o11ygin.WithSkipPathPrefixes("/health/", "/internal/")),
+)...)
+```
+
 ### Resty HTTP client
 
 Use the `resty` sub-package to instrument `github.com/go-resty/resty/v2`

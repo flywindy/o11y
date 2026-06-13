@@ -106,6 +106,9 @@ func WithSkipPathPrefixes(prefixes ...string) SkipPathsOption {
 func WithSkipPaths(opts ...SkipPathsOption) Option {
 	cfg := &skipPathsConfig{}
 	for _, o := range opts {
+		if o == nil {
+			continue
+		}
 		o.applySkipPaths(cfg)
 	}
 	defaults := DefaultSkipPaths()
@@ -113,7 +116,12 @@ func WithSkipPaths(opts ...SkipPathsOption) Option {
 	for _, p := range defaults {
 		exact[p] = struct{}{}
 	}
-	prefixes := cfg.prefixes
+	var prefixes []string
+	for _, prefix := range cfg.prefixes {
+		if prefix != "" {
+			prefixes = append(prefixes, prefix)
+		}
+	}
 	return WithFilter(func(r *http.Request) bool {
 		p := r.URL.Path
 		if _, ok := exact[p]; ok {
