@@ -51,62 +51,68 @@ func WithMetricAttributesFn(f func(*http.Request) []attribute.KeyValue) Option {
 	})
 }
 
-// defaultProbeExactPaths are the well-known infra probe paths skipped by
-// [WithSkipProbes] by default. These are exact matches only.
-var defaultProbeExactPaths = map[string]struct{}{
-	"/health":    {},
-	"/healthz":   {},
-	"/livez":     {},
-	"/readyz":    {},
-	"/metrics":   {},
-	"/ping":      {},
-	"/ready":     {},
-	"/live":      {},
+// DefaultSkipPaths is the list of exact paths excluded from tracing by
+// [WithSkipPaths]. It covers the most common Kubernetes liveness, readiness,
+// and metrics scrape endpoints. Export allows callers to inspect or extend the
+// list before passing it to [WithFilter].
+var DefaultSkipPaths = []string{
+	"/health",
+	"/healthz",
+	"/livez",
+	"/readyz",
+	"/metrics",
+	"/ping",
+	"/ready",
+	"/live",
 }
 
-// SkipProbesOption configures [WithSkipProbes].
-type SkipProbesOption interface {
-	applySkipProbes(*skipProbesConfig)
+// SkipPathsOption configures [WithSkipPaths].
+type SkipPathsOption interface {
+	applySkipPaths(*skipPathsConfig)
 }
 
-type skipProbesConfig struct {
+type skipPathsConfig struct {
 	prefixes []string
 }
 
-type skipProbesFn func(*skipProbesConfig)
+type skipPathsFn func(*skipPathsConfig)
 
-func (f skipProbesFn) applySkipProbes(cfg *skipProbesConfig) { f(cfg) }
+func (f skipPathsFn) applySkipPaths(cfg *skipPathsConfig) { f(cfg) }
 
-// WithSkipProbePrefixes opts in to prefix-based skipping in addition to the
-// default exact-path list. Requests whose path starts with any of the given
-// prefixes are excluded from tracing.
+// WithSkipPathPrefixes opts in to prefix-based skipping in addition to the
+// [DefaultSkipPaths] exact list. Requests whose path starts with any of the
+// given prefixes are excluded from tracing.
 //
-// Example:
+// This is the recommended way to handle sub-path probe conventions such as
+// /health/probe or /health/live:
 //
-//	o11ygin.WithSkipProbes(o11ygin.WithSkipProbePrefixes("/internal/", "/_"))
-func WithSkipProbePrefixes(prefixes ...string) SkipProbesOption {
-	return skipProbesFn(func(cfg *skipProbesConfig) {
+//	o11ygin.WithSkipPaths(o11ygin.WithSkipPathPrefixes("/health/"))
+func WithSkipPathPrefixes(prefixes ...string) SkipPathsOption {
+	return skipPathsFn(func(cfg *skipPathsConfig) {
 		cfg.prefixes = append(cfg.prefixes, prefixes...)
 	})
 }
 
-// WithSkipProbes returns an [Option] that excludes well-known infra probe
-// endpoints from tracing. By default only exact paths are matched
-// (/health, /healthz, /livez, /readyz, /metrics, /ping, /ready, /live).
+// WithSkipPaths returns an [Option] that excludes common infra endpoints from
+// tracing. By default the paths in [DefaultSkipPaths] are matched exactly.
 //
-// Pass [WithSkipProbePrefixes] to also skip paths by prefix:
+// Pass [WithSkipPathPrefixes] to also exclude paths by prefix:
 //
-//	o11ygin.Middleware(svc, tp, mp, prop, o11ygin.WithSkipProbes())
-//	o11ygin.Middleware(svc, tp, mp, prop, o11ygin.WithSkipProbes(o11ygin.WithSkipProbePrefixes("/internal/")))
-func WithSkipProbes(opts ...SkipProbesOption) Option {
-	cfg := &skipProbesConfig{}
+//	o11ygin.Middleware(svc, tp, mp, prop, o11ygin.WithSkipPaths())
+//	o11ygin.Middleware(svc, tp, mp, prop, o11ygin.WithSkipPaths(o11ygin.WithSkipPathPrefixes("/health/", "/internal/")))
+func WithSkipPaths(opts ...SkipPathsOption) Option {
+	cfg := &skipPathsConfig{}
 	for _, o := range opts {
-		o.applySkipProbes(cfg)
+		o.applySkipPaths(cfg)
+	}
+	exact := make(map[string]struct{}, len(DefaultSkipPaths))
+	for _, p := range DefaultSkipPaths {
+		exact[p] = struct{}{}
 	}
 	prefixes := cfg.prefixes
 	return WithFilter(func(r *http.Request) bool {
 		p := r.URL.Path
-		if _, ok := defaultProbeExactPaths[p]; ok {
+		if _, ok := exact[p]; ok {
 			return false
 		}
 		for _, prefix := range prefixes {
