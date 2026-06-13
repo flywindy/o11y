@@ -165,6 +165,67 @@ func TestMiddleware_MatrixRow10_InvertedRecoveryOrderProducesIncompleteSpan(t *t
 	assertMetricStatusCodes(t, result.metrics)
 }
 
+func TestWithSkipProbes_ExactPaths(t *testing.T) {
+	probePaths := []string{
+		"/health", "/healthz", "/livez", "/readyz",
+		"/metrics", "/ping", "/ready", "/live",
+	}
+	for _, path := range probePaths {
+		t.Run(path, func(t *testing.T) {
+			env := newTestEnv(t)
+			router := ginframework.New()
+			router.Use(o11ygin.Middleware(testService, env.tracerProvider, env.meterProvider, propagation.TraceContext{},
+				o11ygin.WithSkipProbes(),
+			)...)
+			router.GET(path, func(c *ginframework.Context) { c.Status(http.StatusOK) })
+			router.GET(testRoute, func(c *ginframework.Context) { c.Status(http.StatusOK) })
+
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+			require.Equal(t, http.StatusOK, rec.Code)
+			require.Empty(t, env.spanRecorder.Ended(), "probe path %s should produce no span", path)
+
+			rec2 := httptest.NewRecorder()
+			router.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, testPath, nil))
+			require.Len(t, env.spanRecorder.Ended(), 1, "non-probe path should still produce a span")
+		})
+	}
+}
+
+func TestWithSkipProbes_PrefixOpt(t *testing.T) {
+	env := newTestEnv(t)
+	router := ginframework.New()
+	router.Use(o11ygin.Middleware(testService, env.tracerProvider, env.meterProvider, propagation.TraceContext{},
+		o11ygin.WithSkipProbes(o11ygin.WithSkipProbePrefixes("/internal/")),
+	)...)
+	router.GET("/internal/debug", func(c *ginframework.Context) { c.Status(http.StatusOK) })
+	router.GET(testRoute, func(c *ginframework.Context) { c.Status(http.StatusOK) })
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/internal/debug", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Empty(t, env.spanRecorder.Ended(), "prefix-matched path should produce no span")
+
+	rec2 := httptest.NewRecorder()
+	router.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, testPath, nil))
+	require.Len(t, env.spanRecorder.Ended(), 1, "non-prefix path should still produce a span")
+}
+
+func TestWithSkipProbes_ExactNotMatchedByPrefixOpt(t *testing.T) {
+	env := newTestEnv(t)
+	router := ginframework.New()
+	// No prefix opt — /healthcheck should NOT be skipped (it's not in the exact list).
+	router.Use(o11ygin.Middleware(testService, env.tracerProvider, env.meterProvider, propagation.TraceContext{},
+		o11ygin.WithSkipProbes(),
+	)...)
+	router.GET("/healthcheck", func(c *ginframework.Context) { c.Status(http.StatusOK) })
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthcheck", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Len(t, env.spanRecorder.Ended(), 1, "/healthcheck is not in exact list and should be traced")
+}
+
 func TestMiddleware_OptionPassThroughs(t *testing.T) {
 	env := newTestEnv(t, customMetricKey)
 	router := ginframework.New()

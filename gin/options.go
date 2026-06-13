@@ -51,6 +51,73 @@ func WithMetricAttributesFn(f func(*http.Request) []attribute.KeyValue) Option {
 	})
 }
 
+// defaultProbeExactPaths are the well-known infra probe paths skipped by
+// [WithSkipProbes] by default. These are exact matches only.
+var defaultProbeExactPaths = map[string]struct{}{
+	"/health":    {},
+	"/healthz":   {},
+	"/livez":     {},
+	"/readyz":    {},
+	"/metrics":   {},
+	"/ping":      {},
+	"/ready":     {},
+	"/live":      {},
+}
+
+// SkipProbesOption configures [WithSkipProbes].
+type SkipProbesOption interface {
+	applySkipProbes(*skipProbesConfig)
+}
+
+type skipProbesConfig struct {
+	prefixes []string
+}
+
+type skipProbesFn func(*skipProbesConfig)
+
+func (f skipProbesFn) applySkipProbes(cfg *skipProbesConfig) { f(cfg) }
+
+// WithSkipProbePrefixes opts in to prefix-based skipping in addition to the
+// default exact-path list. Requests whose path starts with any of the given
+// prefixes are excluded from tracing.
+//
+// Example:
+//
+//	o11ygin.WithSkipProbes(o11ygin.WithSkipProbePrefixes("/internal/", "/_"))
+func WithSkipProbePrefixes(prefixes ...string) SkipProbesOption {
+	return skipProbesFn(func(cfg *skipProbesConfig) {
+		cfg.prefixes = append(cfg.prefixes, prefixes...)
+	})
+}
+
+// WithSkipProbes returns an [Option] that excludes well-known infra probe
+// endpoints from tracing. By default only exact paths are matched
+// (/health, /healthz, /livez, /readyz, /metrics, /ping, /ready, /live).
+//
+// Pass [WithSkipProbePrefixes] to also skip paths by prefix:
+//
+//	o11ygin.Middleware(svc, tp, mp, prop, o11ygin.WithSkipProbes())
+//	o11ygin.Middleware(svc, tp, mp, prop, o11ygin.WithSkipProbes(o11ygin.WithSkipProbePrefixes("/internal/")))
+func WithSkipProbes(opts ...SkipProbesOption) Option {
+	cfg := &skipProbesConfig{}
+	for _, o := range opts {
+		o.applySkipProbes(cfg)
+	}
+	prefixes := cfg.prefixes
+	return WithFilter(func(r *http.Request) bool {
+		p := r.URL.Path
+		if _, ok := defaultProbeExactPaths[p]; ok {
+			return false
+		}
+		for _, prefix := range prefixes {
+			if len(p) >= len(prefix) && p[:len(prefix)] == prefix {
+				return false
+			}
+		}
+		return true
+	})
+}
+
 func applyOptions(options []Option) []otelgin.Option {
 	opts := ginOptions{}
 	for _, option := range options {
