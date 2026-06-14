@@ -37,6 +37,18 @@ adopters can plan their upgrades.
   `/health/` to cover `/health/probe`). `DefaultSkipPaths()` returns the
   built-in list for inspection or composition.
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+### Breaking Changes (Migration Guide)
+
 ---
 
 ## [0.5.0] - 2026-06-11
