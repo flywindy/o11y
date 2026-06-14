@@ -1,6 +1,6 @@
 # ADR 0019 — Cassandra Integration
 
-**Status**: Proposed
+**Status**: Accepted (implemented)
 **Date**: 2026-06-04
 **Relates to**: ADR 0003 (global state policy), ADR 0006 (semconv upgrade
 strategy), ADR 0008 (instrumentation sourcing policy), ADR 0013 (Redis/Valkey —

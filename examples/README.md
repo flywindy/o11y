@@ -161,6 +161,22 @@ The integration is trace-only (ADR 0020 §6). Override the endpoint and
 credentials via `ELASTICSEARCH_URL`, `ELASTICSEARCH_USERNAME`, and
 `ELASTICSEARCH_PASSWORD`.
 
+### Cassandra
+
+Port-forward Cassandra to `localhost:9042`, then run the example:
+
+```bash
+kubectl port-forward -n infra svc/cassandra 9042:9042
+go run examples/cassandra/main.go
+```
+
+The example builds an instrumented `*gocql.Session` with
+`cassandra.NewSession`, then runs an `INSERT`, a `SELECT`, and a batch (via
+`cassandra.ExecuteBatch`) every two seconds. It emits per-attempt CLIENT spans,
+`db.client.operation.duration`, and the `cassandra.query.attempts` counter
+through OTLP. Set `O11Y_CASSANDRA_QUERY_TEXT=1` to record CQL statement text on
+spans.
+
 ## Messaging
 
 ### NATS Core (two terminals)
