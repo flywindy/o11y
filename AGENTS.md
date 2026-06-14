@@ -116,6 +116,12 @@ go run examples/basic/main.go
 go run examples/nats-core/subscriber/main.go
 go run examples/nats-core/publisher/main.go
 
+# Run the NATS Core request/reply examples (two terminals; responder replies via conn.Respond)
+# Export both gates first, or otel-nats v0.2.11 injects no traceparent (replies work but untraced):
+export OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true OTEL_NATS_TRACING_ENABLED=true
+go run examples/nats-core/responder/main.go
+go run examples/nats-core/requester/main.go
+
 # Run the JetStream examples (two terminals; NATS must have JetStream enabled)
 # Start publisher first — it creates the JetStream stream; then start the subscriber
 go run examples/jetstream/publisher/main.go   # creates the stream and publishes
@@ -254,7 +260,7 @@ defer cc.Stop()
 
 ### Request-Reply note
 
-When replying to a message inside a `Subscribe` handler, do **not** use `msg.Respond(data)` if you need the reply to carry trace context. `msg.Respond` routes through the raw NATS connection and skips header injection. Use `conn.Publish(ctx, msg.Reply, data)` instead.
+When replying to a message inside a `Subscribe` handler, do **not** use `msg.Respond(data)` if you need the reply to carry trace context. `msg.Respond` routes through the raw NATS connection and skips header injection. Use `conn.Respond(ctx, msg, data)` (or `conn.Publish(ctx, msg.Reply, data)`) instead — `Respond` validates the reply subject and routes through the traced publish path.
 
 ---
 
@@ -328,7 +334,7 @@ accepts the key and value exposure risk.
 - ❌ Import `go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin` directly from services — always go through `o11ygin.Middleware` so SDK providers, propagator, and typed gin error events are wired consistently
 - ❌ Import `github.com/redis/go-redis/extra/redisotel/v9` directly from services — always go through `o11yredis.Wrap` so SDK-owned semconv v1.39.0 attributes, metrics, and sensitive defaults stay consistent
 - ❌ Write MongoDB `_oteltrace` into persisted business documents through this SDK — use outbox/event-envelope propagation for asynchronous workflows instead
-- ❌ Use `msg.Respond(data)` inside a Subscribe handler when trace context must be preserved in the reply — use `conn.Publish(ctx, msg.Reply, data)` instead
+- ❌ Use `msg.Respond(data)` inside a Subscribe handler when trace context must be preserved in the reply — use `conn.Respond(ctx, msg, data)` instead
 - ❌ Use `WithTeam` — it no longer exists; use `WithServiceNamespace` instead
 - ❌ Use non-canonical environment strings in config files or docs (code accepts aliases like `"prod"` but canonical values are preferred)
 - ❌ Mix SDK-owned OTel semconv imports — always import `go.opentelemetry.io/otel/semconv/v1.39.0` in this repository's own code

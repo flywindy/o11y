@@ -14,6 +14,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
 	o11ynats "github.com/flywindy/o11y/nats"
@@ -177,6 +178,115 @@ func TestQueueSubscribe(t *testing.T) {
 	case <-received:
 	case <-time.After(2 * time.Second):
 		t.Fatal("queue subscriber did not receive message within timeout")
+	}
+}
+
+// TestRespond_TracePropagation verifies the headline guarantee of Conn.Respond:
+// a reply sent from inside a handler carries the W3C trace context, unlike a
+// raw msg.Respond. The responder replies via conn.Respond and the requester
+// asserts the reply message headers contain a traceparent.
+func TestRespond_TracePropagation(t *testing.T) {
+	enableNATSTracing(t)
+
+	_, url := startTestServer(t)
+	tp, prop, sr := newTestProviders()
+
+	responder, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer responder.Close()
+
+	requester, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer requester.Close()
+
+	subject := "test.reqreply"
+
+	// The responder publishes the reply to msg.Reply (a dynamic inbox). Capture
+	// that subject so the test can locate the reply's producer span below.
+	replySubjectCh := make(chan string, 1)
+
+	_, err = responder.Subscribe(context.Background(), subject, func(ctx context.Context, msg *nats.Msg) {
+		replySubjectCh <- msg.Reply
+		// Reply over the traced path so the response carries trace context.
+		// Use assert (not require): this runs on a subscription goroutine, where
+		// FailNow must not be called, but a reply failure should still surface.
+		assert.NoError(t, responder.Respond(ctx, msg, []byte("pong")))
+	})
+	require.NoError(t, err)
+	require.NoError(t, responder.NatsConn().FlushTimeout(2*time.Second))
+
+	// Start a root span so there is a valid trace ID to propagate.
+	tracer := tp.Tracer("test")
+	reqCtx, span := tracer.Start(context.Background(), "test-request")
+	defer span.End()
+
+	reply, err := requester.Request(reqCtx, subject, []byte("ping"), 2*time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+	assert.Equal(t, "pong", string(reply.Data))
+
+	// The reply must carry the responder's trace context in its headers; this is
+	// exactly what raw msg.Respond would drop.
+	require.NotNil(t, reply.Header, "reply must carry headers")
+	assert.NotEmpty(t, reply.Header.Get("traceparent"),
+		"reply should carry a traceparent header injected by Respond")
+
+	// Span-level proof that Respond routed through the traced publish path (not a
+	// raw msg.Respond): a producer "send" span must be recorded for the reply,
+	// addressed to the dynamic reply inbox.
+	var replySubject string
+	select {
+	case replySubject = <-replySubjectCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not run")
+	}
+	require.NotEmpty(t, replySubject, "reply subject (inbox) must be set")
+
+	assert.Eventually(t, func() bool {
+		for _, s := range sr.Ended() {
+			var destMatch, isSend bool
+			for _, a := range s.Attributes() {
+				switch a.Key {
+				case semconv.MessagingDestinationNameKey:
+					destMatch = a.Value.AsString() == replySubject
+				case semconv.MessagingOperationTypeKey:
+					isSend = a.Value.AsString() == semconv.MessagingOperationTypeSend.Value.AsString()
+				}
+			}
+			if destMatch && isSend {
+				return true
+			}
+		}
+		return false
+	}, 2*time.Second, 10*time.Millisecond,
+		"a producer send span should be recorded for the reply publish, proving Respond uses the traced Publish path")
+}
+
+// TestRespond_Validation locks down the registration-time guards on
+// Conn.Respond: a nil message and a message with no reply subject both return
+// an error rather than panicking or silently publishing nowhere.
+func TestRespond_Validation(t *testing.T) {
+	_, url := startTestServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	cases := []struct {
+		name    string
+		msg     *nats.Msg
+		wantErr string
+	}{
+		{"nil msg", nil, "msg must not be nil"},
+		{"empty reply", &nats.Msg{Subject: "test.subject"}, "no reply subject"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := conn.Respond(context.Background(), tc.msg, []byte("data"))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
 	}
 }
 

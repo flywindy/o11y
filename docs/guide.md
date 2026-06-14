@@ -583,6 +583,13 @@ producer's trace.
 
 Use `obs.Propagator` together with the `nats` sub-package to propagate trace context across NATS messages.
 
+> **Tracing must be enabled.** The underlying `otel-nats` gates all NATS trace
+> propagation behind two environment variables — set **both**
+> `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true` and
+> `OTEL_NATS_TRACING_ENABLED=true`. When they are unset, `Publish`, `Subscribe`,
+> and `Respond` fall back to raw NATS paths that inject no `traceparent`, so
+> messages flow but carry no trace context.
+
 ```go
 import (
     o11ynats "github.com/flywindy/o11y/nats"
@@ -611,6 +618,35 @@ if err != nil {
 }
 defer func() { _ = sub.Drain() }() // gracefully drain on shutdown
 ```
+
+For **request/reply**, reply with `conn.Respond` from inside the handler so the
+reply message carries trace context. Do not use `msg.Respond` — it routes
+through the raw NATS connection, skips header injection, and breaks reply-side
+trace propagation.
+
+```go
+// Responder: Respond validates the reply subject (non-nil msg, non-empty
+// msg.Reply) and routes through the same traced publish path as conn.Publish.
+_, err = conn.Subscribe(ctx, "orders.get", func(ctx context.Context, msg *gonats.Msg) {
+    if err := conn.Respond(ctx, msg, []byte("ok")); err != nil {
+        obs.Logger.ErrorContext(ctx, "respond failed", slog.Any("error", err))
+    }
+})
+
+// Requester: conn.Request injects the active trace into the request headers.
+// The reply returned here carries trace headers if the responder used
+// conn.Respond, but conn.Request does not extract them or create a requester-
+// side receive span.
+reply, err := conn.Request(ctx, "orders.get", []byte("42"), 2*time.Second)
+```
+
+`Respond` guarantees the reply carries trace context; it does not complete the
+requester-side half of the round trip. In Tempo you should expect request
+publish, responder processing, and responder reply publish spans, but not a
+separate requester-side "received reply" span linked to that reply publish. That
+would require `Request` (or a future helper such as `RequestTraced`) to extract
+reply headers and start/link a receive span; ADR 0022 tracks that as a follow-up
+open question rather than part of Phase 1.
 
 ## Object Storage
 

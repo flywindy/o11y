@@ -21,9 +21,10 @@ import (
 // enabling log correlation and child span creation within the handler body.
 //
 // Note: to reply to a message while preserving trace context, use
-// conn.Publish(ctx, msg.Reply, data) instead of msg.Respond(data).
-// msg.Respond routes through the raw NATS connection and does not inject
-// trace headers, breaking the distributed trace.
+// conn.Respond(ctx, msg, data) (or conn.Publish(ctx, msg.Reply, data))
+// instead of msg.Respond(data). msg.Respond routes through the raw NATS
+// connection and does not inject trace headers, breaking the distributed
+// trace.
 type MsgHandler func(ctx context.Context, msg *natsgo.Msg)
 
 // Conn is a tracing-aware NATS connection. It embeds *otelnats.Conn so all
@@ -117,6 +118,37 @@ func (c *Conn) QueueSubscribe(ctx context.Context, subject, queue string, handle
 	return c.Conn.QueueSubscribe(subject, queue, func(m otelnats.Msg) {
 		handler(m.Ctx, m.Msg)
 	})
+}
+
+// Respond replies to msg over the traced publish path, preserving trace
+// context end to end. It injects the active span context carried by ctx into
+// the reply headers using the same producer instrumentation as Publish, so the
+// reply links into the distributed trace.
+//
+// Use this instead of msg.Respond(data), which routes through the raw NATS
+// connection and skips header injection, breaking the trace (ADR 0004 §5).
+// Respond is the recommended way to reply from inside a Subscribe /
+// QueueSubscribe handler.
+//
+// It returns an error if msg is nil or if msg.Reply is empty, matching the
+// up-front validation Subscribe and QueueSubscribe perform — an empty reply
+// subject means there is nowhere to send the response and is almost always a
+// programming error.
+//
+// Respond guarantees the reply carries the trace context; it does not create a
+// requester-side span that links back to the responder. That requester-side
+// linkage is out of scope (see ADR 0022).
+func (c *Conn) Respond(ctx context.Context, msg *natsgo.Msg, data []byte) error {
+	if msg == nil {
+		return fmt.Errorf("nats respond: msg must not be nil")
+	}
+	if msg.Reply == "" {
+		return fmt.Errorf("nats respond: msg has no reply subject")
+	}
+	if err := c.Publish(ctx, msg.Reply, data); err != nil {
+		return fmt.Errorf("nats respond to %q: %w", msg.Reply, err)
+	}
+	return nil
 }
 
 // JetStream returns a tracing-aware JetStream interface backed by this connection.

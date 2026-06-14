@@ -155,6 +155,35 @@ go run examples/nats-core/subscriber/main.go
 go run examples/nats-core/publisher/main.go
 ```
 
+### NATS Core request/reply (two terminals)
+
+`otel-nats` gates trace propagation behind two env vars; export them in **both**
+terminals or no `traceparent` is injected and you will see replies without
+NATS trace correlation:
+
+```bash
+export OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true
+export OTEL_NATS_TRACING_ENABLED=true
+
+# Terminal 1 — start responder first
+go run examples/nats-core/responder/main.go
+
+# Terminal 2 — requester sends a request every 3 seconds and logs the reply
+go run examples/nats-core/requester/main.go
+```
+
+The responder replies with `conn.Respond`, which routes the reply through the
+traced publish path so the reply message carries the responder's trace context
+(unlike raw `msg.Respond`). The requester uses `conn.Request` and logs the
+reply from its request span context.
+
+This example proves reply header propagation, not a fully closed requester-side
+round trip. Today `conn.Request` returns the reply without extracting its
+headers or creating a requester-side receive span, so Tempo will show the
+request publish, responder processing, and traced reply publish, but not a
+separate "requester received reply" span linked back to the responder. That
+requester-side reply linkage is tracked as an ADR 0022 follow-up.
+
 ### JetStream (two terminals; requires JetStream-enabled NATS server)
 
 ```bash
