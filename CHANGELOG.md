@@ -13,6 +13,10 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+---
+
+## [0.6.0] - 2026-06-14
+
 ### Added
 
 - ADR 0024: `obsctx` package (`Detach`, `DetachWithTimeout`, `Go`) for carrying
@@ -26,6 +30,12 @@ adopters can plan their upgrades.
   regression test.
 - `tools/lint/o11y-context.yml` — a semgrep ruleset to self-audit for
   request-scoped contexts captured by goroutines.
+- `gin.WithSkipPaths` — convenience option that excludes common Kubernetes probe
+  and metrics-scrape endpoints (`/health`, `/healthz`, `/livez`, `/readyz`,
+  `/metrics`, `/ping`, `/ready`, `/live`) from tracing without hand-writing a
+  `WithFilter`. `WithSkipPathPrefixes` opts in to prefix-based skipping (e.g.
+  `/health/` to cover `/health/probe`). `DefaultSkipPaths()` returns the
+  built-in list for inspection or composition.
 
 ---
 
