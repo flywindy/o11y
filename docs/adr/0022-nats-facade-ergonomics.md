@@ -349,7 +349,8 @@ This ADR is docs-only. The implementing work is intended to land as two PRs:
 - Open question: a requester-side receive span that links to the responder (so
   the requester's trace shows the reply as a linked span, not just propagated
   headers). Needs `Request` to extract reply headers and start a span;
-  deferred beyond Phase 1.
+  deferred beyond Phase 1. This is separate from the Phase 2 JetStream typed
+  wrapper work and should be handled as its own request/reply follow-up.
 - Open question: whether `Respond` needs a header-carrying variant
   (`RespondMsg(ctx, msg, *nats.Msg)`). Today `Publish(ctx, subj, data)` sets
   no custom reply headers; chat's `ReplyJSON` puts status in the JSON

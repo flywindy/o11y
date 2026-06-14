@@ -1,8 +1,8 @@
 // Package main demonstrates a NATS Core request/reply responder instrumented
 // with the o11y SDK. It replies with conn.Respond, which routes the reply
-// through the traced publish path so the response carries trace context —
-// unlike raw msg.Respond, which would break the request → reply correlation.
-// Run together with examples/nats-core/requester to see the trace in Tempo.
+// through the traced publish path so the response carries trace context.
+// Raw msg.Respond skips header injection and makes the reply untraced.
+// Run together with examples/nats-core/requester to verify reply propagation.
 package main
 
 import (
@@ -72,8 +72,7 @@ func main() {
 	// 3. Subscribe and reply with conn.Respond. The handler's ctx already holds a
 	//    consumer span linked to the requester's trace; Respond routes the reply
 	//    through the traced publish path, injecting that context into the reply
-	//    headers. Using raw msg.Respond here would drop the trace and break the
-	//    request → reply correlation in Tempo.
+	//    headers. Using raw msg.Respond here would drop the reply trace headers.
 	_, err = conn.Subscribe(ctx, subject, func(msgCtx context.Context, msg *nats.Msg) {
 		msgCtx, span := tracer.Start(msgCtx, "handle-greet")
 		defer span.End()

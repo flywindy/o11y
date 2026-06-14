@@ -156,9 +156,16 @@ go run examples/nats-core/requester/main.go
 ```
 
 The responder replies with `conn.Respond`, which routes the reply through the
-traced publish path so it carries trace context (unlike raw `msg.Respond`); the
-requester uses `conn.Request`. In Tempo the request and reply appear in one
-correlated trace.
+traced publish path so the reply message carries the responder's trace context
+(unlike raw `msg.Respond`). The requester uses `conn.Request` and logs the
+reply from its request span context.
+
+This example proves reply header propagation, not a fully closed requester-side
+round trip. Today `conn.Request` returns the reply without extracting its
+headers or creating a requester-side receive span, so Tempo will show the
+request publish, responder processing, and traced reply publish, but not a
+separate "requester received reply" span linked back to the responder. That
+requester-side reply linkage is tracked as an ADR 0022 follow-up.
 
 ### JetStream (two terminals; requires JetStream-enabled NATS server)
 

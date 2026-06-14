@@ -592,8 +592,9 @@ defer func() { _ = sub.Drain() }() // gracefully drain on shutdown
 ```
 
 For **request/reply**, reply with `conn.Respond` from inside the handler so the
-reply carries trace context. Do not use `msg.Respond` — it routes through the
-raw NATS connection, skips header injection, and breaks the trace.
+reply message carries trace context. Do not use `msg.Respond` — it routes
+through the raw NATS connection, skips header injection, and breaks reply-side
+trace propagation.
 
 ```go
 // Responder: Respond validates the reply subject (non-nil msg, non-empty
@@ -604,13 +605,20 @@ _, err = conn.Subscribe(ctx, "orders.get", func(ctx context.Context, msg *gonats
     }
 })
 
-// Requester: conn.Request injects the active trace into the request headers;
-// the reply (sent via conn.Respond) carries trace context back.
+// Requester: conn.Request injects the active trace into the request headers.
+// The reply returned here carries trace headers if the responder used
+// conn.Respond, but conn.Request does not extract them or create a requester-
+// side receive span.
 reply, err := conn.Request(ctx, "orders.get", []byte("42"), 2*time.Second)
 ```
 
-`Respond` guarantees the reply carries trace context; it does not create a
-requester-side span that links back to the responder (see ADR 0022).
+`Respond` guarantees the reply carries trace context; it does not complete the
+requester-side half of the round trip. In Tempo you should expect request
+publish, responder processing, and responder reply publish spans, but not a
+separate requester-side "received reply" span linked to that reply publish. That
+would require `Request` (or a future helper such as `RequestTraced`) to extract
+reply headers and start/link a receive span; ADR 0022 tracks that as a follow-up
+open question rather than part of Phase 1.
 
 ## Object Storage
 

@@ -1,8 +1,9 @@
 // Package main demonstrates a NATS Core request/reply requester instrumented
 // with the o11y SDK. It sends a request every requestRate inside its own root
-// span and logs the traced reply.
-// Run together with examples/nats-core/responder to see a request → reply
-// trace correlate end to end in Grafana Tempo.
+// span and logs the reply.
+// Run together with examples/nats-core/responder to verify that replies sent by
+// conn.Respond carry trace headers. conn.Request does not yet extract those
+// reply headers or create a requester-side receive span.
 package main
 
 import (
@@ -75,10 +76,10 @@ func main() {
 			return
 
 		case <-ticker.C:
-			// Each request lives inside its own root span so Tempo shows a clear
-			// requester → responder → reply trace. conn.Request injects the active
-			// trace context into the request headers; the responder's reply (sent
-			// via conn.Respond) carries trace context back.
+			// Each request lives inside its own root span. conn.Request injects
+			// the active trace context into the request headers; the responder's
+			// reply (sent via conn.Respond) carries trace headers back, but this
+			// requester does not extract them into a receive span yet.
 			reqCtx, span := tracer.Start(ctx, "send-request")
 
 			reply, err := conn.Request(reqCtx, subject, []byte("o11y"), requestTimeout)
