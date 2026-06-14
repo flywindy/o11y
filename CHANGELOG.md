@@ -13,6 +13,20 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+### Added
+
+- ADR 0024: `obsctx` package (`Detach`, `DetachWithTimeout`, `Go`) for carrying
+  observability/trace context into background work that outlives a request,
+  without inheriting the request's cancelation or deadline. Prevents the
+  `context canceled` / `connection reset by peer` failures caused by threading a
+  request-scoped context (or `*gin.Context`) into post-response / fire-and-forget
+  work.
+- `o11ytest` package (`CanceledRequestContext`, `RequireNotCanceled`) — test
+  helpers that turn the above into a deterministic, traffic-independent
+  regression test.
+- `tools/lint/o11y-context.yml` — a semgrep ruleset to self-audit for
+  request-scoped contexts captured by goroutines.
+
 ---
 
 ## [0.5.0] - 2026-06-11

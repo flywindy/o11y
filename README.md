@@ -299,6 +299,29 @@ attributes, trace sampling, continuous profiling, and the NATS / MongoDB /
 Redis / HTTP / Resty / MinIO / gin sub-packages — see the
 **[Developer Guide](docs/guide.md)**.
 
+### Background work & context lifecycle
+
+Work that outlives the request — background goroutines, post-response writes,
+fire-and-forget — must **not** use the request context (`c.Request.Context()` or
+`*gin.Context`). It is canceled the moment the handler returns, which aborts the
+work mid-flight (`context canceled`, and for databases `connection reset by
+peer`). The failure is timing-dependent, so it tends to pass locally and only
+surface under production latency/concurrency.
+
+Use [`obsctx`](obsctx) to keep the trace context but drop the cancelation:
+
+```go
+import "github.com/flywindy/o11y/obsctx"
+
+// in a gin handler, after responding:
+obsctx.Go(c.Request.Context(), 5*time.Second, func(ctx context.Context) {
+    _ = repo.WriteAudit(ctx, event) // stays in the same trace; not canceled with the request
+})
+```
+
+See [`examples/background`](examples/background) and
+[ADR 0024](docs/adr/0024-context-lifecycle-for-background-work.md).
+
 ## Examples
 
 Runnable programs live in [`examples/`](examples/), organized like the

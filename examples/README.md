@@ -113,6 +113,23 @@ The example sends traces, logs, MongoDB operation-duration metrics, and MongoDB
 connection-pool metrics to the OTel Collector at `http://localhost:4318`, so
 keep the Collector port-forward open while it runs.
 
+### Background work (gin + MongoDB + obsctx)
+
+Demonstrates the safe context pattern for work that outlives a request. With a
+MongoDB instance reachable (default `mongodb://localhost:27017`) and the
+Collector port-forward open:
+
+```bash
+export MONGODB_URI=mongodb://localhost:27017
+go run examples/background/main.go
+curl http://localhost:8080/things/abc
+```
+
+The handler reads with the request context, responds, and then runs a
+post-response MongoDB write via `obsctx.Go` — keeping the request's trace while
+not being canceled when the request ends. See
+[ADR 0024](../docs/adr/0024-context-lifecycle-for-background-work.md).
+
 ### Redis
 
 Port-forward Redis to `localhost:6379`, then run the example:
