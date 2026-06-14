@@ -45,12 +45,28 @@ rules:
               }(...)
           - pattern: go $FUNC(..., $REQ.Request.Context(), ...)
           - pattern: go $FUNC(..., $R.Context(), ...)
-      # Don't flag goroutines that already detach via obsctx (Detach,
-      # DetachWithTimeout, or Go).
+      # Don't flag goroutines that already detach via obsctx's safe helpers.
+      # Enumerate them explicitly (not obsctx.$F) so the exemption tracks the
+      # safe semantics, not the package name: a future obsctx helper that does
+      # NOT detach must not silently suppress the rule. The three are separate
+      # pattern-not-inside entries (ANDed), which suppresses a match inside any
+      # one of them.
       - pattern-not-inside: |
           go func(...) {
             ...
-            obsctx.$F(...)
+            obsctx.Detach(...)
+            ...
+          }(...)
+      - pattern-not-inside: |
+          go func(...) {
+            ...
+            obsctx.DetachWithTimeout(...)
+            ...
+          }(...)
+      - pattern-not-inside: |
+          go func(...) {
+            ...
+            obsctx.Go(...)
             ...
           }(...)
 
