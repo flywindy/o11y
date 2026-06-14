@@ -1,7 +1,7 @@
 # ADR 0020 — Elasticsearch Integration
 
-**Status**: Proposed
-**Date**: 2026-06-04
+**Status**: Accepted
+**Date**: 2026-06-04 (accepted 2026-06-14, on implementation)
 **Relates to**: ADR 0003 (global state policy), ADR 0006 (semconv upgrade
 strategy), ADR 0008 (instrumentation sourcing policy), ADR 0004 (NATS — the
 reference for a trace-only facade with deliberately deferred metrics).
@@ -241,16 +241,47 @@ from the instrumentation's `BeforeRequest` / `AfterResponse` seam (or a metrics
 
 ### Library surveyed: `github.com/elastic/elastic-transport-go/v8` (OTel instrumentation)
 
-### Version: to pin at implementation time (consumer is on `go-elasticsearch/v8 v8.19.3`)
+### Version: `elastic-transport-go/v8 v8.8.0` (via `go-elasticsearch/v8 v8.19.3`)
 
-### Expected result: SAFE — to confirm by source read
+### Result: SAFE — confirmed by source read
 
-`NewOtelInstrumentation(provider, …)` stores the supplied `TracerProvider` and
-is documented to fall back to the OTel global only when `provider == nil`. The
-facade always passes the SDK provider, so the fallback never fires, and no
-`otel.SetTracerProvider` call is expected on the constructor path. The
-implementing PR must record the exact source-inspection finding (the verification
-command and outcome) before this ADR moves to Accepted, per ADR 0003.
+Source inspected at `elastic-transport-go/v8@v8.8.0`
+`elastictransport/instrumentation.go:87-101`:
+
+```go
+func NewOtelInstrumentation(provider trace.TracerProvider, captureSearchBody bool, version string, options ...trace.TracerOption) *ElasticsearchOpenTelemetry {
+    if provider == nil {
+        provider = otel.GetTracerProvider()
+    }
+    // ...
+    return &ElasticsearchOpenTelemetry{tracer: provider.Tracer(tracerName, options...), recordBody: captureSearchBody}
+}
+```
+
+`provider` is read from `otel.GetTracerProvider()` **only** when it is `nil`;
+otherwise the supplied provider is stored on the tracer and the global is never
+touched. The facade rejects a nil `tp` (`elasticsearch/client.go` `instrument`),
+so the fallback can never fire. A grep of the package for the forbidden setters
+confirms none exist:
+
+```text
+$ grep -rn 'otel\.\(SetTracerProvider\|SetTextMapPropagator\|SetMeterProvider\|SetLoggerProvider\)' \
+    $(go env GOMODCACHE)/github.com/elastic/elastic-transport-go/v8@v8.8.0
+(no matches)
+```
+
+`TestProviderWiring` (`elasticsearch/client_test.go`) backs this at runtime: it
+sets a sentinel global provider, builds the facade client with a *different*
+SDK provider, and asserts every span lands on the supplied provider and the
+global records none. The integration is therefore SAFE under ADR 0003.
+
+The same source read confirms the §4 attribute caveats as fact: `AfterRequest`
+sets `db.system` / `db.operation` (legacy core keys); `RecordRequestBody` sets
+`db.statement`; `RecordPathPart` sets `db.elasticsearch.path_parts.<key>`;
+`AfterResponse` sets `db.elasticsearch.cluster.name` / `.node.name`; and
+`RecordError` sets only span status `codes.Error` + `RecordError(err)` with no
+`error.type`. These are pinned by the compatibility assertions in
+`elasticsearch/client_test.go`.
 
 ---
 
@@ -330,10 +361,16 @@ command and outcome) before this ADR moves to Accepted, per ADR 0003.
 
 ## Open questions
 
-1. `db.statement` handling — confirm option (a) accept-and-document vs (b)
-   boundary-normalize against the pinned `elastic-transport-go` version (§4).
-2. Does `search-sync-worker`'s bulk-indexing path want client-attributed metrics
-   soon enough to fold a justified-T3 metrics layer into v1, or is span duration
-   sufficient until a backend dashboard need appears (§6 revisit trigger)?
-3. Confirm the gate-wiring choice for the `github.com/elastic/...` instrumentation
-   prefix (extend the §7.1 matched set vs rely on the ADR 0003 row).
+_All resolved at implementation (2026-06-14):_
+
+1. `db.statement` handling — **resolved: option (a) accept-and-document.** The
+   facade inherits the legacy upstream keys and pins them with a compatibility
+   test; `docs/semconv.md` records the drift. No boundary normalization in v1.
+2. Client-attributed bulk-indexing metrics — **resolved: deferred (v1
+   trace-only).** Span duration is sufficient for now; `elasticsearch_exporter`
+   covers ES health. A justified-T3 metrics ADR is the path when a concrete
+   per-worker dashboard need appears (§6 revisit triggers).
+3. Gate wiring — **resolved: both.** `scripts/check_integrations.go` matches
+   `github.com/elastic/go-elasticsearch/v8` and
+   `github.com/elastic/elastic-transport-go/v8`, and both have rows in ADR
+   0003's Approved-integrations table.

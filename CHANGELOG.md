@@ -19,6 +19,15 @@ adopters can plan their upgrades.
 
 ### Added
 
+- ADR 0020: `elasticsearch` package — a T2 facade (`NewClient`,
+  `NewTypedClient`, `WithSearchBody`) that wires the SDK `TracerProvider` into
+  `github.com/elastic/go-elasticsearch/v8`'s first-party OpenTelemetry
+  instrumentation without touching OTel globals. Trace-only in v1 (no
+  `MeterProvider` / propagator parameters); search-body capture is opt-in and
+  off by default. The pinned `elastic-transport-go/v8 v8.8.0` emits legacy
+  semconv keys (`db.system`, `db.operation`, `db.statement`,
+  `db.elasticsearch.*`), documented in `docs/semconv.md` and pinned by a
+  compatibility test.
 - ADR 0024: `obsctx` package (`Detach`, `DetachWithTimeout`, `Go`) for carrying
   observability/trace context into background work that outlives a request,
   without inheriting the request's cancelation or deadline. Prevents the

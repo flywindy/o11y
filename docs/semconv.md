@@ -328,6 +328,52 @@ that build their own MeterProvider must register the same views via
 
 ---
 
+## Database - Elasticsearch (package `github.com/flywindy/o11y/elasticsearch`)
+
+Spans are emitted by the **first-party** OpenTelemetry instrumentation built
+into `github.com/elastic/go-elasticsearch/v8` (in the shared
+`github.com/elastic/elastic-transport-go/v8` transport, pinned at v8.8.0). The
+SDK-owned `elasticsearch` facade only wires the SDK `TracerProvider` into the
+client and sets the search-body default; it emits no attributes of its own.
+The integration is **trace-only** in v1 — no metrics (ADR 0020 §6). See ADR
+0020 for the design and the ADR 0008 §2 evaluation that justifies the T2
+sourcing.
+
+### Span Attributes (as emitted by the pinned upstream)
+
+The pinned `elastic-transport-go/v8 v8.8.0` predates the DB semconv
+stabilization and emits the **legacy** spellings. These keys are reproduced
+verbatim and asserted by a compatibility test so an upstream bump that renames
+them is caught (ADR 0006). The current-semconv target each one maps to is in
+the right column.
+
+| Emitted key (pinned upstream) | Type | Current-semconv target (v1.39.0) | Notes |
+|---|---|---|---|
+| `db.system` | string | `db.system.name` | Constant `"elasticsearch"`. |
+| `db.operation` | string | `db.operation.name` | Endpoint id (e.g. `search`, `bulk`, `index`). |
+| `db.statement` | string | `db.query.text` | Search-family request body. Only when `elasticsearch.WithSearchBody(true)`. |
+| `db.elasticsearch.path_parts.<key>` | string | `db.operation.parameter.<key>` | Dynamic URL path segments (e.g. `path_parts.index`). |
+| `db.elasticsearch.cluster.name` | string | `db.namespace` | Elastic Cloud cluster id, from response headers. |
+| `db.elasticsearch.node.name` | string | `elasticsearch.node.name` | Routed node/instance, from response headers (Elastic Cloud). |
+| `http.request.method` | string | (unchanged) | Underlying HTTP method. |
+| `url.full` | string | (unchanged) | Request target URL. |
+| `server.address` | string | (unchanged) | ES host. |
+| `server.port` | int | (unchanged) | ES port, when present. |
+
+Span name is emitted by the upstream instrumentation and is **not** under
+facade control (no span-name seam exists on a T2 wiring), so the cross-package
+`{db.system.name}.{operation} {target}` convention (ADR 0023) does **not**
+apply to Elasticsearch in v1 — a recorded, accepted divergence.
+
+### Explicitly NOT Emitted
+
+| Key | Reason |
+|---|---|
+| `error.type` | The pinned upstream `RecordError` sets span **status = Error** and records the exception event only; it sets no `error.type` attribute. Failures are observable via span status, not this attribute (ADR 0020 §4 †). |
+| `db.collection.name` | The index is recorded only as the `db.elasticsearch.path_parts.index` path variable; the transport never emits `db.collection.name` (ADR 0020 §4 ‡). |
+| `db.system.name` / `db.operation.name` / `db.query.text` / `db.operation.parameter.*` | The current-semconv spellings are not emitted; the facade inherits the legacy keys above rather than normalizing at the boundary (ADR 0020 §4, option (a)). |
+| Any Elasticsearch metric | Trace-only in v1; operators rely on `elasticsearch_exporter` for ES health and span duration for per-call latency (ADR 0020 §6). |
+
 ## Logs
 
 All log records pass through the `otelslog` bridge, which applies OTel Log
@@ -354,6 +400,7 @@ Data Model attributes automatically.
 | `resty.error.kind`, `resty.retry.exhausted` | `resty` wrapper | Resty-specific bounded failure class and retry-budget marker. Standard `error.type` remains present; these keys preserve operator-facing retry and transport semantics without adding metric cardinality. |
 | `object_store.*` namespace (`system.name`, `operation.name`, `bucket.name`, `object.key`, `object.size`) | `minio` wrapper | OTel object-store semconv is at status Development and only the AWS-S3 page exists, framed as AWS-SDK / `rpc.system=aws-api`. The SDK-owned `object_store.*` namespace is package-local but shaped to mirror current OTel naming patterns; future migration to a blessed convention is expected to be a key rename. See ADR 0018 §4 and References. |
 | `minio.error.kind`, `minio.client.operation.duration` | `minio` wrapper | MinIO-specific bounded SRE classification (span-only) and per-operation duration histogram. No stable OTel object-store metric exists, so the instrument name stays package-local; standard `error.type` is co-emitted on spans and as the metric failure label. |
+| Legacy ES keys (`db.system`, `db.operation`, `db.statement`, `db.elasticsearch.*`) | `go-elasticsearch/v8` first-party instrumentation | The pinned `elastic-transport-go/v8 v8.8.0` predates DB semconv stabilization and emits these deprecated spellings on its own span. A T2 facade has no seam to rewrite them, so the drift is accepted and documented (ADR 0020 §4, option (a)) rather than normalized via a span processor. A compatibility test pins the exact emitted keys; an upstream fix is inherited for free. |
 
 Any new deviation must list:
 
