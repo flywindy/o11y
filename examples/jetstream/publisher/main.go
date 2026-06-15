@@ -12,10 +12,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Marz32onE/instrumentation-go/otel-nats/oteljetstream"
 	"github.com/flywindy/o11y"
 	o11ynats "github.com/flywindy/o11y/nats"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 const (
@@ -69,7 +69,7 @@ func main() {
 	// 4. Create or update the stream. CreateOrUpdateStream is idempotent, so
 	//    it is safe to call on every startup without checking whether the
 	//    stream already exists.
-	_, err = js.CreateOrUpdateStream(ctx, oteljetstream.StreamConfig{
+	_, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:     streamName,
 		Subjects: []string{subject},
 	})

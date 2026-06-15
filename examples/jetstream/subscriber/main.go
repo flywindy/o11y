@@ -12,10 +12,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Marz32onE/instrumentation-go/otel-nats/oteljetstream"
 	"github.com/flywindy/o11y"
 	o11ynats "github.com/flywindy/o11y/nats"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 const (
@@ -88,10 +88,10 @@ func main() {
 	// 5. Create or update a durable consumer. Using CreateOrUpdateConsumer makes
 	//    the subscriber idempotent: restarting the process resumes from where it
 	//    left off rather than reprocessing already-acknowledged messages.
-	consumer, err := stream.CreateOrUpdateConsumer(ctx, oteljetstream.ConsumerConfig{
+	consumer, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
 		Durable:       consumerName,
 		FilterSubject: subject,
-		AckPolicy:     oteljetstream.AckExplicitPolicy,
+		AckPolicy:     jetstream.AckExplicitPolicy,
 	})
 	if err != nil {
 		logger.ErrorContext(ctx, "failed to create consumer", slog.Any("error", err))
@@ -100,12 +100,12 @@ func main() {
 
 	tracer := obs.Tracer("jetstream-subscriber")
 
-	// 6. Consume messages. oteljetstream extracts the publisher's trace context
-	//    from each message's headers and links it to a new consumer span.
-	//    m.Context() carries that span context so slog calls will include the
-	//    correct traceId and spanId.
-	cc, err := consumer.Consume(func(m oteljetstream.Msg) {
-		msgCtx, span := tracer.Start(m.Context(), "process-event")
+	// 6. Consume messages. The o11y wrapper extracts the publisher's trace
+	//    context from each message's headers and delivers it as the handler's
+	//    ctx (linked to a new consumer span); m is the native jetstream.Msg, so
+	//    Subject / Data / Metadata / Ack are available directly.
+	cc, err := consumer.Consume(func(msgCtx context.Context, m jetstream.Msg) {
+		msgCtx, span := tracer.Start(msgCtx, "process-event")
 		defer span.End()
 
 		logAttrs := []any{

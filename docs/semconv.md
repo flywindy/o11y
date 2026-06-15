@@ -138,8 +138,16 @@ adds no attributes of its own.
 | `messaging.message.body.size` | int | Emitted when payload is non-empty. |
 | `messaging.message.conversation_id` | string | Request/reply inbox, when present. |
 | `messaging.consumer.group.name` | string | Queue group, when present. |
+| `messaging.consumer.name` | string | JetStream consumer name. **Deviation** — see below. |
 | `server.address` | string | NATS endpoint host. |
 | `server.port` | int | NATS endpoint port, omitted for default port 4222. |
+
+`messaging.consumer.name` is emitted by `otel-nats` on every JetStream consumer
+span (`Consume` / `Messages` / `Next` / `Fetch`) but is **not** a key in the
+pinned `semconv/v1.39.0` package (which carries only
+`messaging.consumer.group.name`). It is listed here as a documented deviation;
+the upstream hardcodes the string literal. Re-evaluate when the messaging
+semconv stabilizes a consumer-name key or when `otel-nats` is bumped.
 
 ### Upstream NATS Trace-Event Attributes
 
