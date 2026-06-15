@@ -113,7 +113,10 @@ func runCycle(
 	cycleCtx, span := tracer.Start(cycleCtx, "elasticsearch-cycle")
 	defer span.End()
 
-	// Index — refresh=true so the document is immediately searchable.
+	// Index — refresh=true so the document is immediately searchable. The
+	// index is created on first write by Elasticsearch's default
+	// action.auto_create_index; no explicit create step is needed (unlike S3
+	// buckets in the minio example).
 	doc := fmt.Sprintf(`{"title":"hello","ts":%q}`, time.Now().UTC().Format(time.RFC3339))
 	res, err := client.Index(index, strings.NewReader(doc),
 		client.Index.WithDocumentID(docID),
