@@ -210,9 +210,13 @@ func (c *consumer) Consume(handler JetStreamMsgHandler, opts ...jetstream.PullCo
 	if handler == nil {
 		return nil, fmt.Errorf("nats jetstream consume: handler must not be nil")
 	}
-	return c.c.Consume(func(m oteljetstream.Msg) {
+	cc, err := c.c.Consume(func(m oteljetstream.Msg) {
 		handler(m.Context(), m.Msg)
 	}, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return cc, nil
 }
 
 func (c *consumer) Messages(opts ...jetstream.PullMessagesOpt) (MessagesContext, error) {
