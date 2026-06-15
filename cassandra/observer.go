@@ -39,8 +39,7 @@ type observer struct {
 // the host actually contacted. The span uses the observation's own timestamps
 // and is parented to the caller's context.
 func (o *observer) ObserveQuery(ctx context.Context, q gocql.ObservedQuery) {
-	operation := parseOperation(q.Statement)
-	table := parseTable(q.Statement)
+	operation, table := parseStatement(q.Statement)
 
 	attrs := o.baseAttrs(operation, q.Keyspace, table, q.Host)
 	attrs = append(attrs, semconv.DBResponseReturnedRows(q.Rows))
@@ -63,13 +62,7 @@ func (o *observer) ObserveQuery(ctx context.Context, q gocql.ObservedQuery) {
 // against context.Background.
 func (o *observer) ObserveConnect(c gocql.ObservedConnect) {
 	ctx := context.Background()
-	attrs := []attribute.KeyValue{semconv.DBSystemNameCassandra}
-	if o.server.host != "" {
-		attrs = append(attrs, semconv.ServerAddress(o.server.host))
-		if o.server.port > 0 {
-			attrs = append(attrs, semconv.ServerPort(o.server.port))
-		}
-	}
+	attrs := o.appendServerAttrs([]attribute.KeyValue{semconv.DBSystemNameCassandra})
 	if c.Err != nil {
 		attrs = append(attrs, semconv.ErrorTypeKey.String(errorType(c.Err)))
 	}
@@ -127,12 +120,7 @@ func (o *observer) baseAttrs(operation, keyspace, table string, host *gocql.Host
 	if table != "" {
 		attrs = append(attrs, semconv.DBCollectionName(table))
 	}
-	if o.server.host != "" {
-		attrs = append(attrs, semconv.ServerAddress(o.server.host))
-		if o.server.port > 0 {
-			attrs = append(attrs, semconv.ServerPort(o.server.port))
-		}
-	}
+	attrs = o.appendServerAttrs(attrs)
 	// network.peer.* and cassandra.coordinator.* describe the actual contacted
 	// coordinator; kept Opt-In so the package leads with server.* (ADR 0019 §5).
 	if host != nil {
@@ -164,14 +152,24 @@ func (o *observer) metricAttrs(operation, keyspace string, obsErr error) []attri
 	if keyspace != "" {
 		attrs = append(attrs, semconv.DBNamespace(keyspace))
 	}
-	if o.server.host != "" {
-		attrs = append(attrs, semconv.ServerAddress(o.server.host))
-		if o.server.port > 0 {
-			attrs = append(attrs, semconv.ServerPort(o.server.port))
-		}
-	}
+	attrs = o.appendServerAttrs(attrs)
 	if obsErr != nil {
 		attrs = append(attrs, semconv.ErrorTypeKey.String(errorType(obsErr)))
+	}
+	return attrs
+}
+
+// appendServerAttrs appends the logical-server (configured contact point)
+// attributes shared by spans, the operation metric, and the connect path. The
+// configured contact point is a small fixed set per client, so these are safe
+// as metric labels (ADR 0019 §7).
+func (o *observer) appendServerAttrs(attrs []attribute.KeyValue) []attribute.KeyValue {
+	if o.server.host == "" {
+		return attrs
+	}
+	attrs = append(attrs, semconv.ServerAddress(o.server.host))
+	if o.server.port > 0 {
+		attrs = append(attrs, semconv.ServerPort(o.server.port))
 	}
 	return attrs
 }

@@ -38,6 +38,18 @@ func contactPoint(hosts []string, defaultPort int) serverAddr {
 	return serverAddr{host: first, port: defaultPort}
 }
 
+// parseStatement extracts both the CQL operation verb and the single addressed
+// table from a statement in one tokenization pass. ObserveQuery runs per attempt
+// and per page, so sharing the strings.Fields split here avoids tokenizing the
+// statement twice on every callback.
+func parseStatement(statement string) (operation, table string) {
+	fields := strings.Fields(statement)
+	if len(fields) == 0 {
+		return "", ""
+	}
+	return strings.ToUpper(fields[0]), parseTableFields(fields)
+}
+
 // parseOperation extracts the CQL operation verb (SELECT, INSERT, UPDATE, …)
 // from a statement. It returns the uppercased leading keyword, or "" when the
 // statement is empty or unparseable.
@@ -55,7 +67,12 @@ func parseOperation(statement string) string {
 // falls back to "" so the span name degrades to cassandra.{operation} rather
 // than guessing.
 func parseTable(statement string) string {
-	fields := strings.Fields(statement)
+	return parseTableFields(strings.Fields(statement))
+}
+
+// parseTableFields is the shared table-parsing core operating on a pre-split
+// statement, so callers that already tokenized do not split again.
+func parseTableFields(fields []string) string {
 	if len(fields) < 2 {
 		return ""
 	}

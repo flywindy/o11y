@@ -50,6 +50,11 @@ func MetricViews(histogramBuckets []float64) []sdkmetric.View {
 				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
 					Boundaries: histogramBuckets,
 				},
+				AttributeFilter: attribute.NewAllowKeysFilter(
+					semconv.DBSystemNameKey,
+					semconv.ServerAddressKey,
+					semconv.ServerPortKey,
+				),
 			},
 		),
 	}
