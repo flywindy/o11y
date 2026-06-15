@@ -27,3 +27,5 @@ images:
     newName: internal-registry.example.com/redis
   - name: grafana/pyroscope
     newName: internal-registry.example.com/grafana/pyroscope
+  - name: docker.elastic.co/elasticsearch/elasticsearch
+    newName: internal-registry.example.com/elasticsearch/elasticsearch

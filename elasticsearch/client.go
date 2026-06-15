@@ -26,6 +26,11 @@ type config struct {
 // are captured only on explicit opt-in — consistent with
 // redis.WithCommandTextEnabled and the ADR 0019 cassandra.WithQueryText
 // posture (ADR 0020 §5).
+//
+// This governs only the request body. The span's url.full attribute (always
+// emitted by the upstream) includes the URL query string, so a query-string
+// search (client.Search.WithQuery("...")) records its terms regardless of this
+// option; use the body DSL for sensitive search terms.
 func WithSearchBody(enabled bool) Option {
 	return func(cfg *config) {
 		cfg.captureSearchBody = enabled

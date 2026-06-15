@@ -160,8 +160,11 @@ returns `(*Response, nil)` from the low-level API, and the instrumentation's
 `AfterResponse` records only Elastic Cloud headers — it does **not** inspect the
 status code. So an ES-rejected request leaves the span **status = UNSET**: it is
 *not* observable via span status. A transport failure is observable via span
-status = Error + the exception; an application-level ES error is visible only in
-`http.response.status_code`/`url.full`, not in span status, in v1.
+status = Error + the exception; an application-level ES error is **not surfaced
+on the span at all** in v1 — the pinned instrumentation emits no
+`http.response.status_code` attribute either (`AfterRequest` sets only method /
+`url.full` / `server.*`, `AfterResponse` only Elastic Cloud headers), so only
+`url.full` and `db.operation` identify the request.
 
 Per the (a) Mongo-T2 posture the SDK accepts this rather than adding a
 normalization span-processor or a status-setting transport wrapper in v1; the
