@@ -15,6 +15,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -127,6 +128,10 @@ func runCycle(
 		failCycle(cycleCtx, logger, span, "Index", err)
 		return
 	}
+	if res == nil {
+		failCycle(cycleCtx, logger, span, "Index", errors.New("nil response received"))
+		return
+	}
 	drain(res.Body)
 	if res.IsError() {
 		failCycle(cycleCtx, logger, span, "Index", fmt.Errorf("status %s", res.Status()))
@@ -142,6 +147,10 @@ func runCycle(
 	)
 	if err != nil {
 		failCycle(cycleCtx, logger, span, "Search", err)
+		return
+	}
+	if res == nil {
+		failCycle(cycleCtx, logger, span, "Search", errors.New("nil response received"))
 		return
 	}
 	drain(res.Body)

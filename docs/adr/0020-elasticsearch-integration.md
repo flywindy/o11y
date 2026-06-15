@@ -146,17 +146,30 @@ therefore **does not apply** to Elasticsearch in v1; this is a recorded,
 accepted divergence (the same class as the §4 legacy-attribute drift). Revisit
 if upstream adds a span-name formatter or the facade is promoted to a T3 seam.
 
-**† `error.type` is not set by the pinned instrumentation.** Verified against
-`elastic-transport-go/v8 v8.8.0` (`elastictransport/instrumentation.go`):
-`RecordError` does only `span.SetStatus(codes.Error, …)` + `span.RecordError(err)`
-— it records an exception event and sets the span status, but sets **no**
-`error.type` attribute (no such constant exists in the package). A failed request
-is therefore observable via span **status = Error** and the recorded exception,
-not via an `error.type` attribute. Per the (a) Mongo-T2 posture the SDK accepts
-this rather than adding a normalization span-processor in v1; the compatibility
-test asserts *status-Error-without-`error.type`*, and `docs/semconv.md` records
-the gap. (A backend that needs `error.type` for ES is the trigger to add an
-SDK-owned normalization seam — same escalation path as the deferred metrics, §6.)
+**† `error.type` is not set, and only *transport* errors set span status.**
+Verified against `elastic-transport-go/v8 v8.8.0`
+(`elastictransport/instrumentation.go`): `RecordError` does only
+`span.SetStatus(codes.Error, …)` + `span.RecordError(err)` — it records an
+exception event and sets the span status, but sets **no** `error.type`
+attribute (no such constant exists in the package).
+
+Crucially, the generated API only calls `RecordError` on a **transport-level
+error** (connection refused, DNS failure, timeout). An Elasticsearch
+**HTTP error response** (4xx/5xx — a rejected query, a 429 throttle, a 500)
+returns `(*Response, nil)` from the low-level API, and the instrumentation's
+`AfterResponse` records only Elastic Cloud headers — it does **not** inspect the
+status code. So an ES-rejected request leaves the span **status = UNSET**: it is
+*not* observable via span status. A transport failure is observable via span
+status = Error + the exception; an application-level ES error is visible only in
+`http.response.status_code`/`url.full`, not in span status, in v1.
+
+Per the (a) Mongo-T2 posture the SDK accepts this rather than adding a
+normalization span-processor or a status-setting transport wrapper in v1; the
+compatibility test asserts *transport-error → status-Error-without-`error.type`*,
+and `docs/semconv.md` records the gap. (A backend that needs ES HTTP-status
+errors reflected in span status — for error-rate dashboards/alerts — is the
+trigger to add an SDK-owned normalization seam, the same escalation path as the
+deferred metrics, §6.)
 
 **‡ `db.collection.name` is not set by the pinned instrumentation either.** The
 index is recorded **only** through `RecordPathPart` as the dynamic path variable

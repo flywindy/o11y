@@ -369,7 +369,8 @@ apply to Elasticsearch in v1 — a recorded, accepted divergence.
 
 | Key | Reason |
 |---|---|
-| `error.type` | The pinned upstream `RecordError` sets span **status = Error** and records the exception event only; it sets no `error.type` attribute. Failures are observable via span status, not this attribute (ADR 0020 §4 †). |
+| `error.type` | The pinned upstream `RecordError` sets span **status = Error** and records the exception event only; it sets no `error.type` attribute (ADR 0020 §4 †). |
+| span status on ES HTTP errors (4xx/5xx) | Only **transport** errors set status = Error. An Elasticsearch error *response* (rejected query, 429, 500) returns `(*Response, nil)`; the upstream `AfterResponse` does not inspect the status code, so the span stays **status = UNSET**. Application-level ES errors are visible only via `http.response.status_code`, not span status, in v1 (ADR 0020 §4 †). |
 | `db.collection.name` | The index is recorded only as the `db.elasticsearch.path_parts.index` path variable; the transport never emits `db.collection.name` (ADR 0020 §4 ‡). |
 | `db.system.name` / `db.operation.name` / `db.query.text` / `db.operation.parameter.*` | The current-semconv spellings are not emitted; the facade inherits the legacy keys above rather than normalizing at the boundary (ADR 0020 §4, option (a)). |
 | Any Elasticsearch metric | Trace-only in v1; operators rely on `elasticsearch_exporter` for ES health and span duration for per-call latency (ADR 0020 §6). |

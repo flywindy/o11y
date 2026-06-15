@@ -42,6 +42,14 @@ spec:
           # starts on a kind node without tuning vm.max_map_count.
           - name: discovery.type
             value: single-node
+          # Dev-only: kind / generic K8s nodes are usually left at the default
+          # low vm.max_map_count. single-node mode skips the *bootstrap check*,
+          # but Lucene still uses mmap for the index store and can become
+          # unstable under a low limit. Switching the store to niofs avoids
+          # needing a privileged sysctl init container on the local stack.
+          # Production should instead raise vm.max_map_count and drop this.
+          - name: node.store.allow_mmap
+            value: "false"
           # Dev-only: HTTP security (TLS + auth) is disabled so the example
           # connects over plain http://...:9200 with no credentials. Shared /
           # production environments MUST enable xpack.security and supply

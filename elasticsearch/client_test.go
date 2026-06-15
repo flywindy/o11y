@@ -155,6 +155,73 @@ func TestSearchBody_OptIn(t *testing.T) {
 	}
 }
 
+// TestSearchBody_NilBodyNoPanic guards the nilBodyGuard wrapper: a search-family
+// request with no body under WithSearchBody(true) must not panic. The pinned
+// upstream calls bytes.Buffer.ReadFrom(query) unconditionally for search
+// endpoints, which panics on the nil body the generated API passes for a
+// bodyless search.
+func TestSearchBody_NilBodyNoPanic(t *testing.T) {
+	srv := esStub(t, http.StatusOK)
+	tp, rec := recordingProvider()
+
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp, WithSearchBody(true))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	// No WithBody — r.Body is nil; without the guard this panics upstream.
+	res, err := client.Search(
+		client.Search.WithContext(context.Background()),
+		client.Search.WithIndex("my-index"),
+	)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	_ = res.Body.Close()
+
+	spans := rec.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want 1", len(spans))
+	}
+	if _, ok := attrMap(spans[0].Attributes())["db.statement"]; ok {
+		t.Error("db.statement present for a bodyless search; want absent")
+	}
+}
+
+// TestTypedClient_Do_EmitsSpan asserts the typed client's idiomatic .Do(ctx)
+// path is fully instrumented (the documented, supported typed path — unlike the
+// raw .Perform escape hatch, see NewTypedClient). It backs the claim that
+// NewTypedClient shares the same instrumentation wiring as NewClient.
+func TestTypedClient_Do_EmitsSpan(t *testing.T) {
+	srv := esStub(t, http.StatusOK)
+	tp, rec := recordingProvider()
+
+	client, err := NewTypedClient(elastic.Config{Addresses: []string{srv.URL}}, tp)
+	if err != nil {
+		t.Fatalf("NewTypedClient: %v", err)
+	}
+
+	if _, err := client.Search().Index("my-index").Do(context.Background()); err != nil {
+		t.Fatalf("typed Search.Do: %v", err)
+	}
+
+	spans := rec.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want 1", len(spans))
+	}
+	span := spans[0]
+	if span.SpanKind() != trace.SpanKindClient {
+		t.Fatalf("span kind = %v, want client", span.SpanKind())
+	}
+	attrs := attrMap(span.Attributes())
+	if got := attrs["db.operation"].AsString(); got != "search" {
+		t.Errorf("db.operation = %q, want search", got)
+	}
+	if got := attrs["db.elasticsearch.path_parts.index"].AsString(); got != "my-index" {
+		t.Errorf("db.elasticsearch.path_parts.index = %q, want my-index", got)
+	}
+}
+
 // TestFailedRequest_StatusErrorNoErrorType asserts a failed request sets span
 // status = Error and records the exception, with no error.type attribute,
 // matching elastic-transport-go/v8 v8.8.0's RecordError (ADR 0020 §4 †).

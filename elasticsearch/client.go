@@ -1,9 +1,12 @@
 package elasticsearch
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 
+	"github.com/elastic/elastic-transport-go/v8/elastictransport"
 	elastic "github.com/elastic/go-elasticsearch/v8"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -73,6 +76,14 @@ func NewClient(cfg elastic.Config, tp trace.TracerProvider, opts ...Option) (*el
 // is not reachable from *elasticsearch.Client, so this parallel constructor
 // lets typed-API call sites stay on the typed API while sharing the same
 // instrumentation wiring as NewClient. tp is required and rejected when nil.
+//
+// Call typed requests with their .Do(ctx) terminator (e.g.
+// client.Search().Index("idx").Do(ctx)) to get a fully populated span. The
+// lower-level .Perform(ctx) escape hatch is NOT fully instrumented: in
+// go-elasticsearch v8.19.3 typed Perform starts the span on a shadowed local
+// context and then builds the request with the original context, so path
+// parts, request attributes, and error status are not recorded on the span.
+// This is an upstream quirk a T2 facade cannot patch; use .Do(ctx).
 func NewTypedClient(cfg elastic.Config, tp trace.TracerProvider, opts ...Option) (*elastic.TypedClient, error) {
 	if err := instrument(&cfg, tp, opts...); err != nil {
 		return nil, fmt.Errorf("elasticsearch new typed client: %w", err)
@@ -97,6 +108,28 @@ func instrument(cfg *elastic.Config, tp trace.TracerProvider, opts ...Option) er
 		return errors.New("tracer provider must not be nil")
 	}
 	c := newConfig(opts)
-	cfg.Instrumentation = elastic.NewOpenTelemetryInstrumentation(tp, c.captureSearchBody)
+	cfg.Instrumentation = nilBodyGuard{
+		Instrumentation: elastic.NewOpenTelemetryInstrumentation(tp, c.captureSearchBody),
+	}
 	return nil
+}
+
+// nilBodyGuard wraps the client's first-party instrumentation to make
+// RecordRequestBody a no-op when the request carries no body.
+//
+// With WithSearchBody(true), the pinned elastic-transport-go/v8 v8.8.0 calls
+// bytes.Buffer.ReadFrom(query) unconditionally for search-family endpoints
+// (instrumentation.go RecordRequestBody). The generated API passes a nil body
+// for bodyless searches (e.g. client.Search() with only query-string params),
+// and ReadFrom on a nil reader panics. Guarding here keeps WithSearchBody(true)
+// safe for every search call; it changes no attribute the upstream emits.
+type nilBodyGuard struct {
+	elastictransport.Instrumentation
+}
+
+func (g nilBodyGuard) RecordRequestBody(ctx context.Context, endpoint string, query io.Reader) io.ReadCloser {
+	if query == nil {
+		return nil
+	}
+	return g.Instrumentation.RecordRequestBody(ctx, endpoint, query)
 }
