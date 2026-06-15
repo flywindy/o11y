@@ -54,7 +54,8 @@ func newConfig(opts []Option) config {
 // and it does not propagate trace context toward Elasticsearch (§3).
 //
 // Any cfg.Instrumentation set by the caller is replaced by the o11y-wired
-// instrumentation.
+// instrumentation. cfg is taken by value, so the caller's own Config struct is
+// not mutated.
 func NewClient(cfg elastic.Config, tp trace.TracerProvider, opts ...Option) (*elastic.Client, error) {
 	if err := instrument(&cfg, tp, opts...); err != nil {
 		return nil, fmt.Errorf("elasticsearch new client: %w", err)
