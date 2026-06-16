@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -195,4 +196,75 @@ func TestJetStream_Consume_NilHandler(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, cc)
 	assert.Contains(t, err.Error(), "handler must not be nil")
+}
+
+// TestJetStream_ManagementRoundTrip exercises the thin passthrough surface that
+// the trace-propagation tests above don't reach directly: stream/consumer
+// lookup, Info / CachedInfo, PublishMsg, the single-message Consumer.Next, the
+// Messages Drain path, and DeleteConsumer / DeleteStream.
+func TestJetStream_ManagementRoundTrip(t *testing.T) {
+	enableNATSTracing(t)
+	_, url := startJetStreamServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	const streamName, subject, consumerName = "EVENTS_MGMT", "events.mgmt.created", "mgmt-consumer"
+
+	// Stream: create, look up, Info, CachedInfo.
+	_, err = js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+
+	stream, err := js.Stream(ctx, streamName)
+	require.NoError(t, err)
+	info, err := stream.Info(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, streamName, info.Config.Name)
+	assert.NotNil(t, stream.CachedInfo())
+
+	// Consumer: create, look up, Info, CachedInfo.
+	_, err = js.CreateOrUpdateConsumer(ctx, streamName, jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	cons, err := js.Consumer(ctx, streamName, consumerName)
+	require.NoError(t, err)
+	cinfo, err := cons.Info(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, consumerName, cinfo.Name)
+	assert.NotNil(t, cons.CachedInfo())
+
+	// Publish + PublishMsg, then fetch one with the single-message Next.
+	_, err = js.Publish(ctx, subject, []byte("a"))
+	require.NoError(t, err)
+	_, err = js.PublishMsg(ctx, &nats.Msg{Subject: subject, Data: []byte("b")})
+	require.NoError(t, err)
+
+	fetchCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	_, msg, err := cons.Next(fetchCtx)
+	require.NoError(t, err)
+	require.NotNil(t, msg)
+	require.NoError(t, msg.Ack())
+
+	// Messages iterator Drain path must not panic.
+	iter, err := cons.Messages()
+	require.NoError(t, err)
+	iter.Drain()
+
+	// Delete consumer and stream.
+	require.NoError(t, js.DeleteConsumer(ctx, streamName, consumerName))
+	require.NoError(t, js.DeleteStream(ctx, streamName))
 }
