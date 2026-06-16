@@ -5,9 +5,10 @@
 // The instrumentation ships inside the client (in the shared
 // github.com/elastic/elastic-transport-go/v8 transport), so this package owns
 // only the wiring and the defaults plus two thin response-side normalizations
-// the bare upstream lacks: it guards search-body capture against a nil body and
-// reflects HTTP error responses (4xx/5xx) on the span as status = Error with
-// http.response.status_code (see ADR 0020 §4). The integration is trace-only in
+// the bare upstream lacks: it guards search-body capture against a nil body, and
+// it records http.response.status_code and marks the span status = Error for an
+// ES HTTP error response (status > 299, matching the client's own IsError) that
+// the upstream would otherwise leave UNSET (see ADR 0020 §4). The integration is trace-only in
 // v1: there is no MeterProvider parameter (see ADR 0020 §6) and no propagator
 // parameter, because the upstream instrumentation accepts neither.
 //

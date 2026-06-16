@@ -122,7 +122,7 @@ func instrument(cfg *elastic.Config, tp trace.TracerProvider, opts ...Option) er
 	return nil
 }
 
-// instrumentation wraps the client's first-party OTel instrumentation with two
+// instrumentation wraps the client's first-party OTel instrumentation with
 // thin, SDK-owned behaviors that the bare upstream lacks (ADR 0020 §4):
 //
 //   - RecordRequestBody is made a no-op on a nil body. With WithSearchBody(true)
@@ -130,13 +130,33 @@ func instrument(cfg *elastic.Config, tp trace.TracerProvider, opts ...Option) er
 //     unconditionally for search-family endpoints, and the generated API passes
 //     a nil body for bodyless searches (e.g. a query-string-only search), so
 //     ReadFrom on a nil reader would panic.
-//   - AfterResponse records http.response.status_code and sets the span status
-//     to Error for HTTP error responses. The bare upstream returns (*Response,
-//     nil) for 4xx/5xx and only RecordError-s transport failures, so without
-//     this an ES-rejected request (a bad query, a 429, a 500) would leave the
-//     span status UNSET and carry no status code.
+//   - AfterResponse records http.response.status_code, and Close reflects an ES
+//     HTTP error response in the span status. The bare upstream returns
+//     (*Response, nil) for 4xx/5xx and only RecordError-s transport failures, so
+//     without this an ES-rejected request (a bad query, a 429, a 500) would
+//     leave the span status UNSET and carry no status code.
 type instrumentation struct {
 	elastictransport.Instrumentation
+}
+
+// responseStateKey carries a per-request *responseState through the request
+// context from Start to AfterResponse and Close.
+type responseStateKey struct{}
+
+// responseState records the last HTTP status code seen by AfterResponse. The
+// transport calls AfterResponse once per attempt (including retries), so the
+// final value is the outcome the caller observes. The status decision is made
+// in Close (not per attempt) so it sees the terminal attempt and never races a
+// later RecordError — a per-attempt SetStatus(Ok) would be final under the OTel
+// SDK and would mask the transport/product-check error RecordError reports after
+// the response is in hand.
+type responseState struct {
+	statusCode int
+}
+
+func (g instrumentation) Start(ctx context.Context, name string) context.Context {
+	ctx = g.Instrumentation.Start(ctx, name)
+	return context.WithValue(ctx, responseStateKey{}, &responseState{})
 }
 
 func (g instrumentation) RecordRequestBody(ctx context.Context, endpoint string, query io.Reader) io.ReadCloser {
@@ -146,28 +166,38 @@ func (g instrumentation) RecordRequestBody(ctx context.Context, endpoint string,
 	return g.Instrumentation.RecordRequestBody(ctx, endpoint, query)
 }
 
-// AfterResponse runs after every HTTP attempt (the transport calls it once per
-// try, including retries). It surfaces the response status code and reflects
-// HTTP error responses in the span status.
-//
-// Retry handling: only retryable error statuses (>= 400) are retried, so the
-// only path that sets Ok is the terminal successful attempt, which overrides an
-// Error left by an earlier retried attempt (the OTel SDK permits Error -> Ok but
-// not the reverse). A request that exhausts retries on errors ends Error;
-// http.response.status_code reflects the final attempt.
+// AfterResponse runs after every HTTP attempt. It records the response status
+// code (last write wins, so the attribute reflects the final attempt) and
+// stashes it for the Close-time status decision. It deliberately does not set
+// the span status: see responseState.
 func (g instrumentation) AfterResponse(ctx context.Context, res *http.Response) {
 	g.Instrumentation.AfterResponse(ctx, res)
 	if res == nil {
 		return
 	}
-	span := trace.SpanFromContext(ctx)
-	if !span.IsRecording() {
-		return
+	if span := trace.SpanFromContext(ctx); span.IsRecording() {
+		span.SetAttributes(semconv.HTTPResponseStatusCode(res.StatusCode))
 	}
-	span.SetAttributes(semconv.HTTPResponseStatusCode(res.StatusCode))
-	if res.StatusCode >= 400 {
-		span.SetStatus(codes.Error, http.StatusText(res.StatusCode))
-	} else {
-		span.SetStatus(codes.Ok, "")
+	if st, ok := ctx.Value(responseStateKey{}).(*responseState); ok {
+		st.statusCode = res.StatusCode
 	}
+}
+
+// Close runs once per request (deferred by the generated API, after any
+// RecordError) and ends the span. Before that it flags an ES HTTP error
+// response: a transport failure or product-check error is already Error via
+// RecordError, so here we only mark error *responses*, which the low-level API
+// returns as (*Response, nil) and the bare upstream leaves UNSET.
+//
+// The boundary mirrors the client's own esapi.Response.IsError (status > 299),
+// so redirects/proxy errors (3xx) and 4xx/5xx are flagged. Because it reflects
+// only the final attempt, a request retried from a 5xx to a 2xx stays
+// successful (UNSET), and a 2xx that later fails the product check stays Error.
+func (g instrumentation) Close(ctx context.Context) {
+	if st, ok := ctx.Value(responseStateKey{}).(*responseState); ok && st.statusCode > 299 {
+		if span := trace.SpanFromContext(ctx); span.IsRecording() {
+			span.SetStatus(codes.Error, http.StatusText(st.statusCode))
+		}
+	}
+	g.Instrumentation.Close(ctx)
 }

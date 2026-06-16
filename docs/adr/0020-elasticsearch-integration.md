@@ -165,27 +165,38 @@ UNSET** and invisible to error-rate dashboards.
 
 **Adopted normalization (option (b), scoped to status).** Because that gap
 defeats the primary observability use case, the facade wraps the upstream
-instrumentation and, in `AfterResponse`, records `http.response.status_code` on
-every response and sets the span **status = Error for status >= 400**. This is
-the narrow SDK-owned normalization §6 anticipated, implemented at the
-`Instrumentation` seam (not a span processor). It is deliberately limited:
+instrumentation: `AfterResponse` records `http.response.status_code` on every
+response, and `Close` (the deferred per-request terminator) sets the span
+**status = Error when the final status > 299**. This is the narrow SDK-owned
+normalization §6 anticipated, implemented at the `Instrumentation` seam (not a
+span processor). The design is deliberately constrained by three subtleties of
+the upstream call sequence:
 
-- `error.type` is still **not** synthesized — the upstream supplies no value and
-  the SDK does not invent one; failures are classified by `http.response.status_code`
-  plus the Error status.
-- `AfterResponse` fires once per HTTP attempt, so retries are handled explicitly:
-  only retryable error statuses (>= 400) are retried, so the only call that sets
-  **Ok** is the terminal successful attempt, which overrides an `Error` left by an
-  earlier retried attempt (the OTel SDK permits `Error -> Ok`, not the reverse).
-  A request that exhausts its retries on errors ends `Error`, and
-  `http.response.status_code` reflects the final attempt.
+- **Decide at `Close`, not per attempt.** `AfterResponse` fires once per HTTP
+  attempt, so a per-attempt `SetStatus` cannot see the terminal outcome. Worse,
+  the product check runs in `BaseClient.Perform` *after* the transport returns,
+  and the generated `Do` then calls `RecordError`; a per-attempt `SetStatus(Ok)`
+  would be final under the OTel SDK (`Error→Ok` is allowed, `Ok→Error` is not)
+  and would mask that error. So `AfterResponse` only stashes the status code in
+  a per-request context value and `Close` makes the single status decision,
+  after any `RecordError`. A transport failure or product-check error therefore
+  stays `Error`, and success is left **UNSET** (no forced `Ok`).
+- **Boundary is `> 299`, mirroring `esapi.Response.IsError`.** Redirects/proxy
+  errors (3xx, e.g. a 302 to a login page) are flagged like 4xx/5xx, matching
+  what the client's own error helper reports to callers.
+- **Final attempt wins.** Because the decision reflects the last status code
+  seen, a request retried from a 5xx to a 2xx stays successful (UNSET) with no
+  Error-clearing gymnastics.
 
-A transport failure remains observable the upstream way (status = Error + the
-recorded exception, no `error.type`).
+`error.type` is still **not** synthesized — the upstream supplies no value and
+the SDK does not invent one; failures are classified by `http.response.status_code`
+plus the Error status. A transport failure remains observable the upstream way
+(status = Error + the recorded exception, no `error.type`).
 
-Tests pin both behaviors: *transport-error → status-Error-without-`error.type`*,
-*HTTP 4xx/5xx → status-Error + `http.response.status_code`*, and
-*retried 5xx → 200 → status-Ok*. `docs/semconv.md` records the resulting
+Tests pin the behaviors: *transport-error → status-Error-without-`error.type`*,
+*HTTP 4xx/5xx and 3xx → status-Error + `http.response.status_code`*,
+*product-check failure on a 200 → stays status-Error*, and
+*retried 5xx → 200 → not Error (UNSET)*. `docs/semconv.md` records the resulting
 attribute/status contract.
 
 **‡ `db.collection.name` is not set by the pinned instrumentation either.** The

@@ -332,8 +332,9 @@ func TestHTTPError_SetsErrorStatus(t *testing.T) {
 
 // TestHTTPError_RetryThenSuccess asserts the retry handling: an attempt that
 // fails with a retryable status (503) and then succeeds (200) ends with a
-// single span whose status is Ok (the success overrides the earlier Error) and
-// whose http.response.status_code reflects the final attempt.
+// single span that is not marked Error (status UNSET) because the facade
+// reflects only the final attempt, and whose http.response.status_code reflects
+// that final attempt.
 func TestHTTPError_RetryThenSuccess(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -371,10 +372,87 @@ func TestHTTPError_RetryThenSuccess(t *testing.T) {
 		t.Fatalf("got %d spans, want 1 (one span across retries)", len(spans))
 	}
 	span := spans[0]
-	if span.Status().Code != codes.Ok {
-		t.Errorf("status code = %v, want Ok (success must clear the retried 503 Error)", span.Status().Code)
+	if span.Status().Code != codes.Unset {
+		t.Errorf("status code = %v, want Unset (a retried 503->200 must not be marked Error)", span.Status().Code)
 	}
 	if got := attrMap(span.Attributes())["http.response.status_code"].AsInt64(); got != http.StatusOK {
 		t.Errorf("http.response.status_code = %d, want 200", got)
+	}
+}
+
+// TestHTTP3xx_MarksError asserts a redirect/proxy 3xx (which the client's own
+// esapi.Response.IsError treats as a failure, status > 299) is marked Error on
+// the span — not left successful. Regression test for PR #57 review.
+func TestHTTP3xx_MarksError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		// No Location header, so net/http does not follow the redirect.
+		w.WriteHeader(http.StatusFound) // 302
+	}))
+	t.Cleanup(srv.Close)
+
+	tp, rec := recordingProvider()
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}, DisableRetry: true}, tp)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	res, err := client.Search(
+		client.Search.WithContext(context.Background()),
+		client.Search.WithIndex("my-index"),
+	)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	_ = res.Body.Close()
+
+	spans := rec.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want 1", len(spans))
+	}
+	span := spans[0]
+	if span.Status().Code != codes.Error {
+		t.Errorf("status code = %v, want Error (3xx is > 299)", span.Status().Code)
+	}
+	if got := attrMap(span.Attributes())["http.response.status_code"].AsInt64(); got != http.StatusFound {
+		t.Errorf("http.response.status_code = %d, want 302", got)
+	}
+}
+
+// TestProductCheckFailure_StaysError asserts that a 200 response that then fails
+// the client's product check (no X-Elastic-Product header — e.g. a proxy or a
+// non-ES service) keeps the span status = Error reported by the upstream
+// RecordError. The facade must not have overwritten it with Ok. Regression test
+// for PR #57 review.
+func TestProductCheckFailure_StaysError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Deliberately omit X-Elastic-Product: the product check fails.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	tp, rec := recordingProvider()
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}, DisableRetry: true}, tp)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	// The product check turns this 200 into a client-level error.
+	_, err = client.Search(
+		client.Search.WithContext(context.Background()),
+		client.Search.WithIndex("my-index"),
+	)
+	if err == nil {
+		t.Fatal("Search: want product-check error, got nil")
+	}
+
+	spans := rec.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want 1", len(spans))
+	}
+	if got := spans[0].Status().Code; got != codes.Error {
+		t.Errorf("status code = %v, want Error (product-check failure must not be reported Ok)", got)
 	}
 }

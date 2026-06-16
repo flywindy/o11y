@@ -366,13 +366,16 @@ facade control (no span-name seam exists on a T2 wiring), so the cross-package
 `{db.system.name}.{operation} {target}` convention (ADR 0023) does **not**
 apply to Elasticsearch in v1 — a recorded, accepted divergence.
 
-**Span status.** Transport errors set status = Error via the upstream (with a
-recorded exception). HTTP error responses (4xx/5xx), which the low-level API
-returns as `(*Response, nil)`, are normalized by the facade: `AfterResponse`
-sets status = Error for status >= 400 and Ok otherwise. Because it runs per HTTP
-attempt, a request retried from a 5xx to a final 200 ends Ok; one that exhausts
-its retries ends Error. `error.type` is not synthesized — classify failures by
-status + `http.response.status_code`.
+**Span status.** Transport errors and product-check failures set status = Error
+via the upstream `RecordError` (with a recorded exception). HTTP error
+*responses*, which the low-level API returns as `(*Response, nil)`, are
+normalized by the facade: it records the status code per attempt and, at `Close`
+(after any `RecordError`), sets status = Error when the final status is `> 299`
+— the same boundary as the client's own `esapi.Response.IsError`, so 3xx
+redirect/proxy errors are flagged alongside 4xx/5xx. Successful calls are left
+**UNSET** (no forced `Ok`), and because the decision reflects the final attempt,
+a request retried from a 5xx to a 2xx is not marked Error. `error.type` is not
+synthesized — classify failures by status + `http.response.status_code`.
 
 ### Explicitly NOT Emitted
 
