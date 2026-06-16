@@ -1,6 +1,7 @@
 package cassandra
 
 import (
+	"context"
 	"errors"
 
 	"github.com/gocql/gocql"
@@ -16,8 +17,8 @@ import (
 // gocql attaches observers via the ClusterConfig and cannot attach them to a
 // live session after the fact (ADR 0019 §3). The caller keeps full control of
 // contact points, consistency, auth, pool sizing, and timeouts on the cluster
-// config; NewSession only sets the query and connect observers before creating
-// the session.
+// config; NewSession sets (and, if the caller already configured one, composes
+// with) the query and connect observers before creating the session.
 //
 // tp and mp are required and rejected if nil — the package never falls back to
 // the OpenTelemetry globals (ADR 0003).
@@ -52,8 +53,10 @@ func NewSession(
 		return nil, err
 	}
 
-	cluster.QueryObserver = obs
-	cluster.ConnectObserver = obs
+	// Compose with any observers the caller already configured so adopting this
+	// package does not silently drop their logging/metrics.
+	cluster.QueryObserver = chainQueryObserver(cluster.QueryObserver, obs)
+	cluster.ConnectObserver = chainConnectObserver(cluster.ConnectObserver, obs)
 
 	session, err := cluster.CreateSession()
 	if err != nil {
@@ -85,4 +88,42 @@ func newObserver(
 		cfg:    newConfig(opts),
 		server: contactPoint(cluster.Hosts, cluster.Port),
 	}, nil
+}
+
+// chainQueryObserver composes a caller-supplied QueryObserver with the SDK's, so
+// adopting this package does not silently replace a QueryObserver the caller
+// already configured on the ClusterConfig. The existing observer runs first.
+func chainQueryObserver(existing, sdk gocql.QueryObserver) gocql.QueryObserver {
+	if existing == nil {
+		return sdk
+	}
+	return chainedQueryObserver{existing: existing, sdk: sdk}
+}
+
+type chainedQueryObserver struct {
+	existing gocql.QueryObserver
+	sdk      gocql.QueryObserver
+}
+
+func (c chainedQueryObserver) ObserveQuery(ctx context.Context, q gocql.ObservedQuery) {
+	c.existing.ObserveQuery(ctx, q)
+	c.sdk.ObserveQuery(ctx, q)
+}
+
+// chainConnectObserver mirrors chainQueryObserver for the connect observer.
+func chainConnectObserver(existing, sdk gocql.ConnectObserver) gocql.ConnectObserver {
+	if existing == nil {
+		return sdk
+	}
+	return chainedConnectObserver{existing: existing, sdk: sdk}
+}
+
+type chainedConnectObserver struct {
+	existing gocql.ConnectObserver
+	sdk      gocql.ConnectObserver
+}
+
+func (c chainedConnectObserver) ObserveConnect(o gocql.ObservedConnect) {
+	c.existing.ObserveConnect(o)
+	c.sdk.ObserveConnect(o)
 }

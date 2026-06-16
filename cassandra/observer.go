@@ -97,7 +97,10 @@ func (o *observer) record(
 
 	if obsErr != nil {
 		errType := errorType(obsErr)
-		span.RecordError(obsErr)
+		// Stamp the exception event at the observation's end time. These are
+		// completed snapshots, so the callback's wall-clock now() can be later
+		// than the span's End(end), which would order the event after the span.
+		span.RecordError(obsErr, trace.WithTimestamp(end))
 		span.SetStatus(codes.Error, obsErr.Error())
 		span.SetAttributes(semconv.ErrorTypeKey.String(errType))
 	}

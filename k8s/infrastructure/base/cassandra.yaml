@@ -25,6 +25,16 @@ spec:
       labels:
         app: cassandra
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        # The official cassandra image runs as the cassandra user (uid/gid 999);
+        # fsGroup makes the mounted data volume writable by it.
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: cassandra
         image: cassandra:5.0
@@ -45,6 +55,12 @@ spec:
             cpu: 250m
           limits:
             memory: 2Gi
+            cpu: "1"
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
         readinessProbe:
           exec:
             command: ["cqlsh", "-e", "describe keyspaces"]

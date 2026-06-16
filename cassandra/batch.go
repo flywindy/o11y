@@ -2,6 +2,7 @@ package cassandra
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"runtime"
 	"sync"
@@ -24,9 +25,15 @@ var sessionObservers sync.Map // uintptr -> *observer
 func registerSession(s *gocql.Session, o *observer) {
 	key := sessionKey(s)
 	sessionObservers.Store(key, o)
-	// The cleanup arg must not reference the session, or it would keep it alive
-	// and the cleanup would never run; the bare key value is safe.
-	runtime.AddCleanup(s, func(k uintptr) { sessionObservers.Delete(k) }, key)
+	// CompareAndDelete (not Delete) guards against pointer-address reuse: if this
+	// session is collected and a new one is allocated at the same address and
+	// registered before this cleanup runs, deleting unconditionally would drop
+	// the new session's entry. The cleanup arg must not reference the session
+	// itself, or it would keep it alive and never run; the observer pointer is
+	// safe and is exactly the value to compare against.
+	runtime.AddCleanup(s, func(prev *observer) {
+		sessionObservers.CompareAndDelete(key, prev)
+	}, o)
 }
 
 func sessionKey(s *gocql.Session) uintptr {
@@ -51,7 +58,20 @@ func lookupObserver(s *gocql.Session) (*observer, bool) {
 //
 // If session was not created by NewSession (no registered observer), ExecuteBatch
 // executes the batch without instrumentation, so it is always safe to call.
+//
+// ctx is bound onto the batch via batch.WithContext(ctx) so it governs the
+// driver call itself (cancellation/deadline), not just telemetry — keeping the
+// public batch API context-first. A nil session or batch returns an error
+// rather than panicking.
 func ExecuteBatch(ctx context.Context, session *gocql.Session, batch *gocql.Batch) error {
+	if session == nil {
+		return errors.New("cassandra: session must not be nil")
+	}
+	if batch == nil {
+		return errors.New("cassandra: batch must not be nil")
+	}
+	batch = batch.WithContext(ctx)
+
 	obs, ok := lookupObserver(session)
 	if !ok {
 		return session.ExecuteBatch(batch)

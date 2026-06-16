@@ -4,10 +4,12 @@
 //
 // The package owns Cassandra span creation, attribute population, and metric
 // recording directly, wired to explicit SDK providers with no OpenTelemetry
-// global mutation (ADR 0003, ADR 0019). It is implemented against the driver's
-// three observer extension points (QueryObserver, BatchObserver,
-// ConnectObserver), which are set once on the *gocql.ClusterConfig at session
-// creation, so there is no idempotency map and no hook-removal problem.
+// global mutation (ADR 0003, ADR 0019). Queries and connections are
+// instrumented via the driver's QueryObserver and ConnectObserver, set once on
+// the *gocql.ClusterConfig at session creation, so there is no idempotency map
+// and no hook-removal problem. Batches are instrumented through the SDK-owned
+// ExecuteBatch seam rather than the driver's BatchObserver, whose gocql v1.7.0
+// payload cannot identify a logical batch (ADR 0019 §4).
 //
 // Provenance. The observer skeleton is informed by the abandoned
 // go.opentelemetry.io/contrib/.../gocql/otelgocql package (Apache-2.0, removed

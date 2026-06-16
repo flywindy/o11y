@@ -98,6 +98,46 @@ func TestNewSessionRejectsNilArgs(t *testing.T) {
 	assert.Contains(t, err.Error(), "meter provider must not be nil")
 }
 
+func TestExecuteBatchNilGuards(t *testing.T) {
+	err := ExecuteBatch(context.Background(), nil, gocql.NewBatch(gocql.LoggedBatch)) //nolint:staticcheck // need a *Batch without a live session
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "session must not be nil")
+
+	// A non-nil session pointer with a nil batch must also be rejected before
+	// any driver call. The session is never dereferenced on this path.
+	err = ExecuteBatch(context.Background(), &gocql.Session{}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "batch must not be nil")
+}
+
+// recordingQueryObserver / recordingConnectObserver capture whether a
+// caller-supplied observer is still invoked after NewSession composes the SDK's.
+type recordingQueryObserver struct{ calls int }
+
+func (r *recordingQueryObserver) ObserveQuery(context.Context, gocql.ObservedQuery) { r.calls++ }
+
+type recordingConnectObserver struct{ calls int }
+
+func (r *recordingConnectObserver) ObserveConnect(gocql.ObservedConnect) { r.calls++ }
+
+func TestChainObserversPreservesExisting(t *testing.T) {
+	obs, _, _ := newTestObserver(t, config{})
+
+	existingQ := &recordingQueryObserver{}
+	chainedQ := chainQueryObserver(existingQ, obs)
+	chainedQ.ObserveQuery(context.Background(), gocql.ObservedQuery{Statement: "SELECT id FROM rooms"})
+	assert.Equal(t, 1, existingQ.calls, "caller's QueryObserver must still run")
+
+	existingC := &recordingConnectObserver{}
+	chainedC := chainConnectObserver(existingC, obs)
+	chainedC.ObserveConnect(gocql.ObservedConnect{Start: time.Now(), End: time.Now()})
+	assert.Equal(t, 1, existingC.calls, "caller's ConnectObserver must still run")
+
+	// With no existing observer, the SDK observer is returned unwrapped.
+	assert.Same(t, obs, chainQueryObserver(nil, obs))
+	assert.Same(t, obs, chainConnectObserver(nil, obs))
+}
+
 func TestObserveQueryEmitsSemconvSpanAndDuration(t *testing.T) {
 	obs, sr, reader := newTestObserver(t, config{})
 
@@ -128,7 +168,7 @@ func TestObserveQueryEmitsSemconvSpanAndDuration(t *testing.T) {
 	assert.Contains(t, span.Attributes(), semconv.NetworkPeerAddress("10.0.0.5"))
 	assert.Contains(t, span.Attributes(), semconv.CassandraCoordinatorID("coordinator-1"))
 	assert.False(t, spanHasKey(span, semconv.ErrorTypeKey))
-	assert.False(t, spanHasKey(span, "db.query.text"), "query text off by default")
+	assert.False(t, spanHasKey(span, semconv.DBQueryTextKey), "query text off by default")
 
 	rm := collectMetrics(t, reader)
 	dur := metricByName(rm, "db.client.operation.duration")
