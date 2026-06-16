@@ -673,24 +673,33 @@ _, err = js.Publish(ctx, "events.created", payload)
 cons, err := js.CreateOrUpdateConsumer(ctx, "EVENTS", jetstream.ConsumerConfig{
     Durable: "worker", FilterSubject: "events.created", AckPolicy: jetstream.AckExplicitPolicy,
 })
-cc, err := cons.Consume(func(ctx context.Context, msg jetstream.Msg) {
+cc, err := cons.Consume(ctx, func(ctx context.Context, msg jetstream.Msg) {
     obs.Logger.InfoContext(ctx, "event", slog.String("subject", msg.Subject()))
     _ = msg.Ack()
 })
 defer cc.Stop()
 ```
 
-The pull-iterator form (`cons.Messages()` → `iter.Next()`) delivers the same
-`(ctx, msg)` per message. Prefer it when you need **drain-and-wait** graceful
-shutdown: its `MessagesContext` exposes `Drain()`, whereas the `Consume`
-`ConsumeContext` only exposes `Stop()` (an upstream limitation — `Stop()`
-interrupts in-flight pulls, leaving unacked messages to be redelivered).
+`Consume` and `Messages` take a `ctx` like the core `Subscribe`: it is a
+registration-time guard (an already-cancelled `ctx` is rejected), **not** a
+trace carrier and **not** a way to cancel a running loop — per-message trace
+context arrives on the handler's `ctx`, and you stop via `ConsumeContext.Stop` /
+`MessagesContext.Stop`/`Drain`.
+
+The pull-iterator form (`cons.Messages(ctx, …)` → `iter.Next()`) delivers the
+same `(ctx, msg)` per message. Prefer it when you need **drain-and-wait**
+graceful shutdown: its `MessagesContext` exposes `Drain()`, whereas the
+`Consume` `ConsumeContext` only exposes `Stop()` (an upstream limitation —
+`Stop()` interrupts in-flight pulls, leaving unacked messages to be redelivered).
 
 Not yet wrapped (use a later facade addition or, if needed sooner, the upstream
-package directly): `Fetch` / `FetchBytes` / `FetchNoWait`, push consumers, and
-ordered consumers. The **legacy** `nats.JetStreamContext` API
-(`js.PullSubscribe()` + `sub.FetchBatch()`) is a different, un-instrumented API;
-for it, propagate trace context manually with `nats.Inject` / `nats.Extract`.
+package directly): single-message `Consumer.Next` (upstream v0.2.11 returns the
+producer's remote context, not the local receive span — use
+`cons.Messages(ctx, jetstream.PullMaxMessages(1))` for single fetch),
+`Fetch` / `FetchBytes` / `FetchNoWait`, push consumers, and ordered consumers.
+The **legacy** `nats.JetStreamContext` API (`js.PullSubscribe()` +
+`sub.FetchBatch()`) is a different, un-instrumented API; for it, propagate trace
+context manually with `nats.Inject` / `nats.Extract`.
 
 ## Object Storage
 

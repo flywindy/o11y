@@ -44,7 +44,7 @@ func TestJetStream_Consume_TracePropagation(t *testing.T) {
 	require.NoError(t, err)
 
 	ctxCh := make(chan context.Context, 1)
-	cc, err := cons.Consume(func(msgCtx context.Context, m jetstream.Msg) {
+	cc, err := cons.Consume(context.Background(), func(msgCtx context.Context, m jetstream.Msg) {
 		_ = m.Ack()
 		select {
 		case ctxCh <- msgCtx:
@@ -121,7 +121,7 @@ func TestJetStream_Messages_TracePropagation(t *testing.T) {
 	require.NoError(t, err)
 	span.End()
 
-	iter, err := cons.Messages()
+	iter, err := cons.Messages(context.Background())
 	require.NoError(t, err)
 	defer iter.Stop()
 
@@ -192,7 +192,7 @@ func TestJetStream_Consume_NilHandler(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	cc, err := cons.Consume(nil)
+	cc, err := cons.Consume(context.Background(), nil)
 	require.Error(t, err)
 	assert.Nil(t, cc)
 	assert.Contains(t, err.Error(), "handler must not be nil")
@@ -246,22 +246,36 @@ func TestJetStream_ManagementRoundTrip(t *testing.T) {
 	assert.Equal(t, consumerName, cinfo.Name)
 	assert.NotNil(t, cons.CachedInfo())
 
-	// Publish + PublishMsg, then fetch one with the single-message Next.
+	// Publish + PublishMsg, then fetch one via the Messages iterator (the
+	// single-message Consumer.Next is intentionally not wrapped — ADR 0022
+	// amendment; use Messages with PullMaxMessages(1) for single fetch).
 	_, err = js.Publish(ctx, subject, []byte("a"))
 	require.NoError(t, err)
 	_, err = js.PublishMsg(ctx, &nats.Msg{Subject: subject, Data: []byte("b")})
 	require.NoError(t, err)
 
-	fetchCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	_, msg, err := cons.Next(fetchCtx)
+	iter, err := cons.Messages(ctx, jetstream.PullMaxMessages(1))
 	require.NoError(t, err)
-	require.NotNil(t, msg)
-	require.NoError(t, msg.Ack())
 
-	// Messages iterator Drain path must not panic.
-	iter, err := cons.Messages()
-	require.NoError(t, err)
+	type result struct {
+		msg jetstream.Msg
+		err error
+	}
+	resCh := make(chan result, 1)
+	go func() {
+		_, m, e := iter.Next()
+		resCh <- result{m, e}
+	}()
+	select {
+	case res := <-resCh:
+		require.NoError(t, res.err)
+		require.NotNil(t, res.msg)
+		require.NoError(t, res.msg.Ack())
+	case <-time.After(3 * time.Second):
+		t.Fatal("Messages().Next did not return within timeout")
+	}
+
+	// Drain path must not panic.
 	iter.Drain()
 
 	// Delete consumer and stream.

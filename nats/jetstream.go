@@ -19,16 +19,25 @@ import (
 // directly from github.com/nats-io/nats.go/jetstream — they are plain stdlib
 // types, not a Marz dependency.
 //
-// Consume callbacks and the Messages/Next iterators deliver the native
+// The Consume callback and the Messages iterator deliver the native
 // jetstream.Msg together with a ctx carrying the consumer span (matching the
 // core MsgHandler shape (ctx, msg)); no o11y-owned message type is introduced.
 //
+// Consume and Messages also take a registration-time ctx, consistent with the
+// core Subscribe / QueueSubscribe facade: it is checked once up front (an
+// already-cancelled ctx is rejected) but is NOT plumbed into the upstream call
+// and does NOT cancel a running consume loop — use ConsumeContext.Stop /
+// MessagesContext.Stop|Drain for that. Per-message trace context flows from the
+// message headers, not from this registration ctx (see ADR 0022 amendment).
+//
 // Scope: this facade wraps the JetStream surface o11y consumers use today
 // (stream/consumer management, Publish, and the pull consume modes Consume /
-// Messages / Next). Deferred until a consumer needs them: PushConsumer, ordered
-// consumers, Fetch / FetchBytes / FetchNoWait (the batch path would require an
-// o11y-owned carrier type for the channel), and the admin surface
-// (Pause/Resume/List/Unpin). They are wrapped on demand in a later change.
+// Messages). Deferred until a consumer needs them: single-message Consumer.Next
+// (upstream v0.2.11 returns the producer's remote context rather than the local
+// receive span — use Messages with jetstream.PullMaxMessages(1) for single
+// fetch), Fetch / FetchBytes / FetchNoWait (the batch path would require an
+// o11y-owned carrier type for the channel), PushConsumer, ordered consumers,
+// and the admin surface (Pause/Resume/List/Unpin). Wrapped on demand later.
 
 // JetStreamMsgHandler is the Consume callback signature. ctx carries the
 // consumer span extracted from the message headers by the upstream layer, so
@@ -77,17 +86,20 @@ type Consumer interface {
 	// Consume continuously delivers messages to handler on a background
 	// goroutine. Call Stop on the returned ConsumeContext to stop.
 	//
+	// ctx is a registration-time guard only (consistent with Subscribe): an
+	// already-cancelled ctx is rejected up front, but ctx is not plumbed
+	// downstream and does NOT stop a running loop — use ConsumeContext.Stop for
+	// that. Per-message trace context arrives via the handler's ctx argument,
+	// extracted from the message headers.
+	//
 	// Note: the returned ConsumeContext exposes only Stop (an upstream
 	// limitation — see ConsumeContext). If you need drain-and-wait graceful
 	// shutdown, use Messages instead, whose MessagesContext also offers Drain.
-	Consume(handler JetStreamMsgHandler, opts ...jetstream.PullConsumeOpt) (ConsumeContext, error)
+	Consume(ctx context.Context, handler JetStreamMsgHandler, opts ...jetstream.PullConsumeOpt) (ConsumeContext, error)
 	// Messages returns a pull iterator. Each Next yields a ctx carrying the
-	// consumer span plus the native jetstream.Msg.
-	Messages(opts ...jetstream.PullMessagesOpt) (MessagesContext, error)
-	// Next fetches a single message, blocking until one is available, the
-	// fetch times out, or ctx is done. The returned ctx carries the consumer
-	// span for that message.
-	Next(ctx context.Context, opts ...jetstream.FetchOpt) (context.Context, jetstream.Msg, error)
+	// consumer span plus the native jetstream.Msg. ctx is a registration-time
+	// guard only, with the same semantics as Consume's ctx.
+	Messages(ctx context.Context, opts ...jetstream.PullMessagesOpt) (MessagesContext, error)
 	Info(ctx context.Context) (*jetstream.ConsumerInfo, error)
 	CachedInfo() *jetstream.ConsumerInfo
 }
@@ -206,7 +218,10 @@ func (s *stream) DeleteConsumer(ctx context.Context, name string) error {
 
 type consumer struct{ c oteljetstream.Consumer }
 
-func (c *consumer) Consume(handler JetStreamMsgHandler, opts ...jetstream.PullConsumeOpt) (ConsumeContext, error) {
+func (c *consumer) Consume(ctx context.Context, handler JetStreamMsgHandler, opts ...jetstream.PullConsumeOpt) (ConsumeContext, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("nats jetstream consume: %w", err)
+	}
 	if handler == nil {
 		return nil, fmt.Errorf("nats jetstream consume: handler must not be nil")
 	}
@@ -219,16 +234,15 @@ func (c *consumer) Consume(handler JetStreamMsgHandler, opts ...jetstream.PullCo
 	return cc, nil
 }
 
-func (c *consumer) Messages(opts ...jetstream.PullMessagesOpt) (MessagesContext, error) {
+func (c *consumer) Messages(ctx context.Context, opts ...jetstream.PullMessagesOpt) (MessagesContext, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("nats jetstream messages: %w", err)
+	}
 	mc, err := c.c.Messages(opts...)
 	if err != nil {
 		return nil, err
 	}
 	return &messagesContext{mc: mc}, nil
-}
-
-func (c *consumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (context.Context, jetstream.Msg, error) {
-	return c.c.Next(ctx, opts...)
 }
 
 func (c *consumer) Info(ctx context.Context) (*jetstream.ConsumerInfo, error) { return c.c.Info(ctx) }

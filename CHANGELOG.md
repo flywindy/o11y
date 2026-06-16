@@ -20,9 +20,11 @@ adopters can plan their upgrades.
   `github.com/flywindy/o11y/nats`, never the upstream instrumentation package,
   while keeping its trace propagation and consumer span-links. Covers stream and
   consumer management, `Publish` (with `jetstream.WithMsgID` dedup pass-through),
-  and the pull consume modes `Consume` / `Messages` / `Next`; handlers receive
-  the native `jetstream.Msg` plus a trace-carrying `ctx` (the same `(ctx, msg)`
-  shape as core `Subscribe`). See ADR 0022 (Phase 2).
+  and the pull consume modes `Consume` / `Messages`; handlers receive the native
+  `jetstream.Msg` plus a trace-carrying `ctx` (the same `(ctx, msg)` shape as
+  core `Subscribe`). `Consume` and `Messages` take a registration-time `ctx`
+  (up-front guard, consistent with `Subscribe`; not a trace carrier and not a
+  running-loop cancel). See ADR 0022 (Phase 2) and its amendment.
 
 ### Changed
 
@@ -30,8 +32,9 @@ adopters can plan their upgrades.
   interface instead of `oteljetstream.JetStream`, and JetStream config / consume
   callbacks now use `github.com/nats-io/nats.go/jetstream` types rather than
   `oteljetstream` aliases. Update JetStream call sites accordingly — the
-  `examples/jetstream/*` programs show the new shape. `Fetch`/`FetchBytes`/
-  `FetchNoWait`, push consumers, and ordered consumers are not wrapped yet.
+  `examples/jetstream/*` programs show the new shape. Deferred (not wrapped yet):
+  single-message `Consumer.Next`, `Fetch`/`FetchBytes`/`FetchNoWait`, push
+  consumers, and ordered consumers.
 
 ---
 

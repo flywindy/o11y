@@ -104,7 +104,7 @@ func main() {
 	//    context from each message's headers and delivers it as the handler's
 	//    ctx (linked to a new consumer span); m is the native jetstream.Msg, so
 	//    Subject / Data / Metadata / Ack are available directly.
-	cc, err := consumer.Consume(func(msgCtx context.Context, m jetstream.Msg) {
+	cc, err := consumer.Consume(ctx, func(msgCtx context.Context, m jetstream.Msg) {
 		msgCtx, span := tracer.Start(msgCtx, "process-event")
 		defer span.End()
 

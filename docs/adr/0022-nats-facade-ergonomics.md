@@ -379,3 +379,61 @@ This ADR is docs-only. The implementing work is intended to land as two PRs:
    (notably `WithMsgID` dedup and `ConsumeErrHandler`) and `Consume` returning
    the `ConsumeContext`; and the deferral of `PushConsumer` / ordered
    consumers.
+
+---
+
+## Amendment (2026-06-16) — Phase 2 implementation decisions
+
+Implementing the JetStream wrapper (PR #58) surfaced three concrete API
+decisions, recorded here so the rationale is durable (and so the recurring
+"context-first" review flag has a documented answer).
+
+### 1. `Consume` / `Messages` take a registration-time `ctx`; iterator `Next` does not
+
+`Consume(ctx, handler, …)` and `Messages(ctx, …)` accept a `ctx`, consistent
+with the core `Subscribe` / `QueueSubscribe` facade. **Honest scope of that
+ctx:** it is an up-front guard only — an already-cancelled `ctx` is rejected,
+but it is *not* plumbed into the upstream `oteljetstream` call (which has no
+`ctx` parameter) and does *not* cancel a running consume loop (use
+`ConsumeContext.Stop` / `MessagesContext.Stop`/`Drain`). Per-message trace
+context flows from the **message headers** (delivered on the handler's `ctx`),
+not from this registration `ctx`.
+
+So the ctx here carries **no trace benefit** and only a weak cancellation
+guard. It is kept purely for API-design reasons: uniform ctx-first entry points
+(predictability, forward-compat) and consistency with `Subscribe` — the same
+basis on which `Subscribe` itself takes a (equally guard-only) ctx. This is a
+deliberate choice of "uniform ctx-first" over "ctx only where it does real
+work."
+
+`MessagesContext.Next(opts…)` deliberately stays **ctx-less**: it is a per-pull
+iterator call whose upstream (and native `nats.go/jetstream`) signature takes
+only `...NextOpt`; a `ctx` there could not cancel the pull and would be
+misleading. Cancellation is via `Stop`/`Drain`. (Network/blocking operations
+that genuinely use ctx — `CreateOrUpdateStream/Consumer`, `Publish`, the
+deferred single-fetch `Consumer.Next` — do take and plumb ctx.)
+
+### 2. Single-message `Consumer.Next` is deferred (not wrapped)
+
+`oteljetstream` v0.2.11's `Consumer.Next` creates the receive span but discards
+its context and returns the **producer's extracted remote context** instead of
+the local receive-span context — inconsistent with `Consume`/`Messages`, which
+return the receive-span context. Wrapping it as-is would mean
+`tracer.Start(ctxFromNext, …)` parents work under the upstream producer span
+rather than the local consumer span. Rather than ship that inconsistency (or
+re-implement the span ourselves, which would be the T3 re-instrumentation this
+ADR avoids), single-fetch `Consumer.Next` is **deferred** alongside
+`Fetch`/`FetchBytes`/`FetchNoWait`, push consumers, and ordered consumers.
+Callers needing single fetch use `Messages(ctx, jetstream.PullMaxMessages(1))`,
+which returns the correct receive-span context. Revisit if upstream returns the
+receive-span context from `Next`.
+
+### 3. No nil-receiver guards on the facade
+
+`JetStream()` (and the other facade methods) do **not** defensively guard a nil
+receiver / nil embedded `Conn`. A `Conn` obtained from `Connect` always has a
+non-nil embedded connection; a nil embedded `Conn` is only reachable by
+bypassing `Connect` (hand-constructing `&Conn{}`), which is misuse that panics
+identically across `Subscribe` / `QueueSubscribe` / `Respond` / `JetStream`.
+Guarding only `JetStream` would be asymmetric; guarding all of them is not
+warranted for a misuse-only path. Left to panic, consistent with the package.
