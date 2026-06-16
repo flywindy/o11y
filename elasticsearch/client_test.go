@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	elastic "github.com/elastic/go-elasticsearch/v8"
@@ -290,5 +291,90 @@ func TestProviderWiring(t *testing.T) {
 	}
 	if got := len(globalRec.Ended()); got != 0 {
 		t.Errorf("global provider recorded %d spans, want 0 (no global fallback)", got)
+	}
+}
+
+// TestHTTPError_SetsErrorStatus asserts the facade reflects an ES HTTP error
+// response (which the low-level API returns as (*Response, nil)) on the span:
+// status = Error plus http.response.status_code. The bare upstream does neither
+// (ADR 0020 §4).
+func TestHTTPError_SetsErrorStatus(t *testing.T) {
+	srv := esStub(t, http.StatusInternalServerError)
+	tp, rec := recordingProvider()
+
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}, DisableRetry: true}, tp)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	// A 500 is not a transport error: Search returns a response with nil err.
+	res, err := client.Search(
+		client.Search.WithContext(context.Background()),
+		client.Search.WithIndex("my-index"),
+	)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	_ = res.Body.Close()
+
+	spans := rec.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want 1", len(spans))
+	}
+	span := spans[0]
+	if span.Status().Code != codes.Error {
+		t.Errorf("status code = %v, want Error", span.Status().Code)
+	}
+	if got := attrMap(span.Attributes())["http.response.status_code"].AsInt64(); got != http.StatusInternalServerError {
+		t.Errorf("http.response.status_code = %d, want 500", got)
+	}
+}
+
+// TestHTTPError_RetryThenSuccess asserts the retry handling: an attempt that
+// fails with a retryable status (503) and then succeeds (200) ends with a
+// single span whose status is Ok (the success overrides the earlier Error) and
+// whose http.response.status_code reflects the final attempt.
+func TestHTTPError_RetryThenSuccess(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable) // retried by default
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	tp, rec := recordingProvider()
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	res, err := client.Search(
+		client.Search.WithContext(context.Background()),
+		client.Search.WithIndex("my-index"),
+	)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	_ = res.Body.Close()
+
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("server calls = %d, want 2 (one retry)", got)
+	}
+	spans := rec.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want 1 (one span across retries)", len(spans))
+	}
+	span := spans[0]
+	if span.Status().Code != codes.Ok {
+		t.Errorf("status code = %v, want Ok (success must clear the retried 503 Error)", span.Status().Code)
+	}
+	if got := attrMap(span.Attributes())["http.response.status_code"].AsInt64(); got != http.StatusOK {
+		t.Errorf("http.response.status_code = %d, want 200", got)
 	}
 }

@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 
 	"github.com/elastic/elastic-transport-go/v8/elastictransport"
 	elastic "github.com/elastic/go-elasticsearch/v8"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -113,28 +116,58 @@ func instrument(cfg *elastic.Config, tp trace.TracerProvider, opts ...Option) er
 		return errors.New("tracer provider must not be nil")
 	}
 	c := newConfig(opts)
-	cfg.Instrumentation = nilBodyGuard{
+	cfg.Instrumentation = instrumentation{
 		Instrumentation: elastic.NewOpenTelemetryInstrumentation(tp, c.captureSearchBody),
 	}
 	return nil
 }
 
-// nilBodyGuard wraps the client's first-party instrumentation to make
-// RecordRequestBody a no-op when the request carries no body.
+// instrumentation wraps the client's first-party OTel instrumentation with two
+// thin, SDK-owned behaviors that the bare upstream lacks (ADR 0020 §4):
 //
-// With WithSearchBody(true), the pinned elastic-transport-go/v8 v8.8.0 calls
-// bytes.Buffer.ReadFrom(query) unconditionally for search-family endpoints
-// (instrumentation.go RecordRequestBody). The generated API passes a nil body
-// for bodyless searches (e.g. client.Search() with only query-string params),
-// and ReadFrom on a nil reader panics. Guarding here keeps WithSearchBody(true)
-// safe for every search call; it changes no attribute the upstream emits.
-type nilBodyGuard struct {
+//   - RecordRequestBody is made a no-op on a nil body. With WithSearchBody(true)
+//     the pinned elastic-transport-go/v8 v8.8.0 calls bytes.Buffer.ReadFrom(query)
+//     unconditionally for search-family endpoints, and the generated API passes
+//     a nil body for bodyless searches (e.g. a query-string-only search), so
+//     ReadFrom on a nil reader would panic.
+//   - AfterResponse records http.response.status_code and sets the span status
+//     to Error for HTTP error responses. The bare upstream returns (*Response,
+//     nil) for 4xx/5xx and only RecordError-s transport failures, so without
+//     this an ES-rejected request (a bad query, a 429, a 500) would leave the
+//     span status UNSET and carry no status code.
+type instrumentation struct {
 	elastictransport.Instrumentation
 }
 
-func (g nilBodyGuard) RecordRequestBody(ctx context.Context, endpoint string, query io.Reader) io.ReadCloser {
+func (g instrumentation) RecordRequestBody(ctx context.Context, endpoint string, query io.Reader) io.ReadCloser {
 	if query == nil {
 		return nil
 	}
 	return g.Instrumentation.RecordRequestBody(ctx, endpoint, query)
+}
+
+// AfterResponse runs after every HTTP attempt (the transport calls it once per
+// try, including retries). It surfaces the response status code and reflects
+// HTTP error responses in the span status.
+//
+// Retry handling: only retryable error statuses (>= 400) are retried, so the
+// only path that sets Ok is the terminal successful attempt, which overrides an
+// Error left by an earlier retried attempt (the OTel SDK permits Error -> Ok but
+// not the reverse). A request that exhausts retries on errors ends Error;
+// http.response.status_code reflects the final attempt.
+func (g instrumentation) AfterResponse(ctx context.Context, res *http.Response) {
+	g.Instrumentation.AfterResponse(ctx, res)
+	if res == nil {
+		return
+	}
+	span := trace.SpanFromContext(ctx)
+	if !span.IsRecording() {
+		return
+	}
+	span.SetAttributes(semconv.HTTPResponseStatusCode(res.StatusCode))
+	if res.StatusCode >= 400 {
+		span.SetStatus(codes.Error, http.StatusText(res.StatusCode))
+	} else {
+		span.SetStatus(codes.Ok, "")
+	}
 }

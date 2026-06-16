@@ -359,19 +359,26 @@ the right column.
 | `url.full` | string | (unchanged) | Request target URL. **Includes the query string**: a query-string search (e.g. `client.Search.WithQuery("...")`) puts user search terms in `?q=...`, which are recorded on the span regardless of `WithSearchBody`. `WithSearchBody` governs only the request *body* (`db.statement`). Same posture as the SDK's other `url.full`-emitting clients (http/resty); use the body DSL for sensitive search terms. |
 | `server.address` | string | (unchanged) | ES host. |
 | `server.port` | int | (unchanged) | ES port, when present. |
+| `http.response.status_code` | int | (unchanged) | **SDK-owned (facade)** — not emitted by the upstream. Set on every response from the facade's `AfterResponse` wrapper, reflecting the final attempt across retries. |
 
 Span name is emitted by the upstream instrumentation and is **not** under
 facade control (no span-name seam exists on a T2 wiring), so the cross-package
 `{db.system.name}.{operation} {target}` convention (ADR 0023) does **not**
 apply to Elasticsearch in v1 — a recorded, accepted divergence.
 
+**Span status.** Transport errors set status = Error via the upstream (with a
+recorded exception). HTTP error responses (4xx/5xx), which the low-level API
+returns as `(*Response, nil)`, are normalized by the facade: `AfterResponse`
+sets status = Error for status >= 400 and Ok otherwise. Because it runs per HTTP
+attempt, a request retried from a 5xx to a final 200 ends Ok; one that exhausts
+its retries ends Error. `error.type` is not synthesized — classify failures by
+status + `http.response.status_code`.
+
 ### Explicitly NOT Emitted
 
 | Key | Reason |
 |---|---|
-| `error.type` | The pinned upstream `RecordError` sets span **status = Error** and records the exception event only; it sets no `error.type` attribute (ADR 0020 §4 †). |
-| span status on ES HTTP errors (4xx/5xx) | Only **transport** errors set status = Error. An Elasticsearch error *response* (rejected query, 429, 500) returns `(*Response, nil)`; the upstream `AfterResponse` does not inspect the status code, so the span stays **status = UNSET**. The bare upstream also emits **no** `http.response.status_code` attribute, so an application-level ES error is not surfaced on the span at all in v1 — only `url.full` / `db.operation` identify the request. Reflecting ES HTTP-status errors on the span is the deferred SDK-owned normalization seam (ADR 0020 §4 †, §6). |
-| `http.response.status_code` | The pinned `elastic-transport-go/v8 v8.8.0` `AfterRequest`/`AfterResponse` never set it; do not build dashboards on a status-code span attribute for ES (ADR 0020 §4 †). |
+| `error.type` | Neither the upstream nor the facade emits it — the upstream supplies no value and the SDK does not synthesize one. Failures are classified by span **status = Error** plus `http.response.status_code` (ADR 0020 §4 †). |
 | `db.collection.name` | The index is recorded only as the `db.elasticsearch.path_parts.index` path variable; the transport never emits `db.collection.name` (ADR 0020 §4 ‡). |
 | `db.system.name` / `db.operation.name` / `db.query.text` / `db.operation.parameter.*` | The current-semconv spellings are not emitted; the facade inherits the legacy keys above rather than normalizing at the boundary (ADR 0020 §4, option (a)). |
 | Any Elasticsearch metric | Trace-only in v1; operators rely on `elasticsearch_exporter` for ES health and span duration for per-call latency (ADR 0020 §6). |

@@ -136,7 +136,8 @@ stabilization, exactly as `db.cassandra.*` was (ADR 0019):
 | `elasticsearch.node.name` | Recommended | node/instance the request was routed to (Elastic Cloud) — **replaces deprecated `db.elasticsearch.node.name`** (no `db.` prefix) |
 | `url.full` / `server.address` / `server.port` | Recommended | request target |
 | `http.request.method` | Recommended | underlying HTTP method |
-| `error.type` | Conditionally Required | **NOT emitted by upstream** — see † |
+| `http.response.status_code` | Recommended | **NOT emitted by upstream; set by the facade** on every response — see † |
+| `error.type` | Conditionally Required | **NOT emitted** (no upstream value, facade does not synthesize one) — see † |
 
 Span name is emitted by the upstream `elastic-transport-go` instrumentation
 and is **not** under facade control: a T2 facade only wires providers and has
@@ -156,23 +157,36 @@ attribute (no such constant exists in the package).
 Crucially, the generated API only calls `RecordError` on a **transport-level
 error** (connection refused, DNS failure, timeout). An Elasticsearch
 **HTTP error response** (4xx/5xx — a rejected query, a 429 throttle, a 500)
-returns `(*Response, nil)` from the low-level API, and the instrumentation's
+returns `(*Response, nil)` from the low-level API, and the bare upstream
 `AfterResponse` records only Elastic Cloud headers — it does **not** inspect the
-status code. So an ES-rejected request leaves the span **status = UNSET**: it is
-*not* observable via span status. A transport failure is observable via span
-status = Error + the exception; an application-level ES error is **not surfaced
-on the span at all** in v1 — the pinned instrumentation emits no
-`http.response.status_code` attribute either (`AfterRequest` sets only method /
-`url.full` / `server.*`, `AfterResponse` only Elastic Cloud headers), so only
-`url.full` and `db.operation` identify the request.
+status code, and `AfterRequest` emits no `http.response.status_code` either. By
+itself the upstream would therefore leave an ES-rejected request **status =
+UNSET** and invisible to error-rate dashboards.
 
-Per the (a) Mongo-T2 posture the SDK accepts this rather than adding a
-normalization span-processor or a status-setting transport wrapper in v1; the
-compatibility test asserts *transport-error → status-Error-without-`error.type`*,
-and `docs/semconv.md` records the gap. (A backend that needs ES HTTP-status
-errors reflected in span status — for error-rate dashboards/alerts — is the
-trigger to add an SDK-owned normalization seam, the same escalation path as the
-deferred metrics, §6.)
+**Adopted normalization (option (b), scoped to status).** Because that gap
+defeats the primary observability use case, the facade wraps the upstream
+instrumentation and, in `AfterResponse`, records `http.response.status_code` on
+every response and sets the span **status = Error for status >= 400**. This is
+the narrow SDK-owned normalization §6 anticipated, implemented at the
+`Instrumentation` seam (not a span processor). It is deliberately limited:
+
+- `error.type` is still **not** synthesized — the upstream supplies no value and
+  the SDK does not invent one; failures are classified by `http.response.status_code`
+  plus the Error status.
+- `AfterResponse` fires once per HTTP attempt, so retries are handled explicitly:
+  only retryable error statuses (>= 400) are retried, so the only call that sets
+  **Ok** is the terminal successful attempt, which overrides an `Error` left by an
+  earlier retried attempt (the OTel SDK permits `Error -> Ok`, not the reverse).
+  A request that exhausts its retries on errors ends `Error`, and
+  `http.response.status_code` reflects the final attempt.
+
+A transport failure remains observable the upstream way (status = Error + the
+recorded exception, no `error.type`).
+
+Tests pin both behaviors: *transport-error → status-Error-without-`error.type`*,
+*HTTP 4xx/5xx → status-Error + `http.response.status_code`*, and
+*retried 5xx → 200 → status-Ok*. `docs/semconv.md` records the resulting
+attribute/status contract.
 
 **‡ `db.collection.name` is not set by the pinned instrumentation either.** The
 index is recorded **only** through `RecordPathPart` as the dynamic path variable

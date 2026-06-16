@@ -27,7 +27,11 @@ adopters can plan their upgrades.
   off by default. The pinned `elastic-transport-go/v8 v8.8.0` emits legacy
   semconv keys (`db.system`, `db.operation`, `db.statement`,
   `db.elasticsearch.*`), documented in `docs/semconv.md` and pinned by a
-  compatibility test.
+  compatibility test. The facade adds two thin response-side normalizations the
+  bare upstream lacks: it guards search-body capture against a nil body, and it
+  records `http.response.status_code` and sets span status = Error for ES HTTP
+  error responses (4xx/5xx, which the client otherwise returns as a non-error),
+  with retry-aware status handling so a retried 5xx→200 ends Ok.
 - ADR 0024: `obsctx` package (`Detach`, `DetachWithTimeout`, `Go`) for carrying
   observability/trace context into background work that outlives a request,
   without inheriting the request's cancelation or deadline. Prevents the
