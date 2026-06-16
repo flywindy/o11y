@@ -139,13 +139,18 @@ stabilization, exactly as `db.cassandra.*` was (ADR 0019):
 | `http.response.status_code` | Recommended | **NOT emitted by upstream; set by the facade** on every response — see † |
 | `error.type` | Conditionally Required | **NOT emitted** (no upstream value, facade does not synthesize one) — see † |
 
-Span name is emitted by the upstream `elastic-transport-go` instrumentation
-and is **not** under facade control: a T2 facade only wires providers and has
-no span-name seam (unlike `otelmongo`, which exposes `WithSpanNameFormatter`).
-The cross-package convention `{db.system.name}.{operation} {target}` (ADR 0023)
-therefore **does not apply** to Elasticsearch in v1; this is a recorded,
-accepted divergence (the same class as the §4 legacy-attribute drift). Revisit
-if upstream adds a span-name formatter or the facade is promoted to a T3 seam.
+Span name follows the cross-package convention `{db.system.name}.{operation}
+{target}` (ADR 0023): e.g. `elasticsearch.search my-index`. The bare upstream
+names the span with just the endpoint id (`search`), but the `Instrumentation`
+interface exposes `Start(ctx, name)`, which the facade wraps: `Start` prefixes
+the system (`elasticsearch.search`) and `RecordPathPart` appends the index as
+the target once it is known (the index arrives after `Start`, so the name is
+finalized via `span.SetName`). A request with no index path part (e.g. a
+cross-index `_search`, or `cluster.health`) keeps the bare
+`elasticsearch.{operation}` form, with the target omitted — the same rule as
+`mongodb.ping`. This applies to the supported `.Do(ctx)` / low-level paths;
+typed `.Perform(ctx)` is uninstrumented upstream (§ typed-client note) and is
+unaffected.
 
 **† `error.type` is not set, and only *transport* errors set span status.**
 Verified against `elastic-transport-go/v8 v8.8.0`

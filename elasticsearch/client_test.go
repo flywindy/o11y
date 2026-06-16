@@ -91,6 +91,12 @@ func TestSearch_EmitsClientSpan(t *testing.T) {
 		t.Fatalf("span kind = %v, want client", span.SpanKind())
 	}
 
+	// ADR 0023: span name is {db.system.name}.{operation} {target}, rewritten by
+	// the facade from the bare upstream endpoint id ("search").
+	if got := span.Name(); got != "elasticsearch.search my-index" {
+		t.Errorf("span name = %q, want %q", got, "elasticsearch.search my-index")
+	}
+
 	attrs := attrMap(span.Attributes())
 	// ADR 0020 §4: the pinned elastic-transport-go/v8 v8.8.0 emits the legacy
 	// core keys (db.system, not db.system.name; db.operation, not
@@ -377,6 +383,32 @@ func TestHTTPError_RetryThenSuccess(t *testing.T) {
 	}
 	if got := attrMap(span.Attributes())["http.response.status_code"].AsInt64(); got != http.StatusOK {
 		t.Errorf("http.response.status_code = %d, want 200", got)
+	}
+}
+
+// TestSpanName_NoIndex_OmitsTarget asserts a search without an index keeps the
+// bare "elasticsearch.search" name (target omitted), per ADR 0023.
+func TestSpanName_NoIndex_OmitsTarget(t *testing.T) {
+	srv := esStub(t, http.StatusOK)
+	tp, rec := recordingProvider()
+
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	res, err := client.Search(client.Search.WithContext(context.Background()))
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	_ = res.Body.Close()
+
+	spans := rec.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want 1", len(spans))
+	}
+	if got := spans[0].Name(); got != "elasticsearch.search" {
+		t.Errorf("span name = %q, want %q", got, "elasticsearch.search")
 	}
 }
 

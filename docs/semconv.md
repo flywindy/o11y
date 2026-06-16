@@ -361,10 +361,13 @@ the right column.
 | `server.port` | int | (unchanged) | ES port, when present. |
 | `http.response.status_code` | int | (unchanged) | **SDK-owned (facade)** — not emitted by the upstream. Set on every response from the facade's `AfterResponse` wrapper, reflecting the final attempt across retries. |
 
-Span name is emitted by the upstream instrumentation and is **not** under
-facade control (no span-name seam exists on a T2 wiring), so the cross-package
-`{db.system.name}.{operation} {target}` convention (ADR 0023) does **not**
-apply to Elasticsearch in v1 — a recorded, accepted divergence.
+Span name follows the cross-package `{db.system.name}.{operation} {target}`
+convention (ADR 0023): e.g. `elasticsearch.search my-index`. The bare upstream
+names the span with just the endpoint id (`search`); the facade wraps the
+`Instrumentation` `Start` (system prefix) and `RecordPathPart` (appends the
+index target) to conform. A request with no index keeps the bare
+`elasticsearch.{operation}` form. Applies to the supported `.Do(ctx)` /
+low-level paths; typed `.Perform(ctx)` is uninstrumented upstream.
 
 **Span status.** Transport errors and product-check failures set status = Error
 via the upstream `RecordError` (with a recorded exception). HTTP error

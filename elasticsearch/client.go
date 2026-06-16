@@ -135,6 +135,9 @@ func instrument(cfg *elastic.Config, tp trace.TracerProvider, opts ...Option) er
 //     (*Response, nil) for 4xx/5xx and only RecordError-s transport failures, so
 //     without this an ES-rejected request (a bad query, a 429, a 500) would
 //     leave the span status UNSET and carry no status code.
+//   - Start and RecordPathPart rewrite the span name from the bare endpoint id
+//     ("search") to the cross-package {db.system.name}.{operation} {target} form
+//     ("elasticsearch.search my-index"), per ADR 0023.
 type instrumentation struct {
 	elastictransport.Instrumentation
 }
@@ -143,20 +146,49 @@ type instrumentation struct {
 // context from Start to AfterResponse and Close.
 type responseStateKey struct{}
 
-// responseState records the last HTTP status code seen by AfterResponse. The
-// transport calls AfterResponse once per attempt (including retries), so the
-// final value is the outcome the caller observes. The status decision is made
-// in Close (not per attempt) so it sees the terminal attempt and never races a
-// later RecordError — a per-attempt SetStatus(Ok) would be final under the OTel
-// SDK and would mask the transport/product-check error RecordError reports after
-// the response is in hand.
+// esSystem is the db.system.name value for Elasticsearch; it prefixes the span
+// name per the cross-package convention {db.system.name}.{operation} {target}
+// (ADR 0023).
+const esSystem = "elasticsearch"
+
+// responseState carries per-request data between the instrumentation callbacks
+// (all of which receive the request context). operation is the endpoint id from
+// Start, used by RecordPathPart to build the span name. statusCode is the last
+// code seen by AfterResponse (the transport calls it once per attempt, so the
+// final value is what the caller observes); the status decision is made in Close
+// (not per attempt) so it sees the terminal attempt and never races a later
+// RecordError — a per-attempt SetStatus(Ok) would be final under the OTel SDK
+// and would mask the transport/product-check error RecordError reports after the
+// response is in hand.
 type responseState struct {
+	operation  string
 	statusCode int
 }
 
+// Start prefixes the upstream span name (the bare endpoint id, e.g. "search")
+// with the db.system.name so it reads "elasticsearch.search", per ADR 0023. The
+// target (index) is appended later by RecordPathPart, once it is known.
 func (g instrumentation) Start(ctx context.Context, name string) context.Context {
-	ctx = g.Instrumentation.Start(ctx, name)
-	return context.WithValue(ctx, responseStateKey{}, &responseState{})
+	ctx = g.Instrumentation.Start(ctx, esSystem+"."+name)
+	return context.WithValue(ctx, responseStateKey{}, &responseState{operation: name})
+}
+
+// RecordPathPart appends the index to the span name as the {target} component
+// (e.g. "elasticsearch.search my-index"), matching the cross-package convention
+// (ADR 0023). Endpoints without an index path part keep the bare
+// "elasticsearch.{operation}" name (target omitted), like mongodb.ping.
+func (g instrumentation) RecordPathPart(ctx context.Context, pathPart, value string) {
+	g.Instrumentation.RecordPathPart(ctx, pathPart, value)
+	if pathPart != "index" || value == "" {
+		return
+	}
+	st, ok := ctx.Value(responseStateKey{}).(*responseState)
+	if !ok || st.operation == "" {
+		return
+	}
+	if span := trace.SpanFromContext(ctx); span.IsRecording() {
+		span.SetName(esSystem + "." + st.operation + " " + value)
+	}
 }
 
 func (g instrumentation) RecordRequestBody(ctx context.Context, endpoint string, query io.Reader) io.ReadCloser {
