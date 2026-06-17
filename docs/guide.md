@@ -677,6 +677,9 @@ cc, err := cons.Consume(ctx, func(ctx context.Context, msg jetstream.Msg) {
     obs.Logger.InfoContext(ctx, "event", slog.String("subject", msg.Subject()))
     _ = msg.Ack()
 })
+if err != nil {
+    return // cc is nil when Consume returns an error
+}
 defer cc.Stop()
 ```
 
