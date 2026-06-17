@@ -144,6 +144,8 @@ Before introducing any `github.com/<vendor>/otel-<thing>` library, verify:
 | `github.com/gin-gonic/gin` | v1.12.0 | ✅ | Pure HTTP framework; no OpenTelemetry provider globals. | See ADR 0010 |
 | `github.com/go-resty/resty/v2` | v2.17.2 | ✅ | Pure HTTP client; does not import OpenTelemetry or mutate provider globals. The SDK-owned `resty` wrapper wires providers explicitly. | See ADR 0011 |
 | `github.com/minio/minio-go/v7` | v7.2.0 | ✅ | Pure S3 client; does not import OpenTelemetry or mutate provider globals. The SDK-owned `minio` wrapper wires providers explicitly and only uses the public `Options.Transport` seam. | See ADR 0018 |
+| `github.com/elastic/go-elasticsearch/v8` | v8.19.3 | ✅ | First-party OTel instrumentation built into the client. `NewOpenTelemetryInstrumentation(tp, …)` forwards to `elastic-transport-go`'s `NewOtelInstrumentation`, which reads the OTel global only when `tp == nil`; the `elasticsearch` facade always passes the SDK provider, so the fallback never fires and no global is set. Emits legacy semconv keys (`db.system`, `db.operation`, `db.statement`, `db.elasticsearch.*`), documented in `docs/semconv.md`. | See ADR 0020 |
+| `github.com/elastic/elastic-transport-go/v8` | v8.8.0 | ✅ | Shared transport carrying the OTel instrumentation surfaced by `go-elasticsearch/v8`. `elastictransport/instrumentation.go` `NewOtelInstrumentation` falls back to `otel.GetTracerProvider()` only when `provider == nil`; never calls any `otel.SetX`. | See ADR 0020 |
 
 When a new library is added or an existing one bumped, update this table
 in the same PR as the version change.

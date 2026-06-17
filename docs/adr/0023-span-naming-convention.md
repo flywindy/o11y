@@ -104,20 +104,23 @@ never forced onto a caller's override. This matches how every formatter in the
 repo already behaves (the http/gin/resty formatters pass straight through to
 their upstream otel library).
 
-## Elasticsearch exception
+## Elasticsearch
 
 Elasticsearch (ADR 0020) is a **T2 facade** over `elastic-transport-go`'s
-first-party instrumentation, which emits the span name itself and exposes no
-span-name seam (unlike `otelmongo`, whose `WithSpanNameFormatter` is what makes
-mongo conformable). The convention therefore **does not apply** to ES in v1;
-it is a recorded, accepted divergence, to be revisited if upstream adds a
-formatter or the facade is promoted to a T3 seam.
+first-party instrumentation, which names the span with just the endpoint id
+(`search`). It exposes no dedicated span-name formatter (unlike `otelmongo`'s
+`WithSpanNameFormatter`), but the `Instrumentation` interface it does expose has
+`Start(ctx, name)`, which the facade wraps to conform to this convention:
+`Start` prefixes the system (`elasticsearch.search`) and `RecordPathPart`
+appends the index as the target (`elasticsearch.search my-index`) once it is
+known. Endpoints without an index keep the bare `elasticsearch.{operation}`
+form (target omitted), like `mongodb.ping`. See ADR 0020 §4.
 
 ## Consequences
 
-- Span names change for `mongo` and `minio` (and the planned `cassandra`).
-  `redis` is unchanged. Pre-1.0, so no compatibility shim is provided; the
-  change is listed under Breaking Changes in the CHANGELOG.
+- Span names change for `mongo`, `minio`, and `elasticsearch` (and the planned
+  `cassandra`). `redis` is unchanged. Pre-1.0, so no compatibility shim is
+  provided; the change is listed under Breaking Changes in the CHANGELOG.
 - The mongo formatter re-derives the collection from the raw command event,
   mirroring otelmongo's unexported `extractCollection`. This couples the
   package to stable MongoDB wire-format structure; a unit test pins the

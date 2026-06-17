@@ -1,7 +1,7 @@
 # ADR 0020 — Elasticsearch Integration
 
-**Status**: Proposed
-**Date**: 2026-06-04
+**Status**: Accepted
+**Date**: 2026-06-04 (accepted 2026-06-14, on implementation)
 **Relates to**: ADR 0003 (global state policy), ADR 0006 (semconv upgrade
 strategy), ADR 0008 (instrumentation sourcing policy), ADR 0004 (NATS — the
 reference for a trace-only facade with deliberately deferred metrics).
@@ -136,27 +136,82 @@ stabilization, exactly as `db.cassandra.*` was (ADR 0019):
 | `elasticsearch.node.name` | Recommended | node/instance the request was routed to (Elastic Cloud) — **replaces deprecated `db.elasticsearch.node.name`** (no `db.` prefix) |
 | `url.full` / `server.address` / `server.port` | Recommended | request target |
 | `http.request.method` | Recommended | underlying HTTP method |
-| `error.type` | Conditionally Required | **NOT emitted by upstream** — see † |
+| `http.response.status_code` | Recommended | **NOT emitted by upstream; set by the facade** on every response — see † |
+| `error.type` | Conditionally Required | **NOT emitted** (no upstream value, facade does not synthesize one) — see † |
 
-Span name is emitted by the upstream `elastic-transport-go` instrumentation
-and is **not** under facade control: a T2 facade only wires providers and has
-no span-name seam (unlike `otelmongo`, which exposes `WithSpanNameFormatter`).
-The cross-package convention `{db.system.name}.{operation} {target}` (ADR 0023)
-therefore **does not apply** to Elasticsearch in v1; this is a recorded,
-accepted divergence (the same class as the §4 legacy-attribute drift). Revisit
-if upstream adds a span-name formatter or the facade is promoted to a T3 seam.
+Span name follows the cross-package convention `{system.name}.{operation}
+{target}` (ADR 0023): e.g. `elasticsearch.search my-index`. The bare upstream
+names the span with just the endpoint id (`search`), but the `Instrumentation`
+interface exposes `Start(ctx, name)`, which the facade wraps: `Start` prefixes
+the system (`elasticsearch.search`) and `RecordPathPart` appends the index as
+the target once it is known (the index arrives after `Start`, so the name is
+finalized via `span.SetName`). A request with no index path part (e.g. a
+cross-index `_search`, or `cluster.health`) keeps the bare
+`elasticsearch.{operation}` form, with the target omitted — the same rule as
+`mongodb.ping`. This applies to the supported `.Do(ctx)` / low-level paths;
+typed `.Perform(ctx)` is uninstrumented upstream (§ typed-client note) and is
+unaffected.
 
-**† `error.type` is not set by the pinned instrumentation.** Verified against
-`elastic-transport-go/v8 v8.8.0` (`elastictransport/instrumentation.go`):
-`RecordError` does only `span.SetStatus(codes.Error, …)` + `span.RecordError(err)`
-— it records an exception event and sets the span status, but sets **no**
-`error.type` attribute (no such constant exists in the package). A failed request
-is therefore observable via span **status = Error** and the recorded exception,
-not via an `error.type` attribute. Per the (a) Mongo-T2 posture the SDK accepts
-this rather than adding a normalization span-processor in v1; the compatibility
-test asserts *status-Error-without-`error.type`*, and `docs/semconv.md` records
-the gap. (A backend that needs `error.type` for ES is the trigger to add an
-SDK-owned normalization seam — same escalation path as the deferred metrics, §6.)
+**† `error.type` is not set, and only *transport* errors set span status.**
+Verified against `elastic-transport-go/v8 v8.8.0`
+(`elastictransport/instrumentation.go`): `RecordError` does only
+`span.SetStatus(codes.Error, …)` + `span.RecordError(err)` — it records an
+exception event and sets the span status, but sets **no** `error.type`
+attribute (no such constant exists in the package).
+
+Crucially, the generated API only calls `RecordError` on a **transport-level
+error** (connection refused, DNS failure, timeout). An Elasticsearch
+**HTTP error response** (4xx/5xx — a rejected query, a 429 throttle, a 500)
+returns `(*Response, nil)` from the low-level API, and the bare upstream
+`AfterResponse` records only Elastic Cloud headers — it does **not** inspect the
+status code, and `AfterRequest` emits no `http.response.status_code` either. By
+itself the upstream would therefore leave an ES-rejected request **status =
+UNSET** and invisible to error-rate dashboards.
+
+**Adopted normalization (option (b), scoped to status).** Because that gap
+defeats the primary observability use case, the facade wraps the upstream
+instrumentation: `AfterResponse` records `http.response.status_code` on every
+response, and `Close` (the deferred per-request terminator) sets the span
+**status = Error when the final status > 299**. This is the narrow SDK-owned
+normalization §6 anticipated, implemented at the `Instrumentation` seam (not a
+span processor). The design is deliberately constrained by three subtleties of
+the upstream call sequence:
+
+- **Decide at `Close`, not per attempt.** `AfterResponse` fires once per HTTP
+  attempt, so a per-attempt `SetStatus` cannot see the terminal outcome. Worse,
+  the product check runs in `BaseClient.Perform` *after* the transport returns,
+  and the generated `Do` then calls `RecordError`; a per-attempt `SetStatus(Ok)`
+  would be final under the OTel SDK (`Error→Ok` is allowed, `Ok→Error` is not)
+  and would mask that error. So `AfterResponse` only stashes the status code in
+  a per-request context value and `Close` makes the single decision (status +
+  `http.response.status_code` attribute), after any `RecordError`. Success is
+  left **UNSET** (no forced `Ok`).
+- **Defer to `RecordError` on terminal errors.** When `RecordError` fired — a
+  transport failure, a context cancellation, or a product-check failure — it owns
+  the `Error` status, and the stashed status code may be stale (e.g. a 503 from an
+  earlier retried attempt whose retry then failed at the transport level, leaving
+  no response for the terminal attempt). `Close` therefore touches neither the
+  status nor the attribute in that case: it records `http.response.status_code`
+  and sets `Error` for `> 299` **only when the request returned a response**.
+- **Boundary is `> 299`, mirroring `esapi.Response.IsError`.** Redirects/proxy
+  errors (3xx, e.g. a 302 to a login page) are flagged like 4xx/5xx, matching
+  what the client's own error helper reports to callers.
+- **Final response wins.** The recorded code is the response of the caller's
+  terminal outcome, so a request retried from a 5xx to a 2xx stays successful
+  (UNSET) with no Error-clearing gymnastics, and one whose retry ends in a
+  transport error carries no stale code.
+
+`error.type` is still **not** synthesized — the upstream supplies no value and
+the SDK does not invent one; failures are classified by `http.response.status_code`
+plus the Error status. A transport failure remains observable the upstream way
+(status = Error + the recorded exception, no `error.type`).
+
+Tests pin the behaviors: *transport-error → status-Error-without-`error.type`*,
+*HTTP 4xx/5xx and 3xx → status-Error + `http.response.status_code`*,
+*product-check failure on a 200 → stays status-Error*,
+*retried 5xx → 200 → not Error (UNSET)*, and *retried 5xx → transport error →
+Error with no stale status code*. `docs/semconv.md` records the resulting
+attribute/status contract.
 
 **‡ `db.collection.name` is not set by the pinned instrumentation either.** The
 index is recorded **only** through `RecordPathPart` as the dynamic path variable
@@ -241,16 +296,47 @@ from the instrumentation's `BeforeRequest` / `AfterResponse` seam (or a metrics
 
 ### Library surveyed: `github.com/elastic/elastic-transport-go/v8` (OTel instrumentation)
 
-### Version: to pin at implementation time (consumer is on `go-elasticsearch/v8 v8.19.3`)
+### Version: `elastic-transport-go/v8 v8.8.0` (via `go-elasticsearch/v8 v8.19.3`)
 
-### Expected result: SAFE — to confirm by source read
+### Result: SAFE — confirmed by source read
 
-`NewOtelInstrumentation(provider, …)` stores the supplied `TracerProvider` and
-is documented to fall back to the OTel global only when `provider == nil`. The
-facade always passes the SDK provider, so the fallback never fires, and no
-`otel.SetTracerProvider` call is expected on the constructor path. The
-implementing PR must record the exact source-inspection finding (the verification
-command and outcome) before this ADR moves to Accepted, per ADR 0003.
+Source inspected at `elastic-transport-go/v8@v8.8.0`
+`elastictransport/instrumentation.go:87-101`:
+
+```go
+func NewOtelInstrumentation(provider trace.TracerProvider, captureSearchBody bool, version string, options ...trace.TracerOption) *ElasticsearchOpenTelemetry {
+    if provider == nil {
+        provider = otel.GetTracerProvider()
+    }
+    // ...
+    return &ElasticsearchOpenTelemetry{tracer: provider.Tracer(tracerName, options...), recordBody: captureSearchBody}
+}
+```
+
+`provider` is read from `otel.GetTracerProvider()` **only** when it is `nil`;
+otherwise the supplied provider is stored on the tracer and the global is never
+touched. The facade rejects a nil `tp` (`elasticsearch/client.go` `instrument`),
+so the fallback can never fire. A grep of the package for the forbidden setters
+confirms none exist:
+
+```text
+$ grep -rn 'otel\.\(SetTracerProvider\|SetTextMapPropagator\|SetMeterProvider\|SetLoggerProvider\)' \
+    $(go env GOMODCACHE)/github.com/elastic/elastic-transport-go/v8@v8.8.0
+(no matches)
+```
+
+`TestProviderWiring` (`elasticsearch/client_test.go`) backs this at runtime: it
+sets a sentinel global provider, builds the facade client with a *different*
+SDK provider, and asserts every span lands on the supplied provider and the
+global records none. The integration is therefore SAFE under ADR 0003.
+
+The same source read confirms the §4 attribute caveats as fact: `AfterRequest`
+sets `db.system` / `db.operation` (legacy core keys); `RecordRequestBody` sets
+`db.statement`; `RecordPathPart` sets `db.elasticsearch.path_parts.<key>`;
+`AfterResponse` sets `db.elasticsearch.cluster.name` / `.node.name`; and
+`RecordError` sets only span status `codes.Error` + `RecordError(err)` with no
+`error.type`. These are pinned by the compatibility assertions in
+`elasticsearch/client_test.go`.
 
 ---
 
@@ -330,10 +416,16 @@ command and outcome) before this ADR moves to Accepted, per ADR 0003.
 
 ## Open questions
 
-1. `db.statement` handling — confirm option (a) accept-and-document vs (b)
-   boundary-normalize against the pinned `elastic-transport-go` version (§4).
-2. Does `search-sync-worker`'s bulk-indexing path want client-attributed metrics
-   soon enough to fold a justified-T3 metrics layer into v1, or is span duration
-   sufficient until a backend dashboard need appears (§6 revisit trigger)?
-3. Confirm the gate-wiring choice for the `github.com/elastic/...` instrumentation
-   prefix (extend the §7.1 matched set vs rely on the ADR 0003 row).
+_All resolved at implementation (2026-06-14):_
+
+1. `db.statement` handling — **resolved: option (a) accept-and-document.** The
+   facade inherits the legacy upstream keys and pins them with a compatibility
+   test; `docs/semconv.md` records the drift. No boundary normalization in v1.
+2. Client-attributed bulk-indexing metrics — **resolved: deferred (v1
+   trace-only).** Span duration is sufficient for now; `elasticsearch_exporter`
+   covers ES health. A justified-T3 metrics ADR is the path when a concrete
+   per-worker dashboard need appears (§6 revisit triggers).
+3. Gate wiring — **resolved: both.** `scripts/check_integrations.go` matches
+   `github.com/elastic/go-elasticsearch/v8` and
+   `github.com/elastic/elastic-transport-go/v8`, and both have rows in ADR
+   0003's Approved-integrations table.

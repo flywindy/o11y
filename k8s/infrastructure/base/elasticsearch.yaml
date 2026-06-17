@@ -1,0 +1,108 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: elasticsearch-pvc
+  namespace: infra
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: elasticsearch
+  namespace: infra
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: elasticsearch
+  template:
+    metadata:
+      labels:
+        app: elasticsearch
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 0
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: elasticsearch
+        # Matches the go-elasticsearch/v8 v8.19.3 client pinned by ADR 0020.
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.19.3
+        env:
+          # Single-node mode disables the production bootstrap checks, so this
+          # starts on a kind node without tuning vm.max_map_count.
+          - name: discovery.type
+            value: single-node
+          # Dev-only: kind / generic K8s nodes are usually left at the default
+          # low vm.max_map_count. single-node mode skips the *bootstrap check*,
+          # but Lucene still uses mmap for the index store and can become
+          # unstable under a low limit. Switching the store to niofs avoids
+          # needing a privileged sysctl init container on the local stack.
+          # Production should instead raise vm.max_map_count and drop this.
+          - name: node.store.allow_mmap
+            value: "false"
+          # Dev-only: HTTP security (TLS + auth) is disabled so the example
+          # connects over plain http://...:9200 with no credentials. Shared /
+          # production environments MUST enable xpack.security and supply
+          # ELASTICSEARCH_USERNAME / ELASTICSEARCH_PASSWORD via an overlay.
+          - name: xpack.security.enabled
+            value: "false"
+          - name: ES_JAVA_OPTS
+            value: "-Xms512m -Xmx512m"
+        ports:
+          - name: http
+            containerPort: 9200
+        readinessProbe:
+          httpGet:
+            path: /_cluster/health?wait_for_status=yellow&timeout=1s
+            port: http
+          initialDelaySeconds: 15
+          periodSeconds: 5
+          failureThreshold: 6
+        livenessProbe:
+          httpGet:
+            path: /
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "1Gi"
+          limits:
+            cpu: "1"
+            memory: "1536Mi"
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+        volumeMounts:
+          - name: elasticsearch-data
+            mountPath: /usr/share/elasticsearch/data
+      volumes:
+        - name: elasticsearch-data
+          persistentVolumeClaim:
+            claimName: elasticsearch-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch
+  namespace: infra
+spec:
+  selector:
+    app: elasticsearch
+  ports:
+    - name: http
+      port: 9200
+      targetPort: http

@@ -143,6 +143,24 @@ The example emits Redis command spans plus `db.client.operation.duration` and
 connection-pool metrics through OTLP metrics push. It runs `PING`, `SET`,
 `GET`, a cache-miss `GET`, and a pipeline every two seconds.
 
+### Elasticsearch
+
+Port-forward Elasticsearch to `localhost:9200`, then run the example:
+
+```bash
+kubectl port-forward -n infra svc/elasticsearch 9200:9200
+go run examples/elasticsearch/main.go
+```
+
+The example loops every three seconds through `Index` → `Search`, so each
+request appears as a `SpanKindClient` span carrying the upstream's `db.system`
+/ `db.operation` / `db.elasticsearch.path_parts.*` attributes (legacy semconv
+keys, see [`docs/semconv.md`](../docs/semconv.md)). It builds the client with
+`WithSearchBody(true)`, so the search query body is recorded as `db.statement`.
+The integration is trace-only (ADR 0020 §6). Override the endpoint and
+credentials via `ELASTICSEARCH_URL`, `ELASTICSEARCH_USERNAME`, and
+`ELASTICSEARCH_PASSWORD`.
+
 ## Messaging
 
 ### NATS Core (two terminals)
