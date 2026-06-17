@@ -488,3 +488,61 @@ func TestProductCheckFailure_StaysError(t *testing.T) {
 		t.Errorf("status code = %v, want Error (product-check failure must not be reported Ok)", got)
 	}
 }
+
+// TestRetryThenTransportError_NoStaleStatusCode asserts that when a retryable
+// 503 is followed by a terminal transport error, the span is Error (from the
+// upstream RecordError) and does NOT carry the stale 503 status code from the
+// earlier attempt — the status code reflects the caller's terminal outcome, not
+// an intermediate retry. Regression test for PR #57 review.
+func TestRetryThenTransportError_NoStaleStatusCode(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.Header().Set("X-Elastic-Product", "Elasticsearch")
+			w.WriteHeader(http.StatusServiceUnavailable) // 503, retried by default
+			return
+		}
+		// Subsequent attempts: sever the connection to force a transport error.
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Errorf("ResponseWriter is not a Hijacker")
+			return
+		}
+		conn, _, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("Hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	t.Cleanup(srv.Close)
+
+	tp, rec := recordingProvider()
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	_, err = client.Search(
+		client.Search.WithContext(context.Background()),
+		client.Search.WithIndex("my-index"),
+	)
+	if err == nil {
+		t.Fatal("Search: want transport error after retries, got nil")
+	}
+	if got := atomic.LoadInt32(&calls); got < 2 {
+		t.Fatalf("server calls = %d, want >= 2 (a retry after the 503)", got)
+	}
+
+	spans := rec.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want 1", len(spans))
+	}
+	span := spans[0]
+	if span.Status().Code != codes.Error {
+		t.Errorf("status code = %v, want Error", span.Status().Code)
+	}
+	if _, present := attrMap(span.Attributes())["http.response.status_code"]; present {
+		t.Error("http.response.status_code present, want absent (503 was an earlier retried attempt, not the terminal transport error)")
+	}
+}

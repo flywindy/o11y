@@ -32,6 +32,7 @@ For project setup, the `Init` options reference, and feature toggles, see the
   - [Databases](#databases)
     - [MongoDB](#mongodb)
     - [Redis / Valkey](#redis--valkey)
+    - [Elasticsearch](#elasticsearch)
   - [Messaging](#messaging)
     - [NATS](#nats)
   - [Object Storage](#object-storage)
@@ -571,6 +572,70 @@ _, err := o11yredis.Wrap(rdb, obs.TracerProvider(), obs.MeterProvider(),
     o11yredis.WithCommandTextEnabled(true),
 )
 ```
+
+### Elasticsearch
+
+Use the `elasticsearch` sub-package to wire the official
+`github.com/elastic/go-elasticsearch/v8` client's first-party OpenTelemetry
+instrumentation to the SDK-owned `TracerProvider`. `NewClient` returns the
+standard `*elasticsearch.Client`, so the low-level API is unchanged; the
+instrumentation is wired into the transport before the client is built.
+
+```go
+import (
+    o11ies "github.com/flywindy/o11y/elasticsearch"
+    elastic "github.com/elastic/go-elasticsearch/v8"
+)
+
+client, err := o11ies.NewClient(
+    elastic.Config{Addresses: []string{"http://localhost:9200"}},
+    obs.TracerProvider(),
+)
+if err != nil {
+    obs.Logger.ErrorContext(ctx, "Elasticsearch client failed", slog.Any("error", err))
+}
+
+// Pass the request context so the ES span joins the active trace.
+res, err := client.Search(
+    client.Search.WithContext(ctx),
+    client.Search.WithIndex("my-index"),
+)
+if err != nil {
+    obs.Logger.ErrorContext(ctx, "Elasticsearch search failed", slog.Any("error", err))
+}
+defer res.Body.Close()
+```
+
+The integration is **trace-only** (no `MeterProvider` or propagator parameter):
+the upstream instrumentation accepts only a `TracerProvider`, and it does not
+propagate trace context toward Elasticsearch. `tp` is required and rejected when
+nil — the facade never falls back to the global `TracerProvider`. Spans are
+named per the cross-package convention, e.g. `elasticsearch.search my-index`,
+and an ES HTTP error response (4xx/5xx, or a 3xx redirect) is reflected as span
+status Error with `http.response.status_code`.
+
+Search query **bodies** are not captured by default, because they can be large
+and may carry user-supplied terms (PII). Opt in only when that data is safe for
+your trace backend:
+
+```go
+client, err := o11ies.NewClient(cfg, obs.TracerProvider(), o11ies.WithSearchBody(true))
+```
+
+`WithSearchBody` governs only the request *body* (`db.statement`). The span's
+`url.full` is always emitted by the upstream and includes the URL query string,
+so a query-string search (`client.Search.WithQuery("...")`) records its terms
+regardless of this option — use the body DSL for sensitive search terms.
+
+Two upstream caveats to know:
+
+- **Use the client's API methods**, e.g. `client.Search(...)` (and the typed
+  client's `.Do(ctx)`). Constructing a low-level request struct and calling it
+  directly — `esapi.SearchRequest{...}.Do(ctx, client)` — leaves its
+  instrumentation field nil and emits no span.
+- For the **typed client** (`NewTypedClient`), terminate requests with
+  `.Do(ctx)`, not `.Perform(ctx)`: upstream typed `Perform` starts the span on a
+  shadowed context, so path parts, attributes, and error status are not recorded.
 
 ## Messaging
 

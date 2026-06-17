@@ -359,9 +359,9 @@ the right column.
 | `url.full` | string | (unchanged) | Request target URL. **Includes the query string**: a query-string search (e.g. `client.Search.WithQuery("...")`) puts user search terms in `?q=...`, which are recorded on the span regardless of `WithSearchBody`. `WithSearchBody` governs only the request *body* (`db.statement`). Same posture as the SDK's other `url.full`-emitting clients (http/resty); use the body DSL for sensitive search terms. |
 | `server.address` | string | (unchanged) | ES host. |
 | `server.port` | int | (unchanged) | ES port, when present. |
-| `http.response.status_code` | int | (unchanged) | **SDK-owned (facade)** — not emitted by the upstream. Set on every response from the facade's `AfterResponse` wrapper, reflecting the final attempt across retries. |
+| `http.response.status_code` | int | (unchanged) | **SDK-owned (facade)** — not emitted by the upstream. Set by the facade at `Close` when the request returned a response (the terminal attempt's code across retries); omitted when the request ended in a transport error / product-check failure (see Span status). |
 
-Span name follows the cross-package `{db.system.name}.{operation} {target}`
+Span name follows the cross-package `{system.name}.{operation} {target}`
 convention (ADR 0023): e.g. `elasticsearch.search my-index`. The bare upstream
 names the span with just the endpoint id (`search`); the facade wraps the
 `Instrumentation` `Start` (system prefix) and `RecordPathPart` (appends the
@@ -372,13 +372,16 @@ low-level paths; typed `.Perform(ctx)` is uninstrumented upstream.
 **Span status.** Transport errors and product-check failures set status = Error
 via the upstream `RecordError` (with a recorded exception). HTTP error
 *responses*, which the low-level API returns as `(*Response, nil)`, are
-normalized by the facade: it records the status code per attempt and, at `Close`
-(after any `RecordError`), sets status = Error when the final status is `> 299`
-— the same boundary as the client's own `esapi.Response.IsError`, so 3xx
-redirect/proxy errors are flagged alongside 4xx/5xx. Successful calls are left
-**UNSET** (no forced `Ok`), and because the decision reflects the final attempt,
-a request retried from a 5xx to a 2xx is not marked Error. `error.type` is not
-synthesized — classify failures by status + `http.response.status_code`.
+normalized by the facade at `Close` (after any `RecordError`): when the request
+returned a response it records `http.response.status_code` and sets status =
+Error for status `> 299` — the same boundary as the client's own
+`esapi.Response.IsError`, so 3xx redirect/proxy errors are flagged alongside
+4xx/5xx. Successful calls are left **UNSET** (no forced `Ok`); a request retried
+from a 5xx to a 2xx is not marked Error. When `RecordError` already fired (a
+terminal transport error, cancellation, or product-check failure) the facade
+defers to it and emits no status code, so a stale code from an earlier retried
+attempt is never reported. `error.type` is not synthesized — classify failures
+by status + `http.response.status_code`.
 
 ### Explicitly NOT Emitted
 

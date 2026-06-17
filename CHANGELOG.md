@@ -34,7 +34,7 @@ adopters can plan their upgrades.
   otherwise returns as a non-error). The status is decided at `Close` from the
   final attempt, so a retried 5xx→2xx stays successful and a product-check
   failure on a 200 stays Error. Span names follow the cross-package
-  `{db.system.name}.{operation} {target}` convention (ADR 0023), e.g.
+  `{system.name}.{operation} {target}` convention (ADR 0023), e.g.
   `elasticsearch.search my-index`, rewritten from the upstream's bare endpoint id.
 - ADR 0024: `obsctx` package (`Detach`, `DetachWithTimeout`, `Go`) for carrying
   observability/trace context into background work that outlives a request,

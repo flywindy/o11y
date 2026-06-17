@@ -139,7 +139,7 @@ stabilization, exactly as `db.cassandra.*` was (ADR 0019):
 | `http.response.status_code` | Recommended | **NOT emitted by upstream; set by the facade** on every response — see † |
 | `error.type` | Conditionally Required | **NOT emitted** (no upstream value, facade does not synthesize one) — see † |
 
-Span name follows the cross-package convention `{db.system.name}.{operation}
+Span name follows the cross-package convention `{system.name}.{operation}
 {target}` (ADR 0023): e.g. `elasticsearch.search my-index`. The bare upstream
 names the span with just the endpoint id (`search`), but the `Instrumentation`
 interface exposes `Start(ctx, name)`, which the facade wraps: `Start` prefixes
@@ -183,15 +183,23 @@ the upstream call sequence:
   and the generated `Do` then calls `RecordError`; a per-attempt `SetStatus(Ok)`
   would be final under the OTel SDK (`Error→Ok` is allowed, `Ok→Error` is not)
   and would mask that error. So `AfterResponse` only stashes the status code in
-  a per-request context value and `Close` makes the single status decision,
-  after any `RecordError`. A transport failure or product-check error therefore
-  stays `Error`, and success is left **UNSET** (no forced `Ok`).
+  a per-request context value and `Close` makes the single decision (status +
+  `http.response.status_code` attribute), after any `RecordError`. Success is
+  left **UNSET** (no forced `Ok`).
+- **Defer to `RecordError` on terminal errors.** When `RecordError` fired — a
+  transport failure, a context cancellation, or a product-check failure — it owns
+  the `Error` status, and the stashed status code may be stale (e.g. a 503 from an
+  earlier retried attempt whose retry then failed at the transport level, leaving
+  no response for the terminal attempt). `Close` therefore touches neither the
+  status nor the attribute in that case: it records `http.response.status_code`
+  and sets `Error` for `> 299` **only when the request returned a response**.
 - **Boundary is `> 299`, mirroring `esapi.Response.IsError`.** Redirects/proxy
   errors (3xx, e.g. a 302 to a login page) are flagged like 4xx/5xx, matching
   what the client's own error helper reports to callers.
-- **Final attempt wins.** Because the decision reflects the last status code
-  seen, a request retried from a 5xx to a 2xx stays successful (UNSET) with no
-  Error-clearing gymnastics.
+- **Final response wins.** The recorded code is the response of the caller's
+  terminal outcome, so a request retried from a 5xx to a 2xx stays successful
+  (UNSET) with no Error-clearing gymnastics, and one whose retry ends in a
+  transport error carries no stale code.
 
 `error.type` is still **not** synthesized — the upstream supplies no value and
 the SDK does not invent one; failures are classified by `http.response.status_code`
@@ -200,8 +208,9 @@ plus the Error status. A transport failure remains observable the upstream way
 
 Tests pin the behaviors: *transport-error → status-Error-without-`error.type`*,
 *HTTP 4xx/5xx and 3xx → status-Error + `http.response.status_code`*,
-*product-check failure on a 200 → stays status-Error*, and
-*retried 5xx → 200 → not Error (UNSET)*. `docs/semconv.md` records the resulting
+*product-check failure on a 200 → stays status-Error*,
+*retried 5xx → 200 → not Error (UNSET)*, and *retried 5xx → transport error →
+Error with no stale status code*. `docs/semconv.md` records the resulting
 attribute/status contract.
 
 **‡ `db.collection.name` is not set by the pinned instrumentation either.** The
