@@ -16,6 +16,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 // esStub returns an httptest server that answers like Elasticsearch: it sets
@@ -344,7 +345,7 @@ func TestProviderWiring(t *testing.T) {
 // Start, the no-op tracer path panics when it calls ContextWithSpan(nil, ...).
 func TestSearch_NoContextNoopProviderNoPanic(t *testing.T) {
 	srv := esStub(t, http.StatusOK)
-	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, trace.NewNoopTracerProvider())
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, noop.NewTracerProvider())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
