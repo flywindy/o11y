@@ -150,6 +150,27 @@ kubectl port-forward -n infra svc/prometheus 9090:9090
 
 When modifying files under `k8s/infrastructure/**`, use the repo-local `verify-kubernetes-manifests` skill at `.agents/skills/verify-kubernetes-manifests`.
 
+### kustomization overlay image sync
+
+Whenever a new `image:` is added to any file under `k8s/infrastructure/base/`, also add the corresponding entry to `k8s/infrastructure/overlays/private-registry/kustomization.yaml`.
+
+Verify coverage by comparing:
+```bash
+grep -h "image:" k8s/infrastructure/base/*.yaml | sort -u
+```
+against the `images:` block in the overlay — every image must have a matching `newName` entry.
+
+### kind-config.yaml port mappings
+
+Whenever a new `NodePort` Service is added to `k8s/infrastructure/base/`, add a corresponding `extraPortMappings` entry in `kind-config.yaml` so the port is reachable from the host.
+
+Current NodePort → hostPort mappings:
+| NodePort | hostPort | Service |
+|---|---|---|
+| 30000 | 4318 | otel-collector (OTLP HTTP) |
+| 30001 | 4223 | NATS |
+| 30002 | 4040 | Pyroscope |
+
 For changes that affect live infrastructure behavior, verify against the kind cluster with `kubectl` when access is available:
 
 - Inspect the live resource before or after the change with `kubectl get ... -o yaml`
