@@ -9,6 +9,7 @@ import (
 
 	"github.com/elastic/elastic-transport-go/v8/elastictransport"
 	elastic "github.com/elastic/go-elasticsearch/v8"
+	estypes "github.com/elastic/go-elasticsearch/v8/typedapi/types"
 	"go.opentelemetry.io/otel/codes"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
@@ -162,17 +163,20 @@ const esSystem = "elasticsearch"
 // responseState carries per-request data between the instrumentation callbacks
 // (all of which receive the request context). operation is the endpoint id from
 // Start, used by RecordPathPart to build the span name. statusCode is the last
-// code seen by AfterResponse, and errored records whether RecordError fired.
+// code seen by AfterResponse, and errored records whether RecordError fired for
+// a terminal failure that did not return a usable ES response.
 //
 // The HTTP status (attribute + Error decision) is settled in Close, not per
 // attempt: AfterResponse runs once per attempt and cannot see the terminal
 // outcome, and a per-attempt SetStatus would be final under the OTel SDK and
 // could mask a transport/product-check error that RecordError reports only after
-// the response is in hand. When RecordError fired, the request ended on an error
-// (a transport failure, a context cancellation, or a product-check failure), so
+// the response is in hand. When RecordError fired for a terminal failure (a
+// transport failure, a context cancellation, or a product-check failure),
 // statusCode may be a stale code from an earlier retried attempt rather than the
 // caller's outcome; Close then defers entirely to RecordError's Error status and
-// emits no (possibly stale) status code.
+// emits no (possibly stale) status code. Typed API response errors are different:
+// they run RecordError after decoding the ES error body, but still have a final
+// HTTP response, so Close keeps the status-code attribute for dashboards.
 type responseState struct {
 	operation  string
 	statusCode int
@@ -183,6 +187,9 @@ type responseState struct {
 // with the system name so it reads "elasticsearch.search", per ADR 0023. The
 // target (index) is appended later by RecordPathPart, once it is known.
 func (g instrumentation) Start(ctx context.Context, name string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	ctx = g.Instrumentation.Start(ctx, esSystem+"."+name)
 	return context.WithValue(ctx, responseStateKey{}, &responseState{operation: name})
 }
@@ -231,9 +238,17 @@ func (g instrumentation) AfterResponse(ctx context.Context, res *http.Response) 
 // status code from an earlier retried attempt.
 func (g instrumentation) RecordError(ctx context.Context, err error) {
 	g.Instrumentation.RecordError(ctx, err)
+	if isTypedResponseError(err) {
+		return
+	}
 	if st, ok := ctx.Value(responseStateKey{}).(*responseState); ok {
 		st.errored = true
 	}
+}
+
+func isTypedResponseError(err error) bool {
+	var esErr *estypes.ElasticsearchError
+	return errors.As(err, &esErr)
 }
 
 // Close runs once per request (deferred by the generated API, after any

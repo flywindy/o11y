@@ -2,6 +2,7 @@ package elasticsearch
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -229,6 +230,44 @@ func TestTypedClient_Do_EmitsSpan(t *testing.T) {
 	}
 }
 
+// TestTypedClient_Do_HTTPErrorKeepsStatusCode asserts that typed API response
+// errors keep the final http.response.status_code attribute. The typed Do path
+// calls RecordError after decoding the ES error response body; the facade must
+// not treat that as a terminal transport/product-check error that suppresses the
+// status code.
+func TestTypedClient_Do_HTTPErrorKeepsStatusCode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"type":"illegal_argument_exception","reason":"bad request"},"status":400}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	tp, rec := recordingProvider()
+	client, err := NewTypedClient(elastic.Config{Addresses: []string{srv.URL}}, tp)
+	if err != nil {
+		t.Fatalf("NewTypedClient: %v", err)
+	}
+
+	_, err = client.Search().Index("my-index").Do(context.Background())
+	if err == nil {
+		t.Fatal("typed Search.Do: want ES response error, got nil")
+	}
+
+	spans := rec.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want 1", len(spans))
+	}
+	span := spans[0]
+	if span.Status().Code != codes.Error {
+		t.Errorf("status code = %v, want Error", span.Status().Code)
+	}
+	if got := attrMap(span.Attributes())["http.response.status_code"].AsInt64(); got != http.StatusBadRequest {
+		t.Errorf("http.response.status_code = %d, want 400", got)
+	}
+}
+
 // TestFailedRequest_StatusErrorNoErrorType asserts a failed request sets span
 // status = Error and records the exception, with no error.type attribute,
 // matching elastic-transport-go/v8 v8.8.0's RecordError (ADR 0020 §4 †).
@@ -298,6 +337,23 @@ func TestProviderWiring(t *testing.T) {
 	if got := len(globalRec.Ended()); got != 0 {
 		t.Errorf("global provider recorded %d spans, want 0 (no global fallback)", got)
 	}
+}
+
+// TestSearch_NoContextNoopProviderNoPanic asserts the facade tolerates the
+// generated low-level helper's default nil context. Without normalization in
+// Start, the no-op tracer path panics when it calls ContextWithSpan(nil, ...).
+func TestSearch_NoContextNoopProviderNoPanic(t *testing.T) {
+	srv := esStub(t, http.StatusOK)
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, trace.NewNoopTracerProvider())
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	res, err := client.Search(client.Search.WithIndex("my-index"))
+	if err != nil {
+		t.Fatalf("Search without WithContext: %v", err)
+	}
+	_ = res.Body.Close()
 }
 
 // TestHTTPError_SetsErrorStatus asserts the facade reflects an ES HTTP error
@@ -496,6 +552,13 @@ func TestProductCheckFailure_StaysError(t *testing.T) {
 // an intermediate retry. Regression test for PR #57 review.
 func TestRetryThenTransportError_NoStaleStatusCode(t *testing.T) {
 	var calls int32
+	handlerErr := make(chan error, 1)
+	recordHandlerErr := func(err error) {
+		select {
+		case handlerErr <- err:
+		default:
+		}
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		if atomic.AddInt32(&calls, 1) == 1 {
 			w.Header().Set("X-Elastic-Product", "Elasticsearch")
@@ -505,12 +568,12 @@ func TestRetryThenTransportError_NoStaleStatusCode(t *testing.T) {
 		// Subsequent attempts: sever the connection to force a transport error.
 		hj, ok := w.(http.Hijacker)
 		if !ok {
-			t.Errorf("ResponseWriter is not a Hijacker")
+			recordHandlerErr(errors.New("ResponseWriter is not a Hijacker"))
 			return
 		}
 		conn, _, err := hj.Hijack()
 		if err != nil {
-			t.Errorf("Hijack: %v", err)
+			recordHandlerErr(err)
 			return
 		}
 		_ = conn.Close()
@@ -532,6 +595,11 @@ func TestRetryThenTransportError_NoStaleStatusCode(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&calls); got < 2 {
 		t.Fatalf("server calls = %d, want >= 2 (a retry after the 503)", got)
+	}
+	select {
+	case err := <-handlerErr:
+		t.Fatalf("server handler: %v", err)
+	default:
 	}
 
 	spans := rec.Ended()
