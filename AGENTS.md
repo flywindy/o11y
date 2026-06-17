@@ -155,9 +155,13 @@ When modifying files under `k8s/infrastructure/**`, use the repo-local `verify-k
 Whenever a new `image:` is added to any file under `k8s/infrastructure/base/`, also add the corresponding entry to `k8s/infrastructure/overlays/private-registry/kustomization.yaml`.
 
 Verify coverage by comparing:
+
 ```bash
-grep -h "image:" k8s/infrastructure/base/*.yaml | awk '{print $2}' | sed 's/:[^/]*$//' | sort -u
+find k8s/infrastructure/base -name "*.yaml" -type f -print0 \
+  | xargs -0 grep -h "image:" \
+  | awk '{print $2}' | sed 's/:[^/]*$//' | sort -u
 ```
+
 against the `images:` block in the overlay — every image must have a matching `newName` entry.
 
 ### kind-config.yaml port mappings
@@ -165,6 +169,7 @@ against the `images:` block in the overlay — every image must have a matching 
 Whenever a new `NodePort` Service is added to `k8s/infrastructure/base/`, add a corresponding `extraPortMappings` entry in `kind-config.yaml` so the port is reachable from the host.
 
 Current NodePort → hostPort mappings:
+
 | NodePort | hostPort | Service |
 |---|---|---|
 | 30000 | 4318 | otel-collector (OTLP HTTP) |
