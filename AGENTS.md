@@ -156,7 +156,7 @@ Whenever a new `image:` is added to any file under `k8s/infrastructure/base/`, a
 
 Verify coverage by comparing:
 ```bash
-grep -h "image:" k8s/infrastructure/base/*.yaml | sort -u
+grep -h "image:" k8s/infrastructure/base/*.yaml | awk '{print $2}' | sed 's/:[^/]*$//' | sort -u
 ```
 against the `images:` block in the overlay — every image must have a matching `newName` entry.
 
