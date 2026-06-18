@@ -226,9 +226,12 @@ requester-side reply linkage is tracked as an ADR 0022 follow-up.
 
 Requires NATS — apply and port-forward it as shown in the NATS Core section above if not already running.
 
+<<<<<<< HEAD
 As with the core examples, export both tracing gates in each terminal or no
 `traceparent` is injected:
 
+=======
+>>>>>>> 8723288 (docs(examples): add kubectl apply -k component steps before port-forwards)
 ```bash
 export OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true
 export OTEL_NATS_TRACING_ENABLED=true
