@@ -98,6 +98,24 @@ func TestNewSessionRejectsNilArgs(t *testing.T) {
 	assert.Contains(t, err.Error(), "meter provider must not be nil")
 }
 
+func TestNewSessionRestoresObserversOnConfig(t *testing.T) {
+	tp := sdktrace.NewTracerProvider()
+	mp := sdkmetric.NewMeterProvider()
+	// Unroutable TEST-NET-1 host (RFC 5737) with a short dial timeout so
+	// CreateSession fails fast without a live cluster.
+	cluster := gocql.NewCluster("192.0.2.1")
+	cluster.ConnectTimeout = 100 * time.Millisecond
+	cluster.Timeout = 100 * time.Millisecond
+
+	_, err := NewSession(cluster, tp, mp)
+	require.Error(t, err)
+	// The observers must be restored to the caller's originals (nil here) so a
+	// retried NewSession on the same *ClusterConfig does not stack another SDK
+	// observer layer and emit duplicate spans/metrics.
+	assert.Nil(t, cluster.QueryObserver, "QueryObserver must be restored after CreateSession")
+	assert.Nil(t, cluster.ConnectObserver, "ConnectObserver must be restored after CreateSession")
+}
+
 func TestExecuteBatchNilGuards(t *testing.T) {
 	err := ExecuteBatch(context.Background(), nil, gocql.NewBatch(gocql.LoggedBatch)) //nolint:staticcheck // need a *Batch without a live session
 	require.Error(t, err)
@@ -200,7 +218,9 @@ func TestObserveQueryRecordsError(t *testing.T) {
 		Host:      testHost(t),
 	})
 
-	span := sr.Ended()[0]
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	span := spans[0]
 	assert.Equal(t, codes.Error, span.Status().Code)
 	assert.Contains(t, span.Attributes(), semconv.ErrorTypeKey.String("context.DeadlineExceeded"))
 	require.NotEmpty(t, span.Events())
@@ -220,7 +240,9 @@ func TestObserveQueryQueryTextOptIn(t *testing.T) {
 		Start:     time.Now(),
 		End:       time.Now(),
 	})
-	span := sr.Ended()[0]
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	span := spans[0]
 	assert.Contains(t, span.Attributes(), semconv.DBQueryText(stmt))
 }
 
@@ -272,7 +294,9 @@ func TestBatchAttrsMirrorQueryPath(t *testing.T) {
 	start := time.Now()
 	obs.record(context.Background(), spanName("BATCH", ""), "BATCH", "chat", start, start.Add(time.Millisecond), nil, attrs)
 
-	span := sr.Ended()[0]
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	span := spans[0]
 	assert.Equal(t, "cassandra.BATCH", span.Name())
 	assert.Contains(t, span.Attributes(), semconv.DBSystemNameCassandra)
 	assert.Contains(t, span.Attributes(), semconv.DBOperationName("BATCH"))

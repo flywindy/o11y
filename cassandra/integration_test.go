@@ -70,10 +70,14 @@ func TestIntegrationHealthyPath(t *testing.T) {
 	batch := session.NewBatch(gocql.LoggedBatch)
 	batch.Query(`INSERT INTO `+ks+`.rooms (id, name) VALUES (?, ?)`, "r2", "random")
 	batch.Query(`INSERT INTO `+ks+`.rooms (id, name) VALUES (?, ?)`, "r3", "ops")
-	require.NoError(t, ExecuteBatch(context.Background(), session, batch))
+	batchCtx, cancelBatch := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelBatch()
+	require.NoError(t, ExecuteBatch(batchCtx, session, batch))
 
 	// Force span export.
-	require.NoError(t, tp.ForceFlush(context.Background()))
+	flushCtx, cancelFlush := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelFlush()
+	require.NoError(t, tp.ForceFlush(flushCtx))
 	spans := sr.Ended()
 	require.NotEmpty(t, spans)
 

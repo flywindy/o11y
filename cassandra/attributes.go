@@ -43,7 +43,7 @@ func contactPoint(hosts []string, defaultPort int) serverAddr {
 // and per page, so sharing the strings.Fields split here avoids tokenizing the
 // statement twice on every callback.
 func parseStatement(statement string) (operation, table string) {
-	fields := strings.Fields(statement)
+	fields := strings.Fields(trimLeadingComments(statement))
 	if len(fields) == 0 {
 		return "", ""
 	}
@@ -54,11 +54,37 @@ func parseStatement(statement string) (operation, table string) {
 // from a statement. It returns the uppercased leading keyword, or "" when the
 // statement is empty or unparseable.
 func parseOperation(statement string) string {
-	fields := strings.Fields(statement)
+	fields := strings.Fields(trimLeadingComments(statement))
 	if len(fields) == 0 {
 		return ""
 	}
 	return strings.ToUpper(fields[0])
+}
+
+// trimLeadingComments strips leading whitespace and CQL comments so the
+// operation verb and table parse correctly when a statement is prefixed with a
+// query name, routing tag, or ORM annotation. CQL supports line comments (--)
+// and block comments (/* */); the C-style // is not CQL and is left untouched.
+func trimLeadingComments(stmt string) string {
+	for {
+		stmt = strings.TrimSpace(stmt)
+		switch {
+		case strings.HasPrefix(stmt, "--"):
+			nl := strings.IndexByte(stmt, '\n')
+			if nl < 0 {
+				return ""
+			}
+			stmt = stmt[nl+1:]
+		case strings.HasPrefix(stmt, "/*"):
+			end := strings.Index(stmt, "*/")
+			if end < 0 {
+				return ""
+			}
+			stmt = stmt[end+2:]
+		default:
+			return stmt
+		}
+	}
 }
 
 // parseTable returns the single table a statement addresses, or "" when no
@@ -67,7 +93,7 @@ func parseOperation(statement string) string {
 // falls back to "" so the span name degrades to cassandra.{operation} rather
 // than guessing.
 func parseTable(statement string) string {
-	return parseTableFields(strings.Fields(statement))
+	return parseTableFields(strings.Fields(trimLeadingComments(statement)))
 }
 
 // parseTableFields is the shared table-parsing core operating on a pre-split

@@ -54,11 +54,19 @@ func NewSession(
 	}
 
 	// Compose with any observers the caller already configured so adopting this
-	// package does not silently drop their logging/metrics.
-	cluster.QueryObserver = chainQueryObserver(cluster.QueryObserver, obs)
-	cluster.ConnectObserver = chainConnectObserver(cluster.ConnectObserver, obs)
+	// package does not silently drop their logging/metrics. CreateSession copies
+	// the ClusterConfig by value, so the session keeps these composed observers;
+	// we restore the caller's originals on the config afterward (on both paths)
+	// so a retried or repeated NewSession on the same *ClusterConfig does not
+	// stack another SDK observer layer and emit duplicate spans/metrics.
+	origQuery := cluster.QueryObserver
+	origConnect := cluster.ConnectObserver
+	cluster.QueryObserver = chainQueryObserver(origQuery, obs)
+	cluster.ConnectObserver = chainConnectObserver(origConnect, obs)
 
 	session, err := cluster.CreateSession()
+	cluster.QueryObserver = origQuery
+	cluster.ConnectObserver = origConnect
 	if err != nil {
 		return nil, err
 	}

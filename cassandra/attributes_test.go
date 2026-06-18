@@ -20,6 +20,8 @@ func TestParseOperationAndTable(t *testing.T) {
 		{"select count(*) from messages", "SELECT", "messages", "cassandra.SELECT messages"},
 		{"INSERT INTO rooms(id,name) VALUES (?,?)", "INSERT", "rooms", "cassandra.INSERT rooms"},
 		{"TRUNCATE rooms", "TRUNCATE", "", "cassandra.TRUNCATE"},
+		{"-- routing: room-read\nSELECT id FROM messages_by_room WHERE room_id = ?", "SELECT", "messages_by_room", "cassandra.SELECT messages_by_room"},
+		{"/* app=chat */ INSERT INTO chat.rooms (id) VALUES (?)", "INSERT", "rooms", "cassandra.INSERT rooms"},
 		{"", "", "", "cassandra"},
 	}
 	for _, c := range cases {
