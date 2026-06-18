@@ -101,9 +101,20 @@ go test -race ./...          # Always run with race detector
 # Start local kind cluster
 kind create cluster --config kind-config.yaml
 
-# Deploy observability stack via Kustomize (handles ordering and dependencies)
-kubectl apply -k k8s/infrastructure/base
-# OR: private registry deployment (update internal-registry.example.com first)
+# Deploy monitor stack only (Tempo, Loki, Pyroscope, Alloy, OTel Collector, Prometheus, Grafana)
+kubectl apply -k k8s/infrastructure/base/monitor
+
+# Deploy monitor stack + a specific datastore component (repeat for each needed)
+kubectl apply -k k8s/infrastructure/base/monitor
+kubectl apply -k k8s/infrastructure/base/components/nats          # examples: nats-core, jetstream, nats-ws-browser
+kubectl apply -k k8s/infrastructure/base/components/mongodb       # examples: mongodb
+kubectl apply -k k8s/infrastructure/base/components/redis         # examples: redis
+kubectl apply -k k8s/infrastructure/base/components/minio         # examples: minio
+kubectl apply -k k8s/infrastructure/base/components/elasticsearch # examples: elasticsearch
+kubectl apply -k k8s/infrastructure/base/components/cassandra     # examples: cassandra
+
+# Private registry deployment: edit overlays/private-registry/kustomization.yaml
+# to uncomment the resources you need, then:
 kubectl apply -k k8s/infrastructure/overlays/private-registry
 
 # Verify all pods are Running
@@ -157,7 +168,8 @@ Whenever a new `image:` is added to any file under `k8s/infrastructure/base/`, a
 Verify coverage by comparing:
 
 ```bash
-find k8s/infrastructure/base -name "*.yaml" -type f -print0 \
+find k8s/infrastructure/base/monitor k8s/infrastructure/base/components \
+  -name "*.yaml" -type f -print0 \
   | xargs -0 grep -h "image:" \
   | awk '{print $2}' | sed 's/:[^/]*$//' | sort -u
 ```

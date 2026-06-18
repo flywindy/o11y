@@ -24,7 +24,8 @@ Both services export spans to the same OTel Collector and Tempo. In Grafana Temp
 ```sh
 # From the repo root
 kind create cluster --config kind-config.yaml
-kubectl apply -k k8s/infrastructure/base/
+kubectl apply -k k8s/infrastructure/base/monitor
+kubectl apply -k k8s/infrastructure/base/components/nats
 ```
 
 The kind cluster maps:
@@ -34,7 +35,7 @@ The kind cluster maps:
 
 The browser connects directly to `ws://localhost:4223`. That host port is exposed by three pieces working together:
 
-1. `k8s/infrastructure/base/nats.yaml` enables NATS WebSocket on container port `4223`.
+1. `k8s/infrastructure/base/components/nats/nats.yaml` enables NATS WebSocket on container port `4223`.
 2. The `nats-websocket` Kubernetes `NodePort` service exposes that port as node port `30001`.
 3. `kind-config.yaml` maps host port `4223` to kind node port `30001`.
 
@@ -43,7 +44,8 @@ If you created the kind cluster before this mapping existed, recreate it so kind
 ```sh
 kind delete cluster
 kind create cluster --config kind-config.yaml
-kubectl apply -k k8s/infrastructure/base/
+kubectl apply -k k8s/infrastructure/base/monitor
+kubectl apply -k k8s/infrastructure/base/components/nats
 ```
 
 Wait for pods to be ready:

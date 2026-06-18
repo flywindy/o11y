@@ -77,8 +77,10 @@ This configures a control-plane node with an extra port mapping for the OTel Col
 Apply the infrastructure components using Kustomize:
 
 ```bash
-# Standard deployment (public images)
-kubectl apply -k k8s/infrastructure/base
+# Standard deployment (public images) — monitor stack only
+kubectl apply -k k8s/infrastructure/base/monitor
+# Add datastores as needed for the examples you want to run, e.g.:
+# kubectl apply -k k8s/infrastructure/base/components/nats
 
 # OR: Private registry deployment (replace with your registry host)
 # Note: Update internal-registry.example.com in the overlay's kustomization.yaml to your host

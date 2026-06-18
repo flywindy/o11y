@@ -2,7 +2,23 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - ../../base
+  - ../../base/monitor
+
+# Uncomment the resources you need for the examples you want to run:
+#
+#   nats          → examples/nats-core, examples/jetstream, examples/nats-ws-browser
+#   mongodb       → examples/mongodb
+#   redis         → examples/redis
+#   minio         → examples/minio
+#   elasticsearch → examples/elasticsearch
+#   cassandra     → examples/cassandra
+#
+#   - ../../base/components/nats
+#   - ../../base/components/mongodb
+#   - ../../base/components/redis
+#   - ../../base/components/minio
+#   - ../../base/components/elasticsearch
+#   - ../../base/components/cassandra
 
 images:
   - name: grafana/tempo
