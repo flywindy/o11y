@@ -9,7 +9,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/Marz32onE/instrumentation-go/otel-nats/oteljetstream"
 	"github.com/Marz32onE/instrumentation-go/otel-nats/otelnats"
 	natsgo "github.com/nats-io/nats.go"
 	"go.opentelemetry.io/otel/propagation"
@@ -149,14 +148,4 @@ func (c *Conn) Respond(ctx context.Context, msg *natsgo.Msg, data []byte) error 
 		return fmt.Errorf("nats respond to %q: %w", msg.Reply, err)
 	}
 	return nil
-}
-
-// JetStream returns a tracing-aware JetStream interface backed by this connection.
-// The returned JetStream inherits the TracerProvider and Propagator from this Conn
-// via otelnats.Conn.TraceContext — no additional configuration is required.
-//
-// Use the returned interface to create streams, consumers, and publish with
-// full OTel trace propagation across JetStream publish and consume operations.
-func (c *Conn) JetStream() (oteljetstream.JetStream, error) {
-	return oteljetstream.New(c.Conn)
 }

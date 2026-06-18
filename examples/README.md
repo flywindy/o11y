@@ -204,13 +204,24 @@ requester-side reply linkage is tracked as an ADR 0022 follow-up.
 
 ### JetStream (two terminals; requires JetStream-enabled NATS server)
 
+As with the core examples, export both tracing gates in each terminal or no
+`traceparent` is injected:
+
 ```bash
+export OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true
+export OTEL_NATS_TRACING_ENABLED=true
+
 # Terminal 1 — publisher creates the stream and publishes
 go run examples/jetstream/publisher/main.go
 
 # Terminal 2 — subscriber attaches a durable consumer and processes messages
 go run examples/jetstream/subscriber/main.go
 ```
+
+The subscriber's `Consume` handler receives the native `jetstream.Msg` plus a
+`ctx` carrying the consumer span (linked to the publisher's trace), and config
+types come from `github.com/nats-io/nats.go/jetstream` — no upstream
+instrumentation import.
 
 ### NATS over WebSocket (browser)
 
