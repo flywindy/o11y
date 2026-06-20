@@ -33,6 +33,7 @@ For project setup, the `Init` options reference, and feature toggles, see the
     - [MongoDB](#mongodb)
     - [Redis / Valkey](#redis--valkey)
     - [Elasticsearch](#elasticsearch)
+    - [Cassandra](#cassandra)
   - [Messaging](#messaging)
     - [NATS](#nats)
   - [Object Storage](#object-storage)
@@ -636,6 +637,70 @@ Two upstream caveats to know:
 - For the **typed client** (`NewTypedClient`), terminate requests with
   `.Do(ctx)`, not `.Perform(ctx)`: upstream typed `Perform` starts the span on a
   shadowed context, so path parts, attributes, and error status are not recorded.
+
+### Cassandra
+
+Use the `cassandra` sub-package to instrument `github.com/gocql/gocql`. Spans
+and metrics are emitted directly by SDK-owned observers (the `otelgocql`
+contrib package was removed upstream); no OTel globals are touched.
+
+Because gocql attaches observers through the `*gocql.ClusterConfig` and cannot
+attach them to a live session, the SDK builds the session: pass your fully
+configured cluster (contact points, consistency, auth, timeouts) to
+`NewSession`, which wires the observers and returns a normal `*gocql.Session`.
+`tp` and `mp` are required and rejected when nil.
+
+```go
+import (
+    o11ycassandra "github.com/flywindy/o11y/cassandra"
+    "github.com/gocql/gocql"
+)
+
+cluster := gocql.NewCluster("localhost:9042")
+cluster.Consistency = gocql.LocalQuorum
+
+session, err := o11ycassandra.NewSession(
+    cluster,
+    obs.TracerProvider(),
+    obs.MeterProvider(),
+    o11ycassandra.WithPoolName("chat-cluster"),
+)
+if err != nil {
+    obs.Logger.ErrorContext(ctx, "Cassandra session failed", slog.Any("error", err))
+}
+defer session.Close()
+
+// Pass the request context so the query span joins the active trace.
+var name string
+if err := session.Query(`SELECT name FROM rooms WHERE id = ?`, id).
+    WithContext(ctx).Scan(&name); err != nil {
+    obs.Logger.ErrorContext(ctx, "Cassandra query failed", slog.Any("error", err))
+}
+```
+
+Each query observation produces one CLIENT span — gocql fires the observer once
+per attempt and per page, so retries and paged reads appear as sibling spans
+carrying their attempt index and coordinator host. Span names follow the
+cross-package convention, e.g. `cassandra.SELECT rooms`.
+
+**Batches must go through `cassandra.ExecuteBatch`** to be traced. The gocql
+v1.7.0 batch-observer payload cannot identify a logical batch, so the SDK owns a
+batch seam instead; calling `session.ExecuteBatch(batch)` directly emits no
+batch span. `ExecuteBatch` also binds the context onto the batch, so the context
+governs the driver call, not just telemetry:
+
+```go
+batch := session.NewBatch(gocql.LoggedBatch)
+batch.Query(`INSERT INTO rooms (id, name) VALUES (?, ?)`, id, name)
+if err := o11ycassandra.ExecuteBatch(ctx, session, batch); err != nil {
+    obs.Logger.ErrorContext(ctx, "Cassandra batch failed", slog.Any("error", err))
+}
+```
+
+`db.query.text` (the CQL statement) is off by default because statements can be
+high-cardinality and reveal schema topology; bound values are never captured.
+Enable it with `o11ycassandra.WithQueryText(true)` when that is safe for your
+trace backend.
 
 ## Messaging
 
