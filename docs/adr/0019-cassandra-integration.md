@@ -126,6 +126,8 @@ func NewSession(
 type Option func(*config)
 
 func WithQueryText(enabled bool) Option        // default: false (see §6)
+func WithHostAttributes(enabled bool) Option   // default: false (see §5) — gates network.peer.* / cassandra.coordinator.*
+func WithPoolName(name string) Option          // connection-metric pool label; synthesized from the contact point when unset
 func WithAttributes(attrs ...attribute.KeyValue) Option
 ```
 
@@ -219,19 +221,21 @@ Sourced from `ObservedQuery` / `ObservedBatch` / `HostInfo` / `hostMetrics`.
 | `db.collection.name` | Recommended | parsed table when a single table is addressed |
 | `db.query.text` | Opt-In | `ObservedQuery.Statement`, **only when `WithQueryText(true)`** (§6) |
 | `db.response.returned_rows` | Recommended | `ObservedQuery.Rows` |
-| `cassandra.coordinator.id` | Opt-In | `ObservedQuery.Host` (coordinating node id) |
-| `cassandra.coordinator.dc` | Opt-In | `ObservedQuery.Host.DataCenter()` |
+| `cassandra.coordinator.id` | Opt-In | `ObservedQuery.Host` (coordinating node id), **only when `WithHostAttributes(true)`** |
+| `cassandra.coordinator.dc` | Opt-In | `ObservedQuery.Host.DataCenter()`, **only when `WithHostAttributes(true)`** |
 | `server.address` / `server.port` | Recommended | the configured contact point / logical server [1] |
-| `network.peer.address` / `network.peer.port` | Opt-In | the actual contacted coordinator from `HostInfo` [1] |
+| `network.peer.address` / `network.peer.port` | Opt-In | the actual contacted coordinator from `HostInfo`, **only when `WithHostAttributes(true)`** [1] |
 | `error.type` | Conditionally Required | set on `ObservedQuery.Err != nil` |
 
 **[1] `server.*` vs `network.peer.*`.** `server.address`/`server.port` are the
 primary peer keys, consistent with the Redis (ADR 0013) and Elasticsearch
 (ADR 0020) integrations and the `db.client.operation.duration` metric labels
 (§7). `network.peer.*` captures the *actual* contacted coordinator (useful
-under token-aware routing) but is kept Opt-In so the SDK-owned package leads
-with the repo's conformant `server.*` convention — the inverse of the Mongo T2
-case, where the upstream contrib library forces `network.peer.*`.
+under token-aware routing) but is kept Opt-In — gated behind
+`WithHostAttributes(true)` and off by default — so the SDK-owned package leads
+with the repo's conformant `server.*` convention and does not expose per-node
+addresses/UUIDs unless asked. This is the inverse of the Mongo T2 case, where
+the upstream contrib library forces `network.peer.*`.
 
 **Cassandra-specific key namespace.** In the pinned
 `go.opentelemetry.io/otel/semconv/v1.39.0` Go package these keys live in the
@@ -391,12 +395,14 @@ without a live cluster by constructing synthetic `ObservedQuery` /
 - `NewSession` rejects nil `tp` / nil `mp`.
 - A successful `ObservedQuery` yields one span with `db.system.name=cassandra`,
   `db.namespace`, `db.operation.name`, `db.response.returned_rows`, and
-  `network.peer.*`; no `error.type`.
+  `server.*`; no `error.type`. `network.peer.*` / `cassandra.coordinator.*` are
+  absent by default and present only under `WithHostAttributes(true)`.
 - A failed `ObservedQuery` sets `error.type` and records the span error.
 - `db.query.text` is absent by default and present (statement only, no bound
   values) under `WithQueryText(true)`.
 - A multi-attempt `ObservedQuery` sequence produces **one span per attempt**
-  (sibling attempt spans, each with its `Attempt` index and coordinator host),
+  (sibling attempt spans, each with its `Attempt` index, plus the coordinator
+  host when `WithHostAttributes(true)`),
   matching the gocql per-attempt callback semantics — not one collapsed span and
   not a fabricated single logical span (§4 option (a)).
 - `db.client.operation.duration` is recorded with the documented labels and the

@@ -185,8 +185,9 @@ func TestObserveQueryEmitsSemconvSpanAndDuration(t *testing.T) {
 	assert.Contains(t, span.Attributes(), semconv.DBResponseReturnedRows(7))
 	assert.Contains(t, span.Attributes(), semconv.ServerAddress("127.0.0.1"))
 	assert.Contains(t, span.Attributes(), semconv.ServerPort(9042))
-	assert.Contains(t, span.Attributes(), semconv.NetworkPeerAddress("10.0.0.5"))
-	assert.Contains(t, span.Attributes(), semconv.CassandraCoordinatorID("coordinator-1"))
+	// Host-topology attributes are Opt-In (WithHostAttributes); absent by default.
+	assert.False(t, spanHasKey(span, semconv.NetworkPeerAddressKey))
+	assert.False(t, spanHasKey(span, semconv.CassandraCoordinatorIDKey))
 	assert.False(t, spanHasKey(span, semconv.ErrorTypeKey))
 	assert.False(t, spanHasKey(span, semconv.DBQueryTextKey), "query text off by default")
 
@@ -204,6 +205,32 @@ func TestObserveQueryEmitsSemconvSpanAndDuration(t *testing.T) {
 	assertHasAttr(t, dp.Attributes, semconv.DBOperationName("SELECT"))
 	assertHasAttr(t, dp.Attributes, semconv.DBNamespace("chat"))
 	assertHasAttr(t, dp.Attributes, semconv.ServerAddress("127.0.0.1"))
+	assertMissingKey(t, dp.Attributes, semconv.NetworkPeerAddressKey)
+	assertMissingKey(t, dp.Attributes, semconv.CassandraCoordinatorIDKey)
+}
+
+func TestObserveQueryHostAttributesOptIn(t *testing.T) {
+	obs, sr, reader := newTestObserver(t, config{hostAttributesEnabled: true})
+
+	start := time.Now()
+	obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+		Keyspace:  "chat",
+		Statement: "SELECT id FROM messages_by_room WHERE room_id = ?",
+		Start:     start,
+		End:       start.Add(time.Millisecond),
+		Host:      testHost(t),
+	})
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	span := spans[0]
+	// Enabled: the coordinator host topology now appears on the span.
+	assert.Contains(t, span.Attributes(), semconv.NetworkPeerAddress("10.0.0.5"))
+	assert.Contains(t, span.Attributes(), semconv.CassandraCoordinatorID("coordinator-1"))
+
+	// ...but it is still filtered out of the operation-duration metric labels.
+	rm := collectMetrics(t, reader)
+	dp := metricByName(rm, "db.client.operation.duration").Data.(metricdata.Histogram[float64]).DataPoints[0]
 	assertMissingKey(t, dp.Attributes, semconv.NetworkPeerAddressKey)
 	assertMissingKey(t, dp.Attributes, semconv.CassandraCoordinatorIDKey)
 }
@@ -249,7 +276,8 @@ func TestObserveQueryQueryTextOptIn(t *testing.T) {
 }
 
 func TestObserveQueryPerAttemptSpans(t *testing.T) {
-	obs, sr, reader := newTestObserver(t, config{})
+	// Enable host attributes so each sibling span carries its coordinator host.
+	obs, sr, reader := newTestObserver(t, config{hostAttributesEnabled: true})
 
 	start := time.Now()
 	for attempt := 0; attempt < 3; attempt++ {

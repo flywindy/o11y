@@ -6,9 +6,10 @@ import "go.opentelemetry.io/otel/attribute"
 type Option func(*config)
 
 type config struct {
-	queryTextEnabled bool
-	attrs            []attribute.KeyValue
-	poolName         string
+	queryTextEnabled      bool
+	hostAttributesEnabled bool
+	attrs                 []attribute.KeyValue
+	poolName              string
 }
 
 // WithQueryText controls whether the CQL statement text is recorded as
@@ -36,6 +37,21 @@ func WithQueryText(enabled bool) Option {
 func WithAttributes(attrs ...attribute.KeyValue) Option {
 	return func(cfg *config) {
 		cfg.attrs = append(cfg.attrs, attrs...)
+	}
+}
+
+// WithHostAttributes controls whether the contacted-coordinator host topology
+// is recorded on query spans: network.peer.address / network.peer.port and
+// cassandra.coordinator.id / cassandra.coordinator.dc.
+//
+// The default is false. These attributes are Opt-In (ADR 0019 §5): the package
+// leads with the conformant server.* contact-point keys, and the per-node
+// address/UUID are kept off by default since some deployments treat internal
+// host topology as sensitive. Enable this to make token-aware routing and the
+// coordinating node visible per span. They are never emitted as metric labels.
+func WithHostAttributes(enabled bool) Option {
+	return func(cfg *config) {
+		cfg.hostAttributesEnabled = enabled
 	}
 }
 

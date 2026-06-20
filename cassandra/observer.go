@@ -154,8 +154,9 @@ func (o *observer) baseAttrs(operation, keyspace, table string, host *gocql.Host
 	}
 	attrs = o.appendServerAttrs(attrs)
 	// network.peer.* and cassandra.coordinator.* describe the actual contacted
-	// coordinator; kept Opt-In so the package leads with server.* (ADR 0019 §5).
-	if host != nil {
+	// coordinator; Opt-In via WithHostAttributes so the package leads with
+	// server.* and does not expose per-node addresses by default (ADR 0019 §5).
+	if host != nil && o.cfg.hostAttributesEnabled {
 		if ip := host.ConnectAddress(); len(ip) > 0 {
 			attrs = append(attrs, semconv.NetworkPeerAddress(ip.String()))
 			if port := host.Port(); port > 0 {

@@ -32,10 +32,14 @@ adopters can plan their upgrades.
   (no OpenTelemetry globals). Emits CLIENT spans (one per attempt and per page,
   semconv v1.39.0 attributes), the `db.client.operation.duration` histogram, a
   Cassandra-unique `cassandra.query.attempts` retry/speculative counter, and
-  optional connect metrics. CQL statement text is opt-in via
-  `cassandra.WithQueryText(true)`. `cassandra.ExecuteBatch` is the SDK-owned
-  batch seam (one span per logical batch with `db.operation.batch.size`).
-  `cassandra.MetricViews` is composed into `o11y.Init`.
+  optional connect metrics (labeled with `db.client.connection.pool.name`,
+  synthesized from the contact point or set via `cassandra.WithPoolName`). CQL
+  statement text is opt-in via `cassandra.WithQueryText(true)`; the
+  contacted-coordinator host topology (`network.peer.*` /
+  `cassandra.coordinator.*`) is opt-in via `cassandra.WithHostAttributes(true)`.
+  `cassandra.ExecuteBatch` is the SDK-owned batch seam (one span per logical
+  batch with `db.operation.batch.size`). `cassandra.MetricViews` is composed
+  into `o11y.Init`.
 
 ### Changed
 

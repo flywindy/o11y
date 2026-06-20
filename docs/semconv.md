@@ -287,11 +287,11 @@ driver attempt and per page (ADR 0019 §4).
 | `db.operation.batch.size` | int | Statement count, on `ExecuteBatch` spans only. |
 | `db.query.text` | string | Only when `cassandra.WithQueryText(true)` is used; bound values are never captured. |
 | `db.response.returned_rows` | int | Rows in the current page, from `ObservedQuery.Rows`. |
-| `cassandra.coordinator.id` | string | Opt-In. Coordinating node id from `ObservedQuery.Host`. |
-| `cassandra.coordinator.dc` | string | Opt-In. Coordinating node datacenter from `ObservedQuery.Host.DataCenter()`. |
+| `cassandra.coordinator.id` | string | Opt-In, only when `cassandra.WithHostAttributes(true)`. Coordinating node id from `ObservedQuery.Host`. |
+| `cassandra.coordinator.dc` | string | Opt-In, only when `cassandra.WithHostAttributes(true)`. Coordinating node datacenter from `ObservedQuery.Host.DataCenter()`. |
 | `cassandra.query.attempt` | int | SDK-owned. Driver-side attempt index (`ObservedQuery.Attempt`); span-only, never a metric label. |
-| `network.peer.address` | string | Opt-In. Actual contacted coordinator from `HostInfo` (useful under token-aware routing). |
-| `network.peer.port` | int | Opt-In. Actual contacted coordinator port. |
+| `network.peer.address` | string | Opt-In, only when `cassandra.WithHostAttributes(true)`. Actual contacted coordinator from `HostInfo` (useful under token-aware routing). |
+| `network.peer.port` | int | Opt-In, only when `cassandra.WithHostAttributes(true)`. Actual contacted coordinator port. |
 | `server.address` | string | Configured contact point host / logical server. |
 | `server.port` | int | Configured contact point port (defaulted from `ClusterConfig.Port`). |
 | `error.type` | string | Set on `ObservedQuery.Err` / batch error; Go type name or context sentinel. |
