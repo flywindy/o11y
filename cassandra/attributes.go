@@ -38,16 +38,20 @@ func contactPoint(hosts []string, defaultPort int) serverAddr {
 	return serverAddr{host: first, port: defaultPort}
 }
 
-// parseStatement extracts both the CQL operation verb and the single addressed
+// parseStatement extracts the CQL operation verb, the keyspace qualifier (when
+// the addressed table is written as keyspace.table), and the single addressed
 // table from a statement in one tokenization pass. ObserveQuery runs per attempt
 // and per page, so sharing the strings.Fields split here avoids tokenizing the
-// statement twice on every callback.
-func parseStatement(statement string) (operation, table string) {
+// statement twice on every callback. The keyspace is "" unless the statement
+// explicitly qualifies the table; callers use it only as a fallback for
+// db.namespace when the driver reports no session keyspace.
+func parseStatement(statement string) (operation, keyspace, table string) {
 	fields := strings.Fields(trimLeadingComments(statement))
 	if len(fields) == 0 {
-		return "", ""
+		return "", "", ""
 	}
-	return strings.ToUpper(fields[0]), parseTableFields(fields)
+	keyspace, table = parseTableFields(fields)
+	return strings.ToUpper(fields[0]), keyspace, table
 }
 
 // parseOperation extracts the CQL operation verb (SELECT, INSERT, UPDATE, …)
@@ -93,14 +97,17 @@ func trimLeadingComments(stmt string) string {
 // falls back to "" so the span name degrades to cassandra.{operation} rather
 // than guessing.
 func parseTable(statement string) string {
-	return parseTableFields(strings.Fields(trimLeadingComments(statement)))
+	_, table := parseTableFields(strings.Fields(trimLeadingComments(statement)))
+	return table
 }
 
 // parseTableFields is the shared table-parsing core operating on a pre-split
-// statement, so callers that already tokenized do not split again.
-func parseTableFields(fields []string) string {
+// statement, so callers that already tokenized do not split again. It returns
+// the keyspace qualifier (when the table is written keyspace.table) and the
+// bare table name.
+func parseTableFields(fields []string) (keyspace, table string) {
 	if len(fields) < 2 {
-		return ""
+		return "", ""
 	}
 	verb := strings.ToUpper(fields[0])
 	switch verb {
@@ -112,29 +119,31 @@ func parseTableFields(fields []string) string {
 				return normalizeTable(fields[i+1])
 			}
 		}
-		return ""
+		return "", ""
 	case "UPDATE":
 		// UPDATE <table> SET ...
 		return normalizeTable(fields[1])
 	default:
-		return ""
+		return "", ""
 	}
 }
 
-// normalizeTable strips a keyspace qualifier and trailing punctuation/clauses
-// from a parsed table token, leaving the bare table name.
-func normalizeTable(token string) string {
+// normalizeTable strips trailing punctuation/clauses from a parsed table token
+// and splits an explicit keyspace qualifier, returning the keyspace (or "" when
+// unqualified) and the bare table name.
+func normalizeTable(token string) (keyspace, table string) {
 	// Cut at the first character that cannot be part of an identifier so a
 	// "table(col,...)" or "table;" token reduces to the table name.
 	if idx := strings.IndexAny(token, "(;,"); idx >= 0 {
 		token = token[:idx]
 	}
 	token = strings.Trim(token, "\"`")
-	// Drop a keyspace qualifier: keyspace.table -> table.
+	// Split a keyspace qualifier: keyspace.table -> keyspace, table.
 	if idx := strings.LastIndex(token, "."); idx >= 0 {
+		keyspace = strings.Trim(token[:idx], "\"`")
 		token = token[idx+1:]
 	}
-	return strings.Trim(token, "\"`")
+	return keyspace, strings.Trim(token, "\"`")
 }
 
 // spanName builds the cross-package span name (ADR 0023):

@@ -105,7 +105,9 @@ func newObserver(
 
 // poolName resolves the connection-pool name label: the caller-supplied name
 // when set, otherwise a stable value synthesized from the configured contact
-// point (semconv requires a pool name on connection metrics; gocql exposes none).
+// point (semconv recommends a pool name on connection metrics and asks
+// instrumentation to synthesize a unique one when, as with gocql, the driver
+// exposes none).
 func poolName(configured string, server serverAddr) string {
 	if configured != "" {
 		return configured

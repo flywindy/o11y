@@ -281,7 +281,7 @@ driver attempt and per page (ADR 0019 §4).
 | Key | Type | Notes |
 |---|---|---|
 | `db.system.name` | string | Constant `"cassandra"`. |
-| `db.namespace` | string | Keyspace, from `ObservedQuery.Keyspace` / `Batch.Keyspace()`, when known. |
+| `db.namespace` | string | Keyspace, from `ObservedQuery.Keyspace` / `Batch.Keyspace()`, falling back to a `keyspace.table` qualifier parsed from the statement when the session has no keyspace set. |
 | `db.operation.name` | string | Parsed statement verb (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, …) or `BATCH`. |
 | `db.collection.name` | string | Parsed table when a single table is addressed. |
 | `db.operation.batch.size` | int | Statement count, on `ExecuteBatch` spans only. |
@@ -305,10 +305,12 @@ driver attempt and per page (ADR 0019 §4).
 | `db.client.connection.create_time` | Float64Histogram | `s` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port`. `server.*` is the node actually dialed (`ObservedConnect.Host`), not the contact point. |
 | `cassandra.connection.attempts` | Int64Counter | `{attempt}` | SDK-owned name. `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port`, `error.type`. |
 
-`db.client.connection.pool.name` is the application pool label semconv requires
-on connection metrics. gocql exposes no pool identifier, so it defaults to a
-stable value synthesized from the contact point (e.g. `cassandra/10.0.0.1:9042`)
-and is overridable via `cassandra.WithPoolName`.
+`db.client.connection.pool.name` is the application pool label semconv
+recommends on connection metrics (Recommended in v1.39.0, which asks
+instrumentation lacking a pool name to synthesize a unique one). gocql exposes no
+pool identifier, so it defaults to a stable value synthesized from the contact
+point (e.g. `cassandra/10.0.0.1:9042`) and is overridable via
+`cassandra.WithPoolName`.
 
 Cardinality is bounded by the `MetricViews()` allowlist installed via
 `o11y.Init`'s `ExtraViews` (mirrors the redis/mongo pattern). Services that

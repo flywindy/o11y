@@ -324,7 +324,7 @@ func TestBatchAttrsMirrorQueryPath(t *testing.T) {
 	batch.Query("INSERT INTO messages_by_room (room_id, id) VALUES (?, ?)", "r1", "m1")
 	batch.Query("INSERT INTO messages_by_room (room_id, id) VALUES (?, ?)", "r1", "m2")
 
-	attrs := obs.batchAttrs(batch)
+	attrs := obs.batchAttrs(batch, "chat")
 	start := time.Now()
 	obs.record(context.Background(), spanName("BATCH", ""), "BATCH", "chat", start, start.Add(time.Millisecond), nil, attrs)
 
@@ -338,6 +338,50 @@ func TestBatchAttrsMirrorQueryPath(t *testing.T) {
 
 	rm := collectMetrics(t, reader)
 	require.NotNil(t, metricByName(rm, "db.client.operation.duration"))
+}
+
+// TestObserveQueryNamespaceFromQualifiedCQL covers the fallback for sessions
+// with no keyspace set: a qualified keyspace.table in the CQL must still yield
+// db.namespace on both the span and the operation-duration metric.
+func TestObserveQueryNamespaceFromQualifiedCQL(t *testing.T) {
+	obs, sr, reader := newTestObserver(t, config{})
+
+	start := time.Now()
+	obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+		Keyspace:  "", // session has no keyspace; namespace must come from the CQL
+		Statement: "SELECT body FROM o11y_examples.events WHERE id = ?",
+		Start:     start,
+		End:       start.Add(time.Millisecond),
+	})
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	assert.Contains(t, spans[0].Attributes(), semconv.DBNamespace("o11y_examples"))
+	// Span name still uses the bare table, unchanged by the keyspace fallback.
+	assert.Equal(t, "cassandra.SELECT events", spans[0].Name())
+
+	rm := collectMetrics(t, reader)
+	dp := metricByName(rm, "db.client.operation.duration").Data.(metricdata.Histogram[float64]).DataPoints[0]
+	assertHasAttr(t, dp.Attributes, semconv.DBNamespace("o11y_examples"))
+}
+
+// TestBatchNamespaceFromQualifiedCQL covers the same fallback on the batch seam:
+// when the driver reports no batch keyspace, the qualifier is parsed from the
+// batch's statements.
+func TestBatchNamespaceFromQualifiedCQL(t *testing.T) {
+	batch := gocql.NewBatch(gocql.LoggedBatch) //nolint:staticcheck // see TestBatchAttrsMirrorQueryPath
+	batch.Query("INSERT INTO o11y_examples.events (id, body) VALUES (?, ?)", "a", "x")
+	batch.Query("INSERT INTO o11y_examples.events (id, body) VALUES (?, ?)", "b", "y")
+
+	assert.Equal(t, "o11y_examples", batchNamespace(batch))
+
+	obs, sr, _ := newTestObserver(t, config{})
+	ns := batchNamespace(batch)
+	obs.record(context.Background(), spanName("BATCH", ""), "BATCH", ns, time.Now(), time.Now(), nil, obs.batchAttrs(batch, ns))
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	assert.Contains(t, spans[0].Attributes(), semconv.DBNamespace("o11y_examples"))
 }
 
 func TestObserveConnectMetrics(t *testing.T) {

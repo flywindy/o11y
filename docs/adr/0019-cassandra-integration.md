@@ -216,7 +216,7 @@ Sourced from `ObservedQuery` / `ObservedBatch` / `HostInfo` / `hostMetrics`.
 | Attribute | Level | Source |
 |---|---|---|
 | `db.system.name` = `cassandra` | Required | constant |
-| `db.namespace` | Conditionally Required | `ObservedQuery.Keyspace` |
+| `db.namespace` | Conditionally Required | `ObservedQuery.Keyspace`, falling back to a `keyspace.table` qualifier parsed from the statement when the session has no keyspace set |
 | `db.operation.name` | Recommended | parsed from statement verb (SELECT/INSERT/…) / "BATCH" |
 | `db.collection.name` | Recommended | parsed table when a single table is addressed |
 | `db.query.text` | Opt-In | `ObservedQuery.Statement`, **only when `WithQueryText(true)`** (§6) |

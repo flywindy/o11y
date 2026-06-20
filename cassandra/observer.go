@@ -40,21 +40,29 @@ type observer struct {
 // the host actually contacted. The span uses the observation's own timestamps
 // and is parented to the caller's context.
 func (o *observer) ObserveQuery(ctx context.Context, q gocql.ObservedQuery) {
-	operation, table := parseStatement(q.Statement)
+	operation, parsedKeyspace, table := parseStatement(q.Statement)
 
-	attrs := o.baseAttrs(operation, q.Keyspace, table, q.Host)
+	// db.namespace prefers the driver-reported session keyspace; when the
+	// session has none set, fall back to a keyspace.table qualifier parsed from
+	// the statement so qualified CQL still attributes a namespace (ADR 0019 §5).
+	namespace := q.Keyspace
+	if namespace == "" {
+		namespace = parsedKeyspace
+	}
+
+	attrs := o.baseAttrs(operation, namespace, table, q.Host)
 	attrs = append(attrs, semconv.DBResponseReturnedRows(q.Rows))
 	attrs = append(attrs, attemptKey.Int(q.Attempt))
 	if o.cfg.queryTextEnabled && q.Statement != "" {
 		attrs = append(attrs, semconv.DBQueryText(q.Statement))
 	}
 
-	o.record(ctx, spanName(operation, table), operation, q.Keyspace, q.Start, q.End, q.Err, attrs)
+	o.record(ctx, spanName(operation, table), operation, namespace, q.Start, q.End, q.Err, attrs)
 
 	// Increment by a fixed 1 per callback: each callback is exactly one attempt
 	// (ADR 0019 §7.B). Never add q.Metrics.Attempts — it is a cumulative
 	// per-host snapshot and would over-count retried/paged queries.
-	o.inst.attempts.Add(ctx, 1, metric.WithAttributes(o.metricAttrs(operation, q.Keyspace, q.Err)...))
+	o.inst.attempts.Add(ctx, 1, metric.WithAttributes(o.metricAttrs(operation, namespace, q.Err)...))
 }
 
 // ObserveConnect records connect-observer signals (ADR 0019 §7.C): a connection
@@ -66,7 +74,7 @@ func (o *observer) ObserveQuery(ctx context.Context, q gocql.ObservedQuery) {
 // rather than the configured contact point, so per-node connect failures and
 // latencies are attributed to the right host; node count is bounded, so this
 // stays cardinality-safe. db.client.connection.pool.name carries the pool label
-// semconv requires on connection metrics.
+// semconv recommends on connection metrics.
 func (o *observer) ObserveConnect(c gocql.ObservedConnect) {
 	ctx := context.Background()
 	attrs := []attribute.KeyValue{

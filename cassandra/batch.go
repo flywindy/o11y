@@ -81,14 +81,31 @@ func ExecuteBatch(ctx context.Context, session *gocql.Session, batch *gocql.Batc
 	err := session.ExecuteBatch(batch)
 	end := time.Now()
 
-	obs.record(ctx, spanName("BATCH", ""), "BATCH", batch.Keyspace(), start, end, err, obs.batchAttrs(batch))
+	namespace := batchNamespace(batch)
+	obs.record(ctx, spanName("BATCH", ""), "BATCH", namespace, start, end, err, obs.batchAttrs(batch, namespace))
 	return err
+}
+
+// batchNamespace resolves db.namespace for a batch: the driver-reported batch
+// keyspace, falling back to a keyspace.table qualifier parsed from the batch's
+// first statement when the session has no keyspace set (mirrors ObserveQuery so
+// qualified CQL still attributes a namespace, ADR 0019 §5).
+func batchNamespace(batch *gocql.Batch) string {
+	if ks := batch.Keyspace(); ks != "" {
+		return ks
+	}
+	for _, entry := range batch.Entries {
+		if _, ks, _ := parseStatement(entry.Stmt); ks != "" {
+			return ks
+		}
+	}
+	return ""
 }
 
 // batchAttrs builds the span attributes for one logical batch, feeding
 // db.operation.batch.size from the statement count (ADR 0019 §4).
-func (o *observer) batchAttrs(batch *gocql.Batch) []attribute.KeyValue {
-	attrs := o.baseAttrs("BATCH", batch.Keyspace(), "", nil)
+func (o *observer) batchAttrs(batch *gocql.Batch, namespace string) []attribute.KeyValue {
+	attrs := o.baseAttrs("BATCH", namespace, "", nil)
 	if size := batch.Size(); size > 0 {
 		attrs = append(attrs, semconv.DBOperationBatchSize(size))
 	}
