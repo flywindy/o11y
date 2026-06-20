@@ -255,7 +255,11 @@ func TestObserveQueryRecordsError(t *testing.T) {
 	require.NotEmpty(t, span.Events())
 
 	rm := collectMetrics(t, reader)
-	hist := metricByName(rm, "db.client.operation.duration").Data.(metricdata.Histogram[float64])
+	dur := metricByName(rm, "db.client.operation.duration")
+	require.NotNil(t, dur)
+	hist, ok := dur.Data.(metricdata.Histogram[float64])
+	require.True(t, ok)
+	require.Len(t, hist.DataPoints, 1)
 	assertHasAttr(t, hist.DataPoints[0].Attributes, semconv.ErrorTypeKey.String("context.DeadlineExceeded"))
 	assert.Equal(t, "cassandra.INSERT messages_by_room", span.Name())
 }

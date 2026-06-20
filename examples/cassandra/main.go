@@ -25,16 +25,16 @@ const (
 )
 
 func main() {
-	if err := run(); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := run(ctx); err != nil {
 		slog.ErrorContext(context.Background(), "Cassandra example failed", slog.Any("error", err))
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
+func run(ctx context.Context) error {
 	obs, err := o11y.Init(ctx,
 		o11y.WithServiceName("cassandra-example"),
 		o11y.WithServiceVersion("0.1.0"),
