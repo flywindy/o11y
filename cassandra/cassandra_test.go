@@ -37,11 +37,13 @@ func newTestObserver(t *testing.T, cfg config) (*observer, *tracetest.SpanRecord
 	meter := mp.Meter(instrumentationName, metric.WithSchemaURL(semconv.SchemaURL))
 	inst, err := newInstruments(meter)
 	require.NoError(t, err)
+	server := serverAddr{host: "127.0.0.1", port: 9042}
 	obs := &observer{
-		tracer: tp.Tracer(instrumentationName, oteltrace.WithSchemaURL(semconv.SchemaURL)),
-		inst:   inst,
-		cfg:    cfg,
-		server: serverAddr{host: "127.0.0.1", port: 9042},
+		tracer:   tp.Tracer(instrumentationName, oteltrace.WithSchemaURL(semconv.SchemaURL)),
+		inst:     inst,
+		cfg:      cfg,
+		server:   server,
+		poolName: poolName(cfg.poolName, server),
 	}
 	return obs, sr, reader
 }
@@ -310,7 +312,9 @@ func TestObserveConnectMetrics(t *testing.T) {
 	obs, _, reader := newTestObserver(t, config{})
 
 	now := time.Now()
-	obs.ObserveConnect(gocql.ObservedConnect{Start: now, End: now.Add(2 * time.Millisecond)})
+	// Successful connect to a discovered node: server.* must reflect that node
+	// (10.0.0.5), not the configured contact point (127.0.0.1).
+	obs.ObserveConnect(gocql.ObservedConnect{Host: testHost(t), Start: now, End: now.Add(2 * time.Millisecond)})
 	obs.ObserveConnect(gocql.ObservedConnect{Start: now, End: now, Err: context.Canceled})
 
 	rm := collectMetrics(t, reader)
@@ -324,7 +328,20 @@ func TestObserveConnectMetrics(t *testing.T) {
 
 	create := metricByName(rm, "db.client.connection.create_time")
 	require.NotNil(t, create, "create_time recorded only for successful connects")
-	require.Len(t, create.Data.(metricdata.Histogram[float64]).DataPoints, 1)
+	createPoints := create.Data.(metricdata.Histogram[float64]).DataPoints
+	require.Len(t, createPoints, 1)
+	// Actual contacted node + synthesized pool name from the contact point.
+	assertHasAttr(t, createPoints[0].Attributes, semconv.ServerAddress("10.0.0.5"))
+	assertHasAttr(t, createPoints[0].Attributes, semconv.DBClientConnectionPoolName("cassandra/127.0.0.1:9042"))
+}
+
+func TestPoolNameSynthesisAndOverride(t *testing.T) {
+	// Synthesized from the contact point when WithPoolName is not set.
+	assert.Equal(t, "cassandra/10.0.0.1:9042", poolName("", serverAddr{host: "10.0.0.1", port: 9042}))
+	assert.Equal(t, "cassandra/10.0.0.1", poolName("", serverAddr{host: "10.0.0.1"}))
+	assert.Equal(t, "cassandra", poolName("", serverAddr{}))
+	// WithPoolName overrides the synthesized value.
+	assert.Equal(t, "chat-cluster", poolName("chat-cluster", serverAddr{host: "10.0.0.1", port: 9042}))
 }
 
 func assertHasAttr(t *testing.T, set attribute.Set, want attribute.KeyValue) {

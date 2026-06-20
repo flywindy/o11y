@@ -27,10 +27,11 @@ const attemptKey = attribute.Key("cassandra.query.attempt")
 // the *gocql.ClusterConfig before the session exists, so there is no
 // idempotency or hook-removal concern (ADR 0019 §2).
 type observer struct {
-	tracer trace.Tracer
-	inst   *instruments
-	cfg    config
-	server serverAddr
+	tracer   trace.Tracer
+	inst     *instruments
+	cfg      config
+	server   serverAddr
+	poolName string
 }
 
 // ObserveQuery emits one CLIENT span per callback. gocql fires this once per
@@ -60,9 +61,25 @@ func (o *observer) ObserveQuery(ctx context.Context, q gocql.ObservedQuery) {
 // attempt counter and, on success, a connection create-time histogram. gocql's
 // ObservedConnect carries no context, so the connect duration is recorded
 // against context.Background.
+//
+// server.* is taken from the node actually being dialed (ObservedConnect.Host)
+// rather than the configured contact point, so per-node connect failures and
+// latencies are attributed to the right host; node count is bounded, so this
+// stays cardinality-safe. db.client.connection.pool.name carries the pool label
+// semconv requires on connection metrics.
 func (o *observer) ObserveConnect(c gocql.ObservedConnect) {
 	ctx := context.Background()
-	attrs := o.appendServerAttrs([]attribute.KeyValue{semconv.DBSystemNameCassandra})
+	attrs := []attribute.KeyValue{
+		semconv.DBSystemNameCassandra,
+		semconv.DBClientConnectionPoolName(o.poolName),
+	}
+	host, port := o.connectPeer(c.Host)
+	if host != "" {
+		attrs = append(attrs, semconv.ServerAddress(host))
+		if port > 0 {
+			attrs = append(attrs, semconv.ServerPort(port))
+		}
+	}
 	if c.Err != nil {
 		attrs = append(attrs, semconv.ErrorTypeKey.String(errorType(c.Err)))
 	}
@@ -70,6 +87,18 @@ func (o *observer) ObserveConnect(c gocql.ObservedConnect) {
 	if c.Err == nil {
 		o.inst.connectDuration.Record(ctx, c.End.Sub(c.Start).Seconds(), metric.WithAttributes(attrs...))
 	}
+}
+
+// connectPeer resolves the node being dialed for a connect observation,
+// preferring the actual ObservedConnect.Host and falling back to the configured
+// contact point when the driver does not supply a usable address.
+func (o *observer) connectPeer(host *gocql.HostInfo) (string, int) {
+	if host != nil {
+		if ip := host.ConnectAddress(); len(ip) > 0 {
+			return ip.String(), host.Port()
+		}
+	}
+	return o.server.host, o.server.port
 }
 
 // record creates a completed CLIENT span from a finished observation snapshot

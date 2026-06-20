@@ -52,6 +52,7 @@ func MetricViews(histogramBuckets []float64) []sdkmetric.View {
 				},
 				AttributeFilter: attribute.NewAllowKeysFilter(
 					semconv.DBSystemNameKey,
+					semconv.DBClientConnectionPoolNameKey,
 					semconv.ServerAddressKey,
 					semconv.ServerPortKey,
 				),

@@ -302,8 +302,13 @@ driver attempt and per page (ADR 0019 §4).
 |---|---|---|---|
 | `db.client.operation.duration` | Float64Histogram | `s` | `db.system.name`, `db.operation.name`, `db.namespace`, `server.address`, `server.port`, `error.type` |
 | `cassandra.query.attempts` | Int64Counter | `{attempt}` | SDK-owned name. `db.system.name`, `db.operation.name`, `db.namespace`, `server.address`, `server.port`, `error.type`. Incremented by 1 per `ObserveQuery` callback (one per attempt/page), so it counts true client-side attempts (retries + speculative execution). |
-| `db.client.connection.create_time` | Float64Histogram | `s` | `db.system.name`, `server.address`, `server.port` |
-| `cassandra.connection.attempts` | Int64Counter | `{attempt}` | SDK-owned name. `db.system.name`, `server.address`, `server.port`, `error.type`. |
+| `db.client.connection.create_time` | Float64Histogram | `s` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port`. `server.*` is the node actually dialed (`ObservedConnect.Host`), not the contact point. |
+| `cassandra.connection.attempts` | Int64Counter | `{attempt}` | SDK-owned name. `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port`, `error.type`. |
+
+`db.client.connection.pool.name` is the application pool label semconv requires
+on connection metrics. gocql exposes no pool identifier, so it defaults to a
+stable value synthesized from the contact point (e.g. `cassandra/10.0.0.1:9042`)
+and is overridable via `cassandra.WithPoolName`.
 
 Cardinality is bounded by the `MetricViews()` allowlist installed via
 `o11y.Init`'s `ExtraViews` (mirrors the redis/mongo pattern). Services that

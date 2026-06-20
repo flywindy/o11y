@@ -8,6 +8,7 @@ type Option func(*config)
 type config struct {
 	queryTextEnabled bool
 	attrs            []attribute.KeyValue
+	poolName         string
 }
 
 // WithQueryText controls whether the CQL statement text is recorded as
@@ -35,6 +36,21 @@ func WithQueryText(enabled bool) Option {
 func WithAttributes(attrs ...attribute.KeyValue) Option {
 	return func(cfg *config) {
 		cfg.attrs = append(cfg.attrs, attrs...)
+	}
+}
+
+// WithPoolName sets the application-defined connection-pool name reported as
+// db.client.connection.pool.name on Cassandra connection metrics
+// (db.client.connection.create_time and cassandra.connection.attempts).
+//
+// gocql exposes no pool identifier, and semconv treats the pool name as a
+// required label on connection metrics, so when omitted the SDK synthesizes a
+// stable name from the configured contact point (e.g. "cassandra/10.0.0.1:9042").
+// Set this explicitly to disambiguate multiple sessions that target the same
+// contact point, which would otherwise share the synthesized name.
+func WithPoolName(name string) Option {
+	return func(cfg *config) {
+		cfg.poolName = name
 	}
 }
 

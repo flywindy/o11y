@@ -3,6 +3,8 @@ package cassandra
 import (
 	"context"
 	"errors"
+	"net"
+	"strconv"
 
 	"github.com/gocql/gocql"
 	"go.opentelemetry.io/otel/metric"
@@ -90,12 +92,31 @@ func newObserver(
 	if err != nil {
 		return nil, err
 	}
+	cfg := newConfig(opts)
+	server := contactPoint(cluster.Hosts, cluster.Port)
 	return &observer{
-		tracer: tp.Tracer(instrumentationName, trace.WithSchemaURL(semconv.SchemaURL)),
-		inst:   inst,
-		cfg:    newConfig(opts),
-		server: contactPoint(cluster.Hosts, cluster.Port),
+		tracer:   tp.Tracer(instrumentationName, trace.WithSchemaURL(semconv.SchemaURL)),
+		inst:     inst,
+		cfg:      cfg,
+		server:   server,
+		poolName: poolName(cfg.poolName, server),
 	}, nil
+}
+
+// poolName resolves the connection-pool name label: the caller-supplied name
+// when set, otherwise a stable value synthesized from the configured contact
+// point (semconv requires a pool name on connection metrics; gocql exposes none).
+func poolName(configured string, server serverAddr) string {
+	if configured != "" {
+		return configured
+	}
+	if server.host == "" {
+		return "cassandra"
+	}
+	if server.port > 0 {
+		return "cassandra/" + net.JoinHostPort(server.host, strconv.Itoa(server.port))
+	}
+	return "cassandra/" + server.host
 }
 
 // chainQueryObserver composes a caller-supplied QueryObserver with the SDK's, so
