@@ -103,29 +103,76 @@ func parseTable(statement string) string {
 
 // parseTableFields is the shared table-parsing core operating on a pre-split
 // statement, so callers that already tokenized do not split again. It returns
-// the keyspace qualifier (when the table is written keyspace.table) and the
-// bare table name.
+// the keyspace qualifier (when the addressed object is written keyspace.table,
+// or for a CREATE/DROP KEYSPACE whose object is itself a keyspace) and the bare
+// table name. Unrecognized shapes yield "", "".
 func parseTableFields(fields []string) (keyspace, table string) {
 	if len(fields) < 2 {
 		return "", ""
 	}
-	verb := strings.ToUpper(fields[0])
-	switch verb {
-	case "INSERT", "DELETE", "SELECT":
-		// ... FROM <table> ... / INSERT INTO <table> ...
-		for i := 1; i < len(fields)-1; i++ {
-			kw := strings.ToUpper(fields[i])
-			if kw == "FROM" || kw == "INTO" {
-				return normalizeTable(fields[i+1])
-			}
-		}
-		return "", ""
+	switch strings.ToUpper(fields[0]) {
+	case "SELECT", "DELETE":
+		return afterKeyword(fields, "FROM")
+	case "INSERT":
+		return afterKeyword(fields, "INTO")
 	case "UPDATE":
-		// UPDATE <table> SET ...
 		return normalizeTable(fields[1])
+	case "TRUNCATE":
+		// TRUNCATE [TABLE] <name>
+		if strings.ToUpper(fields[1]) == "TABLE" {
+			return objectToken(fields, 2)
+		}
+		return objectToken(fields, 1)
+	case "CREATE", "DROP", "ALTER":
+		return parseDDLTarget(fields)
 	default:
 		return "", ""
 	}
+}
+
+// afterKeyword returns the keyspace/table parsed from the token following the
+// first occurrence of keyword (e.g. FROM/INTO).
+func afterKeyword(fields []string, keyword string) (keyspace, table string) {
+	for i := 1; i < len(fields)-1; i++ {
+		if strings.ToUpper(fields[i]) == keyword {
+			return normalizeTable(fields[i+1])
+		}
+	}
+	return "", ""
+}
+
+// parseDDLTarget extracts the namespace/table from the common qualified DDL
+// forms: CREATE/DROP/ALTER TABLE [IF [NOT] EXISTS] [ks.]table, and CREATE/DROP
+// KEYSPACE [IF [NOT] EXISTS] ks (whose object is itself the keyspace). Other DDL
+// objects (INDEX, TYPE, MATERIALIZED VIEW, …) yield "", "" rather than guessing.
+func parseDDLTarget(fields []string) (keyspace, table string) {
+	if len(fields) < 3 {
+		return "", ""
+	}
+	switch strings.ToUpper(fields[1]) {
+	case "TABLE", "COLUMNFAMILY":
+		return objectToken(fields, 2)
+	case "KEYSPACE", "SCHEMA":
+		// The object names a keyspace directly; there is no table.
+		_, name := objectToken(fields, 2)
+		return name, ""
+	default:
+		return "", ""
+	}
+}
+
+// objectToken returns the keyspace/table parsed from the first token at or after
+// start that is not an IF/NOT/EXISTS modifier.
+func objectToken(fields []string, start int) (keyspace, table string) {
+	for i := start; i < len(fields); i++ {
+		switch strings.ToUpper(fields[i]) {
+		case "IF", "NOT", "EXISTS":
+			continue
+		default:
+			return normalizeTable(fields[i])
+		}
+	}
+	return "", ""
 }
 
 // normalizeTable strips trailing punctuation/clauses from a parsed table token

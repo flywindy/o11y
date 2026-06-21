@@ -281,7 +281,7 @@ driver attempt and per page (ADR 0019 §4).
 | Key | Type | Notes |
 |---|---|---|
 | `db.system.name` | string | Constant `"cassandra"`. |
-| `db.namespace` | string | Keyspace, from `ObservedQuery.Keyspace` / `Batch.Keyspace()`, falling back to a `keyspace.table` qualifier parsed from the statement when the session has no keyspace set. |
+| `db.namespace` | string | Keyspace actually addressed: an explicit `keyspace.table` qualifier in the statement takes precedence (it overrides the session keyspace), otherwise `ObservedQuery.Keyspace` / `Batch.Keyspace()`. A batch that spans multiple keyspaces omits this attribute. |
 | `db.operation.name` | string | Parsed statement verb (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, …) or `BATCH`. |
 | `db.collection.name` | string | Parsed table when a single table is addressed. |
 | `db.operation.batch.size` | int | Statement count, on `ExecuteBatch` spans only. |

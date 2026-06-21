@@ -42,12 +42,14 @@ type observer struct {
 func (o *observer) ObserveQuery(ctx context.Context, q gocql.ObservedQuery) {
 	operation, parsedKeyspace, table := parseStatement(q.Statement)
 
-	// db.namespace prefers the driver-reported session keyspace; when the
-	// session has none set, fall back to a keyspace.table qualifier parsed from
-	// the statement so qualified CQL still attributes a namespace (ADR 0019 §5).
-	namespace := q.Keyspace
+	// db.namespace is the keyspace actually addressed. An explicit keyspace.table
+	// qualifier in the statement is authoritative — it overrides the session
+	// keyspace, since a qualified statement hits that keyspace regardless of any
+	// USE. Only when the statement is unqualified does the driver-reported session
+	// keyspace apply (ADR 0019 §5).
+	namespace := parsedKeyspace
 	if namespace == "" {
-		namespace = parsedKeyspace
+		namespace = q.Keyspace
 	}
 
 	attrs := o.baseAttrs(operation, namespace, table, q.Host)

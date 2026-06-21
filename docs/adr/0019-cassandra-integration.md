@@ -216,7 +216,7 @@ Sourced from `ObservedQuery` / `ObservedBatch` / `HostInfo` / `hostMetrics`.
 | Attribute | Level | Source |
 |---|---|---|
 | `db.system.name` = `cassandra` | Required | constant |
-| `db.namespace` | Conditionally Required | `ObservedQuery.Keyspace`, falling back to a `keyspace.table` qualifier parsed from the statement when the session has no keyspace set |
+| `db.namespace` | Conditionally Required | the keyspace actually addressed: an explicit `keyspace.table` qualifier parsed from the statement (authoritative, overrides the session keyspace), else `ObservedQuery.Keyspace`. Covers DML and qualified `CREATE/ALTER/DROP/TRUNCATE TABLE` and `CREATE/DROP KEYSPACE`. A batch resolves per statement and omits `db.namespace` when it spans multiple keyspaces. |
 | `db.operation.name` | Recommended | parsed from statement verb (SELECT/INSERT/…) / "BATCH" |
 | `db.collection.name` | Recommended | parsed table when a single table is addressed |
 | `db.query.text` | Opt-In | `ObservedQuery.Statement`, **only when `WithQueryText(true)`** (§6) |

@@ -365,6 +365,26 @@ func TestObserveQueryNamespaceFromQualifiedCQL(t *testing.T) {
 	assertHasAttr(t, dp.Attributes, semconv.DBNamespace("o11y_examples"))
 }
 
+// TestObserveQueryQualifierOverridesSessionKeyspace: a statement that explicitly
+// qualifies ks_b.table hits ks_b regardless of the session's USE ks_a, so the
+// explicit qualifier is authoritative for db.namespace.
+func TestObserveQueryQualifierOverridesSessionKeyspace(t *testing.T) {
+	obs, sr, _ := newTestObserver(t, config{})
+
+	start := time.Now()
+	obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+		Keyspace:  "ks_a", // session keyspace
+		Statement: "SELECT body FROM ks_b.events WHERE id = ?",
+		Start:     start,
+		End:       start.Add(time.Millisecond),
+	})
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	assert.Contains(t, spans[0].Attributes(), semconv.DBNamespace("ks_b"))
+	assert.NotContains(t, spans[0].Attributes(), semconv.DBNamespace("ks_a"))
+}
+
 // TestBatchNamespaceFromQualifiedCQL covers the same fallback on the batch seam:
 // when the driver reports no batch keyspace, the qualifier is parsed from the
 // batch's statements.
@@ -382,6 +402,24 @@ func TestBatchNamespaceFromQualifiedCQL(t *testing.T) {
 	spans := sr.Ended()
 	require.Len(t, spans, 1)
 	assert.Contains(t, spans[0].Attributes(), semconv.DBNamespace("o11y_examples"))
+}
+
+// TestBatchNamespaceMultipleKeyspacesOmitted: a batch that genuinely spans two
+// keyspaces must not be labeled with either one, so db.namespace is omitted.
+func TestBatchNamespaceMultipleKeyspacesOmitted(t *testing.T) {
+	batch := gocql.NewBatch(gocql.LoggedBatch) //nolint:staticcheck // see TestBatchAttrsMirrorQueryPath
+	batch.Query("INSERT INTO ks_a.events (id) VALUES (?)", "a")
+	batch.Query("INSERT INTO ks_b.events (id) VALUES (?)", "b")
+
+	assert.Equal(t, "", batchNamespace(batch))
+
+	obs, sr, _ := newTestObserver(t, config{})
+	ns := batchNamespace(batch)
+	obs.record(context.Background(), spanName("BATCH", ""), "BATCH", ns, time.Now(), time.Now(), nil, obs.batchAttrs(batch, ns))
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	assert.False(t, spanHasKey(spans[0], semconv.DBNamespaceKey), "ambiguous batch must omit db.namespace")
 }
 
 func TestObserveConnectMetrics(t *testing.T) {

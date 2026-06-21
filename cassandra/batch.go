@@ -86,20 +86,34 @@ func ExecuteBatch(ctx context.Context, session *gocql.Session, batch *gocql.Batc
 	return err
 }
 
-// batchNamespace resolves db.namespace for a batch: the driver-reported batch
-// keyspace, falling back to a keyspace.table qualifier parsed from the batch's
-// first statement when the session has no keyspace set (mirrors ObserveQuery so
-// qualified CQL still attributes a namespace, ADR 0019 §5).
+// batchNamespace resolves db.namespace for a batch. Each statement's effective
+// keyspace is its explicit keyspace.table qualifier when present (authoritative,
+// as on the query path), otherwise the driver-reported session keyspace. The
+// batch's db.namespace is set only when every statement resolves to the same
+// keyspace; a batch that genuinely spans multiple keyspaces returns "" so the
+// attribute is omitted rather than mislabeling the batch with one of them
+// (ADR 0019 §5).
 func batchNamespace(batch *gocql.Batch) string {
-	if ks := batch.Keyspace(); ks != "" {
-		return ks
-	}
+	session := batch.Keyspace()
+	resolved := ""
 	for _, entry := range batch.Entries {
-		if _, ks, _ := parseStatement(entry.Stmt); ks != "" {
-			return ks
+		_, ks, _ := parseStatement(entry.Stmt)
+		if ks == "" {
+			ks = session
+		}
+		if ks == "" {
+			continue
+		}
+		if resolved == "" {
+			resolved = ks
+		} else if resolved != ks {
+			return "" // batch spans multiple keyspaces; omit db.namespace
 		}
 	}
-	return ""
+	if resolved != "" {
+		return resolved
+	}
+	return session
 }
 
 // batchAttrs builds the span attributes for one logical batch, feeding
