@@ -32,8 +32,18 @@ import (
 //
 // Batch instrumentation is not wired through the driver's BatchObserver: the
 // v1.7.0 batch-observer payload carries no batch identity, so it cannot
-// faithfully produce one span per logical batch. Use ExecuteBatch for
-// instrumented batch execution (ADR 0019 §4).
+// faithfully produce one span per logical batch. Use ExecuteBatch /
+// ExecuteBatchCAS / MapExecuteBatchCAS for instrumented batch execution
+// (ADR 0019 §4).
+//
+// Per-query/per-batch observers: gocql gives each query and batch a single
+// observer slot that this package occupies. Calling (*gocql.Query).Observer or
+// (*gocql.Batch).Observer on work issued through this session REPLACES the SDK
+// observer for that statement, silently dropping its span and metrics. To run
+// your own observer alongside the SDK's, set it on the ClusterConfig
+// (cluster.QueryObserver / cluster.ConnectObserver) before calling NewSession —
+// NewSession composes with those (yours runs first, then the SDK's) — instead of
+// attaching it per query/batch.
 func NewSession(
 	cluster *gocql.ClusterConfig,
 	tp trace.TracerProvider,

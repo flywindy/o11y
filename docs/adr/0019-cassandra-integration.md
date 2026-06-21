@@ -201,13 +201,23 @@ gocql version (one span per attempt and per page, not one per logical query).
 also gets called once for each query in a batch", and v1.7.0 exposes **no batch
 identity** to deduplicate those `(1 + N)` callbacks. Coalescing them into one
 span from the observer payload alone is therefore not reliable. The integration
-resolves this with an **SDK-owned batch-execution seam** — a thin
-`ExecuteBatch(ctx, session, batch)` helper that owns exactly one span per logical
-batch (feeding `db.operation.batch.size` from the statement count) and treats the
-driver's batch-observer callbacks as supplementary timing only. Pure
-observer-only batch instrumentation is **out of scope for v1** precisely because
-the v1.7.0 payload cannot identify the logical batch. The callback multiplicity
-for the pinned gocql version is pinned by a unit test.
+resolves this with an **SDK-owned batch-execution seam** — thin
+`ExecuteBatch(ctx, session, batch)` / `ExecuteBatchCAS` / `MapExecuteBatchCAS`
+helpers that own exactly one span per logical batch (feeding
+`db.operation.batch.size` from the statement count) and treat the driver's
+batch-observer callbacks as supplementary timing only. The CAS forms cover
+lightweight-transaction batches, which gocql executes through separate session
+methods and would otherwise have no instrumented entry point. Pure observer-only
+batch instrumentation is **out of scope for v1** precisely because the v1.7.0
+payload cannot identify the logical batch. The callback multiplicity for the
+pinned gocql version is pinned by a unit test.
+
+**Per-statement observers.** gocql stores a single observer per `Query`/`Batch`
+(inherited from the session, overwritten by `(*Query).Observer` /
+`(*Batch).Observer`). Callers must therefore configure any additional observer on
+the `ClusterConfig` — where `NewSession` composes it with the SDK's — rather than
+per statement, which would replace the SDK observer and silently drop that
+statement's telemetry. This is documented on `NewSession` and in the guide.
 
 ### 5. Span attributes (semconv v1.39.0)
 

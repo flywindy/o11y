@@ -37,9 +37,10 @@ adopters can plan their upgrades.
   statement text is opt-in via `cassandra.WithQueryText(true)`; the
   contacted-coordinator host topology (`network.peer.*` /
   `cassandra.coordinator.*`) is opt-in via `cassandra.WithHostAttributes(true)`.
-  `cassandra.ExecuteBatch` is the SDK-owned batch seam (one span per logical
-  batch with `db.operation.batch.size`). `cassandra.MetricViews` is composed
-  into `o11y.Init`.
+  `cassandra.ExecuteBatch` (plus `cassandra.ExecuteBatchCAS` /
+  `cassandra.MapExecuteBatchCAS` for conditional batches) is the SDK-owned batch
+  seam (one span per logical batch with `db.operation.batch.size`).
+  `cassandra.MetricViews` is composed into `o11y.Init`.
 
 ### Changed
 

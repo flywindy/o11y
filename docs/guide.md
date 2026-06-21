@@ -683,11 +683,14 @@ per attempt and per page, so retries and paged reads appear as sibling spans
 carrying their attempt index and coordinator host. Span names follow the
 cross-package convention, e.g. `cassandra.SELECT rooms`.
 
-**Batches must go through `cassandra.ExecuteBatch`** to be traced. The gocql
-v1.7.0 batch-observer payload cannot identify a logical batch, so the SDK owns a
-batch seam instead; calling `session.ExecuteBatch(batch)` directly emits no
-batch span. `ExecuteBatch` also binds the context onto the batch, so the context
-governs the driver call, not just telemetry:
+**Batches must go through the `cassandra` batch seams** to be traced. The gocql
+v1.7.0 batch-observer payload cannot identify a logical batch, so the SDK owns
+the seams instead; calling `session.ExecuteBatch(batch)` directly emits no batch
+span. Use `cassandra.ExecuteBatch` for normal batches and
+`cassandra.ExecuteBatchCAS` / `cassandra.MapExecuteBatchCAS` for conditional
+(lightweight-transaction) batches — the CAS forms return the driver's `applied`
+flag and result iterator unchanged. All three bind the context onto the batch, so
+the context governs the driver call, not just telemetry:
 
 ```go
 batch := session.NewBatch(gocql.LoggedBatch)
@@ -696,6 +699,13 @@ if err := o11ycassandra.ExecuteBatch(ctx, session, batch); err != nil {
     obs.Logger.ErrorContext(ctx, "Cassandra batch failed", slog.Any("error", err))
 }
 ```
+
+**Do not call `(*gocql.Query).Observer` or `(*gocql.Batch).Observer`** on work
+issued through an instrumented session: gocql gives each statement a single
+observer slot, so setting your own replaces the SDK's and silently drops that
+statement's span and metrics. To run your own observer alongside the SDK's, set
+it on the `*gocql.ClusterConfig` (`QueryObserver` / `ConnectObserver`) before
+`NewSession`, which composes the two.
 
 `db.query.text` (the CQL statement) is off by default because statements can be
 high-cardinality and reveal schema topology; bound values are never captured.

@@ -74,6 +74,14 @@ func TestIntegrationHealthyPath(t *testing.T) {
 	defer cancelBatch()
 	require.NoError(t, ExecuteBatch(batchCtx, session, batch))
 
+	// Conditional (LWT) batch through the CAS seam: must execute, apply, and be
+	// instrumented like the plain batch.
+	casBatch := session.NewBatch(gocql.LoggedBatch)
+	casBatch.Query(`INSERT INTO `+ks+`.rooms (id, name) VALUES (?, ?) IF NOT EXISTS`, "r4", "cas")
+	applied, _, err := ExecuteBatchCAS(batchCtx, session, casBatch)
+	require.NoError(t, err)
+	assert.True(t, applied, "first conditional insert should apply")
+
 	// Force span export.
 	flushCtx, cancelFlush := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelFlush()

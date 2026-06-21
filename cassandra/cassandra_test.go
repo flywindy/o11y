@@ -128,6 +128,20 @@ func TestExecuteBatchNilGuards(t *testing.T) {
 	err = ExecuteBatch(context.Background(), &gocql.Session{}, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "batch must not be nil")
+
+	// The CAS variants share the same guard core and must reject the same way,
+	// returning applied=false / nil iter without dereferencing the session.
+	applied, iter, err := ExecuteBatchCAS(context.Background(), nil, gocql.NewBatch(gocql.LoggedBatch)) //nolint:staticcheck // need a *Batch without a live session
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "session must not be nil")
+	assert.False(t, applied)
+	assert.Nil(t, iter)
+
+	applied, iter, err = MapExecuteBatchCAS(context.Background(), &gocql.Session{}, nil, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "batch must not be nil")
+	assert.False(t, applied)
+	assert.Nil(t, iter)
 }
 
 // recordingQueryObserver / recordingConnectObserver capture whether a

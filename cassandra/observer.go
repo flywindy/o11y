@@ -59,12 +59,13 @@ func (o *observer) ObserveQuery(ctx context.Context, q gocql.ObservedQuery) {
 		attrs = append(attrs, semconv.DBQueryText(q.Statement))
 	}
 
-	o.record(ctx, spanName(operation, table), operation, namespace, q.Start, q.End, q.Err, attrs)
+	spanCtx := o.record(ctx, spanName(operation, table), operation, namespace, q.Start, q.End, q.Err, attrs)
 
 	// Increment by a fixed 1 per callback: each callback is exactly one attempt
 	// (ADR 0019 §7.B). Never add q.Metrics.Attempts — it is a cumulative
-	// per-host snapshot and would over-count retried/paged queries.
-	o.inst.attempts.Add(ctx, 1, metric.WithAttributes(o.metricAttrs(operation, namespace, q.Err)...))
+	// per-host snapshot and would over-count retried/paged queries. Use the
+	// span's context so this counter's exemplar references the query span too.
+	o.inst.attempts.Add(spanCtx, 1, metric.WithAttributes(o.metricAttrs(operation, namespace, q.Err)...))
 }
 
 // ObserveConnect records connect-observer signals (ADR 0019 §7.C): a connection
@@ -113,14 +114,16 @@ func (o *observer) connectPeer(host *gocql.HostInfo) (string, int) {
 
 // record creates a completed CLIENT span from a finished observation snapshot
 // and records the operation-duration metric. It is shared by the query path and
-// the SDK-owned batch seam (ExecuteBatch).
+// the SDK-owned batch seam (ExecuteBatch). It returns the span's context so
+// callers can record additional metrics whose exemplars should reference this
+// operation's span (e.g. the per-attempt counter).
 func (o *observer) record(
 	ctx context.Context,
 	name, operation, keyspace string,
 	start, end time.Time,
 	obsErr error,
 	attrs []attribute.KeyValue,
-) {
+) context.Context {
 	// User attributes go first so the SDK's own semconv attributes win on key
 	// collisions (OTel resolves duplicate keys last-wins); the built-in keys are
 	// part of this package's contract and must not be overridden by
@@ -128,7 +131,7 @@ func (o *observer) record(
 	spanAttrs := append([]attribute.KeyValue{}, o.cfg.attrs...)
 	spanAttrs = append(spanAttrs, attrs...)
 
-	_, span := o.tracer.Start(ctx, name,
+	spanCtx, span := o.tracer.Start(ctx, name,
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithTimestamp(start),
 		trace.WithAttributes(spanAttrs...),
@@ -145,8 +148,14 @@ func (o *observer) record(
 	}
 	span.End(trace.WithTimestamp(end))
 
-	o.inst.operationDuration.Record(ctx, end.Sub(start).Seconds(),
+	// Record against the span's context (not the parent ctx) so the duration
+	// metric's exemplar references this operation's CLIENT span rather than the
+	// caller's parent span. The span has ended, but its SpanContext is still the
+	// correct trace/span id to correlate the data point to.
+	o.inst.operationDuration.Record(spanCtx, end.Sub(start).Seconds(),
 		metric.WithAttributes(o.metricAttrs(operation, keyspace, obsErr)...))
+
+	return spanCtx
 }
 
 // baseAttrs builds the semantic-convention span attributes common to queries

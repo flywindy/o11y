@@ -64,6 +64,57 @@ func lookupObserver(s *gocql.Session) (*observer, bool) {
 // public batch API context-first. A nil session or batch returns an error
 // rather than panicking.
 func ExecuteBatch(ctx context.Context, session *gocql.Session, batch *gocql.Batch) error {
+	return instrumentBatch(ctx, session, batch, func(b *gocql.Batch) error {
+		return session.ExecuteBatch(b)
+	})
+}
+
+// ExecuteBatchCAS is the instrumented counterpart of (*gocql.Session).ExecuteBatchCAS
+// for lightweight-transaction (conditional) batches. It produces the same single
+// BATCH span and metric as ExecuteBatch and returns the driver's applied flag and
+// result iterator unchanged. Without this seam a CAS batch would have no
+// instrumented entry point and emit no telemetry (the BatchObserver is not wired;
+// ADR 0019 §4).
+func ExecuteBatchCAS(
+	ctx context.Context,
+	session *gocql.Session,
+	batch *gocql.Batch,
+	dest ...interface{},
+) (applied bool, iter *gocql.Iter, err error) {
+	err = instrumentBatch(ctx, session, batch, func(b *gocql.Batch) error {
+		applied, iter, err = session.ExecuteBatchCAS(b, dest...)
+		return err
+	})
+	return applied, iter, err
+}
+
+// MapExecuteBatchCAS is the instrumented counterpart of
+// (*gocql.Session).MapExecuteBatchCAS, mirroring ExecuteBatchCAS for the
+// map-destination form.
+func MapExecuteBatchCAS(
+	ctx context.Context,
+	session *gocql.Session,
+	batch *gocql.Batch,
+	dest map[string]interface{},
+) (applied bool, iter *gocql.Iter, err error) {
+	err = instrumentBatch(ctx, session, batch, func(b *gocql.Batch) error {
+		applied, iter, err = session.MapExecuteBatchCAS(b, dest)
+		return err
+	})
+	return applied, iter, err
+}
+
+// instrumentBatch is the shared batch seam: it validates arguments, binds ctx
+// onto the batch, runs the driver call via exec, and records one BATCH span plus
+// the operation-duration metric. exec receives the context-bound batch so each
+// public entry point only supplies the specific driver call (plain vs CAS). A
+// session not created by NewSession runs exec without instrumentation.
+func instrumentBatch(
+	ctx context.Context,
+	session *gocql.Session,
+	batch *gocql.Batch,
+	exec func(*gocql.Batch) error,
+) error {
 	if session == nil {
 		return errors.New("cassandra: session must not be nil")
 	}
@@ -74,11 +125,11 @@ func ExecuteBatch(ctx context.Context, session *gocql.Session, batch *gocql.Batc
 
 	obs, ok := lookupObserver(session)
 	if !ok {
-		return session.ExecuteBatch(batch)
+		return exec(batch)
 	}
 
 	start := time.Now()
-	err := session.ExecuteBatch(batch)
+	err := exec(batch)
 	end := time.Now()
 
 	namespace := batchNamespace(batch)
