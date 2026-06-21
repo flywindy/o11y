@@ -700,12 +700,15 @@ if err := o11ycassandra.ExecuteBatch(ctx, session, batch); err != nil {
 }
 ```
 
-**Do not call `(*gocql.Query).Observer` or `(*gocql.Batch).Observer`** on work
-issued through an instrumented session: gocql gives each statement a single
-observer slot, so setting your own replaces the SDK's and silently drops that
-statement's span and metrics. To run your own observer alongside the SDK's, set
-it on the `*gocql.ClusterConfig` (`QueryObserver` / `ConnectObserver`) before
-`NewSession`, which composes the two.
+**Do not call `(*gocql.Query).Observer`** on queries issued through an
+instrumented session: gocql gives each query a single observer slot, so setting
+your own replaces the SDK's and silently drops that query's span and metrics. To
+run your own query/connect observer alongside the SDK's, set it on the
+`*gocql.ClusterConfig` (`QueryObserver` / `ConnectObserver`) before `NewSession`,
+which composes the two. This does not apply to batches: their telemetry comes
+from the `ExecuteBatch*` seams above, not the driver's batch observer, so a
+`(*gocql.Batch).Observer` you set runs independently and does not affect the SDK
+batch spans.
 
 `db.query.text` (the CQL statement) is off by default because statements can be
 high-cardinality and reveal schema topology; bound values are never captured.

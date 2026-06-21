@@ -212,12 +212,15 @@ batch instrumentation is **out of scope for v1** precisely because the v1.7.0
 payload cannot identify the logical batch. The callback multiplicity for the
 pinned gocql version is pinned by a unit test.
 
-**Per-statement observers.** gocql stores a single observer per `Query`/`Batch`
-(inherited from the session, overwritten by `(*Query).Observer` /
-`(*Batch).Observer`). Callers must therefore configure any additional observer on
-the `ClusterConfig` — where `NewSession` composes it with the SDK's — rather than
-per statement, which would replace the SDK observer and silently drop that
-statement's telemetry. This is documented on `NewSession` and in the guide.
+**Per-query observers.** gocql stores a single query observer per `Query`
+(inherited from the session, overwritten by `(*Query).Observer`). Callers must
+therefore configure any additional query/connect observer on the `ClusterConfig`
+— where `NewSession` composes it with the SDK's — rather than per query, which
+would replace the SDK observer and silently drop that query's telemetry. This
+does **not** apply to batches: their telemetry comes from the `ExecuteBatch*`
+seams, not the driver's `BatchObserver` (which the package does not install), so a
+`(*Batch).Observer` the caller sets runs independently and does not affect the SDK
+batch spans. Documented on `NewSession` and in the guide.
 
 ### 5. Span attributes (semconv v1.39.0)
 

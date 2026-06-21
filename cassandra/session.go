@@ -36,14 +36,19 @@ import (
 // ExecuteBatchCAS / MapExecuteBatchCAS for instrumented batch execution
 // (ADR 0019 §4).
 //
-// Per-query/per-batch observers: gocql gives each query and batch a single
-// observer slot that this package occupies. Calling (*gocql.Query).Observer or
-// (*gocql.Batch).Observer on work issued through this session REPLACES the SDK
-// observer for that statement, silently dropping its span and metrics. To run
-// your own observer alongside the SDK's, set it on the ClusterConfig
+// Per-query observers: gocql gives each query a single observer slot, which this
+// package occupies via the QueryObserver it sets on the ClusterConfig. Calling
+// (*gocql.Query).Observer on a query issued through this session REPLACES the SDK
+// observer for that query, silently dropping its span and metrics. To run your
+// own query/connect observer alongside the SDK's, set it on the ClusterConfig
 // (cluster.QueryObserver / cluster.ConnectObserver) before calling NewSession —
 // NewSession composes with those (yours runs first, then the SDK's) — instead of
-// attaching it per query/batch.
+// attaching it per query.
+//
+// This caveat does not apply to batches: batch telemetry comes from the
+// ExecuteBatch* seams, not the driver's BatchObserver (which this package does
+// not install), so a (*gocql.Batch).Observer you set runs independently and does
+// not affect the SDK's batch spans or metrics.
 func NewSession(
 	cluster *gocql.ClusterConfig,
 	tp trace.TracerProvider,

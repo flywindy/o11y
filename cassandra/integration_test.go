@@ -82,6 +82,14 @@ func TestIntegrationHealthyPath(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, applied, "first conditional insert should apply")
 
+	// Map-destination CAS seam: same instrumentation. r4 already exists, so this
+	// must report not-applied while still emitting a batch span.
+	mapBatch := session.NewBatch(gocql.LoggedBatch)
+	mapBatch.Query(`INSERT INTO `+ks+`.rooms (id, name) VALUES (?, ?) IF NOT EXISTS`, "r4", "cas-2")
+	mapApplied, _, err := MapExecuteBatchCAS(batchCtx, session, mapBatch, map[string]interface{}{})
+	require.NoError(t, err)
+	assert.False(t, mapApplied, "conditional insert on an existing row must not apply")
+
 	// Force span export.
 	flushCtx, cancelFlush := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelFlush()
@@ -89,17 +97,19 @@ func TestIntegrationHealthyPath(t *testing.T) {
 	spans := sr.Ended()
 	require.NotEmpty(t, spans)
 
-	var sawCassandra, sawBatch bool
+	var sawCassandra, batchSpans int
 	for _, span := range spans {
 		for _, a := range span.Attributes() {
 			if a.Key == semconv.DBSystemNameKey && a.Value.AsString() == "cassandra" {
-				sawCassandra = true
+				sawCassandra++
 			}
 			if a.Key == semconv.DBOperationNameKey && a.Value.AsString() == "BATCH" {
-				sawBatch = true
+				batchSpans++
 			}
 		}
 	}
-	assert.True(t, sawCassandra, "expected at least one cassandra span")
-	assert.True(t, sawBatch, "expected a batch span from ExecuteBatch")
+	assert.Positive(t, sawCassandra, "expected at least one cassandra span")
+	// One per seam: ExecuteBatch + ExecuteBatchCAS + MapExecuteBatchCAS. Counting
+	// (not a bool) ensures a single broken path cannot pass on another's span.
+	assert.GreaterOrEqual(t, batchSpans, 3, "expected a batch span from each of the three batch seams")
 }
