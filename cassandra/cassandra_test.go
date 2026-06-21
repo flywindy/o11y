@@ -197,8 +197,10 @@ func TestObserveQueryEmitsSemconvSpanAndDuration(t *testing.T) {
 	assert.Contains(t, span.Attributes(), semconv.DBOperationName("SELECT"))
 	assert.Contains(t, span.Attributes(), semconv.DBCollectionName("messages_by_room"))
 	assert.Contains(t, span.Attributes(), semconv.DBResponseReturnedRows(7))
-	assert.Contains(t, span.Attributes(), semconv.ServerAddress("127.0.0.1"))
-	assert.Contains(t, span.Attributes(), semconv.ServerPort(9042))
+	// server.* is the node that actually ran the query (ObservedQuery.Host),
+	// not the contact point. testHost exposes no port (gocql has no setter), so
+	// server.port coverage lives on the contact-point fallback path below.
+	assert.Contains(t, span.Attributes(), semconv.ServerAddress("10.0.0.5"))
 	// Host-topology attributes are Opt-In (WithHostAttributes); absent by default.
 	assert.False(t, spanHasKey(span, semconv.NetworkPeerAddressKey))
 	assert.False(t, spanHasKey(span, semconv.CassandraCoordinatorIDKey))
@@ -218,7 +220,7 @@ func TestObserveQueryEmitsSemconvSpanAndDuration(t *testing.T) {
 	assertHasAttr(t, dp.Attributes, semconv.DBSystemNameCassandra)
 	assertHasAttr(t, dp.Attributes, semconv.DBOperationName("SELECT"))
 	assertHasAttr(t, dp.Attributes, semconv.DBNamespace("chat"))
-	assertHasAttr(t, dp.Attributes, semconv.ServerAddress("127.0.0.1"))
+	assertHasAttr(t, dp.Attributes, semconv.ServerAddress("10.0.0.5"))
 	assertMissingKey(t, dp.Attributes, semconv.NetworkPeerAddressKey)
 	assertMissingKey(t, dp.Attributes, semconv.CassandraCoordinatorIDKey)
 }
@@ -345,7 +347,7 @@ func TestBatchAttrsMirrorQueryPath(t *testing.T) {
 
 	attrs := obs.batchAttrs(batch, ns, tbl)
 	start := time.Now()
-	obs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, start, start.Add(time.Millisecond), nil, attrs)
+	obs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, obs.server, start, start.Add(time.Millisecond), nil, attrs)
 
 	spans := sr.Ended()
 	require.Len(t, spans, 1)
@@ -418,7 +420,7 @@ func TestBatchTargetsFromQualifiedCQL(t *testing.T) {
 	assert.Equal(t, "events", tbl)
 
 	obs, sr, _ := newTestObserver(t, config{})
-	obs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, time.Now(), time.Now(), nil, obs.batchAttrs(batch, ns, tbl))
+	obs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, obs.server, time.Now(), time.Now(), nil, obs.batchAttrs(batch, ns, tbl))
 
 	spans := sr.Ended()
 	require.Len(t, spans, 1)
@@ -439,7 +441,7 @@ func TestBatchTargetsMixedOmitted(t *testing.T) {
 	assert.Equal(t, "", tbl)
 
 	obs, sr, _ := newTestObserver(t, config{})
-	obs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, time.Now(), time.Now(), nil, obs.batchAttrs(batch, ns, tbl))
+	obs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, obs.server, time.Now(), time.Now(), nil, obs.batchAttrs(batch, ns, tbl))
 
 	spans := sr.Ended()
 	require.Len(t, spans, 1)
@@ -461,14 +463,14 @@ func TestBatchQueryTextOptIn(t *testing.T) {
 	offObs, offSR, _ := newTestObserver(t, config{})
 	b := build()
 	ns, tbl := batchTargets(b)
-	offObs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, time.Now(), time.Now(), nil, offObs.batchAttrs(b, ns, tbl))
+	offObs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, offObs.server, time.Now(), time.Now(), nil, offObs.batchAttrs(b, ns, tbl))
 	require.Len(t, offSR.Ended(), 1)
 	assert.False(t, spanHasKey(offSR.Ended()[0], semconv.DBQueryTextKey), "query text off by default")
 
 	onObs, onSR, _ := newTestObserver(t, config{queryTextEnabled: true})
 	b = build()
 	ns, tbl = batchTargets(b)
-	onObs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, time.Now(), time.Now(), nil, onObs.batchAttrs(b, ns, tbl))
+	onObs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, onObs.server, time.Now(), time.Now(), nil, onObs.batchAttrs(b, ns, tbl))
 	require.Len(t, onSR.Ended(), 1)
 	assert.Contains(t, onSR.Ended()[0].Attributes(),
 		semconv.DBQueryText("INSERT INTO chat.rooms (id) VALUES (?); UPDATE chat.rooms SET name = ? WHERE id = ?"))
@@ -514,9 +516,36 @@ func TestWithAttributesDropsReservedKeys(t *testing.T) {
 	assert.Contains(t, span.Attributes(), attribute.String("team", "payments"))
 	assert.False(t, spanHasKey(span, semconv.DBQueryTextKey), "WithQueryText off: caller cannot force db.query.text")
 	assert.False(t, spanHasKey(span, semconv.ErrorTypeKey), "successful span: caller cannot force error.type")
-	// server.address is still the SDK's configured contact point, not the caller's.
+	// No ObservedQuery.Host, so server.* falls back to the configured contact
+	// point (with its port) — not the caller-supplied value.
 	assert.Contains(t, span.Attributes(), semconv.ServerAddress("127.0.0.1"))
+	assert.Contains(t, span.Attributes(), semconv.ServerPort(9042))
 	assert.NotContains(t, span.Attributes(), semconv.ServerAddress("evil.example.com"))
+}
+
+// TestObserveQueryAttributesToObservedHost: server.* on the span and the
+// operation metric is the node that actually ran the query (token-aware
+// routing), not the configured contact point.
+func TestObserveQueryAttributesToObservedHost(t *testing.T) {
+	obs, sr, reader := newTestObserver(t, config{})
+
+	start := time.Now()
+	obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+		Keyspace:  "chat",
+		Statement: "SELECT id FROM rooms WHERE id = ?",
+		Start:     start,
+		End:       start.Add(time.Millisecond),
+		Host:      testHost(t), // coordinator 10.0.0.5, not contact point 127.0.0.1
+	})
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	assert.Contains(t, spans[0].Attributes(), semconv.ServerAddress("10.0.0.5"))
+	assert.NotContains(t, spans[0].Attributes(), semconv.ServerAddress("127.0.0.1"))
+
+	rm := collectMetrics(t, reader)
+	dp := metricByName(rm, "db.client.operation.duration").Data.(metricdata.Histogram[float64]).DataPoints[0]
+	assertHasAttr(t, dp.Attributes, semconv.ServerAddress("10.0.0.5"))
 }
 
 func TestObserveConnectMetrics(t *testing.T) {

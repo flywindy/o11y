@@ -716,11 +716,12 @@ high-cardinality and reveal schema topology; bound values are never captured.
 Enable it with `o11ycassandra.WithQueryText(true)` when that is safe for your
 trace backend.
 
-The contacted-coordinator host topology (`network.peer.*`,
-`cassandra.coordinator.id` / `.dc`) is also off by default — the package leads
-with the `server.*` contact-point keys and does not expose per-node addresses
-unless asked. Enable it with `o11ycassandra.WithHostAttributes(true)` to make
-token-aware routing and the coordinating node visible per span.
+`server.address` / `server.port` identify the node that actually served the
+operation (the coordinator chosen by token-aware routing), falling back to the
+contact point when the driver reports no host. The coordinator's id and
+datacenter (`cassandra.coordinator.id` / `.dc`, plus `network.peer.*`) are
+additional and off by default; enable them with
+`o11ycassandra.WithHostAttributes(true)`.
 
 ## Messaging
 

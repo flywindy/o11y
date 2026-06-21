@@ -95,20 +95,24 @@ func (o *observer) ObserveQuery(ctx context.Context, q gocql.ObservedQuery) {
 		namespace = q.Keyspace
 	}
 
-	attrs := o.baseAttrs(operation, namespace, table, q.Host)
+	// server.* is the node that actually ran this attempt (token-aware routing),
+	// falling back to the contact point when the driver supplies no host.
+	srv := o.queryServer(q.Host)
+
+	attrs := o.baseAttrs(operation, namespace, table, srv, q.Host)
 	attrs = append(attrs, semconv.DBResponseReturnedRows(q.Rows))
 	attrs = append(attrs, attemptKey.Int(q.Attempt))
 	if o.cfg.queryTextEnabled && q.Statement != "" {
 		attrs = append(attrs, semconv.DBQueryText(q.Statement))
 	}
 
-	spanCtx := o.record(ctx, spanName(operation, table), operation, namespace, q.Start, q.End, q.Err, attrs)
+	spanCtx := o.record(ctx, spanName(operation, table), operation, namespace, srv, q.Start, q.End, q.Err, attrs)
 
 	// Increment by a fixed 1 per callback: each callback is exactly one attempt
 	// (ADR 0019 §7.B). Never add q.Metrics.Attempts — it is a cumulative
 	// per-host snapshot and would over-count retried/paged queries. Use the
 	// span's context so this counter's exemplar references the query span too.
-	o.inst.attempts.Add(spanCtx, 1, metric.WithAttributes(o.metricAttrs(operation, namespace, q.Err)...))
+	o.inst.attempts.Add(spanCtx, 1, metric.WithAttributes(o.metricAttrs(operation, namespace, srv, q.Err)...))
 }
 
 // ObserveConnect records connect-observer signals (ADR 0019 §7.C): a connection
@@ -147,12 +151,8 @@ func (o *observer) ObserveConnect(c gocql.ObservedConnect) {
 // preferring the actual ObservedConnect.Host and falling back to the configured
 // contact point when the driver does not supply a usable address.
 func (o *observer) connectPeer(host *gocql.HostInfo) (string, int) {
-	if host != nil {
-		if ip := host.ConnectAddress(); len(ip) > 0 {
-			return ip.String(), host.Port()
-		}
-	}
-	return o.server.host, o.server.port
+	srv := o.queryServer(host)
+	return srv.host, srv.port
 }
 
 // record creates a completed CLIENT span from a finished observation snapshot
@@ -163,6 +163,7 @@ func (o *observer) connectPeer(host *gocql.HostInfo) (string, int) {
 func (o *observer) record(
 	ctx context.Context,
 	name, operation, keyspace string,
+	srv serverAddr,
 	start, end time.Time,
 	obsErr error,
 	attrs []attribute.KeyValue,
@@ -196,14 +197,16 @@ func (o *observer) record(
 	// caller's parent span. The span has ended, but its SpanContext is still the
 	// correct trace/span id to correlate the data point to.
 	o.inst.operationDuration.Record(spanCtx, end.Sub(start).Seconds(),
-		metric.WithAttributes(o.metricAttrs(operation, keyspace, obsErr)...))
+		metric.WithAttributes(o.metricAttrs(operation, keyspace, srv, obsErr)...))
 
 	return spanCtx
 }
 
 // baseAttrs builds the semantic-convention span attributes common to queries
-// and batches. host is the actual coordinator (may be nil).
-func (o *observer) baseAttrs(operation, keyspace, table string, host *gocql.HostInfo) []attribute.KeyValue {
+// and batches. srv is the server attributed to this observation (the actual
+// coordinator for queries, the contact point for batches); host is the actual
+// coordinator for the Opt-In topology attributes (may be nil).
+func (o *observer) baseAttrs(operation, keyspace, table string, srv serverAddr, host *gocql.HostInfo) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{semconv.DBSystemNameCassandra}
 	if operation != "" {
 		attrs = append(attrs, semconv.DBOperationName(operation))
@@ -214,7 +217,7 @@ func (o *observer) baseAttrs(operation, keyspace, table string, host *gocql.Host
 	if table != "" {
 		attrs = append(attrs, semconv.DBCollectionName(table))
 	}
-	attrs = o.appendServerAttrs(attrs)
+	attrs = appendServerAttrs(attrs, srv)
 	// network.peer.* and cassandra.coordinator.* describe the actual contacted
 	// coordinator; Opt-In via WithHostAttributes so the package leads with
 	// server.* and does not expose per-node addresses by default (ADR 0019 §5).
@@ -236,10 +239,11 @@ func (o *observer) baseAttrs(operation, keyspace, table string, host *gocql.Host
 }
 
 // metricAttrs builds the bounded label set for db.client.operation.duration and
-// the attempts counter. The MetricViews allow-keys filter is the backstop, but
-// keeping the set small here avoids generating high-cardinality streams in the
-// first place (ADR 0019 §7).
-func (o *observer) metricAttrs(operation, keyspace string, obsErr error) []attribute.KeyValue {
+// the attempts counter. srv is the server attributed to the observation (the
+// actual coordinator for queries; cardinality stays bounded because it is one of
+// the cluster's nodes — a fixed set — ADR 0019 §7). The MetricViews allow-keys
+// filter is the backstop.
+func (o *observer) metricAttrs(operation, keyspace string, srv serverAddr, obsErr error) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{semconv.DBSystemNameCassandra}
 	if operation != "" {
 		attrs = append(attrs, semconv.DBOperationName(operation))
@@ -247,24 +251,35 @@ func (o *observer) metricAttrs(operation, keyspace string, obsErr error) []attri
 	if keyspace != "" {
 		attrs = append(attrs, semconv.DBNamespace(keyspace))
 	}
-	attrs = o.appendServerAttrs(attrs)
+	attrs = appendServerAttrs(attrs, srv)
 	if obsErr != nil {
 		attrs = append(attrs, semconv.ErrorTypeKey.String(errorType(obsErr)))
 	}
 	return attrs
 }
 
-// appendServerAttrs appends the logical-server (configured contact point)
-// attributes shared by spans, the operation metric, and the connect path. The
-// configured contact point is a small fixed set per client, so these are safe
-// as metric labels (ADR 0019 §7).
-func (o *observer) appendServerAttrs(attrs []attribute.KeyValue) []attribute.KeyValue {
-	if o.server.host == "" {
+// queryServer resolves the server.* attributed to a query observation: the actual
+// coordinator from ObservedQuery.Host (token-aware routing sends a query to the
+// replica node, not necessarily the configured contact point), falling back to
+// the contact point when the driver supplies no usable host (ADR 0019 §7).
+func (o *observer) queryServer(host *gocql.HostInfo) serverAddr {
+	if host != nil {
+		if ip := host.ConnectAddress(); len(ip) > 0 {
+			return serverAddr{host: ip.String(), port: host.Port()}
+		}
+	}
+	return o.server
+}
+
+// appendServerAttrs appends the server.address / server.port attributes for the
+// given server, shared by spans, the operation metric, and the connect path.
+func appendServerAttrs(attrs []attribute.KeyValue, srv serverAddr) []attribute.KeyValue {
+	if srv.host == "" {
 		return attrs
 	}
-	attrs = append(attrs, semconv.ServerAddress(o.server.host))
-	if o.server.port > 0 {
-		attrs = append(attrs, semconv.ServerPort(o.server.port))
+	attrs = append(attrs, semconv.ServerAddress(srv.host))
+	if srv.port > 0 {
+		attrs = append(attrs, semconv.ServerPort(srv.port))
 	}
 	return attrs
 }

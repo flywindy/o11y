@@ -292,8 +292,8 @@ driver attempt and per page (ADR 0019 §4).
 | `cassandra.query.attempt` | int | SDK-owned. Driver-side attempt index (`ObservedQuery.Attempt`); span-only, never a metric label. |
 | `network.peer.address` | string | Opt-In, only when `cassandra.WithHostAttributes(true)`. Actual contacted coordinator from `HostInfo` (useful under token-aware routing). |
 | `network.peer.port` | int | Opt-In, only when `cassandra.WithHostAttributes(true)`. Actual contacted coordinator port. |
-| `server.address` | string | Configured contact point host / logical server. |
-| `server.port` | int | Configured contact point port (defaulted from `ClusterConfig.Port`). |
+| `server.address` | string | Node that served the operation (`ObservedQuery.Host` / `ObservedConnect.Host`), falling back to the configured contact point (batch spans use the contact point). |
+| `server.port` | int | Port of that node, falling back to the configured contact point port (defaulted from `ClusterConfig.Port`). |
 | `error.type` | string | Set on `ObservedQuery.Err` / batch error; Go type name or context sentinel. |
 
 ### Instruments

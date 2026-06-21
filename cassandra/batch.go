@@ -134,7 +134,9 @@ func instrumentBatch(
 	end := time.Now()
 
 	namespace, table := batchTargets(batch)
-	obs.record(ctx, spanName("BATCH", table), "BATCH", namespace, start, end, err, obs.batchAttrs(batch, namespace, table))
+	// The batch seam has no per-statement host (gocql's ExecuteBatch* take no
+	// observer host here), so server.* is the configured contact point.
+	obs.record(ctx, spanName("BATCH", table), "BATCH", namespace, obs.server, start, end, err, obs.batchAttrs(batch, namespace, table))
 	return err
 }
 
@@ -196,7 +198,7 @@ func batchTargets(batch *gocql.Batch) (namespace, table string) {
 // is appended only under WithQueryText, mirroring the query path; the batch's
 // statements are joined since a batch has no single statement.
 func (o *observer) batchAttrs(batch *gocql.Batch, namespace, table string) []attribute.KeyValue {
-	attrs := o.baseAttrs("BATCH", namespace, table, nil)
+	attrs := o.baseAttrs("BATCH", namespace, table, o.server, nil)
 	if size := batch.Size(); size > 0 {
 		attrs = append(attrs, semconv.DBOperationBatchSize(size))
 	}

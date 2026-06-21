@@ -236,19 +236,20 @@ Sourced from `ObservedQuery` / `ObservedBatch` / `HostInfo` / `hostMetrics`.
 | `db.response.returned_rows` | Recommended | `ObservedQuery.Rows` |
 | `cassandra.coordinator.id` | Opt-In | `ObservedQuery.Host` (coordinating node id), **only when `WithHostAttributes(true)`** |
 | `cassandra.coordinator.dc` | Opt-In | `ObservedQuery.Host.DataCenter()`, **only when `WithHostAttributes(true)`** |
-| `server.address` / `server.port` | Recommended | the configured contact point / logical server [1] |
+| `server.address` / `server.port` | Recommended | the node that served the operation (`ObservedQuery.Host`), falling back to the configured contact point [1] |
 | `network.peer.address` / `network.peer.port` | Opt-In | the actual contacted coordinator from `HostInfo`, **only when `WithHostAttributes(true)`** [1] |
 | `error.type` | Conditionally Required | set on `ObservedQuery.Err != nil` |
 
-**[1] `server.*` vs `network.peer.*`.** `server.address`/`server.port` are the
-primary peer keys, consistent with the Redis (ADR 0013) and Elasticsearch
-(ADR 0020) integrations and the `db.client.operation.duration` metric labels
-(§7). `network.peer.*` captures the *actual* contacted coordinator (useful
-under token-aware routing) but is kept Opt-In — gated behind
-`WithHostAttributes(true)` and off by default — so the SDK-owned package leads
-with the repo's conformant `server.*` convention and does not expose per-node
-addresses/UUIDs unless asked. This is the inverse of the Mongo T2 case, where
-the upstream contrib library forces `network.peer.*`.
+**[1] `server.*` and `WithHostAttributes`.** `server.address`/`server.port` are
+the primary peer keys (consistent with Redis, ADR 0013, and Elasticsearch,
+ADR 0020) and now identify the node that actually served the operation —
+`ObservedQuery.Host` under token-aware routing — falling back to the contact
+point. `WithHostAttributes(true)` additionally records the coordinator's
+`cassandra.coordinator.id` / `.dc` (node UUID and datacenter, which `server.*`
+does not carry) and `network.peer.address`/`network.peer.port`; for a direct
+gocql connection the latter mirror `server.*`, so they are Opt-In and off by
+default rather than always duplicated. These topology details are kept Opt-In so
+the package does not expose per-node UUIDs/DCs unless asked.
 
 **Cassandra-specific key namespace.** In the pinned
 `go.opentelemetry.io/otel/semconv/v1.39.0` Go package these keys live in the
@@ -304,12 +305,17 @@ allow-keys backstop is applied to both SDK-owned attempt counters
 already bounded by construction, but the view guarantees a stray attribute can
 never leak in.
 
-`server.address` / `server.port` are safe as labels because they are the
-client's configured contact points — a small, fixed set per client instance,
-not per-request peer addresses — so they do not explode label cardinality
-(ADR 0008 §3). They are included (rather than dropped) so metrics remain
-attributable in shared-address topologies such as sidecars, provided the
-contact point parses into host and port.
+`server.address` / `server.port` identify the node that actually served the
+operation: `ObservedQuery.Host` for queries (the coordinator chosen by
+token-aware routing) and `ObservedConnect.Host` for connects, falling back to the
+configured contact point when the driver supplies no host (and for the batch
+seam, which has no per-statement host). This is the semconv-conformant meaning of
+`server.*` for `db.client.operation.duration`, and it keeps the query and connect
+metrics consistent. Cardinality stays bounded because the value is one of the
+cluster's nodes — a fixed set per deployment, not a per-request address
+(ADR 0008 §3). Callers who want to keep these labels collapsed to the contact
+point can still aggregate them away downstream; the actual coordinator id/dc are
+additionally available on spans via `WithHostAttributes`.
 
 **B. Retry / speculative-execution counter (v1 or fast-follow, Cassandra-unique)**
 
