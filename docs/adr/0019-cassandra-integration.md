@@ -231,7 +231,7 @@ Sourced from `ObservedQuery` / `ObservedBatch` / `HostInfo` / `hostMetrics`.
 | `db.system.name` = `cassandra` | Required | constant |
 | `db.namespace` | Conditionally Required | the keyspace actually addressed: an explicit `keyspace.table` qualifier parsed from the statement (authoritative, overrides the session keyspace), else `ObservedQuery.Keyspace`. Covers DML and qualified `CREATE/ALTER/DROP/TRUNCATE TABLE` and `CREATE/DROP KEYSPACE`. A batch resolves per statement and omits `db.namespace` when it spans multiple keyspaces. |
 | `db.operation.name` | Recommended | parsed from statement verb (SELECT/INSERT/…) / "BATCH" |
-| `db.collection.name` | Recommended | parsed table when a single table is addressed; for a batch, only when every statement targets the same table |
+| `db.collection.name` | Recommended | parsed table when a single table is addressed; for a batch, only when every statement targets the same fully-qualified `keyspace.table` |
 | `db.query.text` | Opt-In | `ObservedQuery.Statement` (batch: statements joined with `; `), **only when `WithQueryText(true)`** (§6) |
 | `db.response.returned_rows` | Recommended | `ObservedQuery.Rows` |
 | `cassandra.coordinator.id` | Opt-In | `ObservedQuery.Host` (coordinating node id), **only when `WithHostAttributes(true)`** |

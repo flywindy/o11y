@@ -450,6 +450,19 @@ func TestBatchTargetsMixedOmitted(t *testing.T) {
 	assert.Equal(t, "cassandra.BATCH", spans[0].Name())
 }
 
+// TestBatchTargetsSameTableDifferentKeyspaceOmitted: the same bare table name in
+// two keyspaces is not one table — db.collection.name (and the namespace) are
+// omitted so unrelated tables are not collapsed in trace grouping.
+func TestBatchTargetsSameTableDifferentKeyspaceOmitted(t *testing.T) {
+	batch := gocql.NewBatch(gocql.LoggedBatch) //nolint:staticcheck // see TestBatchAttrsMirrorQueryPath
+	batch.Query("INSERT INTO ks_a.events (id) VALUES (?)", "a")
+	batch.Query("INSERT INTO ks_b.events (id) VALUES (?)", "b")
+
+	ns, tbl := batchTargets(batch)
+	assert.Equal(t, "", ns, "differing keyspaces must omit db.namespace")
+	assert.Equal(t, "", tbl, "same bare table in different keyspaces must omit db.collection.name")
+}
+
 // TestBatchQueryTextOptIn: batch spans honor WithQueryText by joining the
 // statement texts, and omit db.query.text by default.
 func TestBatchQueryTextOptIn(t *testing.T) {

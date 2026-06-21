@@ -149,12 +149,14 @@ func instrumentBatch(
 // statement resolves to the same non-empty one. A multi-keyspace batch, or one
 // with any unresolved statement (unqualified with no session keyspace), omits it
 // rather than mislabeling. Table: reported only when every statement addresses
-// the same single table, so common single-table batches can be grouped by table;
-// a mixed or unparseable batch omits it. (ADR 0019 §5.)
+// the same fully-qualified table (same effective keyspace and bare name), so a
+// common single-table batch can be grouped by table while the same bare name in
+// two keyspaces is not collapsed; a mixed or unparseable batch omits it.
+// (ADR 0019 §5.)
 func batchTargets(batch *gocql.Batch) (namespace, table string) {
 	session := batch.Keyspace()
 	resolvedNS, nsConflict := "", false
-	resolvedTbl, tblConflict := "", false
+	resolvedTbl, resolvedKey, tblConflict := "", "", false
 	for _, entry := range batch.Entries {
 		_, ks, tbl := parseStatement(entry.Stmt)
 		if ks == "" {
@@ -175,14 +177,18 @@ func batchTargets(batch *gocql.Batch) (namespace, table string) {
 			}
 		}
 		if !tblConflict {
+			// Compare the fully-qualified <effective-keyspace>.<table> so the same
+			// bare table name in two keyspaces (ks_a.events vs ks_b.events) is not
+			// collapsed into one db.collection.name.
+			key := ks + "." + tbl
 			switch {
 			case tbl == "":
 				// An unparseable/empty table means we cannot prove the batch is
 				// single-table, so omit db.collection.name rather than guess.
 				resolvedTbl, tblConflict = "", true
-			case resolvedTbl == "":
-				resolvedTbl = tbl
-			case resolvedTbl != tbl:
+			case resolvedKey == "":
+				resolvedTbl, resolvedKey = tbl, key
+			case resolvedKey != key:
 				resolvedTbl, tblConflict = "", true
 			}
 		}
