@@ -37,16 +37,11 @@ func TestParseOperationAndTable(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.statement, func(t *testing.T) {
-			op := parseOperation(c.statement)
-			tbl := parseTable(c.statement)
+			op, ks, tbl := parseStatement(c.statement)
 			assert.Equal(t, c.operation, op)
+			assert.Equal(t, c.keyspace, ks, "parsed keyspace qualifier")
 			assert.Equal(t, c.table, tbl)
 			assert.Equal(t, c.span, spanName(op, tbl))
-
-			gotOp, gotKs, gotTbl := parseStatement(c.statement)
-			assert.Equal(t, c.operation, gotOp)
-			assert.Equal(t, c.keyspace, gotKs, "parsed keyspace qualifier")
-			assert.Equal(t, c.table, gotTbl)
 		})
 	}
 }

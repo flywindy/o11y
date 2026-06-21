@@ -231,8 +231,8 @@ Sourced from `ObservedQuery` / `ObservedBatch` / `HostInfo` / `hostMetrics`.
 | `db.system.name` = `cassandra` | Required | constant |
 | `db.namespace` | Conditionally Required | the keyspace actually addressed: an explicit `keyspace.table` qualifier parsed from the statement (authoritative, overrides the session keyspace), else `ObservedQuery.Keyspace`. Covers DML and qualified `CREATE/ALTER/DROP/TRUNCATE TABLE` and `CREATE/DROP KEYSPACE`. A batch resolves per statement and omits `db.namespace` when it spans multiple keyspaces. |
 | `db.operation.name` | Recommended | parsed from statement verb (SELECT/INSERT/…) / "BATCH" |
-| `db.collection.name` | Recommended | parsed table when a single table is addressed |
-| `db.query.text` | Opt-In | `ObservedQuery.Statement`, **only when `WithQueryText(true)`** (§6) |
+| `db.collection.name` | Recommended | parsed table when a single table is addressed; for a batch, only when every statement targets the same table |
+| `db.query.text` | Opt-In | `ObservedQuery.Statement` (batch: statements joined with `; `), **only when `WithQueryText(true)`** (§6) |
 | `db.response.returned_rows` | Recommended | `ObservedQuery.Rows` |
 | `cassandra.coordinator.id` | Opt-In | `ObservedQuery.Host` (coordinating node id), **only when `WithHostAttributes(true)`** |
 | `cassandra.coordinator.dc` | Opt-In | `ObservedQuery.Host.DataCenter()`, **only when `WithHostAttributes(true)`** |
@@ -298,7 +298,11 @@ equivalent). This is the same instrument MongoDB (ADR 0014) and Redis (ADR 0013)
 emit; the SDK provides `cassandra.MetricViews()` composed into `o11y.Init` via
 `internal/metrics.Config.ExtraViews` (same wiring as redis at `o11y.go:233`),
 pinning histogram buckets to the SDK default set for cross-integration
-consistency and applying an allow-keys filter to bound cardinality.
+consistency and applying an allow-keys filter to bound cardinality. The same
+allow-keys backstop is applied to both SDK-owned attempt counters
+(`cassandra.query.attempts`, `cassandra.connection.attempts`); their label set is
+already bounded by construction, but the view guarantees a stray attribute can
+never leak in.
 
 `server.address` / `server.port` are safe as labels because they are the
 client's configured contact points — a small, fixed set per client instance,

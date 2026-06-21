@@ -283,9 +283,9 @@ driver attempt and per page (ADR 0019 §4).
 | `db.system.name` | string | Constant `"cassandra"`. |
 | `db.namespace` | string | Keyspace actually addressed: an explicit `keyspace.table` qualifier in the statement takes precedence (it overrides the session keyspace), otherwise `ObservedQuery.Keyspace` / `Batch.Keyspace()`. A batch that spans multiple keyspaces omits this attribute. |
 | `db.operation.name` | string | Parsed statement verb (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, …) or `BATCH`. |
-| `db.collection.name` | string | Parsed table when a single table is addressed. |
-| `db.operation.batch.size` | int | Statement count, on `ExecuteBatch` spans only. |
-| `db.query.text` | string | Only when `cassandra.WithQueryText(true)` is used; bound values are never captured. |
+| `db.collection.name` | string | Parsed table when a single table is addressed; for a batch, only when every statement targets the same table. |
+| `db.operation.batch.size` | int | Statement count, on `ExecuteBatch*` spans only. |
+| `db.query.text` | string | Only when `cassandra.WithQueryText(true)` is used; bound values are never captured. On batch spans this is the batch's statement texts joined with `; `. |
 | `db.response.returned_rows` | int | Rows in the current page, from `ObservedQuery.Rows`. |
 | `cassandra.coordinator.id` | string | Opt-In, only when `cassandra.WithHostAttributes(true)`. Coordinating node id from `ObservedQuery.Host`. |
 | `cassandra.coordinator.dc` | string | Opt-In, only when `cassandra.WithHostAttributes(true)`. Coordinating node datacenter from `ObservedQuery.Host.DataCenter()`. |
@@ -309,13 +309,17 @@ driver attempt and per page (ADR 0019 §4).
 recommends on connection metrics (Recommended in v1.39.0, which asks
 instrumentation lacking a pool name to synthesize a unique one). gocql exposes no
 pool identifier, so it defaults to a stable value synthesized from the contact
-point (e.g. `cassandra/10.0.0.1:9042`) and is overridable via
-`cassandra.WithPoolName`.
+point and the cluster keyspace, following semconv's suggested
+`server.address:server.port/db.namespace` shape (e.g.
+`cassandra/10.0.0.1:9042/chat`). The keyspace suffix keeps sessions that share a
+contact point but target different keyspaces distinct; sessions sharing both
+should pass `cassandra.WithPoolName` to disambiguate.
 
 Cardinality is bounded by the `MetricViews()` allowlist installed via
-`o11y.Init`'s `ExtraViews` (mirrors the redis/mongo pattern). Services that
-build their own MeterProvider must register the same views via
-`sdkmetric.WithView(...)` at construction.
+`o11y.Init`'s `ExtraViews` (mirrors the redis/mongo pattern); every Cassandra
+instrument above — both histograms and both attempt counters — has an allow-keys
+view. Services that build their own MeterProvider must register the same views
+via `sdkmetric.WithView(...)` at construction.
 
 ### Explicitly NOT Emitted
 

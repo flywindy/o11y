@@ -60,7 +60,10 @@ func run(ctx context.Context) error {
 	// The caller keeps full control of the cluster config (contact points,
 	// consistency, auth, timeouts); NewSession only attaches the observers.
 	cluster := gocql.NewCluster(addr)
-	cluster.Consistency = gocql.LocalQuorum
+	// Quorum works against the bundled single-node dev service (SimpleStrategy,
+	// replication_factor 1); LOCAL_QUORUM assumes a NetworkTopologyStrategy DC and
+	// would fail the read-back on that keyspace.
+	cluster.Consistency = gocql.Quorum
 	cluster.ConnectTimeout = 10 * time.Second
 	cluster.Timeout = 10 * time.Second
 

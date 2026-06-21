@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -132,47 +133,82 @@ func instrumentBatch(
 	err := exec(batch)
 	end := time.Now()
 
-	namespace := batchNamespace(batch)
-	obs.record(ctx, spanName("BATCH", ""), "BATCH", namespace, start, end, err, obs.batchAttrs(batch, namespace))
+	namespace, table := batchTargets(batch)
+	obs.record(ctx, spanName("BATCH", table), "BATCH", namespace, start, end, err, obs.batchAttrs(batch, namespace, table))
 	return err
 }
 
-// batchNamespace resolves db.namespace for a batch. Each statement's effective
-// keyspace is its explicit keyspace.table qualifier when present (authoritative,
-// as on the query path), otherwise the driver-reported session keyspace. The
-// batch's db.namespace is set only when every statement resolves to the same
-// keyspace; a batch that genuinely spans multiple keyspaces returns "" so the
-// attribute is omitted rather than mislabeling the batch with one of them
-// (ADR 0019 §5).
-func batchNamespace(batch *gocql.Batch) string {
+// batchTargets resolves db.namespace and db.collection.name for a batch in a
+// single pass over its statements.
+//
+// Namespace: each statement's effective keyspace is its explicit keyspace.table
+// qualifier when present (authoritative, as on the query path), otherwise the
+// driver-reported session keyspace; the batch reports a namespace only when every
+// statement resolves to the same one (a genuinely multi-keyspace batch omits it
+// rather than mislabeling). Table: reported only when every statement addresses
+// the same single table, so common single-table batches can be grouped by table;
+// a mixed or unparseable batch omits it. (ADR 0019 §5.)
+func batchTargets(batch *gocql.Batch) (namespace, table string) {
 	session := batch.Keyspace()
-	resolved := ""
+	resolvedNS, nsConflict := "", false
+	resolvedTbl, tblConflict := "", false
 	for _, entry := range batch.Entries {
-		_, ks, _ := parseStatement(entry.Stmt)
+		_, ks, tbl := parseStatement(entry.Stmt)
 		if ks == "" {
 			ks = session
 		}
-		if ks == "" {
-			continue
+		if ks != "" && !nsConflict {
+			if resolvedNS == "" {
+				resolvedNS = ks
+			} else if resolvedNS != ks {
+				resolvedNS, nsConflict = "", true
+			}
 		}
-		if resolved == "" {
-			resolved = ks
-		} else if resolved != ks {
-			return "" // batch spans multiple keyspaces; omit db.namespace
+		if !tblConflict {
+			switch {
+			case tbl == "":
+				// An unparseable/empty table means we cannot prove the batch is
+				// single-table, so omit db.collection.name rather than guess.
+				resolvedTbl, tblConflict = "", true
+			case resolvedTbl == "":
+				resolvedTbl = tbl
+			case resolvedTbl != tbl:
+				resolvedTbl, tblConflict = "", true
+			}
 		}
 	}
-	if resolved != "" {
-		return resolved
+	if resolvedNS == "" && !nsConflict {
+		resolvedNS = session
 	}
-	return session
+	return resolvedNS, resolvedTbl
 }
 
 // batchAttrs builds the span attributes for one logical batch, feeding
-// db.operation.batch.size from the statement count (ADR 0019 §4).
-func (o *observer) batchAttrs(batch *gocql.Batch, namespace string) []attribute.KeyValue {
-	attrs := o.baseAttrs("BATCH", namespace, "", nil)
+// db.operation.batch.size from the statement count (ADR 0019 §4). db.query.text
+// is appended only under WithQueryText, mirroring the query path; the batch's
+// statements are joined since a batch has no single statement.
+func (o *observer) batchAttrs(batch *gocql.Batch, namespace, table string) []attribute.KeyValue {
+	attrs := o.baseAttrs("BATCH", namespace, table, nil)
 	if size := batch.Size(); size > 0 {
 		attrs = append(attrs, semconv.DBOperationBatchSize(size))
 	}
+	if o.cfg.queryTextEnabled {
+		if text := batchQueryText(batch); text != "" {
+			attrs = append(attrs, semconv.DBQueryText(text))
+		}
+	}
 	return attrs
+}
+
+// batchQueryText joins the batch's statement texts for db.query.text under the
+// WithQueryText opt-in. Bound values are never included (gocql keeps them in
+// entry.Args, which this does not read).
+func batchQueryText(batch *gocql.Batch) string {
+	stmts := make([]string, 0, len(batch.Entries))
+	for _, entry := range batch.Entries {
+		if entry.Stmt != "" {
+			stmts = append(stmts, entry.Stmt)
+		}
+	}
+	return strings.Join(stmts, "; ")
 }

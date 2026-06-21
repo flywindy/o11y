@@ -58,5 +58,41 @@ func MetricViews(histogramBuckets []float64) []sdkmetric.View {
 				),
 			},
 		),
+		// The two SDK-owned attempt counters carry the same bounded label set by
+		// construction (metricAttrs / ObserveConnect), but they get the same
+		// allow-keys backstop view as the histograms so a future stray attribute
+		// cannot leak into them either. No bucket/aggregation override: counters
+		// keep their default sum aggregation.
+		sdkmetric.NewView(
+			sdkmetric.Instrument{
+				Name:  "cassandra.query.attempts",
+				Scope: instrumentation.Scope{Name: instrumentationName},
+			},
+			sdkmetric.Stream{
+				AttributeFilter: attribute.NewAllowKeysFilter(
+					semconv.DBSystemNameKey,
+					semconv.DBOperationNameKey,
+					semconv.DBNamespaceKey,
+					semconv.ServerAddressKey,
+					semconv.ServerPortKey,
+					semconv.ErrorTypeKey,
+				),
+			},
+		),
+		sdkmetric.NewView(
+			sdkmetric.Instrument{
+				Name:  "cassandra.connection.attempts",
+				Scope: instrumentation.Scope{Name: instrumentationName},
+			},
+			sdkmetric.Stream{
+				AttributeFilter: attribute.NewAllowKeysFilter(
+					semconv.DBSystemNameKey,
+					semconv.DBClientConnectionPoolNameKey,
+					semconv.ServerAddressKey,
+					semconv.ServerPortKey,
+					semconv.ErrorTypeKey,
+				),
+			},
+		),
 	}
 }

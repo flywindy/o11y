@@ -54,17 +54,6 @@ func parseStatement(statement string) (operation, keyspace, table string) {
 	return strings.ToUpper(fields[0]), keyspace, table
 }
 
-// parseOperation extracts the CQL operation verb (SELECT, INSERT, UPDATE, …)
-// from a statement. It returns the uppercased leading keyword, or "" when the
-// statement is empty or unparseable.
-func parseOperation(statement string) string {
-	fields := strings.Fields(trimLeadingComments(statement))
-	if len(fields) == 0 {
-		return ""
-	}
-	return strings.ToUpper(fields[0])
-}
-
 // trimLeadingComments strips leading whitespace and CQL comments so the
 // operation verb and table parse correctly when a statement is prefixed with a
 // query name, routing tag, or ORM annotation. CQL supports line comments (--)
@@ -89,16 +78,6 @@ func trimLeadingComments(stmt string) string {
 			return stmt
 		}
 	}
-}
-
-// parseTable returns the single table a statement addresses, or "" when no
-// single table can be confidently parsed (multi-table statements, unrecognized
-// shapes). It recognizes the common single-table CQL DML forms; anything else
-// falls back to "" so the span name degrades to cassandra.{operation} rather
-// than guessing.
-func parseTable(statement string) string {
-	_, table := parseTableFields(strings.Fields(trimLeadingComments(statement)))
-	return table
 }
 
 // parseTableFields is the shared table-parsing core operating on a pre-split

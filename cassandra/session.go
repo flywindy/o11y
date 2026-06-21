@@ -114,26 +114,36 @@ func newObserver(
 		inst:     inst,
 		cfg:      cfg,
 		server:   server,
-		poolName: poolName(cfg.poolName, server),
+		poolName: poolName(cfg.poolName, server, cluster.Keyspace),
 	}, nil
 }
 
 // poolName resolves the connection-pool name label: the caller-supplied name
 // when set, otherwise a stable value synthesized from the configured contact
-// point (semconv recommends a pool name on connection metrics and asks
-// instrumentation to synthesize a unique one when, as with gocql, the driver
-// exposes none).
-func poolName(configured string, server serverAddr) string {
+// point and the cluster keyspace (semconv recommends a pool name on connection
+// metrics and asks instrumentation to synthesize a unique one when, as with
+// gocql, the driver exposes none — suggesting the `server.address:server.port/
+// db.namespace` shape, which the keyspace suffix follows). Including the keyspace
+// disambiguates sessions that share a contact point but target different
+// keyspaces; sessions sharing both should pass WithPoolName.
+func poolName(configured string, server serverAddr, keyspace string) string {
 	if configured != "" {
 		return configured
 	}
 	if server.host == "" {
+		if keyspace != "" {
+			return "cassandra/" + keyspace
+		}
 		return "cassandra"
 	}
+	name := "cassandra/" + server.host
 	if server.port > 0 {
-		return "cassandra/" + net.JoinHostPort(server.host, strconv.Itoa(server.port))
+		name = "cassandra/" + net.JoinHostPort(server.host, strconv.Itoa(server.port))
 	}
-	return "cassandra/" + server.host
+	if keyspace != "" {
+		name += "/" + keyspace
+	}
+	return name
 }
 
 // chainQueryObserver composes a caller-supplied QueryObserver with the SDK's, so

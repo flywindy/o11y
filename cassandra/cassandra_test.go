@@ -43,7 +43,7 @@ func newTestObserver(t *testing.T, cfg config) (*observer, *tracetest.SpanRecord
 		inst:     inst,
 		cfg:      cfg,
 		server:   server,
-		poolName: poolName(cfg.poolName, server),
+		poolName: poolName(cfg.poolName, server, ""),
 	}
 	return obs, sr, reader
 }
@@ -335,19 +335,25 @@ func TestBatchAttrsMirrorQueryPath(t *testing.T) {
 	// session.NewBatch needs a live session; NewBatch is the only way to build a
 	// *gocql.Batch in a unit test without a cluster.
 	batch := gocql.NewBatch(gocql.LoggedBatch) //nolint:staticcheck // see comment above
-	batch.Query("INSERT INTO messages_by_room (room_id, id) VALUES (?, ?)", "r1", "m1")
-	batch.Query("INSERT INTO messages_by_room (room_id, id) VALUES (?, ?)", "r1", "m2")
+	batch.Query("INSERT INTO chat.messages_by_room (room_id, id) VALUES (?, ?)", "r1", "m1")
+	batch.Query("INSERT INTO chat.messages_by_room (room_id, id) VALUES (?, ?)", "r1", "m2")
 
-	attrs := obs.batchAttrs(batch, "chat")
+	// All statements share one keyspace and table, so the batch reports both.
+	ns, tbl := batchTargets(batch)
+	assert.Equal(t, "chat", ns)
+	assert.Equal(t, "messages_by_room", tbl)
+
+	attrs := obs.batchAttrs(batch, ns, tbl)
 	start := time.Now()
-	obs.record(context.Background(), spanName("BATCH", ""), "BATCH", "chat", start, start.Add(time.Millisecond), nil, attrs)
+	obs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, start, start.Add(time.Millisecond), nil, attrs)
 
 	spans := sr.Ended()
 	require.Len(t, spans, 1)
 	span := spans[0]
-	assert.Equal(t, "cassandra.BATCH", span.Name())
+	assert.Equal(t, "cassandra.BATCH messages_by_room", span.Name())
 	assert.Contains(t, span.Attributes(), semconv.DBSystemNameCassandra)
 	assert.Contains(t, span.Attributes(), semconv.DBOperationName("BATCH"))
+	assert.Contains(t, span.Attributes(), semconv.DBCollectionName("messages_by_room"))
 	assert.Contains(t, span.Attributes(), semconv.DBOperationBatchSize(2))
 
 	rm := collectMetrics(t, reader)
@@ -399,41 +405,73 @@ func TestObserveQueryQualifierOverridesSessionKeyspace(t *testing.T) {
 	assert.NotContains(t, spans[0].Attributes(), semconv.DBNamespace("ks_a"))
 }
 
-// TestBatchNamespaceFromQualifiedCQL covers the same fallback on the batch seam:
-// when the driver reports no batch keyspace, the qualifier is parsed from the
-// batch's statements.
-func TestBatchNamespaceFromQualifiedCQL(t *testing.T) {
+// TestBatchTargetsFromQualifiedCQL covers the batch seam: when the driver
+// reports no batch keyspace, the namespace and table come from the statements,
+// and a single-table batch reports db.collection.name.
+func TestBatchTargetsFromQualifiedCQL(t *testing.T) {
 	batch := gocql.NewBatch(gocql.LoggedBatch) //nolint:staticcheck // see TestBatchAttrsMirrorQueryPath
 	batch.Query("INSERT INTO o11y_examples.events (id, body) VALUES (?, ?)", "a", "x")
 	batch.Query("INSERT INTO o11y_examples.events (id, body) VALUES (?, ?)", "b", "y")
 
-	assert.Equal(t, "o11y_examples", batchNamespace(batch))
+	ns, tbl := batchTargets(batch)
+	assert.Equal(t, "o11y_examples", ns)
+	assert.Equal(t, "events", tbl)
 
 	obs, sr, _ := newTestObserver(t, config{})
-	ns := batchNamespace(batch)
-	obs.record(context.Background(), spanName("BATCH", ""), "BATCH", ns, time.Now(), time.Now(), nil, obs.batchAttrs(batch, ns))
+	obs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, time.Now(), time.Now(), nil, obs.batchAttrs(batch, ns, tbl))
 
 	spans := sr.Ended()
 	require.Len(t, spans, 1)
 	assert.Contains(t, spans[0].Attributes(), semconv.DBNamespace("o11y_examples"))
+	assert.Contains(t, spans[0].Attributes(), semconv.DBCollectionName("events"))
+	assert.Equal(t, "cassandra.BATCH events", spans[0].Name())
 }
 
-// TestBatchNamespaceMultipleKeyspacesOmitted: a batch that genuinely spans two
-// keyspaces must not be labeled with either one, so db.namespace is omitted.
-func TestBatchNamespaceMultipleKeyspacesOmitted(t *testing.T) {
+// TestBatchTargetsMixedOmitted: a batch that genuinely spans two keyspaces (and
+// two tables) must not be labeled with either, so both are omitted.
+func TestBatchTargetsMixedOmitted(t *testing.T) {
 	batch := gocql.NewBatch(gocql.LoggedBatch) //nolint:staticcheck // see TestBatchAttrsMirrorQueryPath
 	batch.Query("INSERT INTO ks_a.events (id) VALUES (?)", "a")
-	batch.Query("INSERT INTO ks_b.events (id) VALUES (?)", "b")
+	batch.Query("INSERT INTO ks_b.rooms (id) VALUES (?)", "b")
 
-	assert.Equal(t, "", batchNamespace(batch))
+	ns, tbl := batchTargets(batch)
+	assert.Equal(t, "", ns)
+	assert.Equal(t, "", tbl)
 
 	obs, sr, _ := newTestObserver(t, config{})
-	ns := batchNamespace(batch)
-	obs.record(context.Background(), spanName("BATCH", ""), "BATCH", ns, time.Now(), time.Now(), nil, obs.batchAttrs(batch, ns))
+	obs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, time.Now(), time.Now(), nil, obs.batchAttrs(batch, ns, tbl))
 
 	spans := sr.Ended()
 	require.Len(t, spans, 1)
 	assert.False(t, spanHasKey(spans[0], semconv.DBNamespaceKey), "ambiguous batch must omit db.namespace")
+	assert.False(t, spanHasKey(spans[0], semconv.DBCollectionNameKey), "ambiguous batch must omit db.collection.name")
+	assert.Equal(t, "cassandra.BATCH", spans[0].Name())
+}
+
+// TestBatchQueryTextOptIn: batch spans honor WithQueryText by joining the
+// statement texts, and omit db.query.text by default.
+func TestBatchQueryTextOptIn(t *testing.T) {
+	build := func() *gocql.Batch {
+		b := gocql.NewBatch(gocql.LoggedBatch) //nolint:staticcheck // see TestBatchAttrsMirrorQueryPath
+		b.Query("INSERT INTO chat.rooms (id) VALUES (?)", "a")
+		b.Query("UPDATE chat.rooms SET name = ? WHERE id = ?", "x", "a")
+		return b
+	}
+
+	offObs, offSR, _ := newTestObserver(t, config{})
+	b := build()
+	ns, tbl := batchTargets(b)
+	offObs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, time.Now(), time.Now(), nil, offObs.batchAttrs(b, ns, tbl))
+	require.Len(t, offSR.Ended(), 1)
+	assert.False(t, spanHasKey(offSR.Ended()[0], semconv.DBQueryTextKey), "query text off by default")
+
+	onObs, onSR, _ := newTestObserver(t, config{queryTextEnabled: true})
+	b = build()
+	ns, tbl = batchTargets(b)
+	onObs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, time.Now(), time.Now(), nil, onObs.batchAttrs(b, ns, tbl))
+	require.Len(t, onSR.Ended(), 1)
+	assert.Contains(t, onSR.Ended()[0].Attributes(),
+		semconv.DBQueryText("INSERT INTO chat.rooms (id) VALUES (?); UPDATE chat.rooms SET name = ? WHERE id = ?"))
 }
 
 func TestObserveConnectMetrics(t *testing.T) {
@@ -465,11 +503,15 @@ func TestObserveConnectMetrics(t *testing.T) {
 
 func TestPoolNameSynthesisAndOverride(t *testing.T) {
 	// Synthesized from the contact point when WithPoolName is not set.
-	assert.Equal(t, "cassandra/10.0.0.1:9042", poolName("", serverAddr{host: "10.0.0.1", port: 9042}))
-	assert.Equal(t, "cassandra/10.0.0.1", poolName("", serverAddr{host: "10.0.0.1"}))
-	assert.Equal(t, "cassandra", poolName("", serverAddr{}))
-	// WithPoolName overrides the synthesized value.
-	assert.Equal(t, "chat-cluster", poolName("chat-cluster", serverAddr{host: "10.0.0.1", port: 9042}))
+	assert.Equal(t, "cassandra/10.0.0.1:9042", poolName("", serverAddr{host: "10.0.0.1", port: 9042}, ""))
+	assert.Equal(t, "cassandra/10.0.0.1", poolName("", serverAddr{host: "10.0.0.1"}, ""))
+	assert.Equal(t, "cassandra", poolName("", serverAddr{}, ""))
+	// The cluster keyspace is appended (semconv's server:port/db.namespace shape)
+	// so sessions to the same contact point but different keyspaces stay distinct.
+	assert.Equal(t, "cassandra/10.0.0.1:9042/chat", poolName("", serverAddr{host: "10.0.0.1", port: 9042}, "chat"))
+	assert.Equal(t, "cassandra/chat", poolName("", serverAddr{}, "chat"))
+	// WithPoolName overrides the synthesized value entirely.
+	assert.Equal(t, "chat-cluster", poolName("chat-cluster", serverAddr{host: "10.0.0.1", port: 9042}, "chat"))
 }
 
 func assertHasAttr(t *testing.T, set attribute.Set, want attribute.KeyValue) {

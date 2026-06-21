@@ -62,9 +62,11 @@ func WithHostAttributes(enabled bool) Option {
 // gocql exposes no pool identifier. semconv (v1.39.0) marks the pool name
 // Recommended and directs instrumentation that lacks one to synthesize a unique
 // value, so when omitted the SDK derives a stable name from the configured
-// contact point (e.g. "cassandra/10.0.0.1:9042"). Set this explicitly to
-// disambiguate multiple sessions that target the same contact point, which would
-// otherwise share the synthesized name.
+// contact point and cluster keyspace, following semconv's suggested
+// "server.address:server.port/db.namespace" shape (e.g.
+// "cassandra/10.0.0.1:9042/chat"). Set this explicitly to disambiguate sessions
+// that share both a contact point and a keyspace, which would otherwise share
+// the synthesized name.
 func WithPoolName(name string) Option {
 	return func(cfg *config) {
 		cfg.poolName = name

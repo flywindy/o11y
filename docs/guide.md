@@ -667,6 +667,7 @@ session, err := o11ycassandra.NewSession(
 )
 if err != nil {
     obs.Logger.ErrorContext(ctx, "Cassandra session failed", slog.Any("error", err))
+    return
 }
 defer session.Close()
 
