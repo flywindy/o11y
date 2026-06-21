@@ -22,6 +22,49 @@ const instrumentationName = "github.com/flywindy/o11y/cassandra"
 // (ADR 0019 §4). There is no stable semconv key for this, so it is SDK-named.
 const attemptKey = attribute.Key("cassandra.query.attempt")
 
+// reservedAttrKeys are the keys this package owns on spans and metrics. Values
+// supplied via WithAttributes that reuse these are dropped (filterReservedAttrs),
+// so a caller cannot override the package's contract or smuggle in a key that is
+// only emitted conditionally — e.g. db.query.text while WithQueryText is off (the
+// default sensitive-data guard), or error.type on a successful span. Relying on
+// last-wins alone would let such a value survive whenever the SDK does not append
+// its own.
+var reservedAttrKeys = map[attribute.Key]struct{}{
+	semconv.DBSystemNameKey:               {},
+	semconv.DBNamespaceKey:                {},
+	semconv.DBOperationNameKey:            {},
+	semconv.DBCollectionNameKey:           {},
+	semconv.DBResponseReturnedRowsKey:     {},
+	semconv.DBQueryTextKey:                {},
+	semconv.DBOperationBatchSizeKey:       {},
+	semconv.ServerAddressKey:              {},
+	semconv.ServerPortKey:                 {},
+	semconv.NetworkPeerAddressKey:         {},
+	semconv.NetworkPeerPortKey:            {},
+	semconv.CassandraCoordinatorIDKey:     {},
+	semconv.CassandraCoordinatorDCKey:     {},
+	semconv.ErrorTypeKey:                  {},
+	semconv.DBClientConnectionPoolNameKey: {},
+	attemptKey:                            {},
+}
+
+// filterReservedAttrs returns attrs without any reserved-key entries, leaving the
+// caller's slice untouched. Returns the input unchanged when nothing is reserved.
+func filterReservedAttrs(attrs []attribute.KeyValue) []attribute.KeyValue {
+	for _, a := range attrs {
+		if _, reserved := reservedAttrKeys[a.Key]; reserved {
+			filtered := make([]attribute.KeyValue, 0, len(attrs))
+			for _, a := range attrs {
+				if _, reserved := reservedAttrKeys[a.Key]; !reserved {
+					filtered = append(filtered, a)
+				}
+			}
+			return filtered
+		}
+	}
+	return attrs
+}
+
 // observer implements gocql's QueryObserver and ConnectObserver interfaces. It
 // is created once per session and shared across all queries; gocql sets it on
 // the *gocql.ClusterConfig before the session exists, so there is no

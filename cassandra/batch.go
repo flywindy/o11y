@@ -144,8 +144,9 @@ func instrumentBatch(
 // Namespace: each statement's effective keyspace is its explicit keyspace.table
 // qualifier when present (authoritative, as on the query path), otherwise the
 // driver-reported session keyspace; the batch reports a namespace only when every
-// statement resolves to the same one (a genuinely multi-keyspace batch omits it
-// rather than mislabeling). Table: reported only when every statement addresses
+// statement resolves to the same non-empty one. A multi-keyspace batch, or one
+// with any unresolved statement (unqualified with no session keyspace), omits it
+// rather than mislabeling. Table: reported only when every statement addresses
 // the same single table, so common single-table batches can be grouped by table;
 // a mixed or unparseable batch omits it. (ADR 0019 §5.)
 func batchTargets(batch *gocql.Batch) (namespace, table string) {
@@ -157,10 +158,17 @@ func batchTargets(batch *gocql.Batch) (namespace, table string) {
 		if ks == "" {
 			ks = session
 		}
-		if ks != "" && !nsConflict {
-			if resolvedNS == "" {
+		if !nsConflict {
+			switch {
+			case ks == "":
+				// An unqualified statement with no session keyspace has an
+				// unknown effective keyspace (and would typically fail to
+				// execute); treat it as ambiguity and omit db.namespace rather
+				// than letting a sibling qualified statement label the batch.
+				resolvedNS, nsConflict = "", true
+			case resolvedNS == "":
 				resolvedNS = ks
-			} else if resolvedNS != ks {
+			case resolvedNS != ks:
 				resolvedNS, nsConflict = "", true
 			}
 		}

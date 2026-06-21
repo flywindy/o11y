@@ -474,6 +474,51 @@ func TestBatchQueryTextOptIn(t *testing.T) {
 		semconv.DBQueryText("INSERT INTO chat.rooms (id) VALUES (?); UPDATE chat.rooms SET name = ? WHERE id = ?"))
 }
 
+// TestBatchNamespaceUnresolvedEntryOmitted: a batch that mixes a qualified
+// statement with an unqualified one (and no session keyspace) has an unknown
+// effective keyspace for the unqualified entry, so db.namespace is omitted rather
+// than letting the qualified sibling label the whole batch.
+func TestBatchNamespaceUnresolvedEntryOmitted(t *testing.T) {
+	batch := gocql.NewBatch(gocql.LoggedBatch) //nolint:staticcheck // see TestBatchAttrsMirrorQueryPath
+	batch.Query("INSERT INTO ks_b.events (id) VALUES (?)", "a")
+	batch.Query("INSERT INTO events (id) VALUES (?)", "b") // unqualified, no session keyspace
+
+	ns, _ := batchTargets(batch)
+	assert.Equal(t, "", ns, "an unresolved entry must omit the batch namespace")
+}
+
+// TestWithAttributesDropsReservedKeys: a caller cannot use WithAttributes to
+// smuggle in a package-owned key — db.query.text stays off when WithQueryText is
+// false, error.type does not appear on a success — while non-reserved custom
+// attributes still pass through to the span.
+func TestWithAttributesDropsReservedKeys(t *testing.T) {
+	cfg := newConfig([]Option{WithAttributes(
+		semconv.DBQueryText("SELECT secret FROM creds"), // reserved + gated: must be dropped
+		semconv.ErrorTypeKey.String("forced"),           // reserved: must be dropped
+		semconv.ServerAddress("evil.example.com"),       // reserved: must be dropped
+		attribute.String("team", "payments"),            // custom: must survive
+	)})
+	obs, sr, _ := newTestObserver(t, cfg)
+
+	start := time.Now()
+	obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+		Keyspace:  "chat",
+		Statement: "SELECT id FROM rooms WHERE id = ?",
+		Start:     start,
+		End:       start.Add(time.Millisecond),
+	})
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	span := spans[0]
+	assert.Contains(t, span.Attributes(), attribute.String("team", "payments"))
+	assert.False(t, spanHasKey(span, semconv.DBQueryTextKey), "WithQueryText off: caller cannot force db.query.text")
+	assert.False(t, spanHasKey(span, semconv.ErrorTypeKey), "successful span: caller cannot force error.type")
+	// server.address is still the SDK's configured contact point, not the caller's.
+	assert.Contains(t, span.Attributes(), semconv.ServerAddress("127.0.0.1"))
+	assert.NotContains(t, span.Attributes(), semconv.ServerAddress("evil.example.com"))
+}
+
 func TestObserveConnectMetrics(t *testing.T) {
 	obs, _, reader := newTestObserver(t, config{})
 

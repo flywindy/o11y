@@ -28,9 +28,12 @@ func WithQueryText(enabled bool) Option {
 // WithAttributes appends extra attributes to every emitted Cassandra span.
 //
 // The SDK's built-in semantic-convention attributes (db.system.name,
-// db.namespace, db.operation.name, db.collection.name, server.address,
-// server.port, etc.) take precedence: if a supplied attribute reuses one of
-// those keys, the built-in value wins and the supplied one is dropped.
+// db.namespace, db.operation.name, db.collection.name, db.query.text,
+// server.address, server.port, error.type, etc.) are reserved: a supplied
+// attribute reusing one of those keys is always dropped, even when the SDK only
+// emits that key conditionally (e.g. db.query.text is gated by WithQueryText, and
+// error.type only on failures), so WithAttributes can never override the
+// package's contract or smuggle in a gated key.
 //
 // These attributes are never applied to metric samples; Cassandra metric labels
 // are fixed by the SDK to keep cardinality bounded.
@@ -61,9 +64,9 @@ func WithHostAttributes(enabled bool) Option {
 //
 // gocql exposes no pool identifier. semconv (v1.39.0) marks the pool name
 // Recommended and directs instrumentation that lacks one to synthesize a unique
-// value, so when omitted the SDK derives a stable name from the configured
-// contact point and cluster keyspace, following semconv's suggested
-// "server.address:server.port/db.namespace" shape (e.g.
+// value, so when omitted the SDK derives a stable name shaped as
+// "cassandra/<server.address>:<server.port>/<keyspace>" — the db.system prefix
+// plus semconv's suggested "server.address:server.port/db.namespace" form (e.g.
 // "cassandra/10.0.0.1:9042/chat"). Set this explicitly to disambiguate sessions
 // that share both a contact point and a keyspace, which would otherwise share
 // the synthesized name.
@@ -80,5 +83,8 @@ func newConfig(opts []Option) config {
 			opt(&cfg)
 		}
 	}
+	// Drop any package-owned semconv keys a caller passed via WithAttributes so
+	// they cannot override the built-ins or smuggle in conditionally-emitted keys.
+	cfg.attrs = filterReservedAttrs(cfg.attrs)
 	return cfg
 }

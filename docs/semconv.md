@@ -308,10 +308,10 @@ driver attempt and per page (ADR 0019 §4).
 `db.client.connection.pool.name` is the application pool label semconv
 recommends on connection metrics (Recommended in v1.39.0, which asks
 instrumentation lacking a pool name to synthesize a unique one). gocql exposes no
-pool identifier, so it defaults to a stable value synthesized from the contact
-point and the cluster keyspace, following semconv's suggested
-`server.address:server.port/db.namespace` shape (e.g.
-`cassandra/10.0.0.1:9042/chat`). The keyspace suffix keeps sessions that share a
+pool identifier, so it defaults to a stable value synthesized as
+`cassandra/<server.address>:<server.port>/<keyspace>` — the `cassandra/` system
+prefix plus semconv's suggested `server.address:server.port/db.namespace` shape
+(e.g. `cassandra/10.0.0.1:9042/chat`). The keyspace suffix keeps sessions that share a
 contact point but target different keyspaces distinct; sessions sharing both
 should pass `cassandra.WithPoolName` to disambiguate.
 
