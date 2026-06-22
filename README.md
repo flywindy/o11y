@@ -25,6 +25,7 @@ This project provides a "Context-First" observability layer for Go applications,
   - **NATS**: High-performance messaging
   - **MongoDB**: NoSQL database for persistence
   - **Redis / Valkey**: Cache and Redis-protocol data stores
+  - **Cassandra**: Wide-column store via `gocql` (SDK-owned observers, [ADR 0019](docs/adr/0019-cassandra-integration.md))
   - **Tempo**: Distributed tracing backend
   - **Loki**: Log aggregation system
   - **Pyroscope**: Continuous profiling backend
@@ -346,6 +347,7 @@ browser WebSocket; Object Storage: MinIO). See
 - [`go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/v2/mongo/otelmongo`](https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/v2/mongo/otelmongo) provides MongoDB command spans and `db.client.operation.duration` metrics through the `mongo` facade; the SDK owns MongoDB connection-pool metrics. See [ADR 0014](docs/adr/0014-mongodb-metrics.md) and [ADR 0021](docs/adr/0021-mongodb-instrumentation-mechanism.md).
 - [`github.com/redis/go-redis/v9`](https://pkg.go.dev/github.com/redis/go-redis/v9) — is the Redis/Valkey client wrapped by the SDK-owned `redis/` instrumentation. The wrapper does not call `redisotel`; see [ADR 0013](docs/adr/0013-redis-valkey-integration.md).
 - [`github.com/elastic/go-elasticsearch/v8`](https://pkg.go.dev/github.com/elastic/go-elasticsearch/v8) — ships first-party OpenTelemetry tracing in its shared transport; the `elasticsearch/` facade wires the SDK `TracerProvider` into it (trace-only, search body opt-in) without touching OTel globals. See [ADR 0020](docs/adr/0020-elasticsearch-integration.md).
+- [`github.com/gocql/gocql`](https://pkg.go.dev/github.com/gocql/gocql) — is the Cassandra driver instrumented by the SDK-owned `cassandra/` observers. The `otelgocql` contrib package was removed upstream, so the SDK owns the observer code; see [ADR 0019](docs/adr/0019-cassandra-integration.md).
 - [`go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp`](https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp) — provides the underlying HTTP server/client instrumentation used by the `http/` facade. See [ADR 0009](docs/adr/0009-replace-http-with-otelhttp.md).
 - [`github.com/grafana/pyroscope-go`](https://github.com/grafana/pyroscope-go) and [`github.com/grafana/otel-profiling-go`](https://github.com/grafana/otel-profiling-go) provide the Pyroscope profiler and trace-to-profile bridge. See [ADR 0012](docs/adr/0012-profiling-integration.md).
 - [`go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin`](https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin) — provides the underlying gin instrumentation used by the `gin/` facade. See [ADR 0010](docs/adr/0010-gin-integration.md).

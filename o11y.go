@@ -19,6 +19,7 @@ import (
 	"os"
 	"sync"
 
+	o11ycassandra "github.com/flywindy/o11y/cassandra"
 	"github.com/flywindy/o11y/internal/baggageattrs"
 	o11ylog "github.com/flywindy/o11y/internal/log"
 	"github.com/flywindy/o11y/internal/metrics"
@@ -242,8 +243,11 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 			HistogramBuckets:    cfg.histogramBuckets,
 			DisableDefaultViews: cfg.disableDefaultViews,
 			ExtraViews: append(
-				append(o11yredis.MetricViews(cfg.histogramBuckets), o11ymongo.MetricViews(cfg.histogramBuckets)...),
-				o11yminio.MetricViews(cfg.histogramBuckets)...,
+				append(
+					append(o11yredis.MetricViews(cfg.histogramBuckets), o11ymongo.MetricViews(cfg.histogramBuckets)...),
+					o11yminio.MetricViews(cfg.histogramBuckets)...,
+				),
+				o11ycassandra.MetricViews(cfg.histogramBuckets)...,
 			),
 			MaxUniqueRoutes:         cfg.maxUniqueRoutes,
 			ExtraHTTPServerAttrKeys: cfg.extraHTTPServerAttrKeys,

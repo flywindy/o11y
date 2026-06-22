@@ -266,6 +266,71 @@ Spans and metrics are emitted by the SDK-owned
 
 ---
 
+## Database - Cassandra (package `github.com/flywindy/o11y/cassandra`)
+
+Spans and metrics are emitted by the SDK-owned `cassandra` wrapper for
+`github.com/gocql/gocql` via the driver's `QueryObserver` / `ConnectObserver`
+seams and the SDK-owned `ExecuteBatch` batch seam. The wrapper imports no OTel
+contrib instrumentation (the `otelgocql` contrib package was removed upstream);
+see ADR 0019 for the design and the ADR 0008 §2 evaluation that justifies the
+T3 sourcing. One CLIENT span is emitted per `ObserveQuery` callback — one per
+driver attempt and per page (ADR 0019 §4).
+
+### Span Attributes
+
+| Key | Type | Notes |
+|---|---|---|
+| `db.system.name` | string | Constant `"cassandra"`. |
+| `db.namespace` | string | Keyspace actually addressed: an explicit `keyspace.table` qualifier in the statement takes precedence (it overrides the session keyspace), otherwise `ObservedQuery.Keyspace` / `Batch.Keyspace()`. A batch that spans multiple keyspaces omits this attribute. |
+| `db.operation.name` | string | Parsed statement verb (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, …) or `BATCH`. |
+| `db.collection.name` | string | Parsed table when a single table is addressed; for a batch, only when every statement targets the same table. |
+| `db.operation.batch.size` | int | Statement count, on `ExecuteBatch*` spans only. |
+| `db.query.text` | string | Only when `cassandra.WithQueryText(true)` is used; bound values are never captured. On batch spans this is the batch's statement texts joined with `; `. |
+| `db.response.returned_rows` | int | Rows in the current page, from `ObservedQuery.Rows`. |
+| `cassandra.coordinator.id` | string | Opt-In, only when `cassandra.WithHostAttributes(true)`. Coordinating node id from `ObservedQuery.Host`. |
+| `cassandra.coordinator.dc` | string | Opt-In, only when `cassandra.WithHostAttributes(true)`. Coordinating node datacenter from `ObservedQuery.Host.DataCenter()`. |
+| `cassandra.query.attempt` | int | SDK-owned. Driver-side attempt index (`ObservedQuery.Attempt`); span-only, never a metric label. |
+| `network.peer.address` | string | Opt-In, only when `cassandra.WithHostAttributes(true)`. Actual contacted coordinator from `HostInfo` (useful under token-aware routing). |
+| `network.peer.port` | int | Opt-In, only when `cassandra.WithHostAttributes(true)`. Actual contacted coordinator port. |
+| `server.address` | string | Node that served the operation (`ObservedQuery.Host` / `ObservedConnect.Host`), falling back to the configured contact point (batch spans use the contact point). |
+| `server.port` | int | Port of that node, falling back to the configured contact point port (defaulted from `ClusterConfig.Port`). |
+| `error.type` | string | Set on `ObservedQuery.Err` / batch error; Go type name or context sentinel. |
+
+### Instruments
+
+| Name | Kind | Unit | Attributes |
+|---|---|---|---|
+| `db.client.operation.duration` | Float64Histogram | `s` | `db.system.name`, `db.operation.name`, `db.namespace`, `server.address`, `server.port`, `error.type` |
+| `cassandra.query.attempts` | Int64Counter | `{attempt}` | SDK-owned name. `db.system.name`, `db.operation.name`, `db.namespace`, `server.address`, `server.port`, `error.type`. Incremented by 1 per `ObserveQuery` callback (one per attempt/page), so it counts true client-side attempts (retries + speculative execution). |
+| `db.client.connection.create_time` | Float64Histogram | `s` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port`. `server.*` is the node actually dialed (`ObservedConnect.Host`), not the contact point. |
+| `cassandra.connection.attempts` | Int64Counter | `{attempt}` | SDK-owned name. `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port`, `error.type`. |
+
+`db.client.connection.pool.name` is the application pool label semconv
+recommends on connection metrics (Recommended in v1.39.0, which asks
+instrumentation lacking a pool name to synthesize a unique one). gocql exposes no
+pool identifier, so it defaults to a stable value synthesized as
+`cassandra/<server.address>:<server.port>/<keyspace>` — the `cassandra/` system
+prefix plus semconv's suggested `server.address:server.port/db.namespace` shape
+(e.g. `cassandra/10.0.0.1:9042/chat`). The keyspace suffix keeps sessions that share a
+contact point but target different keyspaces distinct; sessions sharing both
+should pass `cassandra.WithPoolName` to disambiguate.
+
+Cardinality is bounded by the `MetricViews()` allowlist installed via
+`o11y.Init`'s `ExtraViews` (mirrors the redis/mongo pattern); every Cassandra
+instrument above — both histograms and both attempt counters — has an allow-keys
+view. Services that build their own MeterProvider must register the same views
+via `sdkmetric.WithView(...)` at construction.
+
+### Explicitly NOT Emitted
+
+| Key | Reason |
+|---|---|
+| `cassandra.consistency.level`, `cassandra.page.size`, `cassandra.query.idempotent`, `cassandra.speculative_execution.count` | Per-query settings not exposed by the gocql v1.7.0 `ObservedQuery` payload (it has no `Query` field). Out of scope for v1; see ADR 0019 §5. |
+| `db.cassandra.*` (e.g. `db.cassandra.table`, `db.cassandra.keyspace`) | Deprecated pre-stable namespace; replaced by `cassandra.*`, `db.collection.name`, and `db.namespace`. |
+| `db.client.connection.count` and other pool gauges | gocql exposes no public pool-stats snapshot or pool lifecycle events; cluster/pool health comes from the server-side exporter (ADR 0019 §7). |
+
+---
+
 ## User Identity Helpers (package `github.com/flywindy/o11y`)
 
 ADR 0016 exposes explicit helpers and opt-in baggage materialization for the
@@ -427,6 +492,7 @@ Data Model attributes automatically.
 | `object_store.*` namespace (`system.name`, `operation.name`, `bucket.name`, `object.key`, `object.size`) | `minio` wrapper | OTel object-store semconv is at status Development and only the AWS-S3 page exists, framed as AWS-SDK / `rpc.system=aws-api`. The SDK-owned `object_store.*` namespace is package-local but shaped to mirror current OTel naming patterns; future migration to a blessed convention is expected to be a key rename. See ADR 0018 §4 and References. |
 | `minio.error.kind`, `minio.client.operation.duration` | `minio` wrapper | MinIO-specific bounded SRE classification (span-only) and per-operation duration histogram. No stable OTel object-store metric exists, so the instrument name stays package-local; standard `error.type` is co-emitted on spans and as the metric failure label. |
 | Legacy ES keys (`db.system`, `db.operation`, `db.statement`, `db.elasticsearch.*`) | `go-elasticsearch/v8` first-party instrumentation | The pinned `elastic-transport-go/v8 v8.8.0` predates DB semconv stabilization and emits these deprecated spellings on its own span. A T2 facade has no seam to rewrite them, so the drift is accepted and documented (ADR 0020 §4, option (a)) rather than normalized via a span processor. A compatibility test pins the exact emitted keys; an upstream fix is inherited for free. |
+| `cassandra.query.attempts`, `cassandra.connection.attempts`, `cassandra.query.attempt` | `cassandra` wrapper | SDK-owned names for the client-side attempt/retry/speculative-execution signal, which server-side exporters cannot provide. semconv v1.39.0 defines no attempts metric or attribute; kept package-local (per ADR 0019 §7.B) so they are easy to retire/rename if semconv later standardizes one. |
 
 Any new deviation must list:
 

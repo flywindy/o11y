@@ -15,7 +15,7 @@ import (
 	"strings"
 )
 
-var integrationDirs = []string{"http", "nats", "mongo", "gin", "resty", "redis", "minio", "elasticsearch"}
+var integrationDirs = []string{"http", "nats", "mongo", "gin", "resty", "redis", "minio", "elasticsearch", "cassandra"}
 
 const otelModulePath = "go.opentelemetry.io/otel"
 

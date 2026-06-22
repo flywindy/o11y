@@ -25,6 +25,22 @@ adopters can plan their upgrades.
   core `Subscribe`). `Consume` and `Messages` take a registration-time `ctx`
   (up-front guard, consistent with `Subscribe`; not a trace carrier and not a
   running-loop cancel). See ADR 0022 (Phase 2) and its amendment.
+- ADR 0019: `cassandra` package — T3 SDK-owned observers over
+  `github.com/gocql/gocql`. `cassandra.NewSession` builds an instrumented
+  `*gocql.Session` from a caller-supplied `*gocql.ClusterConfig`, wiring the
+  driver's query and connect observers to explicit SDK tracer/meter providers
+  (no OpenTelemetry globals). Emits CLIENT spans (one per attempt and per page,
+  semconv v1.39.0 attributes), the `db.client.operation.duration` histogram, a
+  Cassandra-unique `cassandra.query.attempts` retry/speculative counter, and
+  optional connect metrics (labeled with `db.client.connection.pool.name`,
+  synthesized from the contact point or set via `cassandra.WithPoolName`). CQL
+  statement text is opt-in via `cassandra.WithQueryText(true)`; the
+  contacted-coordinator host topology (`network.peer.*` /
+  `cassandra.coordinator.*`) is opt-in via `cassandra.WithHostAttributes(true)`.
+  `cassandra.ExecuteBatch` (plus `cassandra.ExecuteBatchCAS` /
+  `cassandra.MapExecuteBatchCAS` for conditional batches) is the SDK-owned batch
+  seam (one span per logical batch with `db.operation.batch.size`).
+  `cassandra.MetricViews` is composed into `o11y.Init`.
 
 ### Changed
 

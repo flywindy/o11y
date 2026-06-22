@@ -1,0 +1,615 @@
+package cassandra
+
+import (
+	"context"
+	"net"
+	"testing"
+	"time"
+
+	"github.com/gocql/gocql"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
+	oteltrace "go.opentelemetry.io/otel/trace"
+)
+
+var testBuckets = []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10}
+
+func newTestObserver(t *testing.T, cfg config) (*observer, *tracetest.SpanRecorder, *sdkmetric.ManualReader) {
+	t.Helper()
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithSpanProcessor(sr),
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+	)
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithView(MetricViews(testBuckets)...),
+	)
+	meter := mp.Meter(instrumentationName, metric.WithSchemaURL(semconv.SchemaURL))
+	inst, err := newInstruments(meter)
+	require.NoError(t, err)
+	server := serverAddr{host: "127.0.0.1", port: 9042}
+	obs := &observer{
+		tracer:   tp.Tracer(instrumentationName, oteltrace.WithSchemaURL(semconv.SchemaURL)),
+		inst:     inst,
+		cfg:      cfg,
+		server:   server,
+		poolName: poolName(cfg.poolName, server, ""),
+	}
+	return obs, sr, reader
+}
+
+func testHost(t *testing.T) *gocql.HostInfo {
+	t.Helper()
+	h := (&gocql.HostInfo{}).SetConnectAddress(net.ParseIP("10.0.0.5"))
+	h.SetHostID("coordinator-1")
+	return h
+}
+
+func collectMetrics(t *testing.T, reader *sdkmetric.ManualReader) metricdata.ResourceMetrics {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	return rm
+}
+
+func metricByName(rm metricdata.ResourceMetrics, name string) *metricdata.Metrics {
+	for i := range rm.ScopeMetrics {
+		for j := range rm.ScopeMetrics[i].Metrics {
+			if rm.ScopeMetrics[i].Metrics[j].Name == name {
+				return &rm.ScopeMetrics[i].Metrics[j]
+			}
+		}
+	}
+	return nil
+}
+
+func spanHasKey(span sdktrace.ReadOnlySpan, key attribute.Key) bool {
+	for _, a := range span.Attributes() {
+		if a.Key == key {
+			return true
+		}
+	}
+	return false
+}
+
+func TestNewSessionRejectsNilArgs(t *testing.T) {
+	tp := sdktrace.NewTracerProvider()
+	mp := sdkmetric.NewMeterProvider()
+	cluster := gocql.NewCluster("127.0.0.1")
+
+	_, err := NewSession(nil, tp, mp)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cluster config must not be nil")
+
+	_, err = NewSession(cluster, nil, mp)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "tracer provider must not be nil")
+
+	_, err = NewSession(cluster, tp, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "meter provider must not be nil")
+}
+
+func TestNewSessionRestoresObserversOnConfig(t *testing.T) {
+	tp := sdktrace.NewTracerProvider()
+	mp := sdkmetric.NewMeterProvider()
+	// Unroutable TEST-NET-1 host (RFC 5737) with a short dial timeout so
+	// CreateSession fails fast without a live cluster.
+	cluster := gocql.NewCluster("192.0.2.1")
+	cluster.ConnectTimeout = 100 * time.Millisecond
+	cluster.Timeout = 100 * time.Millisecond
+
+	_, err := NewSession(cluster, tp, mp)
+	require.Error(t, err)
+	// The observers must be restored to the caller's originals (nil here) so a
+	// retried NewSession on the same *ClusterConfig does not stack another SDK
+	// observer layer and emit duplicate spans/metrics.
+	assert.Nil(t, cluster.QueryObserver, "QueryObserver must be restored after CreateSession")
+	assert.Nil(t, cluster.ConnectObserver, "ConnectObserver must be restored after CreateSession")
+}
+
+func TestExecuteBatchNilGuards(t *testing.T) {
+	err := ExecuteBatch(context.Background(), nil, gocql.NewBatch(gocql.LoggedBatch)) //nolint:staticcheck // need a *Batch without a live session
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "session must not be nil")
+
+	// A non-nil session pointer with a nil batch must also be rejected before
+	// any driver call. The session is never dereferenced on this path.
+	err = ExecuteBatch(context.Background(), &gocql.Session{}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "batch must not be nil")
+
+	// The CAS variants share the same guard core and must reject the same way,
+	// returning applied=false / nil iter without dereferencing the session.
+	applied, iter, err := ExecuteBatchCAS(context.Background(), nil, gocql.NewBatch(gocql.LoggedBatch)) //nolint:staticcheck // need a *Batch without a live session
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "session must not be nil")
+	assert.False(t, applied)
+	assert.Nil(t, iter)
+
+	applied, iter, err = MapExecuteBatchCAS(context.Background(), &gocql.Session{}, nil, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "batch must not be nil")
+	assert.False(t, applied)
+	assert.Nil(t, iter)
+}
+
+// recordingQueryObserver / recordingConnectObserver capture whether a
+// caller-supplied observer is still invoked after NewSession composes the SDK's.
+type recordingQueryObserver struct{ calls int }
+
+func (r *recordingQueryObserver) ObserveQuery(context.Context, gocql.ObservedQuery) { r.calls++ }
+
+type recordingConnectObserver struct{ calls int }
+
+func (r *recordingConnectObserver) ObserveConnect(gocql.ObservedConnect) { r.calls++ }
+
+func TestChainObserversPreservesExisting(t *testing.T) {
+	obs, _, _ := newTestObserver(t, config{})
+
+	existingQ := &recordingQueryObserver{}
+	chainedQ := chainQueryObserver(existingQ, obs)
+	chainedQ.ObserveQuery(context.Background(), gocql.ObservedQuery{Statement: "SELECT id FROM rooms"})
+	assert.Equal(t, 1, existingQ.calls, "caller's QueryObserver must still run")
+
+	existingC := &recordingConnectObserver{}
+	chainedC := chainConnectObserver(existingC, obs)
+	chainedC.ObserveConnect(gocql.ObservedConnect{Start: time.Now(), End: time.Now()})
+	assert.Equal(t, 1, existingC.calls, "caller's ConnectObserver must still run")
+
+	// With no existing observer, the SDK observer is returned unwrapped.
+	assert.Same(t, obs, chainQueryObserver(nil, obs))
+	assert.Same(t, obs, chainConnectObserver(nil, obs))
+}
+
+func TestObserveQueryEmitsSemconvSpanAndDuration(t *testing.T) {
+	obs, sr, reader := newTestObserver(t, config{})
+
+	start := time.Now()
+	obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+		Keyspace:  "chat",
+		Statement: "SELECT id, body FROM messages_by_room WHERE room_id = ?",
+		Start:     start,
+		End:       start.Add(3 * time.Millisecond),
+		Rows:      7,
+		Host:      testHost(t),
+	})
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	span := spans[0]
+	assert.Equal(t, "cassandra.SELECT messages_by_room", span.Name())
+	assert.Equal(t, oteltrace.SpanKindClient, span.SpanKind())
+	assert.Equal(t, codes.Unset, span.Status().Code)
+
+	assert.Contains(t, span.Attributes(), semconv.DBSystemNameCassandra)
+	assert.Contains(t, span.Attributes(), semconv.DBNamespace("chat"))
+	assert.Contains(t, span.Attributes(), semconv.DBOperationName("SELECT"))
+	assert.Contains(t, span.Attributes(), semconv.DBCollectionName("messages_by_room"))
+	assert.Contains(t, span.Attributes(), semconv.DBResponseReturnedRows(7))
+	// server.* is the node that actually ran the query (ObservedQuery.Host),
+	// not the contact point. testHost exposes no port (gocql has no setter), so
+	// server.port coverage lives on the contact-point fallback path below.
+	assert.Contains(t, span.Attributes(), semconv.ServerAddress("10.0.0.5"))
+	// Host-topology attributes are Opt-In (WithHostAttributes); absent by default.
+	assert.False(t, spanHasKey(span, semconv.NetworkPeerAddressKey))
+	assert.False(t, spanHasKey(span, semconv.CassandraCoordinatorIDKey))
+	assert.False(t, spanHasKey(span, semconv.ErrorTypeKey))
+	assert.False(t, spanHasKey(span, semconv.DBQueryTextKey), "query text off by default")
+
+	rm := collectMetrics(t, reader)
+	dur := metricByName(rm, "db.client.operation.duration")
+	require.NotNil(t, dur)
+	hist, ok := dur.Data.(metricdata.Histogram[float64])
+	require.True(t, ok)
+	require.Len(t, hist.DataPoints, 1)
+	dp := hist.DataPoints[0]
+	assert.Equal(t, testBuckets, dp.Bounds)
+	// MetricViews allow-keys filter drops cassandra.coordinator.*/network.peer.*
+	// and keeps the bounded label set.
+	assertHasAttr(t, dp.Attributes, semconv.DBSystemNameCassandra)
+	assertHasAttr(t, dp.Attributes, semconv.DBOperationName("SELECT"))
+	assertHasAttr(t, dp.Attributes, semconv.DBNamespace("chat"))
+	assertHasAttr(t, dp.Attributes, semconv.ServerAddress("10.0.0.5"))
+	assertMissingKey(t, dp.Attributes, semconv.NetworkPeerAddressKey)
+	assertMissingKey(t, dp.Attributes, semconv.CassandraCoordinatorIDKey)
+}
+
+func TestObserveQueryHostAttributesOptIn(t *testing.T) {
+	obs, sr, reader := newTestObserver(t, config{hostAttributesEnabled: true})
+
+	start := time.Now()
+	obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+		Keyspace:  "chat",
+		Statement: "SELECT id FROM messages_by_room WHERE room_id = ?",
+		Start:     start,
+		End:       start.Add(time.Millisecond),
+		Host:      testHost(t),
+	})
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	span := spans[0]
+	// Enabled: the coordinator host topology now appears on the span.
+	assert.Contains(t, span.Attributes(), semconv.NetworkPeerAddress("10.0.0.5"))
+	assert.Contains(t, span.Attributes(), semconv.CassandraCoordinatorID("coordinator-1"))
+
+	// ...but it is still filtered out of the operation-duration metric labels.
+	rm := collectMetrics(t, reader)
+	dp := metricByName(rm, "db.client.operation.duration").Data.(metricdata.Histogram[float64]).DataPoints[0]
+	assertMissingKey(t, dp.Attributes, semconv.NetworkPeerAddressKey)
+	assertMissingKey(t, dp.Attributes, semconv.CassandraCoordinatorIDKey)
+}
+
+func TestObserveQueryRecordsError(t *testing.T) {
+	obs, sr, reader := newTestObserver(t, config{})
+
+	obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+		Keyspace:  "chat",
+		Statement: "INSERT INTO messages_by_room (room_id, id) VALUES (?, ?)",
+		Start:     time.Now(),
+		End:       time.Now().Add(time.Millisecond),
+		Err:       context.DeadlineExceeded,
+		Host:      testHost(t),
+	})
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	span := spans[0]
+	assert.Equal(t, codes.Error, span.Status().Code)
+	assert.Contains(t, span.Attributes(), semconv.ErrorTypeKey.String("context.DeadlineExceeded"))
+	require.NotEmpty(t, span.Events())
+
+	rm := collectMetrics(t, reader)
+	dur := metricByName(rm, "db.client.operation.duration")
+	require.NotNil(t, dur)
+	hist, ok := dur.Data.(metricdata.Histogram[float64])
+	require.True(t, ok)
+	require.Len(t, hist.DataPoints, 1)
+	assertHasAttr(t, hist.DataPoints[0].Attributes, semconv.ErrorTypeKey.String("context.DeadlineExceeded"))
+	assert.Equal(t, "cassandra.INSERT messages_by_room", span.Name())
+}
+
+func TestObserveQueryQueryTextOptIn(t *testing.T) {
+	const stmt = "SELECT * FROM rooms WHERE id = ?"
+
+	obs, sr, _ := newTestObserver(t, config{queryTextEnabled: true})
+	obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+		Statement: stmt,
+		Start:     time.Now(),
+		End:       time.Now(),
+	})
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	span := spans[0]
+	assert.Contains(t, span.Attributes(), semconv.DBQueryText(stmt))
+}
+
+func TestObserveQueryPerAttemptSpans(t *testing.T) {
+	// Enable host attributes so each sibling span carries its coordinator host.
+	obs, sr, reader := newTestObserver(t, config{hostAttributesEnabled: true})
+
+	start := time.Now()
+	for attempt := 0; attempt < 3; attempt++ {
+		obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+			Keyspace:  "chat",
+			Statement: "SELECT id FROM messages_by_room WHERE room_id = ?",
+			Start:     start,
+			End:       start.Add(time.Millisecond),
+			Attempt:   attempt,
+			Host:      testHost(t),
+		})
+	}
+
+	spans := sr.Ended()
+	require.Len(t, spans, 3, "one span per attempt, not one collapsed logical span")
+	for i, span := range spans {
+		assert.Contains(t, span.Attributes(), attemptKey.Int(i))
+		assert.Contains(t, span.Attributes(), semconv.CassandraCoordinatorID("coordinator-1"))
+	}
+
+	// The attempts counter increments by exactly 1 per callback: a 3-attempt
+	// same-host sequence records 3, not 1+2+3 (ADR 0019 §7.B).
+	rm := collectMetrics(t, reader)
+	cnt := metricByName(rm, "cassandra.query.attempts")
+	require.NotNil(t, cnt)
+	sum := cnt.Data.(metricdata.Sum[int64])
+	var total int64
+	for _, dp := range sum.DataPoints {
+		total += dp.Value
+	}
+	assert.Equal(t, int64(3), total)
+}
+
+func TestBatchAttrsMirrorQueryPath(t *testing.T) {
+	obs, sr, reader := newTestObserver(t, config{})
+
+	// session.NewBatch needs a live session; NewBatch is the only way to build a
+	// *gocql.Batch in a unit test without a cluster.
+	batch := gocql.NewBatch(gocql.LoggedBatch) //nolint:staticcheck // see comment above
+	batch.Query("INSERT INTO chat.messages_by_room (room_id, id) VALUES (?, ?)", "r1", "m1")
+	batch.Query("INSERT INTO chat.messages_by_room (room_id, id) VALUES (?, ?)", "r1", "m2")
+
+	// All statements share one keyspace and table, so the batch reports both.
+	ns, tbl := batchTargets(batch)
+	assert.Equal(t, "chat", ns)
+	assert.Equal(t, "messages_by_room", tbl)
+
+	attrs := obs.batchAttrs(batch, ns, tbl)
+	start := time.Now()
+	obs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, obs.server, start, start.Add(time.Millisecond), nil, attrs)
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	span := spans[0]
+	assert.Equal(t, "cassandra.BATCH messages_by_room", span.Name())
+	assert.Contains(t, span.Attributes(), semconv.DBSystemNameCassandra)
+	assert.Contains(t, span.Attributes(), semconv.DBOperationName("BATCH"))
+	assert.Contains(t, span.Attributes(), semconv.DBCollectionName("messages_by_room"))
+	assert.Contains(t, span.Attributes(), semconv.DBOperationBatchSize(2))
+
+	rm := collectMetrics(t, reader)
+	require.NotNil(t, metricByName(rm, "db.client.operation.duration"))
+}
+
+// TestObserveQueryNamespaceFromQualifiedCQL covers the fallback for sessions
+// with no keyspace set: a qualified keyspace.table in the CQL must still yield
+// db.namespace on both the span and the operation-duration metric.
+func TestObserveQueryNamespaceFromQualifiedCQL(t *testing.T) {
+	obs, sr, reader := newTestObserver(t, config{})
+
+	start := time.Now()
+	obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+		Keyspace:  "", // session has no keyspace; namespace must come from the CQL
+		Statement: "SELECT body FROM o11y_examples.events WHERE id = ?",
+		Start:     start,
+		End:       start.Add(time.Millisecond),
+	})
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	assert.Contains(t, spans[0].Attributes(), semconv.DBNamespace("o11y_examples"))
+	// Span name still uses the bare table, unchanged by the keyspace fallback.
+	assert.Equal(t, "cassandra.SELECT events", spans[0].Name())
+
+	rm := collectMetrics(t, reader)
+	dp := metricByName(rm, "db.client.operation.duration").Data.(metricdata.Histogram[float64]).DataPoints[0]
+	assertHasAttr(t, dp.Attributes, semconv.DBNamespace("o11y_examples"))
+}
+
+// TestObserveQueryQualifierOverridesSessionKeyspace: a statement that explicitly
+// qualifies ks_b.table hits ks_b regardless of the session's USE ks_a, so the
+// explicit qualifier is authoritative for db.namespace.
+func TestObserveQueryQualifierOverridesSessionKeyspace(t *testing.T) {
+	obs, sr, _ := newTestObserver(t, config{})
+
+	start := time.Now()
+	obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+		Keyspace:  "ks_a", // session keyspace
+		Statement: "SELECT body FROM ks_b.events WHERE id = ?",
+		Start:     start,
+		End:       start.Add(time.Millisecond),
+	})
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	assert.Contains(t, spans[0].Attributes(), semconv.DBNamespace("ks_b"))
+	assert.NotContains(t, spans[0].Attributes(), semconv.DBNamespace("ks_a"))
+}
+
+// TestBatchTargetsFromQualifiedCQL covers the batch seam: when the driver
+// reports no batch keyspace, the namespace and table come from the statements,
+// and a single-table batch reports db.collection.name.
+func TestBatchTargetsFromQualifiedCQL(t *testing.T) {
+	batch := gocql.NewBatch(gocql.LoggedBatch) //nolint:staticcheck // see TestBatchAttrsMirrorQueryPath
+	batch.Query("INSERT INTO o11y_examples.events (id, body) VALUES (?, ?)", "a", "x")
+	batch.Query("INSERT INTO o11y_examples.events (id, body) VALUES (?, ?)", "b", "y")
+
+	ns, tbl := batchTargets(batch)
+	assert.Equal(t, "o11y_examples", ns)
+	assert.Equal(t, "events", tbl)
+
+	obs, sr, _ := newTestObserver(t, config{})
+	obs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, obs.server, time.Now(), time.Now(), nil, obs.batchAttrs(batch, ns, tbl))
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	assert.Contains(t, spans[0].Attributes(), semconv.DBNamespace("o11y_examples"))
+	assert.Contains(t, spans[0].Attributes(), semconv.DBCollectionName("events"))
+	assert.Equal(t, "cassandra.BATCH events", spans[0].Name())
+}
+
+// TestBatchTargetsMixedOmitted: a batch that genuinely spans two keyspaces (and
+// two tables) must not be labeled with either, so both are omitted.
+func TestBatchTargetsMixedOmitted(t *testing.T) {
+	batch := gocql.NewBatch(gocql.LoggedBatch) //nolint:staticcheck // see TestBatchAttrsMirrorQueryPath
+	batch.Query("INSERT INTO ks_a.events (id) VALUES (?)", "a")
+	batch.Query("INSERT INTO ks_b.rooms (id) VALUES (?)", "b")
+
+	ns, tbl := batchTargets(batch)
+	assert.Equal(t, "", ns)
+	assert.Equal(t, "", tbl)
+
+	obs, sr, _ := newTestObserver(t, config{})
+	obs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, obs.server, time.Now(), time.Now(), nil, obs.batchAttrs(batch, ns, tbl))
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	assert.False(t, spanHasKey(spans[0], semconv.DBNamespaceKey), "ambiguous batch must omit db.namespace")
+	assert.False(t, spanHasKey(spans[0], semconv.DBCollectionNameKey), "ambiguous batch must omit db.collection.name")
+	assert.Equal(t, "cassandra.BATCH", spans[0].Name())
+}
+
+// TestBatchTargetsSameTableDifferentKeyspaceOmitted: the same bare table name in
+// two keyspaces is not one table — db.collection.name (and the namespace) are
+// omitted so unrelated tables are not collapsed in trace grouping.
+func TestBatchTargetsSameTableDifferentKeyspaceOmitted(t *testing.T) {
+	batch := gocql.NewBatch(gocql.LoggedBatch) //nolint:staticcheck // see TestBatchAttrsMirrorQueryPath
+	batch.Query("INSERT INTO ks_a.events (id) VALUES (?)", "a")
+	batch.Query("INSERT INTO ks_b.events (id) VALUES (?)", "b")
+
+	ns, tbl := batchTargets(batch)
+	assert.Equal(t, "", ns, "differing keyspaces must omit db.namespace")
+	assert.Equal(t, "", tbl, "same bare table in different keyspaces must omit db.collection.name")
+}
+
+// TestBatchQueryTextOptIn: batch spans honor WithQueryText by joining the
+// statement texts, and omit db.query.text by default.
+func TestBatchQueryTextOptIn(t *testing.T) {
+	build := func() *gocql.Batch {
+		b := gocql.NewBatch(gocql.LoggedBatch) //nolint:staticcheck // see TestBatchAttrsMirrorQueryPath
+		b.Query("INSERT INTO chat.rooms (id) VALUES (?)", "a")
+		b.Query("UPDATE chat.rooms SET name = ? WHERE id = ?", "x", "a")
+		return b
+	}
+
+	offObs, offSR, _ := newTestObserver(t, config{})
+	b := build()
+	ns, tbl := batchTargets(b)
+	offObs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, offObs.server, time.Now(), time.Now(), nil, offObs.batchAttrs(b, ns, tbl))
+	require.Len(t, offSR.Ended(), 1)
+	assert.False(t, spanHasKey(offSR.Ended()[0], semconv.DBQueryTextKey), "query text off by default")
+
+	onObs, onSR, _ := newTestObserver(t, config{queryTextEnabled: true})
+	b = build()
+	ns, tbl = batchTargets(b)
+	onObs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, onObs.server, time.Now(), time.Now(), nil, onObs.batchAttrs(b, ns, tbl))
+	require.Len(t, onSR.Ended(), 1)
+	assert.Contains(t, onSR.Ended()[0].Attributes(),
+		semconv.DBQueryText("INSERT INTO chat.rooms (id) VALUES (?); UPDATE chat.rooms SET name = ? WHERE id = ?"))
+}
+
+// TestBatchNamespaceUnresolvedEntryOmitted: a batch that mixes a qualified
+// statement with an unqualified one (and no session keyspace) has an unknown
+// effective keyspace for the unqualified entry, so db.namespace is omitted rather
+// than letting the qualified sibling label the whole batch.
+func TestBatchNamespaceUnresolvedEntryOmitted(t *testing.T) {
+	batch := gocql.NewBatch(gocql.LoggedBatch) //nolint:staticcheck // see TestBatchAttrsMirrorQueryPath
+	batch.Query("INSERT INTO ks_b.events (id) VALUES (?)", "a")
+	batch.Query("INSERT INTO events (id) VALUES (?)", "b") // unqualified, no session keyspace
+
+	ns, _ := batchTargets(batch)
+	assert.Equal(t, "", ns, "an unresolved entry must omit the batch namespace")
+}
+
+// TestWithAttributesDropsReservedKeys: a caller cannot use WithAttributes to
+// smuggle in a package-owned key — db.query.text stays off when WithQueryText is
+// false, error.type does not appear on a success — while non-reserved custom
+// attributes still pass through to the span.
+func TestWithAttributesDropsReservedKeys(t *testing.T) {
+	cfg := newConfig([]Option{WithAttributes(
+		semconv.DBQueryText("SELECT secret FROM creds"), // reserved + gated: must be dropped
+		semconv.ErrorTypeKey.String("forced"),           // reserved: must be dropped
+		semconv.ServerAddress("evil.example.com"),       // reserved: must be dropped
+		attribute.String("team", "payments"),            // custom: must survive
+	)})
+	obs, sr, _ := newTestObserver(t, cfg)
+
+	start := time.Now()
+	obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+		Keyspace:  "chat",
+		Statement: "SELECT id FROM rooms WHERE id = ?",
+		Start:     start,
+		End:       start.Add(time.Millisecond),
+	})
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	span := spans[0]
+	assert.Contains(t, span.Attributes(), attribute.String("team", "payments"))
+	assert.False(t, spanHasKey(span, semconv.DBQueryTextKey), "WithQueryText off: caller cannot force db.query.text")
+	assert.False(t, spanHasKey(span, semconv.ErrorTypeKey), "successful span: caller cannot force error.type")
+	// No ObservedQuery.Host, so server.* falls back to the configured contact
+	// point (with its port) — not the caller-supplied value.
+	assert.Contains(t, span.Attributes(), semconv.ServerAddress("127.0.0.1"))
+	assert.Contains(t, span.Attributes(), semconv.ServerPort(9042))
+	assert.NotContains(t, span.Attributes(), semconv.ServerAddress("evil.example.com"))
+}
+
+// TestObserveQueryAttributesToObservedHost: server.* on the span and the
+// operation metric is the node that actually ran the query (token-aware
+// routing), not the configured contact point.
+func TestObserveQueryAttributesToObservedHost(t *testing.T) {
+	obs, sr, reader := newTestObserver(t, config{})
+
+	start := time.Now()
+	obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+		Keyspace:  "chat",
+		Statement: "SELECT id FROM rooms WHERE id = ?",
+		Start:     start,
+		End:       start.Add(time.Millisecond),
+		Host:      testHost(t), // coordinator 10.0.0.5, not contact point 127.0.0.1
+	})
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	assert.Contains(t, spans[0].Attributes(), semconv.ServerAddress("10.0.0.5"))
+	assert.NotContains(t, spans[0].Attributes(), semconv.ServerAddress("127.0.0.1"))
+
+	rm := collectMetrics(t, reader)
+	dp := metricByName(rm, "db.client.operation.duration").Data.(metricdata.Histogram[float64]).DataPoints[0]
+	assertHasAttr(t, dp.Attributes, semconv.ServerAddress("10.0.0.5"))
+}
+
+func TestObserveConnectMetrics(t *testing.T) {
+	obs, _, reader := newTestObserver(t, config{})
+
+	now := time.Now()
+	// Successful connect to a discovered node: server.* must reflect that node
+	// (10.0.0.5), not the configured contact point (127.0.0.1).
+	obs.ObserveConnect(gocql.ObservedConnect{Host: testHost(t), Start: now, End: now.Add(2 * time.Millisecond)})
+	obs.ObserveConnect(gocql.ObservedConnect{Start: now, End: now, Err: context.Canceled})
+
+	rm := collectMetrics(t, reader)
+	cnt := metricByName(rm, "cassandra.connection.attempts")
+	require.NotNil(t, cnt)
+	var total int64
+	for _, dp := range cnt.Data.(metricdata.Sum[int64]).DataPoints {
+		total += dp.Value
+	}
+	assert.Equal(t, int64(2), total)
+
+	create := metricByName(rm, "db.client.connection.create_time")
+	require.NotNil(t, create, "create_time recorded only for successful connects")
+	createPoints := create.Data.(metricdata.Histogram[float64]).DataPoints
+	require.Len(t, createPoints, 1)
+	// Actual contacted node + synthesized pool name from the contact point.
+	assertHasAttr(t, createPoints[0].Attributes, semconv.ServerAddress("10.0.0.5"))
+	assertHasAttr(t, createPoints[0].Attributes, semconv.DBClientConnectionPoolName("cassandra/127.0.0.1:9042"))
+}
+
+func TestPoolNameSynthesisAndOverride(t *testing.T) {
+	// Synthesized from the contact point when WithPoolName is not set.
+	assert.Equal(t, "cassandra/10.0.0.1:9042", poolName("", serverAddr{host: "10.0.0.1", port: 9042}, ""))
+	assert.Equal(t, "cassandra/10.0.0.1", poolName("", serverAddr{host: "10.0.0.1"}, ""))
+	assert.Equal(t, "cassandra", poolName("", serverAddr{}, ""))
+	// The cluster keyspace is appended (semconv's server:port/db.namespace shape)
+	// so sessions to the same contact point but different keyspaces stay distinct.
+	assert.Equal(t, "cassandra/10.0.0.1:9042/chat", poolName("", serverAddr{host: "10.0.0.1", port: 9042}, "chat"))
+	assert.Equal(t, "cassandra/chat", poolName("", serverAddr{}, "chat"))
+	// WithPoolName overrides the synthesized value entirely.
+	assert.Equal(t, "chat-cluster", poolName("chat-cluster", serverAddr{host: "10.0.0.1", port: 9042}, "chat"))
+}
+
+func assertHasAttr(t *testing.T, set attribute.Set, want attribute.KeyValue) {
+	t.Helper()
+	v, ok := set.Value(want.Key)
+	require.True(t, ok, "missing attribute %s", want.Key)
+	assert.Equal(t, want.Value, v)
+}
+
+func assertMissingKey(t *testing.T, set attribute.Set, key attribute.Key) {
+	t.Helper()
+	_, ok := set.Value(key)
+	assert.False(t, ok, "attribute %s should have been filtered out", key)
+}

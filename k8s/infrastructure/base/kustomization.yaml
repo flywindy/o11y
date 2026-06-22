@@ -6,6 +6,7 @@ resources:
   - nats.yaml
   - mongodb.yaml
   - redis.yaml
+  - cassandra.yaml
   - minio.yaml
   - elasticsearch.yaml
   - tempo.yaml

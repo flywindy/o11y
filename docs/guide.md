@@ -33,6 +33,7 @@ For project setup, the `Init` options reference, and feature toggles, see the
     - [MongoDB](#mongodb)
     - [Redis / Valkey](#redis--valkey)
     - [Elasticsearch](#elasticsearch)
+    - [Cassandra](#cassandra)
   - [Messaging](#messaging)
     - [NATS](#nats)
   - [Object Storage](#object-storage)
@@ -636,6 +637,91 @@ Two upstream caveats to know:
 - For the **typed client** (`NewTypedClient`), terminate requests with
   `.Do(ctx)`, not `.Perform(ctx)`: upstream typed `Perform` starts the span on a
   shadowed context, so path parts, attributes, and error status are not recorded.
+
+### Cassandra
+
+Use the `cassandra` sub-package to instrument `github.com/gocql/gocql`. Spans
+and metrics are emitted directly by SDK-owned observers (the `otelgocql`
+contrib package was removed upstream); no OTel globals are touched.
+
+Because gocql attaches observers through the `*gocql.ClusterConfig` and cannot
+attach them to a live session, the SDK builds the session: pass your fully
+configured cluster (contact points, consistency, auth, timeouts) to
+`NewSession`, which wires the observers and returns a normal `*gocql.Session`.
+`tp` and `mp` are required and rejected when nil.
+
+```go
+import (
+    o11ycassandra "github.com/flywindy/o11y/cassandra"
+    "github.com/gocql/gocql"
+)
+
+cluster := gocql.NewCluster("localhost:9042")
+cluster.Consistency = gocql.LocalQuorum
+
+session, err := o11ycassandra.NewSession(
+    cluster,
+    obs.TracerProvider(),
+    obs.MeterProvider(),
+    o11ycassandra.WithPoolName("chat-cluster"),
+)
+if err != nil {
+    obs.Logger.ErrorContext(ctx, "Cassandra session failed", slog.Any("error", err))
+    return
+}
+defer session.Close()
+
+// Pass the request context so the query span joins the active trace.
+var name string
+if err := session.Query(`SELECT name FROM rooms WHERE id = ?`, id).
+    WithContext(ctx).Scan(&name); err != nil {
+    obs.Logger.ErrorContext(ctx, "Cassandra query failed", slog.Any("error", err))
+}
+```
+
+Each query observation produces one CLIENT span — gocql fires the observer once
+per attempt and per page, so retries and paged reads appear as sibling spans
+carrying their attempt index and coordinator host. Span names follow the
+cross-package convention, e.g. `cassandra.SELECT rooms`.
+
+**Batches must go through the `cassandra` batch seams** to be traced. The gocql
+v1.7.0 batch-observer payload cannot identify a logical batch, so the SDK owns
+the seams instead; calling `session.ExecuteBatch(batch)` directly emits no batch
+span. Use `cassandra.ExecuteBatch` for normal batches and
+`cassandra.ExecuteBatchCAS` / `cassandra.MapExecuteBatchCAS` for conditional
+(lightweight-transaction) batches — the CAS forms return the driver's `applied`
+flag and result iterator unchanged. All three bind the context onto the batch, so
+the context governs the driver call, not just telemetry:
+
+```go
+batch := session.NewBatch(gocql.LoggedBatch)
+batch.Query(`INSERT INTO rooms (id, name) VALUES (?, ?)`, id, name)
+if err := o11ycassandra.ExecuteBatch(ctx, session, batch); err != nil {
+    obs.Logger.ErrorContext(ctx, "Cassandra batch failed", slog.Any("error", err))
+}
+```
+
+**Do not call `(*gocql.Query).Observer`** on queries issued through an
+instrumented session: gocql gives each query a single observer slot, so setting
+your own replaces the SDK's and silently drops that query's span and metrics. To
+run your own query/connect observer alongside the SDK's, set it on the
+`*gocql.ClusterConfig` (`QueryObserver` / `ConnectObserver`) before `NewSession`,
+which composes the two. This does not apply to batches: their telemetry comes
+from the `ExecuteBatch*` seams above, not the driver's batch observer, so a
+`(*gocql.Batch).Observer` you set runs independently and does not affect the SDK
+batch spans.
+
+`db.query.text` (the CQL statement) is off by default because statements can be
+high-cardinality and reveal schema topology; bound values are never captured.
+Enable it with `o11ycassandra.WithQueryText(true)` when that is safe for your
+trace backend.
+
+`server.address` / `server.port` identify the node that actually served the
+operation (the coordinator chosen by token-aware routing), falling back to the
+contact point when the driver reports no host. The coordinator's id and
+datacenter (`cassandra.coordinator.id` / `.dc`, plus `network.peer.*`) are
+additional and off by default; enable them with
+`o11ycassandra.WithHostAttributes(true)`.
 
 ## Messaging
 

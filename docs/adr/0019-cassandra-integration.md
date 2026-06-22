@@ -1,6 +1,6 @@
 # ADR 0019 — Cassandra Integration
 
-**Status**: Proposed
+**Status**: Accepted (implemented)
 **Date**: 2026-06-04
 **Relates to**: ADR 0003 (global state policy), ADR 0006 (semconv upgrade
 strategy), ADR 0008 (instrumentation sourcing policy), ADR 0013 (Redis/Valkey —
@@ -126,6 +126,8 @@ func NewSession(
 type Option func(*config)
 
 func WithQueryText(enabled bool) Option        // default: false (see §6)
+func WithHostAttributes(enabled bool) Option   // default: false (see §5) — gates network.peer.* / cassandra.coordinator.*
+func WithPoolName(name string) Option          // connection-metric pool label; synthesized from the contact point when unset
 func WithAttributes(attrs ...attribute.KeyValue) Option
 ```
 
@@ -199,13 +201,26 @@ gocql version (one span per attempt and per page, not one per logical query).
 also gets called once for each query in a batch", and v1.7.0 exposes **no batch
 identity** to deduplicate those `(1 + N)` callbacks. Coalescing them into one
 span from the observer payload alone is therefore not reliable. The integration
-resolves this with an **SDK-owned batch-execution seam** — a thin
-`ExecuteBatch(ctx, session, batch)` helper that owns exactly one span per logical
-batch (feeding `db.operation.batch.size` from the statement count) and treats the
-driver's batch-observer callbacks as supplementary timing only. Pure
-observer-only batch instrumentation is **out of scope for v1** precisely because
-the v1.7.0 payload cannot identify the logical batch. The callback multiplicity
-for the pinned gocql version is pinned by a unit test.
+resolves this with an **SDK-owned batch-execution seam** — thin
+`ExecuteBatch(ctx, session, batch)` / `ExecuteBatchCAS` / `MapExecuteBatchCAS`
+helpers that own exactly one span per logical batch (feeding
+`db.operation.batch.size` from the statement count) and treat the driver's
+batch-observer callbacks as supplementary timing only. The CAS forms cover
+lightweight-transaction batches, which gocql executes through separate session
+methods and would otherwise have no instrumented entry point. Pure observer-only
+batch instrumentation is **out of scope for v1** precisely because the v1.7.0
+payload cannot identify the logical batch. The callback multiplicity for the
+pinned gocql version is pinned by a unit test.
+
+**Per-query observers.** gocql stores a single query observer per `Query`
+(inherited from the session, overwritten by `(*Query).Observer`). Callers must
+therefore configure any additional query/connect observer on the `ClusterConfig`
+— where `NewSession` composes it with the SDK's — rather than per query, which
+would replace the SDK observer and silently drop that query's telemetry. This
+does **not** apply to batches: their telemetry comes from the `ExecuteBatch*`
+seams, not the driver's `BatchObserver` (which the package does not install), so a
+`(*Batch).Observer` the caller sets runs independently and does not affect the SDK
+batch spans. Documented on `NewSession` and in the guide.
 
 ### 5. Span attributes (semconv v1.39.0)
 
@@ -214,24 +229,27 @@ Sourced from `ObservedQuery` / `ObservedBatch` / `HostInfo` / `hostMetrics`.
 | Attribute | Level | Source |
 |---|---|---|
 | `db.system.name` = `cassandra` | Required | constant |
-| `db.namespace` | Conditionally Required | `ObservedQuery.Keyspace` |
+| `db.namespace` | Conditionally Required | the keyspace actually addressed: an explicit `keyspace.table` qualifier parsed from the statement (authoritative, overrides the session keyspace), else `ObservedQuery.Keyspace`. Covers DML and qualified `CREATE/ALTER/DROP/TRUNCATE TABLE` and `CREATE/DROP KEYSPACE`. A batch resolves per statement and omits `db.namespace` when it spans multiple keyspaces. |
 | `db.operation.name` | Recommended | parsed from statement verb (SELECT/INSERT/…) / "BATCH" |
-| `db.collection.name` | Recommended | parsed table when a single table is addressed |
-| `db.query.text` | Opt-In | `ObservedQuery.Statement`, **only when `WithQueryText(true)`** (§6) |
+| `db.collection.name` | Recommended | parsed table when a single table is addressed; for a batch, only when every statement targets the same fully-qualified `keyspace.table` |
+| `db.query.text` | Opt-In | `ObservedQuery.Statement` (batch: statements joined with `; `), **only when `WithQueryText(true)`** (§6) |
 | `db.response.returned_rows` | Recommended | `ObservedQuery.Rows` |
-| `cassandra.coordinator.id` | Opt-In | `ObservedQuery.Host` (coordinating node id) |
-| `cassandra.coordinator.dc` | Opt-In | `ObservedQuery.Host.DataCenter()` |
-| `server.address` / `server.port` | Recommended | the configured contact point / logical server [1] |
-| `network.peer.address` / `network.peer.port` | Opt-In | the actual contacted coordinator from `HostInfo` [1] |
+| `cassandra.coordinator.id` | Opt-In | `ObservedQuery.Host` (coordinating node id), **only when `WithHostAttributes(true)`** |
+| `cassandra.coordinator.dc` | Opt-In | `ObservedQuery.Host.DataCenter()`, **only when `WithHostAttributes(true)`** |
+| `server.address` / `server.port` | Recommended | the node that served the operation (`ObservedQuery.Host`), falling back to the configured contact point [1] |
+| `network.peer.address` / `network.peer.port` | Opt-In | the actual contacted coordinator from `HostInfo`, **only when `WithHostAttributes(true)`** [1] |
 | `error.type` | Conditionally Required | set on `ObservedQuery.Err != nil` |
 
-**[1] `server.*` vs `network.peer.*`.** `server.address`/`server.port` are the
-primary peer keys, consistent with the Redis (ADR 0013) and Elasticsearch
-(ADR 0020) integrations and the `db.client.operation.duration` metric labels
-(§7). `network.peer.*` captures the *actual* contacted coordinator (useful
-under token-aware routing) but is kept Opt-In so the SDK-owned package leads
-with the repo's conformant `server.*` convention — the inverse of the Mongo T2
-case, where the upstream contrib library forces `network.peer.*`.
+**[1] `server.*` and `WithHostAttributes`.** `server.address`/`server.port` are
+the primary peer keys (consistent with Redis, ADR 0013, and Elasticsearch,
+ADR 0020) and now identify the node that actually served the operation —
+`ObservedQuery.Host` under token-aware routing — falling back to the contact
+point. `WithHostAttributes(true)` additionally records the coordinator's
+`cassandra.coordinator.id` / `.dc` (node UUID and datacenter, which `server.*`
+does not carry) and `network.peer.address`/`network.peer.port`; for a direct
+gocql connection the latter mirror `server.*`, so they are Opt-In and off by
+default rather than always duplicated. These topology details are kept Opt-In so
+the package does not expose per-node UUIDs/DCs unless asked.
 
 **Cassandra-specific key namespace.** In the pinned
 `go.opentelemetry.io/otel/semconv/v1.39.0` Go package these keys live in the
@@ -281,14 +299,23 @@ equivalent). This is the same instrument MongoDB (ADR 0014) and Redis (ADR 0013)
 emit; the SDK provides `cassandra.MetricViews()` composed into `o11y.Init` via
 `internal/metrics.Config.ExtraViews` (same wiring as redis at `o11y.go:233`),
 pinning histogram buckets to the SDK default set for cross-integration
-consistency and applying an allow-keys filter to bound cardinality.
+consistency and applying an allow-keys filter to bound cardinality. The same
+allow-keys backstop is applied to both SDK-owned attempt counters
+(`cassandra.query.attempts`, `cassandra.connection.attempts`); their label set is
+already bounded by construction, but the view guarantees a stray attribute can
+never leak in.
 
-`server.address` / `server.port` are safe as labels because they are the
-client's configured contact points — a small, fixed set per client instance,
-not per-request peer addresses — so they do not explode label cardinality
-(ADR 0008 §3). They are included (rather than dropped) so metrics remain
-attributable in shared-address topologies such as sidecars, provided the
-contact point parses into host and port.
+`server.address` / `server.port` identify the node that actually served the
+operation: `ObservedQuery.Host` for queries (the coordinator chosen by
+token-aware routing) and `ObservedConnect.Host` for connects, falling back to the
+configured contact point when the driver supplies no host (and for the batch
+seam, which has no per-statement host). This is the semconv-conformant meaning of
+`server.*` for `db.client.operation.duration`, and it keeps the query and connect
+metrics consistent. Cardinality stays bounded because the value is one of the
+cluster's nodes — a fixed set per deployment, not a per-request address
+(ADR 0008 §3). Callers who want to keep these labels collapsed to the contact
+point can still aggregate them away downstream; the actual coordinator id/dc are
+additionally available on spans via `WithHostAttributes`.
 
 **B. Retry / speculative-execution counter (v1 or fast-follow, Cassandra-unique)**
 
@@ -391,12 +418,14 @@ without a live cluster by constructing synthetic `ObservedQuery` /
 - `NewSession` rejects nil `tp` / nil `mp`.
 - A successful `ObservedQuery` yields one span with `db.system.name=cassandra`,
   `db.namespace`, `db.operation.name`, `db.response.returned_rows`, and
-  `network.peer.*`; no `error.type`.
+  `server.*`; no `error.type`. `network.peer.*` / `cassandra.coordinator.*` are
+  absent by default and present only under `WithHostAttributes(true)`.
 - A failed `ObservedQuery` sets `error.type` and records the span error.
 - `db.query.text` is absent by default and present (statement only, no bound
   values) under `WithQueryText(true)`.
 - A multi-attempt `ObservedQuery` sequence produces **one span per attempt**
-  (sibling attempt spans, each with its `Attempt` index and coordinator host),
+  (sibling attempt spans, each with its `Attempt` index, plus the coordinator
+  host when `WithHostAttributes(true)`),
   matching the gocql per-attempt callback semantics — not one collapsed span and
   not a fabricated single logical span (§4 option (a)).
 - `db.client.operation.duration` is recorded with the documented labels and the
