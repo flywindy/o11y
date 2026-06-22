@@ -16,18 +16,23 @@ All `go run` commands below are run from the **repository root**.
 
 ## Prerequisites
 
-Before running any example, port-forward the required services from the `kind` cluster:
+Before running any example, start the kind cluster and deploy the monitor stack:
 
 ```bash
-kubectl port-forward -n infra svc/otel-collector 4318:4318  # OTel traces and logs
-kubectl port-forward -n infra svc/nats           4222:4222  # NATS connection
-kubectl port-forward -n infra svc/redis          6379:6379  # Redis connection
-kubectl port-forward -n infra svc/grafana        3000:3000  # Grafana UI
-kubectl port-forward -n infra svc/prometheus     9090:9090  # Prometheus UI
-kubectl port-forward -n infra svc/alloy          4040:4040  # Pyroscope ingest for local app profiling
+kind create cluster --config kind-config.yaml
+kubectl apply -k k8s/infrastructure/base/monitor
 ```
 
-Each example below lists any additional port-forwards it needs.
+Then port-forward the monitor services that are not already exposed via kind's extraPortMappings:
+
+```bash
+# 4318 (otel-collector) and 4040 (alloy/pyroscope) are already bound to host
+# ports via kind-config.yaml — no port-forward needed for those.
+kubectl port-forward -n infra svc/grafana    3000:3000  # Grafana UI
+kubectl port-forward -n infra svc/prometheus 9090:9090  # Prometheus UI
+```
+
+Datastore services (NATS, Redis, MongoDB, MinIO, Elasticsearch, Cassandra) are **not deployed by default**. Each example section below shows the `kubectl apply -k` command to bring up the required component before port-forwarding it.
 
 ---
 
@@ -101,10 +106,9 @@ the o11y Resty wrapper every two seconds, and intentionally returns periodic
 
 ### MongoDB
 
-Run a local MongoDB instance or port-forward one to `localhost:27017`, then run
-the example:
-
 ```bash
+kubectl apply -k k8s/infrastructure/base/components/mongodb
+kubectl port-forward -n infra svc/mongodb 27017:27017
 export MONGODB_URI=mongodb://localhost:27017
 go run examples/mongodb/main.go
 ```
@@ -115,9 +119,7 @@ keep the Collector port-forward open while it runs.
 
 ### Background work (gin + MongoDB + obsctx)
 
-Demonstrates the safe context pattern for work that outlives a request. With a
-MongoDB instance reachable (default `mongodb://localhost:27017`) and the
-Collector port-forward open:
+Demonstrates the safe context pattern for work that outlives a request. With MongoDB deployed and port-forwarded (see the MongoDB section above) and the Collector running:
 
 ```bash
 export MONGODB_URI=mongodb://localhost:27017
@@ -132,9 +134,8 @@ not being canceled when the request ends. See
 
 ### Redis
 
-Port-forward Redis to `localhost:6379`, then run the example:
-
 ```bash
+kubectl apply -k k8s/infrastructure/base/components/redis
 kubectl port-forward -n infra svc/redis 6379:6379
 go run examples/redis/main.go
 ```
@@ -145,9 +146,8 @@ connection-pool metrics through OTLP metrics push. It runs `PING`, `SET`,
 
 ### Elasticsearch
 
-Port-forward Elasticsearch to `localhost:9200`, then run the example:
-
 ```bash
+kubectl apply -k k8s/infrastructure/base/components/elasticsearch
 kubectl port-forward -n infra svc/elasticsearch 9200:9200
 go run examples/elasticsearch/main.go
 ```
@@ -163,9 +163,8 @@ credentials via `ELASTICSEARCH_URL`, `ELASTICSEARCH_USERNAME`, and
 
 ### Cassandra
 
-Port-forward Cassandra to `localhost:9042`, then run the example:
-
 ```bash
+kubectl apply -k k8s/infrastructure/base/components/cassandra
 kubectl port-forward -n infra svc/cassandra 9042:9042
 go run examples/cassandra/main.go
 ```
@@ -182,6 +181,9 @@ spans.
 ### NATS Core (two terminals)
 
 ```bash
+kubectl apply -k k8s/infrastructure/base/components/nats
+kubectl port-forward -n infra svc/nats 4222:4222
+
 # Terminal 1 — start subscriber first
 go run examples/nats-core/subscriber/main.go
 
@@ -190,6 +192,8 @@ go run examples/nats-core/publisher/main.go
 ```
 
 ### NATS Core request/reply (two terminals)
+
+Requires NATS — apply and port-forward it as shown in the NATS Core section above if not already running.
 
 `otel-nats` gates trace propagation behind two env vars; export them in **both**
 terminals or no `traceparent` is injected and you will see replies without
@@ -220,6 +224,8 @@ requester-side reply linkage is tracked as an ADR 0022 follow-up.
 
 ### JetStream (two terminals; requires JetStream-enabled NATS server)
 
+Requires NATS — apply and port-forward it as shown in the NATS Core section above if not already running.
+
 As with the core examples, export both tracing gates in each terminal or no
 `traceparent` is injected:
 
@@ -248,9 +254,8 @@ browser-based end-to-end trace propagation example (Vite frontend + Go backend).
 
 ### MinIO
 
-Port-forward MinIO to `localhost:9000`, then run the example:
-
 ```bash
+kubectl apply -k k8s/infrastructure/base/components/minio
 kubectl port-forward -n infra svc/minio 9000:9000
 go run examples/minio/main.go
 ```
