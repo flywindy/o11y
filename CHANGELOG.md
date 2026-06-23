@@ -13,6 +13,21 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+### Changed
+
+- Upgraded the core OpenTelemetry module set
+  (`otel` / `metric` / `trace` / `sdk` / `sdk/metric`) from the
+  `v1.43.1-0.20260521080857-e5bdc311108b` pre-release pseudo-version to the
+  tagged `v1.44.0` release, and aligned the stable OTLP HTTP exporters
+  (`otlpmetrichttp` / `otlptracehttp`) to `v1.44.0`. The pseudo-version set was
+  only pulled in transitively because the official contrib `otelmongo`
+  (mongo-driver/v2) commit required an unreleased core; the newer `otelmongo`
+  commit now depends on tagged `v1.44.0`, so downstream consumers no longer
+  inherit a pre-release core. The contrib `otelmongo` module itself remains a
+  `v0.0.0-…` pseudo-version because upstream has not tagged that module path yet
+  (bumped to `v0.0.0-20260622212340-49857026d46e`, which also moves
+  `go.mongodb.org/mongo-driver/v2` to `v2.7.0`).
+
 ---
 
 ## [0.7.0] - 2026-06-23
