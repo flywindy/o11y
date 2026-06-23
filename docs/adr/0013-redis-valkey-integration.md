@@ -1400,8 +1400,14 @@ rule already defines: a pipeline is dropped only when *every* user command
 in it is filtered. A mixed pipeline (at least one non-filtered command) is
 still recorded, and `db.operation.batch.size` reflects the full user-command
 count including the filtered ones — the existing §8 compromise, unchanged.
-`WithRequireParentSpan` gates the whole pipeline on the presence of a parent
-span, independent of the per-command filters.
+However, `db.query.text` for a mixed pipeline is built from the **unfiltered**
+commands only: a filtered command's arguments (e.g. `AUTH`'s credentials, or a
+command a caller ignored precisely because it carries sensitive data) must not
+leak into a mixed-pipeline span just because a sibling command kept the span
+alive. This tightens the §8 text rule, which predated the connection-lifecycle
+and `WithIgnoredCommands` filters. `WithRequireParentSpan` gates the whole
+pipeline on the presence of a parent span, independent of the per-command
+filters.
 
 ### Out-of-SDK layer (documentation only)
 

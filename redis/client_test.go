@@ -294,6 +294,31 @@ func TestPipelineAllIgnoredCommandsAreSkipped(t *testing.T) {
 	assert.Nil(t, metricByName(rm, "db.client.operation.duration"))
 }
 
+func TestPipelineQueryTextExcludesFilteredCommands(t *testing.T) {
+	// A mixed pipeline is still recorded, but a filtered command's arguments
+	// (here AUTH's credential) must not leak into db.query.text via the
+	// surviving sibling command's span.
+	hook, sr, _ := newTestHook(t, config{commandTextEnabled: true}, "127.0.0.1:6379", 0)
+	cmds := []goredis.Cmder{
+		goredis.NewCmd(context.Background(), "auth", "super-secret"),
+		goredis.NewCmd(context.Background(), "get", "k"),
+	}
+
+	err := hook.ProcessPipelineHook(func(context.Context, []goredis.Cmder) error {
+		return nil
+	})(context.Background(), cmds)
+	require.NoError(t, err)
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	value, ok := spanAttr(spans[0], semconv.DBQueryTextKey)
+	require.True(t, ok)
+	assert.Equal(t, "get k", value.AsString())
+	assert.NotContains(t, value.AsString(), "super-secret")
+	// batch.size still reflects the full user-command count (ADR 0013 §8).
+	assertSpanHas(t, spans[0], semconv.DBOperationBatchSize(2))
+}
+
 func TestPipelineHookHandlesTxFramingAndPubSubFiltering(t *testing.T) {
 	hook, sr, _ := newTestHook(t, config{}, "127.0.0.1:6379", 0)
 	cmds := []goredis.Cmder{

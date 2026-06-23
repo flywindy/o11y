@@ -137,7 +137,15 @@ func (h *redisHook) ProcessPipelineHook(next goredis.ProcessPipelineHook) goredi
 		}
 
 		userCmds := userPipelineCommands(cmds)
-		if len(userCmds) == 0 || h.skipUnparented(ctx) || h.allFiltered(userCmds) {
+		if len(userCmds) == 0 || h.skipUnparented(ctx) {
+			return next(ctx, cmds)
+		}
+		// Drop the whole pipeline only when every user command is filtered;
+		// otherwise record it but expose only the unfiltered commands in
+		// db.query.text so a filtered command's arguments (e.g. AUTH's
+		// credentials) never leak into a mixed-pipeline span.
+		visibleCmds := h.unfilteredPipelineCommands(userCmds)
+		if len(visibleCmds) == 0 {
 			return next(ctx, cmds)
 		}
 
@@ -149,7 +157,7 @@ func (h *redisHook) ProcessPipelineHook(next goredis.ProcessPipelineHook) goredi
 			attrs = append(attrs, semconv.DBOperationBatchSize(len(userCmds)))
 		}
 		if h.cfg.commandTextEnabled {
-			attrs = append(attrs, semconv.DBQueryText(truncateCommandText(pipelineText(userCmds))))
+			attrs = append(attrs, semconv.DBQueryText(truncateCommandText(pipelineText(visibleCmds))))
 		}
 
 		ctx, span := h.tracer.Start(ctx, "redis.pipeline",
@@ -314,15 +322,18 @@ func (h *redisHook) isFilteredCommand(cmd goredis.Cmder) bool {
 	return false
 }
 
-// allFiltered reports whether every command in a pipeline is individually
-// filtered, in which case the whole pipeline span and sample are skipped.
-func (h *redisHook) allFiltered(cmds []goredis.Cmder) bool {
+// unfilteredPipelineCommands returns the pipeline commands that are not
+// individually filtered — the set safe to expose in db.query.text. When the
+// result is empty, every command was filtered and the whole pipeline span and
+// sample can be skipped.
+func (h *redisHook) unfilteredPipelineCommands(cmds []goredis.Cmder) []goredis.Cmder {
+	out := make([]goredis.Cmder, 0, len(cmds))
 	for _, cmd := range cmds {
 		if !h.isFilteredCommand(cmd) {
-			return false
+			out = append(out, cmd)
 		}
 	}
-	return true
+	return out
 }
 
 // skipUnparented reports whether WithRequireParentSpan is set and the context

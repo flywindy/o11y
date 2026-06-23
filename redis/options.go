@@ -59,6 +59,12 @@ func WithAttributes(attrs ...attribute.KeyValue) Option {
 // background health-check PING from an application-issued PING — WithIgnoredCommands("ping")
 // drops both. When only background probes are noisy, prefer either
 // WithRequireParentSpan or a dedicated unwrapped client for the probe.
+//
+// In a pipeline, the whole pipeline span/sample is suppressed only when every
+// user command is ignored. A mixed pipeline (at least one non-ignored command)
+// is still recorded as a pipeline operation with batch size reflecting all user
+// commands, but the ignored commands are excluded from db.query.text so their
+// arguments are not exposed.
 func WithIgnoredCommands(names ...string) Option {
 	return func(cfg *config) {
 		for _, name := range names {
