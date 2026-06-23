@@ -45,6 +45,23 @@ adopters can plan their upgrades.
   `cassandra.MapExecuteBatchCAS` for conditional batches) is the SDK-owned batch
   seam (one span per logical batch with `db.operation.batch.size`).
   `cassandra.MetricViews` is composed into `o11y.Init`.
+- ADR 0020: `elasticsearch` package — a T2 facade (`NewClient`,
+  `NewTypedClient`, `WithSearchBody`) that wires the SDK `TracerProvider` into
+  `github.com/elastic/go-elasticsearch/v8`'s first-party OpenTelemetry
+  instrumentation without touching OTel globals. Trace-only in v1 (no
+  `MeterProvider` / propagator parameters); search-body capture is opt-in and
+  off by default. The pinned `elastic-transport-go/v8 v8.8.0` emits legacy
+  semconv keys (`db.system`, `db.operation`, `db.statement`,
+  `db.elasticsearch.*`), documented in `docs/semconv.md` and pinned by a
+  compatibility test. The facade adds two thin response-side normalizations the
+  bare upstream lacks: it guards search-body capture against a nil body, and it
+  records `http.response.status_code` and marks span status = Error for ES HTTP
+  error responses (status > 299, the client's own `IsError` boundary, which it
+  otherwise returns as a non-error). The status is decided at `Close` from the
+  final attempt, so a retried 5xx→2xx stays successful and a product-check
+  failure on a 200 stays Error. Span names follow the cross-package
+  `{system.name}.{operation} {target}` convention (ADR 0023), e.g.
+  `elasticsearch.search my-index`, rewritten from the upstream's bare endpoint id.
 - k8s infrastructure: monitor stack (`base/monitor/`) and per-datastore
   Kustomize Components (`base/components/{nats,mongodb,redis,minio}`) split
   so the monitor stack is always deployed together while datastores are
@@ -66,23 +83,6 @@ adopters can plan their upgrades.
 
 ### Added
 
-- ADR 0020: `elasticsearch` package — a T2 facade (`NewClient`,
-  `NewTypedClient`, `WithSearchBody`) that wires the SDK `TracerProvider` into
-  `github.com/elastic/go-elasticsearch/v8`'s first-party OpenTelemetry
-  instrumentation without touching OTel globals. Trace-only in v1 (no
-  `MeterProvider` / propagator parameters); search-body capture is opt-in and
-  off by default. The pinned `elastic-transport-go/v8 v8.8.0` emits legacy
-  semconv keys (`db.system`, `db.operation`, `db.statement`,
-  `db.elasticsearch.*`), documented in `docs/semconv.md` and pinned by a
-  compatibility test. The facade adds two thin response-side normalizations the
-  bare upstream lacks: it guards search-body capture against a nil body, and it
-  records `http.response.status_code` and marks span status = Error for ES HTTP
-  error responses (status > 299, the client's own `IsError` boundary, which it
-  otherwise returns as a non-error). The status is decided at `Close` from the
-  final attempt, so a retried 5xx→2xx stays successful and a product-check
-  failure on a 200 stays Error. Span names follow the cross-package
-  `{system.name}.{operation} {target}` convention (ADR 0023), e.g.
-  `elasticsearch.search my-index`, rewritten from the upstream's bare endpoint id.
 - ADR 0024: `obsctx` package (`Detach`, `DetachWithTimeout`, `Go`) for carrying
   observability/trace context into background work that outlives a request,
   without inheriting the request's cancelation or deadline. Prevents the
