@@ -354,6 +354,12 @@ Redis command text is disabled by default. Only enable
 `o11yredis.WithCommandTextEnabled(true)` when the application explicitly
 accepts the key and value exposure risk.
 
+The wrapper always skips Pub/Sub and connection-lifecycle commands (`AUTH`,
+`HELLO`, `SELECT`, auto-issued `CLIENT SETINFO` / `SETNAME`). To trim
+further noise such as health-check PINGs, use `o11yredis.WithIgnoredCommands("ping")`
+(exact, drops every invocation by verb) or `o11yredis.WithRequireParentSpan(true)`
+(drops commands issued without an active parent span; off by default).
+
 ---
 
 ## Do NOT

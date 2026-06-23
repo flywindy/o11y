@@ -1336,7 +1336,7 @@ In addition to the §11 Pub/Sub set, the hook now unconditionally
 short-circuits the connection-setup commands the go-redis client
 issues itself on connect — never the application as a unit of work:
 
-- `AUTH`, `HELLO`, `SELECT`, `COMMAND` (matched by verb);
+- `AUTH`, `HELLO`, `SELECT` (matched by verb);
 - `CLIENT SETINFO` / `CLIENT SETNAME` (matched by subcommand —
   go-redis v9 auto-issues `CLIENT SETINFO lib-name/lib-ver` on every
   new connection, and `CLIENT SETNAME` when `ClientName` is set).
@@ -1392,6 +1392,16 @@ run on a fresh context, while genuine application commands run within a
 server/consumer span and are kept. Off by default because legitimate
 unparented background work (scheduled jobs, warmup) would also be
 dropped — so this is a deliberate, caller-made trade-off.
+
+### Pipelines
+
+All three categories use the same all-match short-circuit the §8 Pub/Sub
+rule already defines: a pipeline is dropped only when *every* user command
+in it is filtered. A mixed pipeline (at least one non-filtered command) is
+still recorded, and `db.operation.batch.size` reflects the full user-command
+count including the filtered ones — the existing §8 compromise, unchanged.
+`WithRequireParentSpan` gates the whole pipeline on the presence of a parent
+span, independent of the per-command filters.
 
 ### Out-of-SDK layer (documentation only)
 

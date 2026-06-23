@@ -17,7 +17,7 @@ adopters can plan their upgrades.
 
 - `redis`: command-noise filtering (ADR 0013 amendment). The wrapper now
   unconditionally skips connection-lifecycle commands the go-redis client
-  issues itself (`AUTH`, `HELLO`, `SELECT`, `COMMAND`, and the auto-issued
+  issues itself (`AUTH`, `HELLO`, `SELECT`, and the auto-issued
   `CLIENT SETINFO` / `CLIENT SETNAME`) in addition to the existing Pub/Sub
   filter — these are never application units of work, and skipping `AUTH` also
   keeps credentials out of `db.query.text`. Two new options let applications

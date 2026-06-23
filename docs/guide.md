@@ -574,6 +574,32 @@ _, err := o11yredis.Wrap(rdb, obs.TracerProvider(), obs.MeterProvider(),
 )
 ```
 
+The wrapper always drops telemetry for Pub/Sub commands and for the
+connection-lifecycle commands the client issues itself (`AUTH`, `HELLO`,
+`SELECT`, and the auto-issued `CLIENT SETINFO` / `SETNAME`) — these are never
+application work. Two opt-in options trim further noise:
+
+```go
+_, err := o11yredis.Wrap(rdb, obs.TracerProvider(), obs.MeterProvider(),
+    // Drop named commands by verb (case-insensitive). Useful for
+    // health-check PINGs or periodic INFO polls you never want traced.
+    o11yredis.WithIgnoredCommands("ping", "info"),
+    // Drop any command issued without an active parent span — i.e. work
+    // outside a traced request, such as background liveness probes,
+    // pool keepalive, or topology refreshes. Off by default.
+    o11yredis.WithRequireParentSpan(true),
+)
+```
+
+Both options suppress the span *and* the `db.client.operation.duration`
+sample. They target different cases: `WithIgnoredCommands` is exact and
+independent of where the command runs (it drops every `PING`, request-bound or
+not), while `WithRequireParentSpan` is a blanket "only trace request-bound
+work" policy that cannot pick out a single command. `WithRequireParentSpan`
+defaults to off because it would otherwise silently drop legitimate unparented
+background work (scheduled jobs, warmup). To stop seeing one specific noisy
+command, reach for `WithIgnoredCommands` first.
+
 ### Elasticsearch
 
 Use the `elasticsearch` sub-package to wire the official

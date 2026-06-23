@@ -348,13 +348,17 @@ func isPubSubCommand(name string) bool {
 // misrepresents application activity (and, for AUTH, would risk leaking
 // credentials into db.query.text), so they are always filtered — like Pub/Sub.
 //
-// AUTH / HELLO / SELECT and COMMAND are matched by verb. For CLIENT, only the
-// auto-issued setup subcommands (SETINFO advertising the library name/version,
-// SETNAME applying ClientName) are filtered; deliberate CLIENT subcommands such
-// as LIST or KILL stay instrumented.
+// AUTH / HELLO / SELECT are matched by verb — go-redis v9 issues them itself on
+// connect (HELLO for the RESP handshake, AUTH for credentials, SELECT for a
+// non-zero DB). For CLIENT, only the auto-issued setup subcommands (SETINFO
+// advertising the library name/version, SETNAME applying ClientName) are
+// filtered; deliberate CLIENT subcommands such as LIST or KILL stay
+// instrumented. Commands a client does not auto-issue (e.g. COMMAND) are left to
+// WithIgnoredCommands so the always-filtered set stays strictly "never
+// application work".
 func isConnectionLifecycleCommand(cmd goredis.Cmder) bool {
 	switch strings.ToLower(cmd.Name()) {
-	case "auth", "hello", "select", "command":
+	case "auth", "hello", "select":
 		return true
 	case "client":
 		return isClientSetupSubcommand(cmd)
