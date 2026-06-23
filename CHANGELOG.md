@@ -13,6 +13,10 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+---
+
+## [0.7.0] - 2026-06-23
+
 ### Added
 
 - `nats.Conn.JetStream()` now returns an o11y-owned JetStream facade
@@ -41,6 +45,10 @@ adopters can plan their upgrades.
   `cassandra.MapExecuteBatchCAS` for conditional batches) is the SDK-owned batch
   seam (one span per logical batch with `db.operation.batch.size`).
   `cassandra.MetricViews` is composed into `o11y.Init`.
+- k8s infrastructure: monitor stack (`base/monitor/`) and per-datastore
+  Kustomize Components (`base/components/{nats,mongodb,redis,minio}`) split
+  so the monitor stack is always deployed together while datastores are
+  applied on-demand only when running the relevant example.
 
 ### Changed
 
