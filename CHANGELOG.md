@@ -13,6 +13,10 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+---
+
+## [0.7.1] - 2026-06-23
+
 ### Changed
 
 - Upgraded the core OpenTelemetry module set
