@@ -1337,6 +1337,10 @@ short-circuits the connection-setup commands the go-redis client
 issues itself on connect — never the application as a unit of work:
 
 - `AUTH`, `HELLO`, `SELECT` (matched by verb);
+- `READONLY` (matched by verb) — go-redis v9 enqueues it during
+  connection initialisation whenever a read-only routing option is set
+  (`ClusterOptions.ReadOnly` / `RouteByLatency` / `RouteRandomly`), so
+  it rides the init pipeline alongside the others;
 - `CLIENT SETINFO` / `CLIENT SETNAME` (matched by subcommand —
   go-redis v9 auto-issues `CLIENT SETINFO lib-name/lib-ver` on every
   new connection, and `CLIENT SETNAME` when `ClientName` is set).

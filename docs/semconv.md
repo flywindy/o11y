@@ -269,7 +269,7 @@ Spans and metrics are emitted by the SDK-owned
 | Command class | Behavior |
 |---|---|
 | Pub/Sub (`PUBLISH`, `SUBSCRIBE`, `PUBSUB`, …) | Always skipped; belongs to the `messaging.*` model, not `db.*` (ADR 0013 §11). |
-| Connection lifecycle (`AUTH`, `HELLO`, `SELECT`, `CLIENT SETINFO` / `SETNAME`) | Always skipped; client-issued on connect, never application work. Skipping `AUTH` also keeps credentials out of `db.query.text`. |
+| Connection lifecycle (`AUTH`, `HELLO`, `SELECT`, `READONLY`, `CLIENT SETINFO` / `SETNAME`) | Always skipped; client-issued on connect, never application work. Skipping `AUTH` also keeps credentials out of `db.query.text`. |
 | Caller-listed commands | Skipped when passed to `redis.WithIgnoredCommands(...)` (matched by verb, case-insensitive). |
 | Commands without a parent span | Skipped when `redis.WithRequireParentSpan(true)` is set. Off by default. |
 

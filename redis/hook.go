@@ -370,9 +370,14 @@ func isPubSubCommand(name string) bool {
 //
 // name must be the lowercased command verb (cmd.Name()); it is passed in rather
 // than recomputed so the per-command hot path lowercases once.
+//
+// READONLY is included because go-redis v9 enqueues it during connection
+// initialisation whenever a read-only routing option is set
+// (ClusterOptions.ReadOnly / RouteByLatency / RouteRandomly), so it rides the
+// init pipeline alongside HELLO/AUTH/SELECT and is never an application command.
 func isConnectionLifecycleCommand(name string, cmd goredis.Cmder) bool {
 	switch name {
-	case "auth", "hello", "select":
+	case "auth", "hello", "select", "readonly":
 		return true
 	case "client":
 		return isClientSetupSubcommand(cmd)

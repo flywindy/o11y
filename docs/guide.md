@@ -576,8 +576,8 @@ _, err := o11yredis.Wrap(rdb, obs.TracerProvider(), obs.MeterProvider(),
 
 The wrapper always drops telemetry for Pub/Sub commands and for the
 connection-lifecycle commands the client issues itself (`AUTH`, `HELLO`,
-`SELECT`, and the auto-issued `CLIENT SETINFO` / `SETNAME`) — these are never
-application work. Two opt-in options trim further noise:
+`SELECT`, `READONLY`, and the auto-issued `CLIENT SETINFO` / `SETNAME`) — these
+are never application work. Two opt-in options trim further noise:
 
 ```go
 _, err := o11yredis.Wrap(rdb, obs.TracerProvider(), obs.MeterProvider(),

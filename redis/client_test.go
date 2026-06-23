@@ -192,6 +192,7 @@ func TestConnectionLifecycleCommandsAreSkipped(t *testing.T) {
 		"auth":                 goredis.NewCmd(context.Background(), "auth", "secret"),
 		"hello":                goredis.NewCmd(context.Background(), "hello", "3"),
 		"select":               goredis.NewCmd(context.Background(), "select", "2"),
+		"readonly":             goredis.NewCmd(context.Background(), "readonly"),
 		"client setinfo":       goredis.NewCmd(context.Background(), "client", "setinfo", "lib-name", "go-redis"),
 		"client setinfo bytes": goredis.NewCmd(context.Background(), "client", []byte("setinfo"), "lib-name", "go-redis"),
 		"client setname":       goredis.NewCmd(context.Background(), "client", "setname", "app"),
