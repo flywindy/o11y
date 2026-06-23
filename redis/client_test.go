@@ -189,11 +189,12 @@ func TestPubSubCommandsAreSkipped(t *testing.T) {
 
 func TestConnectionLifecycleCommandsAreSkipped(t *testing.T) {
 	cmds := map[string]goredis.Cmder{
-		"auth":           goredis.NewCmd(context.Background(), "auth", "secret"),
-		"hello":          goredis.NewCmd(context.Background(), "hello", "3"),
-		"select":         goredis.NewCmd(context.Background(), "select", "2"),
-		"client setinfo": goredis.NewCmd(context.Background(), "client", "setinfo", "lib-name", "go-redis"),
-		"client setname": goredis.NewCmd(context.Background(), "client", "setname", "app"),
+		"auth":                 goredis.NewCmd(context.Background(), "auth", "secret"),
+		"hello":                goredis.NewCmd(context.Background(), "hello", "3"),
+		"select":               goredis.NewCmd(context.Background(), "select", "2"),
+		"client setinfo":       goredis.NewCmd(context.Background(), "client", "setinfo", "lib-name", "go-redis"),
+		"client setinfo bytes": goredis.NewCmd(context.Background(), "client", []byte("setinfo"), "lib-name", "go-redis"),
+		"client setname":       goredis.NewCmd(context.Background(), "client", "setname", "app"),
 	}
 	for name, cmd := range cmds {
 		t.Run(name, func(t *testing.T) {

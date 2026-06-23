@@ -99,7 +99,7 @@ func (h *redisHook) DialHook(next goredis.DialHook) goredis.DialHook {
 
 func (h *redisHook) ProcessHook(next goredis.ProcessHook) goredis.ProcessHook {
 	return func(ctx context.Context, cmd goredis.Cmder) error {
-		if h.disabled.Load() || h.isFilteredCommand(cmd) || h.skipUnparented(ctx) {
+		if h.disabled.Load() || h.skipUnparented(ctx) || h.isFilteredCommand(cmd) {
 			return next(ctx, cmd)
 		}
 
@@ -303,7 +303,7 @@ func truncateCommandText(text string) string {
 //   - commands the caller opted out of via WithIgnoredCommands.
 func (h *redisHook) isFilteredCommand(cmd goredis.Cmder) bool {
 	name := strings.ToLower(cmd.Name())
-	if isPubSubCommand(name) || isConnectionLifecycleCommand(cmd) {
+	if isPubSubCommand(name) || isConnectionLifecycleCommand(name, cmd) {
 		return true
 	}
 	if h.cfg.ignored != nil {
@@ -356,8 +356,11 @@ func isPubSubCommand(name string) bool {
 // instrumented. Commands a client does not auto-issue (e.g. COMMAND) are left to
 // WithIgnoredCommands so the always-filtered set stays strictly "never
 // application work".
-func isConnectionLifecycleCommand(cmd goredis.Cmder) bool {
-	switch strings.ToLower(cmd.Name()) {
+//
+// name must be the lowercased command verb (cmd.Name()); it is passed in rather
+// than recomputed so the per-command hot path lowercases once.
+func isConnectionLifecycleCommand(name string, cmd goredis.Cmder) bool {
+	switch name {
 	case "auth", "hello", "select":
 		return true
 	case "client":
@@ -372,8 +375,16 @@ func isClientSetupSubcommand(cmd goredis.Cmder) bool {
 	if len(args) < 2 {
 		return false
 	}
-	sub, ok := args[1].(string)
-	if !ok {
+	// go-redis accepts command arguments as either string or []byte (callers may
+	// pass []byte to avoid allocations), so handle both rather than assuming
+	// string and silently failing the type assertion.
+	var sub string
+	switch v := args[1].(type) {
+	case string:
+		sub = v
+	case []byte:
+		sub = string(v)
+	default:
 		return false
 	}
 	switch strings.ToLower(sub) {
