@@ -1319,6 +1319,97 @@ candidate for a separate ADR if demand appears:
 
 ---
 
+## Amendment (2026-06-23) — command-noise filtering
+
+Operational experience showed that several command classes that
+travel through `ProcessHook` are pure noise in a `db.*` trace: they
+are not application units of work, yet they produce spans and inflate
+the `db.client.operation.duration` series. This amendment extends the
+§11 Pub/Sub short-circuit into a small, layered filtering model. The
+split follows a single principle: **the SDK filters what is
+*structurally* never application work; it makes *preference-based*
+suppression opt-in.**
+
+### A. Always filtered — connection-lifecycle commands
+
+In addition to the §11 Pub/Sub set, the hook now unconditionally
+short-circuits the connection-setup commands the go-redis client
+issues itself on connect — never the application as a unit of work:
+
+- `AUTH`, `HELLO`, `SELECT`, `COMMAND` (matched by verb);
+- `CLIENT SETINFO` / `CLIENT SETNAME` (matched by subcommand —
+  go-redis v9 auto-issues `CLIENT SETINFO lib-name/lib-ver` on every
+  new connection, and `CLIENT SETNAME` when `ClientName` is set).
+  Deliberate `CLIENT` subcommands (`LIST`, `KILL`, …) stay
+  instrumented.
+
+These are treated exactly like Pub/Sub: no span, no duration sample,
+`next` invoked directly, in both `ProcessHook` and (all-match)
+`ProcessPipelineHook`. Filtering `AUTH` also removes the risk of
+credentials reaching `db.query.text` when `WithCommandTextEnabled` is
+on. Rationale for hardcoding rather than making this configurable: a
+`db.*` span for a handshake misrepresents application activity in
+every deployment, so there is no legitimate "keep it" choice to expose
+— the same reasoning §11 applies to Pub/Sub.
+
+### B. Opt-in suppression — `WithIgnoredCommands`
+
+Commands that *are* legitimate `db.*` operations but are frequently
+noise — health-check / keepalive `PING`, periodic `INFO` polls,
+`ECHO`, `CLUSTER *` topology probes — are **emitted by default** and
+suppressed only when the caller lists them:
+
+```go
+func WithIgnoredCommands(names ...string) Option
+```
+
+Names match case-insensitively against `cmd.Name()` (the verb), so one
+entry covers all invocations regardless of arguments. A listed command
+is filtered identically to category A (no span, no sample; all-match
+short-circuit in pipelines). These are *not* hardcoded because
+reasonable deployments disagree: `PING` latency is a clean server-RTT
+signal some teams want to keep, so the policy belongs to the
+application while the SDK supplies the mechanism (which the application
+cannot implement itself — a downstream go-redis hook cannot suppress a
+span this package's hook already owns).
+
+**Known limitation.** Name matching cannot distinguish a background
+health-check `PING` from an application-issued `PING`;
+`WithIgnoredCommands("ping")` drops both. For probe-only suppression,
+use category C or a dedicated unwrapped client for the probe.
+
+### C. Opt-in scoping — `WithRequireParentSpan`
+
+```go
+func WithRequireParentSpan(enabled bool) Option
+```
+
+When enabled, a command (or pipeline) whose context carries no valid
+span context produces neither a span nor a duration sample. This
+targets background noise that name matching cannot isolate:
+health-check probes, pool keepalive, and topology refreshes typically
+run on a fresh context, while genuine application commands run within a
+server/consumer span and are kept. Off by default because legitimate
+unparented background work (scheduled jobs, warmup) would also be
+dropped — so this is a deliberate, caller-made trade-off.
+
+### Out-of-SDK layer (documentation only)
+
+Cross-service, fleet-wide suppression remains a Collector concern: an
+OTTL `filter` processor (e.g. drop spans where
+`attributes["db.operation.name"] == "PING"`) is the vendor-neutral way
+to enforce policy centrally without redeploying applications. The SDK
+options above cover the in-process case the Collector cannot (dropping
+before serialization/export cost) and the per-client case
+(`WithRequireParentSpan`); the Collector covers org-wide defaults. The
+two compose.
+
+This amendment updates §3 (public API gains `WithIgnoredCommands` and
+`WithRequireParentSpan`) and §11 (the Pub/Sub bullet is now one case of
+the general "always filtered" category A).
+
+---
+
 ## Global-state verification
 
 ### Library: `github.com/redis/go-redis/extra/redisotel/v9`

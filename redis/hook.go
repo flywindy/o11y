@@ -99,7 +99,7 @@ func (h *redisHook) DialHook(next goredis.DialHook) goredis.DialHook {
 
 func (h *redisHook) ProcessHook(next goredis.ProcessHook) goredis.ProcessHook {
 	return func(ctx context.Context, cmd goredis.Cmder) error {
-		if h.disabled.Load() || isPubSubCommand(cmd.Name()) {
+		if h.disabled.Load() || h.isFilteredCommand(cmd) || h.skipUnparented(ctx) {
 			return next(ctx, cmd)
 		}
 
@@ -137,7 +137,7 @@ func (h *redisHook) ProcessPipelineHook(next goredis.ProcessPipelineHook) goredi
 		}
 
 		userCmds := userPipelineCommands(cmds)
-		if len(userCmds) == 0 || allPubSubCommands(userCmds) {
+		if len(userCmds) == 0 || h.skipUnparented(ctx) || h.allFiltered(userCmds) {
 			return next(ctx, cmds)
 		}
 
@@ -293,10 +293,87 @@ func truncateCommandText(text string) string {
 	return text[:end]
 }
 
+// isFilteredCommand reports whether a single command must be excluded from
+// telemetry entirely (no span, no duration sample). Three categories qualify:
+//
+//   - Pub/Sub commands, which belong to the messaging.* model rather than db.*
+//     (ADR 0013 §11) and are always excluded;
+//   - connection-lifecycle commands the client issues itself on connect, which
+//     are never an application unit of work and are always excluded;
+//   - commands the caller opted out of via WithIgnoredCommands.
+func (h *redisHook) isFilteredCommand(cmd goredis.Cmder) bool {
+	name := strings.ToLower(cmd.Name())
+	if isPubSubCommand(name) || isConnectionLifecycleCommand(cmd) {
+		return true
+	}
+	if h.cfg.ignored != nil {
+		if _, ok := h.cfg.ignored[name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// allFiltered reports whether every command in a pipeline is individually
+// filtered, in which case the whole pipeline span and sample are skipped.
+func (h *redisHook) allFiltered(cmds []goredis.Cmder) bool {
+	for _, cmd := range cmds {
+		if !h.isFilteredCommand(cmd) {
+			return false
+		}
+	}
+	return true
+}
+
+// skipUnparented reports whether WithRequireParentSpan is set and the context
+// carries no valid span context, meaning the operation is not part of a traced
+// request and should be dropped.
+func (h *redisHook) skipUnparented(ctx context.Context) bool {
+	return h.cfg.requireParentSpan && !trace.SpanContextFromContext(ctx).IsValid()
+}
+
 func isPubSubCommand(name string) bool {
 	switch strings.ToLower(name) {
 	case "publish", "spublish", "subscribe", "psubscribe", "ssubscribe",
 		"unsubscribe", "punsubscribe", "sunsubscribe", "pubsub":
+		return true
+	default:
+		return false
+	}
+}
+
+// isConnectionLifecycleCommand reports whether a command is one the go-redis
+// client issues itself when establishing or initialising a connection rather
+// than one the application runs as a unit of work. Emitting db.* spans for these
+// misrepresents application activity (and, for AUTH, would risk leaking
+// credentials into db.query.text), so they are always filtered — like Pub/Sub.
+//
+// AUTH / HELLO / SELECT and COMMAND are matched by verb. For CLIENT, only the
+// auto-issued setup subcommands (SETINFO advertising the library name/version,
+// SETNAME applying ClientName) are filtered; deliberate CLIENT subcommands such
+// as LIST or KILL stay instrumented.
+func isConnectionLifecycleCommand(cmd goredis.Cmder) bool {
+	switch strings.ToLower(cmd.Name()) {
+	case "auth", "hello", "select", "command":
+		return true
+	case "client":
+		return isClientSetupSubcommand(cmd)
+	default:
+		return false
+	}
+}
+
+func isClientSetupSubcommand(cmd goredis.Cmder) bool {
+	args := cmd.Args()
+	if len(args) < 2 {
+		return false
+	}
+	sub, ok := args[1].(string)
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(sub) {
+	case "setinfo", "setname":
 		return true
 	default:
 		return false
@@ -314,15 +391,6 @@ func userPipelineCommands(cmds []goredis.Cmder) []goredis.Cmder {
 		}
 	}
 	return out
-}
-
-func allPubSubCommands(cmds []goredis.Cmder) bool {
-	for _, cmd := range cmds {
-		if !isPubSubCommand(cmd.Name()) {
-			return false
-		}
-	}
-	return true
 }
 
 func pipelineError(execErr error, cmds []goredis.Cmder) error {
