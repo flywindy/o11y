@@ -13,6 +13,10 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+---
+
+## [0.7.0] - 2026-06-23
+
 ### Added
 
 - `nats.Conn.JetStream()` now returns an o11y-owned JetStream facade
@@ -41,23 +45,6 @@ adopters can plan their upgrades.
   `cassandra.MapExecuteBatchCAS` for conditional batches) is the SDK-owned batch
   seam (one span per logical batch with `db.operation.batch.size`).
   `cassandra.MetricViews` is composed into `o11y.Init`.
-
-### Changed
-
-- **Breaking:** `nats.Conn.JetStream()` returns the o11y `nats.JetStream`
-  interface instead of `oteljetstream.JetStream`, and JetStream config / consume
-  callbacks now use `github.com/nats-io/nats.go/jetstream` types rather than
-  `oteljetstream` aliases. Update JetStream call sites accordingly — the
-  `examples/jetstream/*` programs show the new shape. Deferred (not wrapped yet):
-  single-message `Consumer.Next`, `Fetch`/`FetchBytes`/`FetchNoWait`, push
-  consumers, and ordered consumers.
-
----
-
-## [0.6.0] - 2026-06-14
-
-### Added
-
 - ADR 0020: `elasticsearch` package — a T2 facade (`NewClient`,
   `NewTypedClient`, `WithSearchBody`) that wires the SDK `TracerProvider` into
   `github.com/elastic/go-elasticsearch/v8`'s first-party OpenTelemetry
@@ -75,6 +62,27 @@ adopters can plan their upgrades.
   failure on a 200 stays Error. Span names follow the cross-package
   `{system.name}.{operation} {target}` convention (ADR 0023), e.g.
   `elasticsearch.search my-index`, rewritten from the upstream's bare endpoint id.
+- k8s infrastructure: monitor stack (`base/monitor/`) and per-datastore
+  Kustomize Components (`base/components/{nats,mongodb,redis,minio}`) split
+  so the monitor stack is always deployed together while datastores are
+  applied on-demand only when running the relevant example.
+
+### Changed
+
+- **Breaking:** `nats.Conn.JetStream()` returns the o11y `nats.JetStream`
+  interface instead of `oteljetstream.JetStream`, and JetStream config / consume
+  callbacks now use `github.com/nats-io/nats.go/jetstream` types rather than
+  `oteljetstream` aliases. Update JetStream call sites accordingly — the
+  `examples/jetstream/*` programs show the new shape. Deferred (not wrapped yet):
+  single-message `Consumer.Next`, `Fetch`/`FetchBytes`/`FetchNoWait`, push
+  consumers, and ordered consumers.
+
+---
+
+## [0.6.0] - 2026-06-14
+
+### Added
+
 - ADR 0024: `obsctx` package (`Detach`, `DetachWithTimeout`, `Go`) for carrying
   observability/trace context into background work that outlives a request,
   without inheriting the request's cancelation or deadline. Prevents the
