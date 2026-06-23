@@ -371,10 +371,17 @@ func isPubSubCommand(name string) bool {
 // name must be the lowercased command verb (cmd.Name()); it is passed in rather
 // than recomputed so the per-command hot path lowercases once.
 //
-// READONLY is included because go-redis v9 enqueues it during connection
-// initialisation whenever a read-only routing option is set
-// (ClusterOptions.ReadOnly / RouteByLatency / RouteRandomly), so it rides the
-// init pipeline alongside HELLO/AUTH/SELECT and is never an application command.
+// READONLY is filtered as intentional control-plane suppression. go-redis v9
+// enqueues it during connection initialisation whenever a read-only routing
+// option is set (ClusterOptions.ReadOnly / RouteByLatency / RouteRandomly), so
+// it rides the init pipeline alongside HELLO/AUTH/SELECT. Unlike those, READONLY
+// is also a public command an application can call directly
+// (ClusterClient.ReadOnly), and the hook cannot tell an init-pipeline READONLY
+// from a deliberate one by name alone. This package treats both the same way:
+// READONLY toggles connection routing rather than touching data, so suppressing
+// the rare explicit call is an accepted trade-off for keeping per-connection
+// init noise out of traces by default. Callers who must observe explicit
+// ReadOnly() calls should track them at the application layer.
 func isConnectionLifecycleCommand(name string, cmd goredis.Cmder) bool {
 	switch name {
 	case "auth", "hello", "select", "readonly":

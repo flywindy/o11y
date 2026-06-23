@@ -1340,7 +1340,16 @@ issues itself on connect — never the application as a unit of work:
 - `READONLY` (matched by verb) — go-redis v9 enqueues it during
   connection initialisation whenever a read-only routing option is set
   (`ClusterOptions.ReadOnly` / `RouteByLatency` / `RouteRandomly`), so
-  it rides the init pipeline alongside the others;
+  it rides the init pipeline alongside the others. Unlike AUTH/HELLO/
+  SELECT, `READONLY` is also a public command an application can call
+  directly (`ClusterClient.ReadOnly`), and the hook cannot distinguish
+  an init-pipeline `READONLY` from a deliberate one by name. Filtering
+  it is therefore **intentional control-plane suppression**, not a
+  claim that it is never application-issued: it toggles connection
+  routing rather than touching data, so suppressing the rare explicit
+  call is an accepted trade-off for keeping per-connection init noise
+  out of traces by default. Callers who need to observe explicit
+  `ReadOnly()` calls track them at the application layer;
 - `CLIENT SETINFO` / `CLIENT SETNAME` (matched by subcommand —
   go-redis v9 auto-issues `CLIENT SETINFO lib-name/lib-ver` on every
   new connection, and `CLIENT SETNAME` when `ClientName` is set).

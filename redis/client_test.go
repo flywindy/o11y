@@ -187,6 +187,23 @@ func TestPubSubCommandsAreSkipped(t *testing.T) {
 	assert.Nil(t, metricByName(rm, "db.client.operation.duration"))
 }
 
+func TestReadOnlyIsSuppressedAsControlPlane(t *testing.T) {
+	// READONLY is filtered intentionally even when issued directly (e.g.
+	// ClusterClient.ReadOnly), not only when go-redis auto-enqueues it during
+	// connection init: it toggles connection routing rather than touching data,
+	// and the hook cannot distinguish the two by name. This locks in that
+	// accepted trade-off so a future change does not silently start emitting it.
+	hook, sr, reader := newTestHook(t, config{}, "127.0.0.1:6379", 0)
+
+	err := hook.ProcessHook(func(context.Context, goredis.Cmder) error {
+		return nil
+	})(context.Background(), goredis.NewCmd(context.Background(), "readonly"))
+	require.NoError(t, err)
+
+	assert.Empty(t, sr.Ended())
+	assert.Nil(t, metricByName(collectRedisMetrics(t, reader), "db.client.operation.duration"))
+}
+
 func TestConnectionLifecycleCommandsAreSkipped(t *testing.T) {
 	cmds := map[string]goredis.Cmder{
 		"auth":                 goredis.NewCmd(context.Background(), "auth", "secret"),
