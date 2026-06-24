@@ -13,6 +13,21 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+### Added
+
+- `redis`: command-noise filtering (ADR 0013 amendment). The wrapper now
+  unconditionally skips connection-lifecycle commands the go-redis client
+  issues itself (`AUTH`, `HELLO`, `SELECT`, `READONLY`, and the auto-issued
+  `CLIENT SETINFO` / `CLIENT SETNAME`) in addition to the existing Pub/Sub
+  filter — these are never application units of work, and skipping `AUTH` also
+  keeps credentials out of `db.query.text`. Two new options let applications
+  suppress preference-based noise: `redis.WithIgnoredCommands(names ...string)`
+  drops named commands (e.g. health-check `PING`, `INFO`) by verb,
+  case-insensitively; `redis.WithRequireParentSpan(true)` drops commands issued
+  without an active parent span (background probes, keepalive, topology
+  refreshes). Both suppress the span and the `db.client.operation.duration`
+  sample. Deliberate `CLIENT` subcommands such as `LIST` remain instrumented.
+
 ---
 
 ## [0.7.1] - 2026-06-23

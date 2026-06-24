@@ -99,7 +99,7 @@ func (h *redisHook) DialHook(next goredis.DialHook) goredis.DialHook {
 
 func (h *redisHook) ProcessHook(next goredis.ProcessHook) goredis.ProcessHook {
 	return func(ctx context.Context, cmd goredis.Cmder) error {
-		if h.disabled.Load() || isPubSubCommand(cmd.Name()) {
+		if h.disabled.Load() || h.skipUnparented(ctx) || h.isFilteredCommand(cmd) {
 			return next(ctx, cmd)
 		}
 
@@ -137,7 +137,15 @@ func (h *redisHook) ProcessPipelineHook(next goredis.ProcessPipelineHook) goredi
 		}
 
 		userCmds := userPipelineCommands(cmds)
-		if len(userCmds) == 0 || allPubSubCommands(userCmds) {
+		if len(userCmds) == 0 || h.skipUnparented(ctx) {
+			return next(ctx, cmds)
+		}
+		// Drop the whole pipeline only when every user command is filtered;
+		// otherwise record it but expose only the unfiltered commands in
+		// db.query.text so a filtered command's arguments (e.g. AUTH's
+		// credentials) never leak into a mixed-pipeline span.
+		visibleCmds := h.unfilteredPipelineCommands(userCmds)
+		if len(visibleCmds) == 0 {
 			return next(ctx, cmds)
 		}
 
@@ -149,7 +157,7 @@ func (h *redisHook) ProcessPipelineHook(next goredis.ProcessPipelineHook) goredi
 			attrs = append(attrs, semconv.DBOperationBatchSize(len(userCmds)))
 		}
 		if h.cfg.commandTextEnabled {
-			attrs = append(attrs, semconv.DBQueryText(truncateCommandText(pipelineText(userCmds))))
+			attrs = append(attrs, semconv.DBQueryText(truncateCommandText(pipelineText(visibleCmds))))
 		}
 
 		ctx, span := h.tracer.Start(ctx, "redis.pipeline",
@@ -293,10 +301,117 @@ func truncateCommandText(text string) string {
 	return text[:end]
 }
 
+// isFilteredCommand reports whether a single command must be excluded from
+// telemetry entirely (no span, no duration sample). Three categories qualify:
+//
+//   - Pub/Sub commands, which belong to the messaging.* model rather than db.*
+//     (ADR 0013 §11) and are always excluded;
+//   - connection-lifecycle commands the client issues itself on connect, which
+//     are never an application unit of work and are always excluded;
+//   - commands the caller opted out of via WithIgnoredCommands.
+func (h *redisHook) isFilteredCommand(cmd goredis.Cmder) bool {
+	name := strings.ToLower(cmd.Name())
+	if isPubSubCommand(name) || isConnectionLifecycleCommand(name, cmd) {
+		return true
+	}
+	if h.cfg.ignored != nil {
+		if _, ok := h.cfg.ignored[name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// unfilteredPipelineCommands returns the pipeline commands that are not
+// individually filtered — the set safe to expose in db.query.text. When the
+// result is empty, every command was filtered and the whole pipeline span and
+// sample can be skipped.
+func (h *redisHook) unfilteredPipelineCommands(cmds []goredis.Cmder) []goredis.Cmder {
+	out := make([]goredis.Cmder, 0, len(cmds))
+	for _, cmd := range cmds {
+		if !h.isFilteredCommand(cmd) {
+			out = append(out, cmd)
+		}
+	}
+	return out
+}
+
+// skipUnparented reports whether WithRequireParentSpan is set and the context
+// carries no valid span context, meaning the operation is not part of a traced
+// request and should be dropped.
+func (h *redisHook) skipUnparented(ctx context.Context) bool {
+	return h.cfg.requireParentSpan && !trace.SpanContextFromContext(ctx).IsValid()
+}
+
 func isPubSubCommand(name string) bool {
 	switch strings.ToLower(name) {
 	case "publish", "spublish", "subscribe", "psubscribe", "ssubscribe",
 		"unsubscribe", "punsubscribe", "sunsubscribe", "pubsub":
+		return true
+	default:
+		return false
+	}
+}
+
+// isConnectionLifecycleCommand reports whether a command is one the go-redis
+// client issues itself when establishing or initialising a connection rather
+// than one the application runs as a unit of work. Emitting db.* spans for these
+// misrepresents application activity (and, for AUTH, would risk leaking
+// credentials into db.query.text), so they are always filtered — like Pub/Sub.
+//
+// AUTH / HELLO / SELECT are matched by verb — go-redis v9 issues them itself on
+// connect (HELLO for the RESP handshake, AUTH for credentials, SELECT for a
+// non-zero DB). For CLIENT, only the auto-issued setup subcommands (SETINFO
+// advertising the library name/version, SETNAME applying ClientName) are
+// filtered; deliberate CLIENT subcommands such as LIST or KILL stay
+// instrumented. Commands a client does not auto-issue (e.g. COMMAND) are left to
+// WithIgnoredCommands so the always-filtered set stays strictly "never
+// application work".
+//
+// name must be the lowercased command verb (cmd.Name()); it is passed in rather
+// than recomputed so the per-command hot path lowercases once.
+//
+// READONLY is filtered as intentional control-plane suppression. go-redis v9
+// enqueues it during connection initialisation whenever a read-only routing
+// option is set (ClusterOptions.ReadOnly / RouteByLatency / RouteRandomly), so
+// it rides the init pipeline alongside HELLO/AUTH/SELECT. Unlike those, READONLY
+// is also a public command an application can call directly
+// (ClusterClient.ReadOnly), and the hook cannot tell an init-pipeline READONLY
+// from a deliberate one by name alone. This package treats both the same way:
+// READONLY toggles connection routing rather than touching data, so suppressing
+// the rare explicit call is an accepted trade-off for keeping per-connection
+// init noise out of traces by default. Callers who must observe explicit
+// ReadOnly() calls should track them at the application layer.
+func isConnectionLifecycleCommand(name string, cmd goredis.Cmder) bool {
+	switch name {
+	case "auth", "hello", "select", "readonly":
+		return true
+	case "client":
+		return isClientSetupSubcommand(cmd)
+	default:
+		return false
+	}
+}
+
+func isClientSetupSubcommand(cmd goredis.Cmder) bool {
+	args := cmd.Args()
+	if len(args) < 2 {
+		return false
+	}
+	// go-redis accepts command arguments as either string or []byte (callers may
+	// pass []byte to avoid allocations), so handle both rather than assuming
+	// string and silently failing the type assertion.
+	var sub string
+	switch v := args[1].(type) {
+	case string:
+		sub = v
+	case []byte:
+		sub = string(v)
+	default:
+		return false
+	}
+	switch strings.ToLower(sub) {
+	case "setinfo", "setname":
 		return true
 	default:
 		return false
@@ -314,15 +429,6 @@ func userPipelineCommands(cmds []goredis.Cmder) []goredis.Cmder {
 		}
 	}
 	return out
-}
-
-func allPubSubCommands(cmds []goredis.Cmder) bool {
-	for _, cmd := range cmds {
-		if !isPubSubCommand(cmd.Name()) {
-			return false
-		}
-	}
-	return true
 }
 
 func pipelineError(execErr error, cmds []goredis.Cmder) error {

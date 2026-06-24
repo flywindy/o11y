@@ -142,7 +142,24 @@ go run examples/redis/main.go
 
 The example emits Redis command spans plus `db.client.operation.duration` and
 connection-pool metrics through OTLP metrics push. It runs `PING`, `SET`,
-`GET`, a cache-miss `GET`, and a pipeline every two seconds.
+`GET`, a cache-miss `GET`, and a pipeline every two seconds, and a background
+liveness probe issues an unparented `PING` every five seconds to model
+health-check traffic.
+
+Two environment variables exercise the command-noise filtering options:
+
+- `O11Y_REDIS_IGNORE_COMMANDS` — comma-separated command verbs to drop entirely
+  (span and duration sample), e.g. `O11Y_REDIS_IGNORE_COMMANDS=ping,info`. This
+  drops every matching command regardless of context, including the request-bound
+  `PING` in the main loop.
+- `O11Y_REDIS_REQUIRE_PARENT_SPAN=true` — drop commands issued without an active
+  parent span. The background liveness `PING` disappears (it runs on a bare
+  context) while the request-bound `PING` inside the `redis-cycle` span stays.
+
+Compare the two against the background probe to see why `WithIgnoredCommands` is
+the precise way to silence one command while `WithRequireParentSpan` drops all
+non-request-bound work. (`O11Y_REDIS_COMMAND_TEXT=true` additionally records
+`db.query.text`.)
 
 ### Elasticsearch
 

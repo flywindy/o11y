@@ -21,6 +21,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func TestWrapValidation(t *testing.T) {
@@ -184,6 +185,156 @@ func TestPubSubCommandsAreSkipped(t *testing.T) {
 	assert.Empty(t, sr.Ended())
 	rm := collectRedisMetrics(t, reader)
 	assert.Nil(t, metricByName(rm, "db.client.operation.duration"))
+}
+
+func TestReadOnlyIsSuppressedAsControlPlane(t *testing.T) {
+	// READONLY is filtered intentionally even when issued directly (e.g.
+	// ClusterClient.ReadOnly), not only when go-redis auto-enqueues it during
+	// connection init: it toggles connection routing rather than touching data,
+	// and the hook cannot distinguish the two by name. This locks in that
+	// accepted trade-off so a future change does not silently start emitting it.
+	hook, sr, reader := newTestHook(t, config{}, "127.0.0.1:6379", 0)
+
+	err := hook.ProcessHook(func(context.Context, goredis.Cmder) error {
+		return nil
+	})(context.Background(), goredis.NewCmd(context.Background(), "readonly"))
+	require.NoError(t, err)
+
+	assert.Empty(t, sr.Ended())
+	assert.Nil(t, metricByName(collectRedisMetrics(t, reader), "db.client.operation.duration"))
+}
+
+func TestConnectionLifecycleCommandsAreSkipped(t *testing.T) {
+	cmds := map[string]goredis.Cmder{
+		"auth":                 goredis.NewCmd(context.Background(), "auth", "secret"),
+		"hello":                goredis.NewCmd(context.Background(), "hello", "3"),
+		"select":               goredis.NewCmd(context.Background(), "select", "2"),
+		"readonly":             goredis.NewCmd(context.Background(), "readonly"),
+		"client setinfo":       goredis.NewCmd(context.Background(), "client", "setinfo", "lib-name", "go-redis"),
+		"client setinfo bytes": goredis.NewCmd(context.Background(), "client", []byte("setinfo"), "lib-name", "go-redis"),
+		"client setname":       goredis.NewCmd(context.Background(), "client", "setname", "app"),
+	}
+	for name, cmd := range cmds {
+		t.Run(name, func(t *testing.T) {
+			hook, sr, reader := newTestHook(t, config{}, "127.0.0.1:6379", 0)
+			err := hook.ProcessHook(func(context.Context, goredis.Cmder) error {
+				return nil
+			})(context.Background(), cmd)
+			require.NoError(t, err)
+
+			assert.Empty(t, sr.Ended())
+			rm := collectRedisMetrics(t, reader)
+			assert.Nil(t, metricByName(rm, "db.client.operation.duration"))
+		})
+	}
+}
+
+func TestDeliberateClientSubcommandIsInstrumented(t *testing.T) {
+	// CLIENT LIST is application-issued, not a connection-setup command, so it
+	// must still produce telemetry — only CLIENT SETINFO / SETNAME are filtered.
+	hook, sr, _ := newTestHook(t, config{}, "127.0.0.1:6379", 0)
+
+	err := hook.ProcessHook(func(context.Context, goredis.Cmder) error {
+		return nil
+	})(context.Background(), goredis.NewCmd(context.Background(), "client", "list"))
+	require.NoError(t, err)
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	assert.Equal(t, "redis.CLIENT", spans[0].Name())
+}
+
+func TestWithIgnoredCommandsSkipsNamedCommands(t *testing.T) {
+	// Exercise the option wiring, including case-insensitive matching.
+	cfg := newConfig([]Option{WithIgnoredCommands("PING", " Info ")})
+	hook, sr, reader := newTestHook(t, cfg, "127.0.0.1:6379", 0)
+
+	for _, name := range []string{"ping", "info"} {
+		err := hook.ProcessHook(func(context.Context, goredis.Cmder) error {
+			return nil
+		})(context.Background(), goredis.NewCmd(context.Background(), name))
+		require.NoError(t, err)
+	}
+	assert.Empty(t, sr.Ended())
+	rm := collectRedisMetrics(t, reader)
+	assert.Nil(t, metricByName(rm, "db.client.operation.duration"))
+
+	// A non-ignored command is still instrumented.
+	err := hook.ProcessHook(func(context.Context, goredis.Cmder) error {
+		return nil
+	})(context.Background(), goredis.NewCmd(context.Background(), "get", "k"))
+	require.NoError(t, err)
+	require.Len(t, sr.Ended(), 1)
+}
+
+func TestRequireParentSpanDropsUnparentedCommands(t *testing.T) {
+	cfg := newConfig([]Option{WithRequireParentSpan(true)})
+	hook, sr, reader := newTestHook(t, cfg, "127.0.0.1:6379", 0)
+
+	// No parent span on the context: dropped.
+	err := hook.ProcessHook(func(context.Context, goredis.Cmder) error {
+		return nil
+	})(context.Background(), goredis.NewCmd(context.Background(), "get", "k"))
+	require.NoError(t, err)
+	assert.Empty(t, sr.Ended())
+	assert.Nil(t, metricByName(collectRedisMetrics(t, reader), "db.client.operation.duration"))
+
+	// Valid parent span context present: instrumented as a child.
+	parent := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID: trace.TraceID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10},
+		SpanID:  trace.SpanID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08},
+	})
+	ctx := trace.ContextWithSpanContext(context.Background(), parent)
+	err = hook.ProcessHook(func(context.Context, goredis.Cmder) error {
+		return nil
+	})(ctx, goredis.NewCmd(context.Background(), "get", "k"))
+	require.NoError(t, err)
+	require.Len(t, sr.Ended(), 1)
+}
+
+func TestPipelineAllIgnoredCommandsAreSkipped(t *testing.T) {
+	cfg := newConfig([]Option{WithIgnoredCommands("ping")})
+	hook, sr, reader := newTestHook(t, cfg, "127.0.0.1:6379", 0)
+	cmds := []goredis.Cmder{
+		goredis.NewCmd(context.Background(), "multi"),
+		goredis.NewCmd(context.Background(), "ping"),
+		goredis.NewCmd(context.Background(), "ping"),
+		goredis.NewCmd(context.Background(), "exec"),
+	}
+
+	err := hook.ProcessPipelineHook(func(context.Context, []goredis.Cmder) error {
+		return nil
+	})(context.Background(), cmds)
+	require.NoError(t, err)
+
+	assert.Empty(t, sr.Ended())
+	rm := collectRedisMetrics(t, reader)
+	assert.Nil(t, metricByName(rm, "db.client.operation.duration"))
+}
+
+func TestPipelineQueryTextExcludesFilteredCommands(t *testing.T) {
+	// A mixed pipeline is still recorded, but a filtered command's arguments
+	// (here AUTH's credential) must not leak into db.query.text via the
+	// surviving sibling command's span.
+	hook, sr, _ := newTestHook(t, config{commandTextEnabled: true}, "127.0.0.1:6379", 0)
+	cmds := []goredis.Cmder{
+		goredis.NewCmd(context.Background(), "auth", "super-secret"),
+		goredis.NewCmd(context.Background(), "get", "k"),
+	}
+
+	err := hook.ProcessPipelineHook(func(context.Context, []goredis.Cmder) error {
+		return nil
+	})(context.Background(), cmds)
+	require.NoError(t, err)
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	value, ok := spanAttr(spans[0], semconv.DBQueryTextKey)
+	require.True(t, ok)
+	assert.Equal(t, "get k", value.AsString())
+	assert.NotContains(t, value.AsString(), "super-secret")
+	// batch.size still reflects the full user-command count (ADR 0013 §8).
+	assertSpanHas(t, spans[0], semconv.DBOperationBatchSize(2))
 }
 
 func TestPipelineHookHandlesTxFramingAndPubSubFiltering(t *testing.T) {
