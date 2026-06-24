@@ -576,8 +576,11 @@ _, err := o11yredis.Wrap(rdb, obs.TracerProvider(), obs.MeterProvider(),
 
 The wrapper always drops telemetry for Pub/Sub commands and for the
 connection-lifecycle commands the client issues itself (`AUTH`, `HELLO`,
-`SELECT`, `READONLY`, and the auto-issued `CLIENT SETINFO` / `SETNAME`) — these
-are never application work. Two opt-in options trim further noise:
+`SELECT`, `READONLY`, and the auto-issued `CLIENT SETINFO` / `SETNAME`). These
+are connection management rather than application data work; `READONLY` is also
+a public command, so filtering it is intentional control-plane suppression (a
+deliberate `ClusterClient.ReadOnly` call is dropped too — it cannot be told
+apart from the auto-issued one by name). Two opt-in options trim further noise:
 
 ```go
 _, err := o11yredis.Wrap(rdb, obs.TracerProvider(), obs.MeterProvider(),
@@ -599,6 +602,23 @@ work" policy that cannot pick out a single command. `WithRequireParentSpan`
 defaults to off because it would otherwise silently drop legitimate unparented
 background work (scheduled jobs, warmup). To stop seeing one specific noisy
 command, reach for `WithIgnoredCommands` first.
+
+To map what you see in a trace back to this model, here is how common commands
+are handled by default:
+
+| Command you see | What it is | Default | How to trim |
+| --- | --- | --- | --- |
+| `SET`, `GET`, `HGETALL`, `INCR`, `DEL`, … | Application data operations | Instrumented | Leave as-is; these are the work you want to see |
+| `EVAL`, `EVALSHA` | Lua scripts run by the app | Instrumented | Leave as-is (or `WithIgnoredCommands` if a specific script is noise) |
+| `PING` | Liveness / health probe | Instrumented | `WithRequireParentSpan(true)` for background probes, or `WithIgnoredCommands("ping")` to drop all |
+| `INFO`, `COMMAND` | Periodic polls / introspection | Instrumented | `WithIgnoredCommands("info", "command")` if unwanted |
+| `CLIENT LIST`, `CLIENT KILL` | Deliberate admin commands | Instrumented | `WithIgnoredCommands` if unwanted |
+| `AUTH`, `HELLO`, `SELECT`, `READONLY`, `CLIENT SETINFO` / `SETNAME` | Connection setup / control-plane | Always dropped | n/a (built-in) |
+| `SUBSCRIBE`, `PUBLISH`, … | Pub/Sub | Always dropped | n/a (built-in) |
+
+A command issued under a parent span (e.g. inside a traced HTTP handler) keeps
+its span regardless of `WithRequireParentSpan`; that option only affects
+commands with no active parent span.
 
 ### Elasticsearch
 
