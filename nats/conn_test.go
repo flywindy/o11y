@@ -366,6 +366,56 @@ func TestRequest_ReplyLink_CustomAttrs(t *testing.T) {
 	assert.True(t, found, "a %q consumer span should be recorded", "receive "+subject)
 }
 
+// TestRequest_ReplyLink_BaseAttrsWinCollision verifies that a caller-supplied
+// attr reusing one of the span's own semconv keys cannot override it — the
+// same "built-in wins" guarantee redis.WithAttributes / cassandra.WithAttributes
+// document elsewhere in this SDK. Without this, a caller could silently
+// corrupt messaging.system/destination.name/operation.type/operation.name on
+// the reply-link span.
+func TestRequest_ReplyLink_BaseAttrsWinCollision(t *testing.T) {
+	enableNATSTracing(t)
+
+	_, url := startTestServer(t)
+	tp, prop, sr := newTestProviders()
+
+	responder, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer responder.Close()
+
+	requester, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer requester.Close()
+
+	subject := "test.reqreply.collision"
+
+	_, err = responder.Subscribe(context.Background(), subject, func(ctx context.Context, msg *nats.Msg) {
+		assert.NoError(t, responder.Respond(ctx, msg, []byte("pong")))
+	})
+	require.NoError(t, err)
+	require.NoError(t, responder.NatsConn().FlushTimeout(2*time.Second))
+
+	reply, err := requester.Request(context.Background(), subject, []byte("ping"), 2*time.Second,
+		semconv.MessagingSystemKey.String("not-nats"),
+		attribute.String("app.request_id", "req-123"),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+
+	var found bool
+	for _, s := range sr.Ended() {
+		if s.Name() != "receive "+subject {
+			continue
+		}
+		attrs := s.Attributes()
+		assert.Contains(t, attrs, semconv.MessagingSystemKey.String("nats"),
+			"the SDK's own messaging.system value must win over a caller-supplied collision")
+		assert.Contains(t, attrs, attribute.String("app.request_id", "req-123"),
+			"a non-colliding caller attr must still be attached")
+		found = true
+	}
+	assert.True(t, found, "a %q consumer span should be recorded", "receive "+subject)
+}
+
 // TestRequest_NoReplyHeader_NoLinkSpan verifies Request degrades cleanly when
 // the reply carries no trace context — e.g. an untraced responder, or one
 // that replied with the raw msg.Respond instead of Conn.Respond. No span

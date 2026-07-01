@@ -938,6 +938,13 @@ if err := batch.Error(); err != nil {
 `FetchNoWait` returns only currently-available messages and never blocks
 waiting for new ones.
 
+Always range `Messages()` to completion, even if you only need the first few
+messages of a batch. A background goroutine forwards one message at a time
+onto the channel; abandoning the loop early leaves it blocked on the next send
+with no reader, until the underlying fetch's own expiry elapses. `MessageBatch`
+has no `Stop`/cancel method — draining fully is the only way to release it
+promptly. `examples/jetstream/fetch-worker` shows the full pattern.
+
 Not yet wrapped (use a later facade addition or, if needed sooner, the upstream
 package directly): single-message `Consumer.Next` (upstream v0.2.11 returns the
 producer's remote context, not the local receive span — use

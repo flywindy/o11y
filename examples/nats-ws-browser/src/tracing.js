@@ -60,10 +60,13 @@ function extractCarrierFromHeaders(msgHeaders) {
 // message-handling / render-dispatch work — inside it. Exceptions thrown by
 // callback are recorded on the span and re-thrown; the span always ends.
 //
-// name is the span name (e.g. "nats.receive"); attributes are merged over
-// the default messaging.* attributes (system/operation are fixed; pass
+// name is the span name (e.g. "nats.receive"); attributes are merged with
+// the fixed messaging.system/operation.type/operation.name (pass
 // 'messaging.destination.name' and any app-specific fields — a request ID, a
-// room/site ID — that make the span searchable). callback receives the
+// room/site ID — that make the span searchable). If attributes reuses one of
+// those three fixed keys, the fixed value wins and the supplied one is
+// dropped — the fixed keys are placed last in the merge below specifically
+// so a collision can never silently corrupt them. callback receives the
 // started span so it can read spanContext().traceId for its own correlation
 // needs (e.g. matching a locally pending producer span).
 export function receiveWithSpan(msg, { name, attributes = {} }, callback) {
@@ -71,10 +74,10 @@ export function receiveWithSpan(msg, { name, attributes = {} }, callback) {
   const span = tracer.startSpan(name, {
     kind: SpanKind.CONSUMER,
     attributes: {
+      ...attributes,
       'messaging.system': 'nats',
       'messaging.operation.type': 'receive',
       'messaging.operation.name': 'receive',
-      ...attributes,
     },
   }, parentCtx);
 

@@ -177,7 +177,12 @@ func (c *Conn) Respond(ctx context.Context, msg *natsgo.Msg, data []byte) error 
 // SDK has no way to know on its own. They are ignored when no span is
 // created. Keep them low-to-medium cardinality per the usual span-attribute
 // guidance; see docs/semconv.md for the base attribute set this span always
-// carries.
+// carries. If attrs reuses one of those base keys (messaging.system,
+// messaging.destination.name, messaging.operation.type/name,
+// messaging.message.body.size), the base value wins and the supplied one is
+// dropped — matching the redis.WithAttributes / cassandra.WithAttributes
+// precedent elsewhere in this SDK, so a caller can never corrupt the span's
+// own semantic-convention attributes.
 func (c *Conn) Request(ctx context.Context, subject string, data []byte, timeout time.Duration, attrs ...attribute.KeyValue) (*natsgo.Msg, error) {
 	reply, err := c.Conn.Request(ctx, subject, data, timeout)
 	if err != nil || !c.TracingEnabled() {
@@ -205,7 +210,13 @@ func (c *Conn) linkReply(ctx context.Context, subject string, reply *natsgo.Msg,
 	if !originSpanCtx.IsValid() {
 		return
 	}
-	spanAttrs := append(replyAttrs(subject, len(reply.Data)), extraAttrs...)
+	// extraAttrs first, base attrs last: the OTel SDK keeps the last value on
+	// a duplicate key (sdk/trace/span.go dedupeAttrsFromRecord), so ordering
+	// the SDK-owned base attrs after the caller-supplied ones guarantees they
+	// always win a collision, never silently get overwritten by it.
+	spanAttrs := make([]attribute.KeyValue, 0, len(extraAttrs)+5)
+	spanAttrs = append(spanAttrs, extraAttrs...)
+	spanAttrs = append(spanAttrs, replyAttrs(subject, len(reply.Data))...)
 	_, span := tracer.Start(ctx, "receive "+subject,
 		trace.WithSpanKind(trace.SpanKindConsumer),
 		trace.WithAttributes(spanAttrs...),

@@ -133,10 +133,12 @@ export OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true OTEL_NATS_TRACING_ENABLED=tr
 go run examples/nats-core/responder/main.go
 go run examples/nats-core/requester/main.go
 
-# Run the JetStream examples (two terminals; NATS must have JetStream enabled)
+# Run the JetStream examples (NATS must have JetStream enabled)
 # Start publisher first — it creates the JetStream stream; then start the subscriber
-go run examples/jetstream/publisher/main.go   # creates the stream and publishes
-go run examples/jetstream/subscriber/main.go  # attaches durable consumer and processes
+# and/or the fetch-worker (own durable consumer, so both can run at once)
+go run examples/jetstream/publisher/main.go     # creates the stream and publishes
+go run examples/jetstream/subscriber/main.go    # push-style Consume: durable consumer, processes as messages arrive
+go run examples/jetstream/fetch-worker/main.go  # batch-pull: Consumer.Fetch in bounded batches
 
 # Run the metrics example (pushes via OTLP → OTel Collector → Prometheus; cluster must be up)
 go run examples/metrics/main.go

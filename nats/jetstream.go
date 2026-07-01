@@ -65,6 +65,16 @@ type FetchedMessage struct {
 // Messages yields each delivered message paired with its consumer-span ctx;
 // range over the channel until it closes, then call Error for the terminal
 // batch error (matching the native jetstream.MessageBatch contract).
+//
+// Always drain Messages() to completion (range until the channel closes),
+// even if the caller only needs the first few messages of a larger batch.
+// Each message is forwarded onto the channel by a background goroutine one at
+// a time; abandoning the range early leaves that goroutine blocked on the
+// next send, with nothing left to receive it, until the underlying fetch's
+// own expiry elapses (unbounded for Fetch/FetchBytes unless a
+// jetstream.FetchMaxWait option is set). There is no Stop/cancel escape hatch
+// on MessageBatch — draining to completion is the only way to release it
+// promptly.
 type MessageBatch interface {
 	Messages() <-chan FetchedMessage
 	Error() error

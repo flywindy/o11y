@@ -21,7 +21,11 @@ adopters can plan their upgrades.
   upstream `oteljetstream` package directly to get trace context, or got none
   at all. Each delivered message arrives as a `FetchedMessage{Ctx, Msg}` on
   the new `MessageBatch.Messages()` channel, mirroring the `(ctx, msg)` shape
-  `Consume`/`Messages` already deliver.
+  `Consume`/`Messages` already deliver. `Messages()` must be drained to
+  completion — there is no `Stop`/cancel escape hatch, and abandoning the
+  range early leaves the forwarding goroutine blocked until the underlying
+  fetch's own expiry elapses; see the new `examples/jetstream/fetch-worker`
+  for the full pattern.
 - `nats`: `Conn.Request` now closes the requester-side half of the
   request/reply round trip. When the reply carries a trace context (the
   responder replied via `Conn.Respond`), `Request` starts a `receive
@@ -29,12 +33,15 @@ adopters can plan their upgrades.
   responder's reply-send span — previously the handler → requester leg was
   invisible in Grafana Tempo. `Request` also takes an optional variadic
   `attrs ...attribute.KeyValue` attached to that span, for domain identifiers
-  (a request ID, a room/site ID) the SDK cannot infer on its own.
+  (a request ID, a room/site ID) the SDK cannot infer on its own; a supplied
+  attr that reuses one of the span's own base keys is dropped in favor of the
+  base value, matching the `redis.WithAttributes` / `cassandra.WithAttributes`
+  "built-in wins" precedent elsewhere in the SDK.
 - `examples/nats-ws-browser`: extracted the inline browser receive-span logic
   into a reusable `receiveWithSpan(msg, { name, attributes }, callback)`
   helper in `src/tracing.js`, documented as the pattern for any nats.ws
   consumer that needs to appear correlated with a Go backend's distributed
-  trace.
+  trace. Same "built-in wins" collision protection as `Conn.Request` above.
 - `redis`: command-noise filtering (ADR 0013 amendment). The wrapper now
   unconditionally skips connection-lifecycle commands the go-redis client
   issues itself (`AUTH`, `HELLO`, `SELECT`, `READONLY`, and the auto-issued
