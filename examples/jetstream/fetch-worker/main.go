@@ -130,6 +130,14 @@ func main() {
 		//    loop iteration) open for the library's default wait on every pass.
 		batch, err := consumer.Fetch(ctx, batchSize, jetstream.FetchMaxWait(fetchMaxWait))
 		if err != nil {
+			// A cancelled ctx makes Fetch fail immediately (not after
+			// fetchMaxWait), so without this check a shutdown signal arriving
+			// here (rather than being caught by the <-quit case above) would
+			// spin the loop at full CPU logging the same error forever.
+			if ctx.Err() != nil {
+				logger.InfoContext(ctx, "shutting down fetch worker")
+				return
+			}
 			logger.ErrorContext(ctx, "fetch failed", slog.Any("error", err))
 			continue
 		}

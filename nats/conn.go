@@ -233,7 +233,7 @@ func replyAttrs(subject string, bodySize int) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{
 		semconv.MessagingSystemKey.String("nats"),
 		semconv.MessagingDestinationNameKey.String(subject),
-		attribute.String(string(semconv.MessagingOperationTypeKey), "receive"),
+		semconv.MessagingOperationTypeKey.String("receive"),
 		semconv.MessagingOperationNameKey.String("receive"),
 	}
 	if bodySize > 0 {
