@@ -11,6 +11,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -260,6 +261,147 @@ func TestRespond_TracePropagation(t *testing.T) {
 		return false
 	}, 2*time.Second, 10*time.Millisecond,
 		"a producer send span should be recorded for the reply publish, proving Respond uses the traced Publish path")
+}
+
+// TestRequest_ReplyLink verifies the requester-side gap closed by
+// Conn.Request (ADR 0022 amendment, 2026-07-01): once the reply carrying the
+// responder's trace context (injected by Conn.Respond) comes back, Request
+// must start a CONSUMER-kind span that links to that context, closing the
+// handler → requester leg of the round trip in the trace view.
+func TestRequest_ReplyLink(t *testing.T) {
+	enableNATSTracing(t)
+
+	_, url := startTestServer(t)
+	tp, prop, sr := newTestProviders()
+
+	responder, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer responder.Close()
+
+	requester, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer requester.Close()
+
+	subject := "test.reqreply.link"
+
+	_, err = responder.Subscribe(context.Background(), subject, func(ctx context.Context, msg *nats.Msg) {
+		assert.NoError(t, responder.Respond(ctx, msg, []byte("pong")))
+	})
+	require.NoError(t, err)
+	require.NoError(t, responder.NatsConn().FlushTimeout(2*time.Second))
+
+	tracer := tp.Tracer("test")
+	reqCtx, span := tracer.Start(context.Background(), "test-request")
+	requestTraceID := span.SpanContext().TraceID()
+
+	reply, err := requester.Request(reqCtx, subject, []byte("ping"), 2*time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+	span.End()
+
+	// The reply-receive span must be a child of the request's own trace (it
+	// runs synchronously right after Request returns, in the same local flow)
+	// while also carrying a link to the responder's reply-send span context —
+	// the cross-service correlation that makes the round trip visible.
+	var found bool
+	for _, s := range sr.Ended() {
+		if s.Name() != "receive "+subject {
+			continue
+		}
+		assert.Equal(t, requestTraceID, s.SpanContext().TraceID(),
+			"reply-receive span should stay in the requester's own trace")
+		require.Len(t, s.Links(), 1, "reply-receive span should carry exactly one link")
+		assert.True(t, s.Links()[0].SpanContext.IsValid(),
+			"the link should point at a valid remote span context")
+		assert.NotEqual(t, requestTraceID, s.Links()[0].SpanContext.TraceID(),
+			"the link should point at the responder's trace, not loop back to the requester's own")
+		found = true
+	}
+	assert.True(t, found, "a %q consumer span should be recorded", "receive "+subject)
+}
+
+// TestRequest_ReplyLink_CustomAttrs verifies the variadic attrs on Request
+// land on the reply-link span. This is the hook applications use to make the
+// span searchable on domain identifiers the SDK cannot infer on its own
+// (request/correlation ID, room ID, site ID, …).
+func TestRequest_ReplyLink_CustomAttrs(t *testing.T) {
+	enableNATSTracing(t)
+
+	_, url := startTestServer(t)
+	tp, prop, sr := newTestProviders()
+
+	responder, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer responder.Close()
+
+	requester, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer requester.Close()
+
+	subject := "test.reqreply.attrs"
+
+	_, err = responder.Subscribe(context.Background(), subject, func(ctx context.Context, msg *nats.Msg) {
+		assert.NoError(t, responder.Respond(ctx, msg, []byte("pong")))
+	})
+	require.NoError(t, err)
+	require.NoError(t, responder.NatsConn().FlushTimeout(2*time.Second))
+
+	reply, err := requester.Request(context.Background(), subject, []byte("ping"), 2*time.Second,
+		attribute.String("app.request_id", "req-123"),
+		attribute.String("app.room_id", "room-42"),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+
+	var found bool
+	for _, s := range sr.Ended() {
+		if s.Name() != "receive "+subject {
+			continue
+		}
+		attrs := s.Attributes()
+		assert.Contains(t, attrs, attribute.String("app.request_id", "req-123"))
+		assert.Contains(t, attrs, attribute.String("app.room_id", "room-42"))
+		found = true
+	}
+	assert.True(t, found, "a %q consumer span should be recorded", "receive "+subject)
+}
+
+// TestRequest_NoReplyHeader_NoLinkSpan verifies Request degrades cleanly when
+// the reply carries no trace context — e.g. an untraced responder, or one
+// that replied with the raw msg.Respond instead of Conn.Respond. No span
+// should be created, and Request must still return the reply as-is.
+func TestRequest_NoReplyHeader_NoLinkSpan(t *testing.T) {
+	enableNATSTracing(t)
+
+	_, url := startTestServer(t)
+	tp, prop, sr := newTestProviders()
+
+	responder, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer responder.Close()
+
+	requester, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer requester.Close()
+
+	subject := "test.reqreply.nolink"
+
+	// Reply via the raw NATS msg.Respond, which does not inject trace headers.
+	_, err = responder.Subscribe(context.Background(), subject, func(_ context.Context, msg *nats.Msg) {
+		assert.NoError(t, msg.Respond([]byte("pong")))
+	})
+	require.NoError(t, err)
+	require.NoError(t, responder.NatsConn().FlushTimeout(2*time.Second))
+
+	reply, err := requester.Request(context.Background(), subject, []byte("ping"), 2*time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+	assert.Equal(t, "pong", string(reply.Data))
+
+	for _, s := range sr.Ended() {
+		assert.NotEqual(t, "receive "+subject, s.Name(),
+			"no reply-receive span should be recorded when the reply carries no trace context")
+	}
 }
 
 // TestRespond_Validation locks down the registration-time guards on

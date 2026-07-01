@@ -15,6 +15,26 @@ adopters can plan their upgrades.
 
 ### Added
 
+- `nats`: JetStream `Consumer.Fetch` / `FetchBytes` / `FetchNoWait` are now
+  wrapped (ADR 0022 amendment, 2026-07-01), closing the largest remaining
+  chat-integration gap — batch pull consumers previously had to import the
+  upstream `oteljetstream` package directly to get trace context, or got none
+  at all. Each delivered message arrives as a `FetchedMessage{Ctx, Msg}` on
+  the new `MessageBatch.Messages()` channel, mirroring the `(ctx, msg)` shape
+  `Consume`/`Messages` already deliver.
+- `nats`: `Conn.Request` now closes the requester-side half of the
+  request/reply round trip. When the reply carries a trace context (the
+  responder replied via `Conn.Respond`), `Request` starts a `receive
+  {subject}` span, as a child of the caller's ctx, linking back to the
+  responder's reply-send span — previously the handler → requester leg was
+  invisible in Grafana Tempo. `Request` also takes an optional variadic
+  `attrs ...attribute.KeyValue` attached to that span, for domain identifiers
+  (a request ID, a room/site ID) the SDK cannot infer on its own.
+- `examples/nats-ws-browser`: extracted the inline browser receive-span logic
+  into a reusable `receiveWithSpan(msg, { name, attributes }, callback)`
+  helper in `src/tracing.js`, documented as the pattern for any nats.ws
+  consumer that needs to appear correlated with a Go backend's distributed
+  trace.
 - `redis`: command-noise filtering (ADR 0013 amendment). The wrapper now
   unconditionally skips connection-lifecycle commands the go-redis client
   issues itself (`AUTH`, `HELLO`, `SELECT`, `READONLY`, and the auto-issued
@@ -27,6 +47,18 @@ adopters can plan their upgrades.
   without an active parent span (background probes, keepalive, topology
   refreshes). Both suppress the span and the `db.client.operation.duration`
   sample. Deliberate `CLIENT` subcommands such as `LIST` remain instrumented.
+
+### Fixed
+
+- `nats`: `Inject`/`Extract` (and the new `Conn.Request` reply-link
+  extraction) previously used `propagation.HeaderCarrier`, which
+  canonicalizes header keys to MIME form (`"traceparent"` →
+  `"Traceparent"`). `nats.Header.Get`/`Set` is case-sensitive with no
+  canonicalization, so this silently failed to read back headers written by
+  `otel-nats` itself (or by any other W3C-compliant writer using the literal
+  lowercase key) — the bug was self-masked as long as both `Inject` and
+  `Extract` were only ever used against each other. Both now use a
+  case-sensitive carrier backed directly by `nats.Header`.
 
 ---
 

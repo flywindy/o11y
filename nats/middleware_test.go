@@ -45,9 +45,11 @@ func TestInject_SetsTraceparentHeader(t *testing.T) {
 	o11ynats.Inject(ctx, prop, msg)
 
 	require.NotNil(t, msg.Header)
-	// nats.Header.Get is case-sensitive; the W3C propagator stores the key in
-	// MIME canonical form ("Traceparent") via propagation.HeaderCarrier.
-	assert.NotEmpty(t, msg.Header["Traceparent"], "traceparent header must be set")
+	// nats.Header.Get/Set is case-sensitive (unlike http.Header); Inject uses
+	// headerCarrier, which writes the literal-case key the W3C propagator
+	// passes in ("traceparent", lowercase per the W3C spec) with no MIME
+	// canonicalization, matching how otel-nats itself writes NATS headers.
+	assert.NotEmpty(t, msg.Header["traceparent"], "traceparent header must be set")
 }
 
 // TestInject_InitializesNilHeader verifies that Inject handles a nil Header map.
@@ -99,4 +101,29 @@ func TestInjectExtract_RoundTrip(t *testing.T) {
 	assert.True(t, got.IsValid(), "extracted span context must be valid")
 	assert.Equal(t, traceID, got.TraceID(), "TraceID must survive round trip")
 	assert.Equal(t, spanID, got.SpanID(), "SpanID must survive round trip")
+}
+
+// TestExtract_LiteralCaseHeaderKey locks down the interop fix at the heart of
+// this package: Extract must read a header keyed by the literal lowercase
+// "traceparent" nats.go's case-sensitive Header uses — the exact form
+// otel-nats itself writes, and the form a W3C-compliant non-Go client (e.g.
+// the nats.ws browser example) would also use. Before this fix, Extract went
+// through propagation.HeaderCarrier, which is backed by http.Header and
+// canonicalizes lookups to "Traceparent", silently missing this header and
+// returning ctx unchanged instead of the extracted span context.
+func TestExtract_LiteralCaseHeaderKey(t *testing.T) {
+	prop := newProp()
+	msg := &gonnats.Msg{
+		Header: gonnats.Header{
+			"traceparent": []string{"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"},
+		},
+	}
+
+	extracted := o11ynats.Extract(context.Background(), prop, msg)
+
+	got := trace.SpanContextFromContext(extracted)
+	require.True(t, got.IsValid(), "Extract must read a literal-case lowercase traceparent header")
+	wantTraceID, err := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	require.NoError(t, err)
+	assert.Equal(t, wantTraceID, got.TraceID())
 }

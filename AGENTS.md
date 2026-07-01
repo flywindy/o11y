@@ -270,35 +270,66 @@ conn.Subscribe("o11y.events", func(ctx context.Context, msg *nats.Msg) {
 })
 ```
 
+To make the consumer span itself searchable on domain identifiers the SDK has
+no way to know (a room ID, a site ID, a request ID from the payload), set them
+on the span the handler was handed — `otel-nats` owns that span's name and
+base attributes and cannot be forked for this (ADR 0022), but its span
+accepts extra attributes like any other:
+
+```go
+conn.Subscribe("o11y.events", func(ctx context.Context, msg *nats.Msg) {
+    trace.SpanFromContext(ctx).SetAttributes(
+        attribute.String("app.room_id", roomID),
+    )
+    // ...
+})
+```
+
 ### JetStream
+
+`conn.JetStream()` returns an o11y-owned facade (ADR 0022 Phase 2); configuration types come straight from `github.com/nats-io/nats.go/jetstream`, so callers never import the upstream `oteljetstream` package.
 
 ```go
 js, err := conn.JetStream()
 
 // Idempotent stream creation — safe to call on every startup.
-js.CreateOrUpdateStream(ctx, oteljetstream.StreamConfig{
+js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
     Name: "EVENTS", Subjects: []string{"events.>"},
 })
 
 // Publish — trace context injected into JetStream message headers.
 js.Publish(ctx, "events.created", payload)
 
-// Durable pull consumer with Consume (push-style delivery).
+// Durable pull consumer with Consume (push-style delivery). Handler ctx
+// carries the consumer span linked to the producer's trace.
 stream, _ := js.Stream(ctx, "EVENTS")
-consumer, _ := stream.CreateOrUpdateConsumer(ctx, oteljetstream.ConsumerConfig{
-    Durable: "events-processor", AckPolicy: oteljetstream.AckExplicitPolicy,
+consumer, _ := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+    Durable: "events-processor", AckPolicy: jetstream.AckExplicitPolicy,
 })
-cc, _ := consumer.Consume(func(m oteljetstream.Msg) {
-    ctx, span := tracer.Start(m.Context(), "process-event")
+cc, _ := consumer.Consume(ctx, func(ctx context.Context, msg jetstream.Msg) {
+    _, span := tracer.Start(ctx, "process-event")
     defer span.End()
-    m.Ack()
+    msg.Ack()
 })
 defer cc.Stop()
+
+// Fetch / FetchBytes / FetchNoWait deliver a MessageBatch: each FetchedMessage
+// on the channel pairs the native jetstream.Msg with its consumer-span ctx.
+batch, _ := consumer.Fetch(ctx, 10)
+for m := range batch.Messages() {
+    _, span := tracer.Start(m.Ctx, "process-event")
+    m.Msg.Ack()
+    span.End()
+}
 ```
+
+Not yet wrapped: single-message `Consumer.Next` (use `Messages(ctx, jetstream.PullMaxMessages(1))` instead — see ADR 0022 amendment), `PushConsumer`, and ordered consumers.
 
 ### Request-Reply note
 
 When replying to a message inside a `Subscribe` handler, do **not** use `msg.Respond(data)` if you need the reply to carry trace context. `msg.Respond` routes through the raw NATS connection and skips header injection. Use `conn.Respond(ctx, msg, data)` (or `conn.Publish(ctx, msg.Reply, data)`) instead — `Respond` validates the reply subject and routes through the traced publish path.
+
+On the requester side, `conn.Request(ctx, subject, data, timeout, attrs...)` closes the round trip: when the reply carries a trace context (i.e. the responder replied via `conn.Respond`), `Request` starts a short `receive {subject}` span linking back to it, so the handler → requester leg is visible in Grafana Tempo instead of the trace stopping at the responder's reply-send span. The optional `attrs` land on that span — use them for domain identifiers the SDK can't infer on its own (a request/correlation ID, a room/site ID) so the span is searchable in Tempo. No span is created if the reply carries no trace context (untraced responder, or one that used raw `msg.Respond`).
 
 ---
 

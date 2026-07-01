@@ -422,11 +422,14 @@ return the receive-span context. Wrapping it as-is would mean
 `tracer.Start(ctxFromNext, …)` parents work under the upstream producer span
 rather than the local consumer span. Rather than ship that inconsistency (or
 re-implement the span ourselves, which would be the T3 re-instrumentation this
-ADR avoids), single-fetch `Consumer.Next` is **deferred** alongside
-`Fetch`/`FetchBytes`/`FetchNoWait`, push consumers, and ordered consumers.
-Callers needing single fetch use `Messages(ctx, jetstream.PullMaxMessages(1))`,
-which returns the correct receive-span context. Revisit if upstream returns the
-receive-span context from `Next`.
+ADR avoids), single-fetch `Consumer.Next` is **deferred** alongside push
+consumers and ordered consumers. (`Fetch`/`FetchBytes`/`FetchNoWait` do not
+have this inconsistency — each delivered message gets its own correctly-scoped
+receive-span ctx, same as `Consume`/`Messages` — so they were wrapped in the
+2026-07-01 amendment below.) Callers needing single fetch use
+`Messages(ctx, jetstream.PullMaxMessages(1))`, which returns the correct
+receive-span context. Revisit `Next` if upstream returns the receive-span
+context from it.
 
 ### 3. No nil-receiver guards on the facade
 
@@ -437,3 +440,120 @@ bypassing `Connect` (hand-constructing `&Conn{}`), which is misuse that panics
 identically across `Subscribe` / `QueueSubscribe` / `Respond` / `JetStream`.
 Guarding only `JetStream` would be asymmetric; guarding all of them is not
 warranted for a misuse-only path. Left to panic, consistent with the package.
+
+---
+
+## Amendment (2026-07-01) — closing the remaining chat-integration gaps
+
+The `hmchangw/chat` migration (this ADR's original motivation) surfaced four
+concrete gaps once JetStream pull consumers, request/reply, and Grafana
+readability were exercised end to end. This amendment closes the three that
+are in scope for a Go SDK and records the decision for the fourth.
+
+### 1. `Fetch` / `FetchBytes` / `FetchNoWait` are now wrapped
+
+The 2026-06-16 amendment §2 deferred these alongside `Consumer.Next` on the
+theory that batch delivery would need "an o11y-owned carrier type for the
+channel" (§3, "Surface to wrap"). That type is now added:
+`FetchedMessage{Ctx, Msg}`, and a `MessageBatch` interface
+(`Messages() <-chan FetchedMessage`, `Error() error`) mirroring the native
+`jetstream.MessageBatch` contract. Unlike `Consumer.Next` (deferred, see
+above), the upstream `oteljetstream.Fetch`/`FetchBytes`/`FetchNoWait` do
+**not** have the receive-span-context bug: each `oteljetstream.Msg` on the
+batch channel already carries the correct local receive-span ctx (verified
+against `otel-nats` v0.2.11 source), so wrapping is a straight adapter, not a
+re-instrumentation. `Fetch`/`FetchBytes`/`FetchNoWait` take a
+registration-time `ctx` guard, consistent with `Consume`/`Messages` (§1
+above) — same honest scope: rejects an already-cancelled `ctx` up front, does
+not cancel an in-flight batch.
+
+This was `search-sync-worker`'s largest gap: JetStream batch pull is its
+primary consume pattern, and every batch message previously arrived with no
+trace context at all once callers dropped the direct `oteljetstream` import.
+
+### 2. `Conn.Request` closes the requester-side reply-link gap
+
+The base ADR (Decision 1, "Header propagation ≠ requester-side span linkage")
+and the 2026-06-16 amendment left this as an open follow-up: `Respond`
+guarantees the reply *carries* trace context, but nothing on the requester
+side turned that into a visible span. `Conn.Request` now wraps the embedded
+`otelnats.Conn.Request` and, when the reply carries a valid trace context,
+starts a `receive {subject}` span (`SpanKind` CONSUMER) **as a child of the
+caller's ctx** — not a new trace, unlike the JetStream/Core consumer spans
+above — carrying a **link** to the trace context extracted from the reply.
+Child-of-ctx (rather than "new trace + link back," the pattern used
+everywhere else in this ADR) is deliberate: the reply-receive span is a
+synchronous continuation of a call the requester is already tracking in its
+own trace, not an independent unit of work triggered by an inbound message;
+the link still supplies the cross-service correlation to the responder's
+reply-send span. No span is created when the reply has no trace context
+(untraced responder, or one using the raw `msg.Respond`) — `Request` then
+behaves exactly like the embedded method, so this is purely additive.
+
+`Request` also takes an optional variadic `attrs ...attribute.KeyValue`,
+attached to the reply-link span only (see item 4 below for why it can't reach
+the other spans in the exchange).
+
+### 3. Browser receive-side helper — documented pattern, not new Go code
+
+A browser frontend on `nats.ws` is outside this SDK's surface (Go-only, per
+the package doc). The gap is real but the fix is a documented **pattern**,
+not a Go API: `examples/nats-ws-browser/src/tracing.js` now exports
+`receiveWithSpan(msg, { name, attributes }, callback)`, extracted from what
+was previously inlined ad hoc in that example's `main.js`. It extracts
+`traceparent`/`tracestate` from `msg.headers`, starts a `SpanKind.CONSUMER`
+span, and wraps `callback` — the render/dispatch work — inside it, recording
+and re-throwing any callback exception and always ending the span. This is
+the reusable version of the same three-step recipe (extract → CONSUMER span →
+wrap the dispatch) that `Conn.Subscribe` and the JetStream consume paths
+already apply on the Go side; frontend teams integrating with this SDK's
+backends should copy this pattern rather than re-deriving header extraction
+from scratch.
+
+### 4. Span naming / attributes — attributes, not names, and only where o11y owns the span
+
+Chat's readability complaint ("a wall of indistinguishable `nats.request`
+spans in Grafana") is **not** an o11y span-naming defect: every span this SDK
+or `otel-nats` emits is already `{operation} {subject}` (`send
+events.created`, `process events.created`, `receive events.created`, …), so
+the subject is already in the name. The actual missing piece is
+**attributes** for high-cardinality, app-specific identifiers — a request ID,
+a room ID, a site ID — which the SDK cannot know and must not put in the span
+*name* regardless (unbounded cardinality in span names defeats trace-backend
+indexing; see "Known Cardinality Risks" in `docs/semconv.md`). Two concrete,
+bounded outcomes, no ADR 0023 (`{system}.{operation} {target}`) scope
+expansion — ADR 0023 is explicitly data-store-only and NATS is a messaging
+system with no single "target" dimension:
+
+- **Spans o11y creates itself** (only `Conn.Request`'s reply-link span so
+  far) accept caller-supplied `attribute.KeyValue`s directly — see item 2.
+- **Spans `otel-nats` creates** (`Subscribe`/`QueueSubscribe` process spans,
+  JetStream consumer spans) cannot take extra attributes through this facade
+  without forking `otel-nats`, which this ADR has already rejected (Decision
+  driver, above). The correct, already-available pattern — no new SDK code
+  needed — is for the handler to call
+  `trace.SpanFromContext(ctx).SetAttributes(...)` on the consumer span it was
+  handed, using the domain values it already has in scope. Documented in
+  `AGENTS.md` / `docs/guide.md` rather than wrapped, since wrapping would add
+  no capability over the three-line stdlib OTel call.
+
+### 5. Header-carrier case-sensitivity fix (found while implementing item 2)
+
+Building the reply-link span surfaced a latent bug in `nats/middleware.go`'s
+public `Inject`/`Extract`: they used
+`go.opentelemetry.io/otel/propagation.HeaderCarrier`, which is backed by
+`http.Header` and canonicalizes keys to MIME form (`"traceparent"` →
+`"Traceparent"`) on both `Get` and `Set`. `nats.Header.Get`/`Set`, unlike
+`http.Header`, is **case-sensitive** with no canonicalization — so a header
+written by `otel-nats` itself (which uses its own case-sensitive
+`otelnats.HeaderCarrier` internally, storing the literal lowercase
+`"traceparent"` the W3C propagator passes in) could never be read back by
+this package's own `Extract`, and would silently return `ctx` unchanged. The
+bug was self-masked until now: `Inject` and `Extract` always canonicalized
+the *same* way, so a round trip through only this package's own two functions
+happened to still work. Both now use a package-local `headerCarrier` backed
+directly by `nats.Header`'s own case-sensitive `Get`/`Set` — the same
+approach `otelnats.HeaderCarrier` already uses — so extraction is correct
+against headers written by `otel-nats`, this package's own `Inject`, or any
+other W3C-compliant writer (e.g. the `nats.ws` browser client). Locked down
+by `TestExtract_LiteralCaseHeaderKey`.

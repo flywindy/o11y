@@ -8,10 +8,13 @@ package nats
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/Marz32onE/instrumentation-go/otel-nats/otelnats"
 	natsgo "github.com/nats-io/nats.go"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -134,9 +137,10 @@ func (c *Conn) QueueSubscribe(ctx context.Context, subject, queue string, handle
 // subject means there is nowhere to send the response and is almost always a
 // programming error.
 //
-// Respond guarantees the reply carries the trace context; it does not create a
-// requester-side span that links back to the responder. That requester-side
-// linkage is out of scope (see ADR 0022).
+// Respond itself does not create a requester-side span; the reply is simply
+// injected with ctx's trace context via the traced Publish path. The
+// requester-side receive span that links back to this reply is created by
+// Conn.Request (ADR 0022 amendment, 2026-07-01).
 func (c *Conn) Respond(ctx context.Context, msg *natsgo.Msg, data []byte) error {
 	if msg == nil {
 		return fmt.Errorf("nats respond: msg must not be nil")
@@ -148,4 +152,81 @@ func (c *Conn) Respond(ctx context.Context, msg *natsgo.Msg, data []byte) error 
 		return fmt.Errorf("nats respond to %q: %w", msg.Reply, err)
 	}
 	return nil
+}
+
+// Request sends subject/data and waits for a reply, exactly like the
+// embedded otelnats.Conn.Request (producer "send" span, W3C header
+// injection, timeout applied to the wait). It additionally closes the
+// requester-side half of the request/reply round trip left open by ADR 0022:
+// when the reply carries a trace context — which it does whenever the
+// responder replied via Conn.Respond — Request starts a short CONSUMER-kind
+// span, as a child of ctx, that links to that context.
+//
+// Without this, the handler → requester leg of every request/reply exchange
+// is invisible in Grafana Tempo: the distributed trace stops at the
+// responder's reply-send span and the requester side shows nothing for the
+// reply it actually received.
+//
+// If the reply has no headers or carries no valid trace context (an
+// untraced responder, or one that replied with the raw msg.Respond instead
+// of Conn.Respond), no span is created and reply is returned unchanged —
+// Request behaves exactly like the embedded method.
+//
+// attrs are attached to the reply-link span as extra searchable attributes
+// (e.g. a request/correlation ID, a room/site ID) — domain identifiers the
+// SDK has no way to know on its own. They are ignored when no span is
+// created. Keep them low-to-medium cardinality per the usual span-attribute
+// guidance; see docs/semconv.md for the base attribute set this span always
+// carries.
+func (c *Conn) Request(ctx context.Context, subject string, data []byte, timeout time.Duration, attrs ...attribute.KeyValue) (*natsgo.Msg, error) {
+	reply, err := c.Conn.Request(ctx, subject, data, timeout)
+	if err != nil || !c.TracingEnabled() {
+		return reply, err
+	}
+	c.linkReply(ctx, subject, reply, attrs)
+	return reply, nil
+}
+
+// linkReply starts and immediately ends a short CONSUMER-kind "receive"
+// span, as a child of ctx, linking to the trace context carried on reply's
+// headers (if any). It is a no-op when reply carries no valid trace context.
+//
+// Extraction uses headerCarrier (nats.Header's own case-sensitive Get), not
+// propagation.HeaderCarrier — the reply was written by otel-nats's Respond →
+// Publish path with a literal-case "traceparent" key, which
+// propagation.HeaderCarrier's MIME-canonicalizing Get would fail to find.
+func (c *Conn) linkReply(ctx context.Context, subject string, reply *natsgo.Msg, extraAttrs []attribute.KeyValue) {
+	if reply == nil || reply.Header == nil {
+		return
+	}
+	tracer, prop := c.TraceContext()
+	replyCtx := prop.Extract(context.Background(), headerCarrier{h: reply.Header})
+	originSpanCtx := trace.SpanContextFromContext(replyCtx)
+	if !originSpanCtx.IsValid() {
+		return
+	}
+	spanAttrs := append(replyAttrs(subject, len(reply.Data)), extraAttrs...)
+	_, span := tracer.Start(ctx, "receive "+subject,
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(spanAttrs...),
+		trace.WithLinks(trace.Link{SpanContext: originSpanCtx}),
+	)
+	span.End()
+}
+
+// replyAttrs builds the attributes for the requester-side reply-receive span
+// started by linkReply. Mirrors otelnats' own receiveAttrs shape (messaging
+// system/destination/operation, body size) so the new span reads consistently
+// with the "send"/"process"/"receive" spans otelnats already emits.
+func replyAttrs(subject string, bodySize int) []attribute.KeyValue {
+	attrs := []attribute.KeyValue{
+		semconv.MessagingSystemKey.String("nats"),
+		semconv.MessagingDestinationNameKey.String(subject),
+		attribute.String(string(semconv.MessagingOperationTypeKey), "receive"),
+		semconv.MessagingOperationNameKey.String("receive"),
+	}
+	if bodySize > 0 {
+		attrs = append(attrs, semconv.MessagingMessageBodySize(bodySize))
+	}
+	return attrs
 }

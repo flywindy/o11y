@@ -123,9 +123,16 @@ package is the authoritative source and changes across contrib versions.
 ## Messaging - NATS (package `github.com/flywindy/o11y/nats`)
 
 Spans are emitted by
-`github.com/Marz32onE/instrumentation-go/otel-nats` v0.2.11. The upstream
-package imports `go.opentelemetry.io/otel/semconv/v1.39.0`; the o11y wrapper
-adds no attributes of its own.
+`github.com/Marz32onE/instrumentation-go/otel-nats` v0.2.11 (Core Subscribe /
+Publish / Request, and JetStream Consume / Messages / Fetch / FetchBytes /
+FetchNoWait). The upstream package imports
+`go.opentelemetry.io/otel/semconv/v1.39.0`.
+
+**`Conn.Request`'s reply-link span is o11y-owned** (ADR 0022 amendment,
+2026-07-01): it closes the requester-side half of request/reply correlation
+that `otel-nats` itself does not cover (see "Reply-Link Span" below). It
+reuses the same attribute set as the table below — no new keys — so it reads
+consistently with the upstream-emitted spans.
 
 ### Core and JetStream Attributes
 
@@ -148,6 +155,22 @@ pinned `semconv/v1.39.0` package (which carries only
 `messaging.consumer.group.name`). It is listed here as a documented deviation;
 the upstream hardcodes the string literal. Re-evaluate when the messaging
 semconv stabilizes a consumer-name key or when `otel-nats` is bumped.
+
+### Reply-Link Span (`Conn.Request`, o11y-owned)
+
+`Conn.Request` performs the request exactly as `otel-nats`'s own `Request`
+(producer "send" span, header injection), then — when the reply carries a
+trace context, i.e. the responder replied via `Conn.Respond` — starts a short
+`receive {subject}` span (`SpanKind` CONSUMER) as a **child of the caller's
+own ctx**, carrying a **link** to the trace context extracted from the
+reply's headers. This differs from the JetStream/Core consumer spans above,
+which start a *new* trace and link back to the producer (OTel messaging
+correlation convention): here, the span deliberately stays in the requester's
+own trace (it is a synchronous continuation of the request the caller is
+already tracking), while the link supplies the cross-service correlation to
+the responder's reply-send span. No span is created if the reply has no
+headers or no valid trace context (untraced responder, or one that replied
+via the raw `msg.Respond` instead of `Conn.Respond`).
 
 ### Upstream NATS Trace-Event Attributes
 

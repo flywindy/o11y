@@ -166,6 +166,212 @@ func TestJetStream_Messages_TracePropagation(t *testing.T) {
 		"a consumer receive span should link back to the publisher's trace")
 }
 
+// TestJetStream_Fetch_TracePropagation exercises the batch pull path (Fetch):
+// each FetchedMessage delivered on the MessageBatch channel must carry a ctx
+// with a valid consumer span that links back to the publisher's trace.
+func TestJetStream_Fetch_TracePropagation(t *testing.T) {
+	enableNATSTracing(t)
+	_, url := startJetStreamServer(t)
+	tp, prop, sr := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	const streamName, subject, consumerName = "EVENTS_F", "events.f.created", "fetch-test"
+	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	tracer := tp.Tracer("test")
+	pubCtx, span := tracer.Start(context.Background(), "publish-event")
+	pubTraceID := span.SpanContext().TraceID()
+	_, err = js.Publish(pubCtx, subject, []byte("hi"))
+	require.NoError(t, err)
+	span.End()
+
+	batch, err := cons.Fetch(context.Background(), 1)
+	require.NoError(t, err)
+
+	var fetched o11ynats.FetchedMessage
+	select {
+	case fetched = <-batch.Messages():
+	case <-time.After(3 * time.Second):
+		t.Fatal("Fetch did not deliver a message within timeout")
+	}
+	require.NotNil(t, fetched.Msg)
+	require.NoError(t, fetched.Msg.Ack())
+
+	gotTraceID := oteltrace.SpanFromContext(fetched.Ctx).SpanContext().TraceID()
+	assert.True(t, gotTraceID.IsValid(), "fetched message ctx should carry a valid trace ID")
+	// Like the Messages() iterator, the batch's per-message receive span isn't
+	// ended until the next message arrives or the underlying pull request
+	// completes (which can take up to its expiry) — so assert against
+	// Started(), where the link is already set at span creation, rather than
+	// Ended().
+	assert.Eventually(t, func() bool {
+		for _, s := range sr.Started() {
+			for _, link := range s.Links() {
+				if link.SpanContext.TraceID() == pubTraceID {
+					return true
+				}
+			}
+		}
+		return false
+	}, 3*time.Second, 10*time.Millisecond,
+		"a consumer span should link back to the publisher's trace")
+}
+
+// TestJetStream_FetchBytes_Deliver is a lighter smoke test for FetchBytes:
+// trace propagation is exercised in full by TestJetStream_Fetch_TracePropagation
+// (all three batch modes share wrapMessageBatch), so this only asserts
+// delivery and drains the batch fully. FetchMaxWait bounds the pull request
+// so it closes once the byte budget's wait expires rather than staying open
+// waiting for more bytes.
+func TestJetStream_FetchBytes_Deliver(t *testing.T) {
+	_, url := startJetStreamServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	const streamName, subject, consumerName = "EVENTS_FB", "events.fb.created", "fetch-bytes-test"
+	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	_, err = js.Publish(context.Background(), subject, []byte("a"))
+	require.NoError(t, err)
+
+	fbBatch, err := cons.FetchBytes(context.Background(), 1024, jetstream.FetchMaxWait(500*time.Millisecond))
+	require.NoError(t, err)
+
+	var got int
+	timeout := time.After(3 * time.Second)
+drain:
+	for {
+		select {
+		case m, ok := <-fbBatch.Messages():
+			if !ok {
+				break drain
+			}
+			require.NoError(t, m.Msg.Ack())
+			got++
+		case <-timeout:
+			t.Fatal("FetchBytes did not close within timeout")
+		}
+	}
+	require.Equal(t, 1, got, "FetchBytes should deliver exactly the one published message")
+	require.NoError(t, fbBatch.Error())
+}
+
+// TestJetStream_FetchNoWait_Deliver mirrors TestJetStream_FetchBytes_Deliver
+// for FetchNoWait: the message is published before the call so it is already
+// available server-side, matching FetchNoWait's "no waiting for new messages"
+// contract.
+func TestJetStream_FetchNoWait_Deliver(t *testing.T) {
+	_, url := startJetStreamServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	const streamName, subject, consumerName = "EVENTS_FNW", "events.fnw.created", "fetch-nowait-test"
+	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	_, err = js.Publish(context.Background(), subject, []byte("a"))
+	require.NoError(t, err)
+	require.NoError(t, conn.NatsConn().FlushTimeout(2*time.Second))
+
+	// The publish ack round trip above guarantees the message is committed
+	// server-side before FetchNoWait asks for it.
+	batch, err := cons.FetchNoWait(context.Background(), 1)
+	require.NoError(t, err)
+
+	select {
+	case m, ok := <-batch.Messages():
+		require.True(t, ok, "FetchNoWait should deliver the already-published message")
+		require.NoError(t, m.Msg.Ack())
+	case <-time.After(3 * time.Second):
+		t.Fatal("FetchNoWait did not deliver within timeout")
+	}
+}
+
+// TestJetStream_Fetch_ContextGuard locks down the one validation guard the
+// batch wrappers add: an already-cancelled registration ctx is rejected up
+// front by Fetch / FetchBytes / FetchNoWait, consistent with Consume/Messages.
+func TestJetStream_Fetch_ContextGuard(t *testing.T) {
+	_, url := startJetStreamServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	const streamName, subject, consumerName = "EVENTS_FG", "events.fg.created", "fetch-guard-test"
+	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = cons.Fetch(canceled, 1)
+	require.Error(t, err)
+	_, err = cons.FetchBytes(canceled, 1024)
+	require.Error(t, err)
+	_, err = cons.FetchNoWait(canceled, 1)
+	require.Error(t, err)
+}
+
 // TestJetStream_Consume_NilHandler locks down the one validation guard the
 // wrapper adds: a nil Consume handler returns an error rather than panicking.
 func TestJetStream_Consume_NilHandler(t *testing.T) {

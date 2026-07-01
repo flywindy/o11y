@@ -21,23 +21,27 @@ import (
 //
 // The Consume callback and the Messages iterator deliver the native
 // jetstream.Msg together with a ctx carrying the consumer span (matching the
-// core MsgHandler shape (ctx, msg)); no o11y-owned message type is introduced.
+// core MsgHandler shape (ctx, msg)). Fetch / FetchBytes / FetchNoWait deliver
+// the same (ctx, msg) pairing over a channel, via the o11y-owned
+// FetchedMessage type — required because a channel, unlike a callback or
+// iterator method, cannot return two separate values per delivery.
 //
-// Consume and Messages also take a registration-time ctx, consistent with the
-// core Subscribe / QueueSubscribe facade: it is checked once up front (an
-// already-cancelled ctx is rejected) but is NOT plumbed into the upstream call
-// and does NOT cancel a running consume loop — use ConsumeContext.Stop /
-// MessagesContext.Stop|Drain for that. Per-message trace context flows from the
+// Consume, Messages, and Fetch/FetchBytes/FetchNoWait also take a
+// registration-time ctx, consistent with the core Subscribe / QueueSubscribe
+// facade: it is checked once up front (an already-cancelled ctx is rejected)
+// but is NOT plumbed into the upstream call and does NOT cancel a running
+// consume/fetch — use ConsumeContext.Stop / MessagesContext.Stop|Drain, or let
+// the batch channel close, for that. Per-message trace context flows from the
 // message headers, not from this registration ctx (see ADR 0022 amendment).
 //
 // Scope: this facade wraps the JetStream surface o11y consumers use today
 // (stream/consumer management, Publish, and the pull consume modes Consume /
-// Messages). Deferred until a consumer needs them: single-message Consumer.Next
-// (upstream v0.2.11 returns the producer's remote context rather than the local
-// receive span — use Messages with jetstream.PullMaxMessages(1) for single
-// fetch), Fetch / FetchBytes / FetchNoWait (the batch path would require an
-// o11y-owned carrier type for the channel), PushConsumer, ordered consumers,
-// and the admin surface (Pause/Resume/List/Unpin). Wrapped on demand later.
+// Messages / Fetch / FetchBytes / FetchNoWait). Deferred until a consumer
+// needs them: single-message Consumer.Next (upstream v0.2.11 returns the
+// producer's remote context rather than the local receive span — use
+// Messages with jetstream.PullMaxMessages(1) for single fetch), PushConsumer,
+// ordered consumers, and the admin surface (Pause/Resume/List/Unpin). Wrapped
+// on demand later.
 
 // JetStreamMsgHandler is the Consume callback signature. ctx carries the
 // consumer span extracted from the message headers by the upstream layer, so
@@ -45,6 +49,26 @@ import (
 // correlated with the producer's trace. msg is the native jetstream.Msg, so
 // Ack / Nak / Term / InProgress / Metadata are available directly.
 type JetStreamMsgHandler func(ctx context.Context, msg jetstream.Msg)
+
+// FetchedMessage pairs a message delivered through Consumer.Fetch /
+// FetchBytes / FetchNoWait with the consumer-span ctx extracted from its
+// headers, mirroring the (ctx, msg) shape Consume and Messages already
+// deliver. An o11y-owned type is needed here (rather than re-exporting the
+// upstream oteljetstream.Msg) because the batch is delivered over a channel,
+// not a callback/iterator method — see ADR 0022 amendment (2026-07-01).
+type FetchedMessage struct {
+	Ctx context.Context
+	Msg jetstream.Msg
+}
+
+// MessageBatch is the result of Consumer.Fetch / FetchBytes / FetchNoWait.
+// Messages yields each delivered message paired with its consumer-span ctx;
+// range over the channel until it closes, then call Error for the terminal
+// batch error (matching the native jetstream.MessageBatch contract).
+type MessageBatch interface {
+	Messages() <-chan FetchedMessage
+	Error() error
+}
 
 // JetStream is a tracing-aware JetStream context. Obtain one from Conn.JetStream.
 type JetStream interface {
@@ -100,6 +124,19 @@ type Consumer interface {
 	// consumer span plus the native jetstream.Msg. ctx is a registration-time
 	// guard only, with the same semantics as Consume's ctx.
 	Messages(ctx context.Context, opts ...jetstream.PullMessagesOpt) (MessagesContext, error)
+	// Fetch requests up to batch messages and returns immediately with a
+	// MessageBatch; messages (each paired with its consumer-span ctx) arrive
+	// on the returned channel as the server delivers them. ctx is a
+	// registration-time guard only, matching Consume / Messages.
+	Fetch(ctx context.Context, batch int, opts ...jetstream.FetchOpt) (MessageBatch, error)
+	// FetchBytes is the byte-budgeted variant of Fetch: the server stops
+	// delivering once maxBytes is reached rather than once batch messages
+	// have arrived.
+	FetchBytes(ctx context.Context, maxBytes int, opts ...jetstream.FetchOpt) (MessageBatch, error)
+	// FetchNoWait requests up to batch currently-available messages and
+	// returns without waiting for more to arrive (no jetstream.FetchOpt —
+	// matches the native jetstream.Consumer.FetchNoWait signature).
+	FetchNoWait(ctx context.Context, batch int) (MessageBatch, error)
 	Info(ctx context.Context) (*jetstream.ConsumerInfo, error)
 	CachedInfo() *jetstream.ConsumerInfo
 }
@@ -244,6 +281,61 @@ func (c *consumer) Messages(ctx context.Context, opts ...jetstream.PullMessagesO
 	}
 	return &messagesContext{mc: mc}, nil
 }
+
+func (c *consumer) Fetch(ctx context.Context, batch int, opts ...jetstream.FetchOpt) (MessageBatch, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("nats jetstream fetch: %w", err)
+	}
+	mb, err := c.c.Fetch(batch, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return wrapMessageBatch(mb), nil
+}
+
+func (c *consumer) FetchBytes(ctx context.Context, maxBytes int, opts ...jetstream.FetchOpt) (MessageBatch, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("nats jetstream fetch-bytes: %w", err)
+	}
+	mb, err := c.c.FetchBytes(maxBytes, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return wrapMessageBatch(mb), nil
+}
+
+func (c *consumer) FetchNoWait(ctx context.Context, batch int) (MessageBatch, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("nats jetstream fetch-no-wait: %w", err)
+	}
+	mb, err := c.c.FetchNoWait(batch)
+	if err != nil {
+		return nil, err
+	}
+	return wrapMessageBatch(mb), nil
+}
+
+// wrapMessageBatch adapts the upstream oteljetstream.MessageBatch (a channel
+// of oteljetstream.Msg) to the o11y MessageBatch (a channel of
+// FetchedMessage), forwarding each message's consumer-span ctx unchanged.
+func wrapMessageBatch(mb oteljetstream.MessageBatch) MessageBatch {
+	out := make(chan FetchedMessage)
+	go func() {
+		defer close(out)
+		for m := range mb.Messages() {
+			out <- FetchedMessage{Ctx: m.Ctx, Msg: m.Msg}
+		}
+	}()
+	return &messageBatch{ch: out, mb: mb}
+}
+
+type messageBatch struct {
+	ch chan FetchedMessage
+	mb oteljetstream.MessageBatch
+}
+
+func (m *messageBatch) Messages() <-chan FetchedMessage { return m.ch }
+func (m *messageBatch) Error() error                    { return m.mb.Error() }
 
 func (c *consumer) Info(ctx context.Context) (*jetstream.ConsumerInfo, error) { return c.c.Info(ctx) }
 

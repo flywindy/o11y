@@ -5,6 +5,7 @@ import { Resource } from '@opentelemetry/resources';
 import { ATTR_SERVICE_NAME } from '@opentelemetry/semantic-conventions';
 import { CompositePropagator, W3CTraceContextPropagator, W3CBaggagePropagator } from '@opentelemetry/core';
 import { ZoneContextManager } from '@opentelemetry/context-zone';
+import { propagation, ROOT_CONTEXT, SpanKind, SpanStatusCode } from '@opentelemetry/api';
 
 const exporter = new OTLPTraceExporter({
   url: 'http://localhost:4318/v1/traces',
@@ -31,3 +32,60 @@ provider.register({
 });
 
 export const tracer = provider.getTracer('nats-ws-browser');
+
+// extractCarrierFromHeaders adapts a nats.ws MsgHdrs object (from msg.headers)
+// to the plain string-keyed object propagation.extract expects.
+function extractCarrierFromHeaders(msgHeaders) {
+  const carrier = {};
+  if (
+    msgHeaders &&
+    typeof msgHeaders.keys === 'function' &&
+    typeof msgHeaders.get === 'function'
+  ) {
+    for (const key of msgHeaders.keys()) {
+      const value = msgHeaders.get(key);
+      if (typeof value === 'string') {
+        carrier[key] = value;
+      }
+    }
+  }
+  return carrier;
+}
+
+// receiveWithSpan is the browser-side receive helper item 3 of the o11y NATS
+// gap analysis asks for: extract the trace context nats.ws delivered on
+// msg.headers, start a CONSUMER span linked into that trace (SpanKind
+// CONSUMER, matching how the Go SDK's Subscribe/Consume handlers are
+// instrumented server-side), and wrap the callback — the actual
+// message-handling / render-dispatch work — inside it. Exceptions thrown by
+// callback are recorded on the span and re-thrown; the span always ends.
+//
+// name is the span name (e.g. "nats.receive"); attributes are merged over
+// the default messaging.* attributes (system/operation are fixed; pass
+// 'messaging.destination.name' and any app-specific fields — a request ID, a
+// room/site ID — that make the span searchable). callback receives the
+// started span so it can read spanContext().traceId for its own correlation
+// needs (e.g. matching a locally pending producer span).
+export function receiveWithSpan(msg, { name, attributes = {} }, callback) {
+  const parentCtx = propagation.extract(ROOT_CONTEXT, extractCarrierFromHeaders(msg.headers));
+  const span = tracer.startSpan(name, {
+    kind: SpanKind.CONSUMER,
+    attributes: {
+      'messaging.system': 'nats',
+      'messaging.operation.type': 'receive',
+      'messaging.operation.name': 'receive',
+      ...attributes,
+    },
+  }, parentCtx);
+
+  try {
+    return callback(span);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    span.recordException(err instanceof Error ? err : new Error(message));
+    span.setStatus({ code: SpanStatusCode.ERROR, message });
+    throw err;
+  } finally {
+    span.end();
+  }
+}
