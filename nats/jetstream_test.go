@@ -440,6 +440,131 @@ func TestJetStream_Fetch_CtxCancellation_MidFetch(t *testing.T) {
 	assert.GreaterOrEqual(t, elapsed, 250*time.Millisecond, "fetch should not resolve before ctx was actually canceled")
 }
 
+// TestJetStream_Fetch_CtxOptionCollision_NotSwallowed locks down
+// isFetchMaxWaitCollision's precision: fetchWithCtxFallback must only retry
+// without ctx when the native rejection is specifically the
+// FetchContext+FetchMaxWait collision, not any jetstream.ErrInvalidOption.
+// Pairing a short ctx deadline with an explicit FetchHeartbeat triggers a
+// different native rejection ("expiry time should be at least 2 times the
+// heartbeat", also ErrInvalidOption) — a blind fallback would silently drop
+// ctx here and run the fetch to the 30s default wait instead of surfacing
+// this error, defeating the caller's own cancellation/deadline.
+func TestJetStream_Fetch_CtxOptionCollision_NotSwallowed(t *testing.T) {
+	_, url := startJetStreamServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	const streamName, subject, consumerName = "EVENTS_HBCOLLIDE", "events.hbcollide.created", "hb-collide-test"
+	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	// A 1s ctx deadline combined with a 2s heartbeat: the ctx-derived expiry
+	// (under 1s once FetchContext reserves its buffer) is under 2x the
+	// heartbeat, so the native call rejects the combination outright.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_, err = cons.Fetch(ctx, 1, jetstream.FetchHeartbeat(2*time.Second))
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, jetstream.ErrInvalidOption)
+	assert.NotContains(t, err.Error(), "cannot specify both FetchContext and FetchMaxWait",
+		"this should be the heartbeat/expiry rejection, not the FetchMaxWait collision")
+	assert.Less(t, elapsed, 5*time.Second,
+		"the error should return immediately during option validation, not after falling back to a blocking fetch")
+}
+
+// TestJetStream_Fetch_ReceiveSpanEndsBeforeConsumption documents a known
+// trade-off of the goroutine-leak fix (see MessageBatch's doc comment):
+// buffering the forwarding channel to bufSize lets the forwarding goroutine
+// race ahead through the whole upstream batch — and upstream ends message N's
+// receive span as soon as it reads message N+1 off its own channel — well
+// ahead of the caller's own processing pace. So by the time a caller's loop
+// gets to later messages in a batch, those receive spans are typically
+// already ended, and trace.SpanFromContext(m.Ctx).SetAttributes(...) on them
+// is a silent no-op; log correlation and child spans (see
+// examples/jetstream/fetch-worker) are unaffected and remain the supported
+// pattern. If upstream oteljetstream ever changes this span-lifecycle
+// behavior, this test breaks as a prompt to update the doc comments that
+// describe it.
+func TestJetStream_Fetch_ReceiveSpanEndsBeforeConsumption(t *testing.T) {
+	_, url := startJetStreamServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	const streamName, subject, consumerName = "EVENTS_SPANLIFECYCLE", "events.spanlifecycle.created", "span-lifecycle-test"
+	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	const batchSize = 5
+	for i := 0; i < batchSize; i++ {
+		_, err = js.Publish(context.Background(), subject, []byte("m"))
+		require.NoError(t, err)
+	}
+	require.NoError(t, conn.NatsConn().FlushTimeout(2*time.Second))
+
+	batch, err := cons.Fetch(context.Background(), batchSize)
+	require.NoError(t, err)
+
+	var last o11ynats.FetchedMessage
+	var got int
+drain:
+	for {
+		select {
+		case m, ok := <-batch.Messages():
+			if !ok {
+				break drain
+			}
+			last = m
+			got++
+			// Simulate realistic per-message processing time, giving the
+			// forwarding goroutine room to race ahead through the rest of
+			// the already-buffered batch before this loop reads the next
+			// message — the condition under which spans end early.
+			time.Sleep(20 * time.Millisecond)
+		case <-time.After(3 * time.Second):
+			t.Fatal("Fetch did not deliver the full batch within timeout")
+		}
+	}
+	require.Equal(t, batchSize, got)
+	require.NoError(t, batch.Error())
+
+	assert.False(t, oteltrace.SpanFromContext(last.Ctx).IsRecording(),
+		"the last message's receive span should already be ended by the time this loop reads it, per the documented trade-off")
+}
+
 // TestJetStream_Fetch_NoGoroutineLeakOnEarlyAbandon locks down the
 // wrapMessageBatch buffering fix: batch is Fetch's own hard cap on message
 // count, so sizing the forwarding channel's buffer to batch lets the

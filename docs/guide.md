@@ -853,7 +853,7 @@ _, err = conn.Subscribe(ctx, "orders.get", func(ctx context.Context, msg *gonats
 // ctx, linking back to that context. attrs (optional, variadic) land on that
 // span: use them for domain identifiers the SDK has no way to know, such as
 // a request/correlation ID or a room/site ID, so the span is searchable.
-reply, err := conn.Request(ctx, "orders.get", []byte("42"), 2*time.Second,
+_, err = conn.Request(ctx, "orders.get", []byte("42"), 2*time.Second,
     attribute.String("app.request_id", requestID),
 )
 ```
@@ -960,6 +960,17 @@ Prefer `Fetch`/`FetchNoWait` over `FetchBytes` when early abandonment is a
 realistic caller pattern; `MessageBatch` has no `Stop`/cancel method, so
 draining fully is the only way to guarantee prompt release in the `FetchBytes`
 case. `examples/jetstream/fetch-worker` shows the full drain pattern.
+
+That same buffering has a tracing consequence: `m.Ctx`'s receive span may
+already be ended by the time your loop body runs it for message 2 and later
+in a batch (upstream ends message N's span as soon as its own internal
+forwarding reads message N+1, and buffering lets that race ahead of your
+processing) — so unlike the `Subscribe` pattern above,
+`trace.SpanFromContext(m.Ctx).SetAttributes(...)` is unreliable here. Two
+things still work: `obs.Logger.*Context(m.Ctx, ...)` log correlation (reads
+only the immutable trace/span IDs, not the span's live state), and starting
+your own child span via `tracer.Start(m.Ctx, ...)` for per-message work —
+the pattern `examples/jetstream/fetch-worker` actually uses.
 
 Not yet wrapped (use a later facade addition or, if needed sooner, the upstream
 package directly): single-message `Consumer.Next` (upstream v0.2.11 returns the

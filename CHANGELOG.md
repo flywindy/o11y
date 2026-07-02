@@ -34,7 +34,17 @@ adopters can plan their upgrades.
   (falls back to the caller's own `FetchMaxWait`, unmodified, when one is set
   explicitly — the two are mutually exclusive upstream); `FetchNoWait` has no
   `FetchOpt` to plumb `ctx` into, so it stays a registration-time guard only,
-  same as `Consume`/`Messages`.
+  same as `Consume`/`Messages`. The fallback is scoped precisely to that one
+  collision (not any `jetstream.ErrInvalidOption`): pairing a tight ctx
+  deadline with an explicit `jetstream.FetchHeartbeat`, for example, triggers
+  a different native rejection, and is surfaced as an error rather than
+  silently falling back to an unbounded fetch that ignores the caller's
+  deadline. Documented caveat (no code change, upstream behavior): buffering
+  the forwarding channel means a batch message's receive span (`m.Ctx`) may
+  already be ended by the time your loop body runs for messages after the
+  first — `trace.SpanFromContext(m.Ctx).SetAttributes(...)` is unreliable
+  there; use log correlation or a child span instead, as
+  `examples/jetstream/fetch-worker` does.
 - `nats`: `Conn.Request` now closes the requester-side half of the
   request/reply round trip. When the reply carries a trace context (the
   responder replied via `Conn.Respond`), `Request` starts a `receive

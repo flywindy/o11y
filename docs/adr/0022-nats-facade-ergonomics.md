@@ -496,6 +496,31 @@ No interface change (`MessageBatch` gained no `Stop`/`Close`) — see
 `nats/jetstream.go`'s `MessageBatch` doc comment for the full guarantee.
 Locked down by `TestJetStream_Fetch_NoGoroutineLeakOnEarlyAbandon`.
 
+That buffering has a tracing cost, found in review after the fact: upstream
+`oteljetstream.wrapMessageBatch` ends message N's receive span as soon as its
+own internal goroutine reads message N+1 off *its* channel — not when the
+caller finishes processing message N. Before this buffering fix, our own
+forwarding channel being unbuffered end-to-end kept that upstream loop
+naturally throttled to roughly the caller's own consumption pace. Buffering
+removes that throttle: our forwarding goroutine can now drain the entire
+upstream batch into the buffer in one tight loop, letting upstream race
+through ending every span in the batch well before the caller has read past
+the first message. Net effect: for a batch of more than one message,
+`trace.SpanFromContext(m.Ctx).SetAttributes(...)` is a silent no-op for most
+of the batch by the time the caller's loop body runs. This is a genuine
+regression relative to the (leaky) unbuffered version, but not one worth
+re-opening the goroutine-leak trade-off over: log correlation
+(`obs.Logger.*Context(m.Ctx, ...)`, which only reads the immutable trace/span
+IDs off `ctx`) and starting a child span via `tracer.Start(m.Ctx, ...)` — the
+pattern `examples/jetstream/fetch-worker` already uses — are both unaffected,
+and neither this repo's own example nor `docs/guide.md`'s Fetch section ever
+demonstrated the `SetAttributes`-on-the-receive-span pattern for the batch
+path (that pattern is `Subscribe`-specific, callback-based rather than
+channel-based, so its span never needs to outlive processing). Documented as
+a caveat on `MessageBatch`'s doc comment and in `docs/guide.md` rather than
+worked around. Locked down (as a known-behavior regression test, not a fix)
+by `TestJetStream_Fetch_ReceiveSpanEndsBeforeConsumption`.
+
 **`ctx` propagation into `Fetch`/`FetchBytes` (not just a registration
 guard).** Unlike `Consume`/`Messages` (§1 of the 2026-06-16 amendment), the
 native `jetstream.Consumer.Fetch`/`FetchBytes` accept a `jetstream.FetchOpt`
@@ -515,6 +540,23 @@ the caller's explicit `FetchMaxWait` exactly as before this change. Confirmed
 against `nats.go` v1.50.0 source that this fallback is side-effect-free (the
 collision check runs before any network I/O). Locked down by
 `TestJetStream_Fetch_CtxCancellation_MidFetch`.
+
+The fallback match is deliberately narrower than "any `jetstream.ErrInvalidOption`":
+that sentinel is also returned for unrelated rejections native to `Fetch`'s own
+option validation — e.g. a ctx-derived expiry too tight for an explicit
+`jetstream.FetchHeartbeat` (`"expiry time should be at least 2 times the
+heartbeat"`), or a ctx whose deadline has already passed
+(`"context deadline already exceeded"`). An early version of this fix matched
+the sentinel alone and would have silently retried without `FetchContext` in
+those cases too — passing option validation on the retry (no `FetchContext`
+means no ctx-derived expiry to conflict with the heartbeat) and quietly
+running the fetch to its 30s default wait, discarding the caller's real
+cancellation/deadline instead of surfacing the actual problem. `isFetchMaxWaitCollision`
+matches on the specific `"cannot specify both FetchContext and FetchMaxWait"`
+message instead, so only that one collision falls back; every other invalid
+combination is returned to the caller as an error. Locked down by
+`TestJetStream_Fetch_CtxOptionCollision_NotSwallowed` (confirmed to fail
+against the sentinel-only match by temporarily reverting it).
 
 ### 2. `Conn.Request` closes the requester-side reply-link gap
 

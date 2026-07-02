@@ -357,14 +357,18 @@ func TestRequest_ReplyLink_ServerAttrs(t *testing.T) {
 		if s.Name() != "receive "+subject {
 			continue
 		}
-		var hasServerAddress bool
+		var hasServerAddress, hasServerPort bool
 		for _, a := range s.Attributes() {
 			if a.Key == semconv.ServerAddressKey {
 				hasServerAddress = true
 				assert.NotEmpty(t, a.Value.AsString())
 			}
+			if a.Key == semconv.ServerPortKey {
+				hasServerPort = true
+			}
 		}
 		assert.True(t, hasServerAddress, "reply-link span should carry server.address")
+		assert.True(t, hasServerPort, "reply-link span should carry server.port for a non-default port")
 		found = true
 	}
 	assert.True(t, found, "a %q consumer span should be recorded", "receive "+subject)

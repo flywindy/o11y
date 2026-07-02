@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/Marz32onE/instrumentation-go/otel-nats/oteljetstream"
 	natsgo "github.com/nats-io/nats.go"
@@ -86,6 +87,19 @@ type FetchedMessage struct {
 // receive it, until the caller resumes reading or the process exits — there
 // is no Stop/cancel escape hatch on MessageBatch. Prefer Fetch/FetchNoWait
 // over FetchBytes when early abandonment is a realistic caller pattern.
+//
+// That same buffering means each FetchedMessage's receive span (m.Ctx) may
+// already be ended by the time your loop body runs: the upstream oteljetstream
+// library ends message N's span as soon as it reads message N+1 off its own
+// channel, and buffering lets the forwarding goroutine race ahead through the
+// whole batch well before the caller has processed message N — so
+// trace.SpanFromContext(m.Ctx).SetAttributes(...) is a silent no-op for most
+// messages in a batch of more than one. Two things are unaffected by this and
+// remain safe: obs.Logger.*Context(m.Ctx, ...) log correlation (it only reads
+// the immutable trace/span IDs off ctx, not the span's recording state), and
+// starting your own child span via tracer.Start(m.Ctx, ...) for per-message
+// work — see examples/jetstream/fetch-worker, which uses exactly that
+// pattern rather than enriching the receive span directly.
 type MessageBatch interface {
 	Messages() <-chan FetchedMessage
 	Error() error
@@ -154,7 +168,9 @@ type Consumer interface {
 	// rather than only being checked once up front. If opts already contains
 	// jetstream.FetchMaxWait, that takes precedence and ctx reverts to a
 	// registration-time guard only — the two options are mutually exclusive
-	// in the native API.
+	// in the native API. Any other invalid combination (e.g. a ctx deadline
+	// too tight for an explicit jetstream.FetchHeartbeat) is returned as an
+	// error rather than silently falling back to an unbounded fetch.
 	Fetch(ctx context.Context, batch int, opts ...jetstream.FetchOpt) (MessageBatch, error)
 	// FetchBytes is the byte-budgeted variant of Fetch: the server stops
 	// delivering once maxBytes is reached rather than once batch messages
@@ -313,14 +329,9 @@ func (c *consumer) Fetch(ctx context.Context, batch int, opts ...jetstream.Fetch
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("nats jetstream fetch: %w", err)
 	}
-	mb, err := c.c.Fetch(batch, fetchOptsWithCtx(ctx, opts)...)
-	if errors.Is(err, jetstream.ErrInvalidOption) {
-		// The native API rejects combining FetchContext with an explicit
-		// FetchMaxWait (see fetchOptsWithCtx) — the caller supplied their
-		// own FetchMaxWait, so defer to it exactly as before rather than
-		// erroring out because of our own ctx wiring.
-		mb, err = c.c.Fetch(batch, opts...)
-	}
+	mb, err := fetchWithCtxFallback(ctx, opts, func(o []jetstream.FetchOpt) (oteljetstream.MessageBatch, error) {
+		return c.c.Fetch(batch, o...)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -335,10 +346,9 @@ func (c *consumer) FetchBytes(ctx context.Context, maxBytes int, opts ...jetstre
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("nats jetstream fetch-bytes: %w", err)
 	}
-	mb, err := c.c.FetchBytes(maxBytes, fetchOptsWithCtx(ctx, opts)...)
-	if errors.Is(err, jetstream.ErrInvalidOption) {
-		mb, err = c.c.FetchBytes(maxBytes, opts...)
-	}
+	mb, err := fetchWithCtxFallback(ctx, opts, func(o []jetstream.FetchOpt) (oteljetstream.MessageBatch, error) {
+		return c.c.FetchBytes(maxBytes, o...)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -349,21 +359,48 @@ func (c *consumer) FetchBytes(ctx context.Context, maxBytes int, opts ...jetstre
 	return wrapMessageBatch(mb, fetchBytesBatchBuf), nil
 }
 
-// fetchOptsWithCtx prepends jetstream.FetchContext(ctx) to opts so Fetch /
-// FetchBytes actually honor ctx cancellation and deadlines mid-fetch,
-// instead of only checking ctx.Err() once up front (see the package doc
-// comment for how that differs from Consume/Messages/FetchNoWait, which have
-// no native mechanism to plumb ctx into at all).
+// fetchWithCtxFallback calls call with jetstream.FetchContext(ctx) prepended
+// to opts, so Fetch/FetchBytes actually honor ctx cancellation and deadlines
+// mid-fetch instead of only checking ctx.Err() once up front (see the
+// package doc comment for how that differs from Consume/Messages/
+// FetchNoWait, which have no native mechanism to plumb ctx into at all).
 //
 // The native API rejects combining FetchContext with an explicit
 // FetchMaxWait outright (regardless of option order — jetstream.pullConsumer
-// checks for both being set only after applying every opt), so this alone
-// isn't sufficient: each call site above must retry without this injection
-// (falling back to the caller's opts as-is) when that specific collision
-// error comes back, deferring to the caller's explicit FetchMaxWait exactly
-// as before this change.
+// checks for both being set only after applying every opt), so when the
+// caller already supplied their own FetchMaxWait, call is retried with opts
+// unchanged (no FetchContext), deferring to that FetchMaxWait exactly as
+// before this change. The retry is scoped precisely to that collision via
+// isFetchMaxWaitCollision: jetstream.ErrInvalidOption also covers unrelated
+// rejections (e.g. a ctx-derived expiry too small for an explicit
+// FetchHeartbeat, or a ctx whose deadline has already passed), and blindly
+// retrying on any of those would silently drop the caller's real
+// cancellation/deadline instead of surfacing the actual problem — so those
+// are returned to the caller as-is.
+func fetchWithCtxFallback(ctx context.Context, opts []jetstream.FetchOpt, call func([]jetstream.FetchOpt) (oteljetstream.MessageBatch, error)) (oteljetstream.MessageBatch, error) {
+	mb, err := call(fetchOptsWithCtx(ctx, opts))
+	if isFetchMaxWaitCollision(err) {
+		mb, err = call(opts)
+	}
+	return mb, err
+}
+
 func fetchOptsWithCtx(ctx context.Context, opts []jetstream.FetchOpt) []jetstream.FetchOpt {
 	return append([]jetstream.FetchOpt{jetstream.FetchContext(ctx)}, opts...)
+}
+
+// isFetchMaxWaitCollision reports whether err is specifically nats.go's
+// rejection of combining FetchContext with an explicit FetchMaxWait in the
+// same call ("cannot specify both FetchContext and FetchMaxWait"), the one
+// jetstream.ErrInvalidOption case fetchWithCtxFallback should retry around.
+// Matching the message, not just the errors.Is(err, jetstream.ErrInvalidOption)
+// sentinel, is deliberate: that sentinel is shared by several unrelated
+// rejections (heartbeat/expiry mismatch, an already-expired ctx deadline,
+// invalid priority-group settings, ...), and only this specific one means
+// "the caller's own FetchMaxWait should win, ctx is still fine to drop."
+func isFetchMaxWaitCollision(err error) bool {
+	return errors.Is(err, jetstream.ErrInvalidOption) &&
+		strings.Contains(err.Error(), "cannot specify both FetchContext and FetchMaxWait")
 }
 
 func (c *consumer) FetchNoWait(ctx context.Context, batch int) (MessageBatch, error) {

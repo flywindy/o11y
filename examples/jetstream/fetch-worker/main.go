@@ -144,12 +144,16 @@ func main() {
 			}
 			// A persistent non-cancellation error (consumer deleted, auth
 			// failure, ...) would otherwise retry immediately forever,
-			// spinning the loop at full CPU and flooding the logs. This
-			// backoff still exits promptly on shutdown via ctx.Done().
+			// spinning the loop at full CPU and flooding the logs. ctx is
+			// only cancelled by main's deferred cancel() on return, so <-quit
+			// (not <-ctx.Done()) is what makes this backoff exit promptly on
+			// a SIGINT/SIGTERM that arrives mid-sleep.
 			logger.ErrorContext(ctx, "fetch failed", slog.Any("error", err))
 			select {
 			case <-time.After(fetchErrorBackoff):
-			case <-ctx.Done():
+			case <-quit:
+				logger.InfoContext(ctx, "shutting down fetch worker")
+				return
 			}
 			continue
 		}
