@@ -462,14 +462,59 @@ above), the upstream `oteljetstream.Fetch`/`FetchBytes`/`FetchNoWait` do
 **not** have the receive-span-context bug: each `oteljetstream.Msg` on the
 batch channel already carries the correct local receive-span ctx (verified
 against `otel-nats` v0.2.11 source), so wrapping is a straight adapter, not a
-re-instrumentation. `Fetch`/`FetchBytes`/`FetchNoWait` take a
-registration-time `ctx` guard, consistent with `Consume`/`Messages` (§1
-above) — same honest scope: rejects an already-cancelled `ctx` up front, does
-not cancel an in-flight batch.
+re-instrumentation. `FetchNoWait` takes a registration-time `ctx` guard only,
+consistent with `Consume`/`Messages` (§1 above) — the native API gives it no
+`FetchOpt` list to plumb `ctx` into. `Fetch`/`FetchBytes` go further: `ctx` is
+also passed into the native call via `jetstream.FetchContext(ctx)`, so
+cancelling or timing out `ctx` after the call returns actually ends the
+in-flight pull and closes the batch channel early, instead of only being
+checked once up front — see the "ctx propagation" sub-point below for why
+this differs from `Consume`/`Messages`/`FetchNoWait`.
 
 This was `search-sync-worker`'s largest gap: JetStream batch pull is its
 primary consume pattern, and every batch message previously arrived with no
 trace context at all once callers dropped the direct `oteljetstream` import.
+
+**Forwarding-channel buffering (goroutine leak).** Each delivered message is
+forwarded from the upstream channel to the o11y one by a background
+goroutine (`wrapMessageBatch`), because `FetchedMessage` — an o11y-owned type
+pairing `Ctx` and `Msg` — can't be produced by a simple type-cast over the
+channel. That goroutine originally forwarded onto an **unbuffered** channel,
+so a caller that read only part of a batch and stopped (a realistic pattern —
+e.g. bailing out after the first error) left the goroutine blocked forever on
+the next send, with no reader and no way to cancel it (neither
+`oteljetstream.MessageBatch` nor the native `jetstream.MessageBatch` expose a
+`Stop`/`Close`). Fixed by sizing the forwarding channel's buffer to each
+call's own message-count bound where one exists: `batch` for `Fetch` and
+`FetchNoWait` is the API's own hard cap, so the goroutine can always drain
+the whole upstream batch into the buffer and exit on its own — early
+abandonment leaks nothing. `FetchBytes` has no message-count bound (only a
+byte budget, satisfiable by an unbounded number of small messages), so it
+gets a fixed best-effort buffer (`fetchBytesBatchBuf = 256`) instead of a
+provable one; a batch larger than that can still leak on early abandonment.
+No interface change (`MessageBatch` gained no `Stop`/`Close`) — see
+`nats/jetstream.go`'s `MessageBatch` doc comment for the full guarantee.
+Locked down by `TestJetStream_Fetch_NoGoroutineLeakOnEarlyAbandon`.
+
+**`ctx` propagation into `Fetch`/`FetchBytes` (not just a registration
+guard).** Unlike `Consume`/`Messages` (§1 of the 2026-06-16 amendment), the
+native `jetstream.Consumer.Fetch`/`FetchBytes` accept a `jetstream.FetchOpt`
+list, and `jetstream.FetchContext(ctx)` is a real, documented option that
+cancels the in-flight pull when `ctx` is done — so unlike `Consume`/
+`Messages`/`FetchNoWait`, there was a native mechanism sitting unused. The
+wrapper now prepends `jetstream.FetchContext(ctx)` to the caller's `opts` on
+every call. This collides with an explicit `jetstream.FetchMaxWait` in the
+caller's own `opts`: the native API rejects combining the two
+(`jetstream.ErrInvalidOption`, checked internally after all opts are
+applied), because the point of `FetchMaxWait` is to make the call an
+authoritative deadline. Rather than surface that error to every caller who
+happens to already set `FetchMaxWait` (e.g. this repo's own
+`examples/jetstream/fetch-worker`), the wrapper retries without the
+`FetchContext` injection when that specific error comes back, deferring to
+the caller's explicit `FetchMaxWait` exactly as before this change. Confirmed
+against `nats.go` v1.50.0 source that this fallback is side-effect-free (the
+collision check runs before any network I/O). Locked down by
+`TestJetStream_Fetch_CtxCancellation_MidFetch`.
 
 ### 2. `Conn.Request` closes the requester-side reply-link gap
 

@@ -939,6 +939,16 @@ if err := batch.Error(); err != nil {
 `FetchNoWait` returns only currently-available messages and never blocks
 waiting for new ones.
 
+Unlike `Consume`/`Messages`, `ctx` on `Fetch`/`FetchBytes` is more than a
+registration-time guard: it is also passed into the native pull request, so
+cancelling or timing out `ctx` after the call returns ends the in-flight
+fetch early and closes the batch channel — useful for bounding a fetch by the
+caller's own deadline without setting `FetchMaxWait`. If `opts` already
+includes an explicit `jetstream.FetchMaxWait`, that takes precedence (the two
+are mutually exclusive in the native API) and `ctx` reverts to a
+registration-time guard only, same as before. `FetchNoWait` takes no
+`FetchOpt`, so it stays a registration-time guard regardless.
+
 A background goroutine forwards messages onto the channel, buffered to the
 request's own message-count bound where one exists. For `Fetch`/`FetchNoWait`,
 `batch` is that bound, so it's safe to abandon `Messages()` before reading

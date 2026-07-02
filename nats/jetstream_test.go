@@ -386,6 +386,60 @@ func TestJetStream_Fetch_ContextGuard(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestJetStream_Fetch_CtxCancellation_MidFetch locks down the fetchOptsWithCtx
+// fix: Fetch plumbs ctx into the native pull request via jetstream.FetchContext,
+// so cancelling ctx after Fetch has already returned ends the in-flight wait
+// early instead of running to the (multi-second, in this test's case) default
+// FetchMaxWait. No message is ever published, so without the fix this would
+// block for the full default wait; the assertion budget is well under that.
+func TestJetStream_Fetch_CtxCancellation_MidFetch(t *testing.T) {
+	_, url := startJetStreamServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	const streamName, subject, consumerName = "EVENTS_CTXCANCEL", "events.ctxcancel.created", "ctx-cancel-test"
+	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	start := time.Now()
+	batch, err := cons.Fetch(ctx, 1)
+	require.NoError(t, err)
+
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		cancel()
+	}()
+
+	select {
+	case _, ok := <-batch.Messages():
+		require.False(t, ok, "no message was ever published, the channel should close without delivering one")
+	case <-time.After(5 * time.Second):
+		t.Fatal("batch channel did not close within the cancellation budget — ctx is not reaching the native fetch")
+	}
+	elapsed := time.Since(start)
+
+	assert.ErrorIs(t, batch.Error(), context.Canceled)
+	assert.Less(t, elapsed, 5*time.Second, "cancelling ctx should end the fetch well under the default FetchMaxWait")
+	assert.GreaterOrEqual(t, elapsed, 250*time.Millisecond, "fetch should not resolve before ctx was actually canceled")
+}
+
 // TestJetStream_Fetch_NoGoroutineLeakOnEarlyAbandon locks down the
 // wrapMessageBatch buffering fix: batch is Fetch's own hard cap on message
 // count, so sizing the forwarding channel's buffer to batch lets the

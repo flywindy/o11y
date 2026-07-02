@@ -2,6 +2,7 @@ package nats
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/Marz32onE/instrumentation-go/otel-nats/oteljetstream"
@@ -26,13 +27,20 @@ import (
 // FetchedMessage type — required because a channel, unlike a callback or
 // iterator method, cannot return two separate values per delivery.
 //
-// Consume, Messages, and Fetch/FetchBytes/FetchNoWait also take a
-// registration-time ctx, consistent with the core Subscribe / QueueSubscribe
-// facade: it is checked once up front (an already-cancelled ctx is rejected)
-// but is NOT plumbed into the upstream call and does NOT cancel a running
-// consume/fetch — use ConsumeContext.Stop / MessagesContext.Stop|Drain, or let
-// the batch channel close, for that. Per-message trace context flows from the
-// message headers, not from this registration ctx (see ADR 0022 amendment).
+// Consume, Messages, and Fetch/FetchBytes/FetchNoWait also take a ctx. For
+// Consume and Messages it is a registration-time guard only, consistent with
+// the core Subscribe / QueueSubscribe facade: checked once up front (an
+// already-cancelled ctx is rejected) but NOT plumbed into the upstream call —
+// it does NOT cancel a running consume — use ConsumeContext.Stop /
+// MessagesContext.Stop|Drain for that. Fetch and FetchBytes go further: ctx
+// is also passed to the native call via jetstream.FetchContext, so cancelling
+// or timing out ctx after the call returns actually cancels the in-flight
+// pull and closes the batch channel early (falling back to the caller's own
+// FetchMaxWait, unmodified, when one is explicitly set — the two are mutually
+// exclusive upstream). FetchNoWait takes no FetchOpt in the native API, so
+// there is nothing to plumb ctx into; it remains a registration-time guard
+// only. Per-message trace context flows from the message headers, not from
+// this registration ctx (see ADR 0022 amendment).
 //
 // Scope: this facade wraps the JetStream surface o11y consumers use today
 // (stream/consumer management, Publish, and the pull consume modes Consume /
@@ -139,12 +147,18 @@ type Consumer interface {
 	Messages(ctx context.Context, opts ...jetstream.PullMessagesOpt) (MessagesContext, error)
 	// Fetch requests up to batch messages and returns immediately with a
 	// MessageBatch; messages (each paired with its consumer-span ctx) arrive
-	// on the returned channel as the server delivers them. ctx is a
-	// registration-time guard only, matching Consume / Messages.
+	// on the returned channel as the server delivers them. Unlike Consume /
+	// Messages, ctx is plumbed into the native pull request (via
+	// jetstream.FetchContext): cancelling or timing out ctx after Fetch
+	// returns ends the in-flight pull early and closes the batch channel,
+	// rather than only being checked once up front. If opts already contains
+	// jetstream.FetchMaxWait, that takes precedence and ctx reverts to a
+	// registration-time guard only — the two options are mutually exclusive
+	// in the native API.
 	Fetch(ctx context.Context, batch int, opts ...jetstream.FetchOpt) (MessageBatch, error)
 	// FetchBytes is the byte-budgeted variant of Fetch: the server stops
 	// delivering once maxBytes is reached rather than once batch messages
-	// have arrived.
+	// have arrived. ctx is plumbed into the native call exactly as for Fetch.
 	FetchBytes(ctx context.Context, maxBytes int, opts ...jetstream.FetchOpt) (MessageBatch, error)
 	// FetchNoWait requests up to batch currently-available messages and
 	// returns without waiting for more to arrive (no jetstream.FetchOpt —
@@ -299,7 +313,14 @@ func (c *consumer) Fetch(ctx context.Context, batch int, opts ...jetstream.Fetch
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("nats jetstream fetch: %w", err)
 	}
-	mb, err := c.c.Fetch(batch, opts...)
+	mb, err := c.c.Fetch(batch, fetchOptsWithCtx(ctx, opts)...)
+	if errors.Is(err, jetstream.ErrInvalidOption) {
+		// The native API rejects combining FetchContext with an explicit
+		// FetchMaxWait (see fetchOptsWithCtx) — the caller supplied their
+		// own FetchMaxWait, so defer to it exactly as before rather than
+		// erroring out because of our own ctx wiring.
+		mb, err = c.c.Fetch(batch, opts...)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -314,7 +335,10 @@ func (c *consumer) FetchBytes(ctx context.Context, maxBytes int, opts ...jetstre
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("nats jetstream fetch-bytes: %w", err)
 	}
-	mb, err := c.c.FetchBytes(maxBytes, opts...)
+	mb, err := c.c.FetchBytes(maxBytes, fetchOptsWithCtx(ctx, opts)...)
+	if errors.Is(err, jetstream.ErrInvalidOption) {
+		mb, err = c.c.FetchBytes(maxBytes, opts...)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -323,6 +347,23 @@ func (c *consumer) FetchBytes(ctx context.Context, maxBytes int, opts ...jetstre
 	// there is no buffer size that provably fits the whole batch — see the
 	// fetchBytesBatchBuf doc comment.
 	return wrapMessageBatch(mb, fetchBytesBatchBuf), nil
+}
+
+// fetchOptsWithCtx prepends jetstream.FetchContext(ctx) to opts so Fetch /
+// FetchBytes actually honor ctx cancellation and deadlines mid-fetch,
+// instead of only checking ctx.Err() once up front (see the package doc
+// comment for how that differs from Consume/Messages/FetchNoWait, which have
+// no native mechanism to plumb ctx into at all).
+//
+// The native API rejects combining FetchContext with an explicit
+// FetchMaxWait outright (regardless of option order — jetstream.pullConsumer
+// checks for both being set only after applying every opt), so this alone
+// isn't sufficient: each call site above must retry without this injection
+// (falling back to the caller's opts as-is) when that specific collision
+// error comes back, deferring to the caller's explicit FetchMaxWait exactly
+// as before this change.
+func fetchOptsWithCtx(ctx context.Context, opts []jetstream.FetchOpt) []jetstream.FetchOpt {
+	return append([]jetstream.FetchOpt{jetstream.FetchContext(ctx)}, opts...)
 }
 
 func (c *consumer) FetchNoWait(ctx context.Context, batch int) (MessageBatch, error) {

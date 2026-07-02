@@ -27,7 +27,14 @@ adopters can plan their upgrades.
   is safe for those two — the forwarding goroutine always drains the whole
   batch and exits on its own. `FetchBytes` has no message-count bound, so its
   buffer is a fixed best-effort size; see the new `examples/jetstream/fetch-worker`
-  for the full drain pattern and `docs/guide.md` for the full caveat.
+  for the full drain pattern and `docs/guide.md` for the full caveat. `Fetch`
+  and `FetchBytes` also plumb `ctx` into the native pull request via
+  `jetstream.FetchContext`, so cancelling `ctx` after the call returns ends
+  the fetch early instead of running to the default/`FetchMaxWait` timeout
+  (falls back to the caller's own `FetchMaxWait`, unmodified, when one is set
+  explicitly — the two are mutually exclusive upstream); `FetchNoWait` has no
+  `FetchOpt` to plumb `ctx` into, so it stays a registration-time guard only,
+  same as `Consume`/`Messages`.
 - `nats`: `Conn.Request` now closes the requester-side half of the
   request/reply round trip. When the reply carries a trace context (the
   responder replied via `Conn.Respond`), `Request` starts a `receive
