@@ -491,6 +491,57 @@ func TestJetStream_Fetch_CtxOptionCollision_NotSwallowed(t *testing.T) {
 		"the error should return immediately during option validation, not after falling back to a blocking fetch")
 }
 
+// TestJetStream_Fetch_FetchMaxWaitCollision_Retries locks down the actual
+// positive-path collision fetchWithCtxFallback exists for: a caller passing
+// both a live ctx and their own explicit jetstream.FetchMaxWait. Injecting
+// jetstream.FetchContext(ctx) unconditionally would make every such call
+// fail outright with jetstream.ErrInvalidOption ("cannot specify both
+// FetchContext and FetchMaxWait") — this asserts the retry recovers
+// transparently instead, deferring to the caller's FetchMaxWait, against an
+// empty consumer so the only thing that can end the batch is that FetchMaxWait
+// actually expiring (proving it's in effect, not merely that no error leaked).
+func TestJetStream_Fetch_FetchMaxWaitCollision_Retries(t *testing.T) {
+	_, url := startJetStreamServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	const streamName, subject, consumerName = "EVENTS_MAXWAITCOLLIDE", "events.maxwaitcollide.created", "maxwait-collide-test"
+	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	// ctx is live (no deadline, never cancelled) so FetchContext(ctx) is
+	// always injected first; jetstream.FetchMaxWait below is what collides
+	// with it and must win.
+	start := time.Now()
+	batch, err := cons.Fetch(context.Background(), 1, jetstream.FetchMaxWait(300*time.Millisecond))
+	require.NoError(t, err, "the FetchMaxWait collision should be retried transparently, not surfaced to the caller")
+
+	_, ok := <-batch.Messages()
+	elapsed := time.Since(start)
+	require.False(t, ok, "no message was ever published, the channel should close without delivering one")
+	require.NoError(t, batch.Error())
+
+	assert.GreaterOrEqual(t, elapsed, 250*time.Millisecond,
+		"should not resolve before the caller's own FetchMaxWait")
+	assert.Less(t, elapsed, 5*time.Second,
+		"should resolve close to the caller's 300ms FetchMaxWait, not the 30s default")
+}
+
 // TestJetStream_Fetch_ReceiveSpanEndsBeforeConsumption documents a known
 // trade-off of the goroutine-leak fix (see MessageBatch's doc comment):
 // buffering the forwarding channel to bufSize lets the forwarding goroutine

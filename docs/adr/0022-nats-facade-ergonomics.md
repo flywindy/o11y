@@ -556,7 +556,24 @@ matches on the specific `"cannot specify both FetchContext and FetchMaxWait"`
 message instead, so only that one collision falls back; every other invalid
 combination is returned to the caller as an error. Locked down by
 `TestJetStream_Fetch_CtxOptionCollision_NotSwallowed` (confirmed to fail
-against the sentinel-only match by temporarily reverting it).
+against the sentinel-only match by temporarily reverting it), and by
+`TestJetStream_Fetch_FetchMaxWaitCollision_Retries` for the positive case —
+a live ctx plus an explicit `FetchMaxWait` retries transparently and
+actually honors that `FetchMaxWait` (confirmed to fail the same way if the
+fallback is removed).
+
+**Upstream-upgrade note:** `isFetchMaxWaitCollision` couples to that exact
+upstream message string — there is no typed/sentinel error more specific
+than `jetstream.ErrInvalidOption` for this one collision (confirmed against
+`nats.go`'s source; `ErrInvalidOption` is shared by every option-validation
+rejection in the package). If a future `nats.go` upgrade rewords it, the
+fallback silently stops matching and any caller combining a live ctx with
+their own `FetchMaxWait` starts seeing a hard `ErrInvalidOption` instead of
+the transparent retry — both regression tests above would start failing
+(`TestJetStream_Fetch_FetchMaxWaitCollision_Retries` directly; the
+`NotSwallowed` test's `assert.NotContains` would still pass but the intent
+would be moot), which is the intended signal to check this string against the
+new `nats.go` release when bumping the `github.com/nats-io/nats.go` version.
 
 ### 2. `Conn.Request` closes the requester-side reply-link gap
 
