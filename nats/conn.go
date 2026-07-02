@@ -214,9 +214,10 @@ func (c *Conn) linkReply(ctx context.Context, subject string, reply *natsgo.Msg,
 	// a duplicate key (sdk/trace/span.go dedupeAttrsFromRecord), so ordering
 	// the SDK-owned base attrs after the caller-supplied ones guarantees they
 	// always win a collision, never silently get overwritten by it.
-	spanAttrs := make([]attribute.KeyValue, 0, len(extraAttrs)+5)
+	serverAttrs := c.ServerAttrs()
+	spanAttrs := make([]attribute.KeyValue, 0, len(extraAttrs)+5+len(serverAttrs))
 	spanAttrs = append(spanAttrs, extraAttrs...)
-	spanAttrs = append(spanAttrs, replyAttrs(subject, len(reply.Data))...)
+	spanAttrs = append(spanAttrs, replyAttrs(subject, len(reply.Data), serverAttrs)...)
 	_, span := tracer.Start(ctx, "receive "+subject,
 		trace.WithSpanKind(trace.SpanKindConsumer),
 		trace.WithAttributes(spanAttrs...),
@@ -227,8 +228,10 @@ func (c *Conn) linkReply(ctx context.Context, subject string, reply *natsgo.Msg,
 
 // replyAttrs builds the attributes for the requester-side reply-receive span
 // started by linkReply. Mirrors otelnats' own receiveAttrs shape (messaging
-// system/destination/operation, body size) so the new span reads consistently
-// with the "send"/"process"/"receive" spans otelnats already emits.
+// system/destination/operation, body size, server.address/server.port) so
+// the new span reads consistently with the "send"/"process"/"receive" spans
+// otelnats already emits — including being filterable by broker, per
+// docs/semconv.md's documented NATS attribute set.
 //
 // messaging.message.body.size is always included, even when bodySize is 0:
 // linkReply relies on every one of these base keys being present so a
@@ -236,13 +239,16 @@ func (c *Conn) linkReply(ctx context.Context, subject string, reply *natsgo.Msg,
 // this were only appended for a non-empty body, a caller-supplied
 // messaging.message.body.size would go unchallenged whenever the reply
 // happens to be empty, silently breaking the "built-in wins" guarantee for
-// that one key in that one case.
-func replyAttrs(subject string, bodySize int) []attribute.KeyValue {
-	return []attribute.KeyValue{
+// that one key in that one case. serverAttrs (server.address, and
+// server.port when non-default) come from the connection itself, so they
+// carry the same guarantee for the same reason.
+func replyAttrs(subject string, bodySize int, serverAttrs []attribute.KeyValue) []attribute.KeyValue {
+	attrs := []attribute.KeyValue{
 		semconv.MessagingSystemKey.String("nats"),
 		semconv.MessagingDestinationNameKey.String(subject),
 		semconv.MessagingOperationTypeKey.String("receive"),
 		semconv.MessagingOperationNameKey.String("receive"),
 		semconv.MessagingMessageBodySize(bodySize),
 	}
+	return append(attrs, serverAttrs...)
 }

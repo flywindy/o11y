@@ -172,6 +172,13 @@ the responder's reply-send span. No span is created if the reply has no
 headers or no valid trace context (untraced responder, or one that replied
 via the raw `msg.Respond` instead of `Conn.Respond`).
 
+One deviation from the table above: this span always emits
+`messaging.message.body.size` (even `0` for an empty reply), rather than
+omitting it for an empty payload — every base attribute on this span,
+including body size, must always be present so a caller-supplied
+`attrs` collision on any of them is always overridden (see `nats/conn.go`'s
+`replyAttrs`).
+
 ### Upstream NATS Trace-Event Attributes
 
 `otel-nats` also emits NATS-server infrastructure trace-event spans when the

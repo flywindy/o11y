@@ -320,6 +320,56 @@ func TestRequest_ReplyLink(t *testing.T) {
 	assert.True(t, found, "a %q consumer span should be recorded", "receive "+subject)
 }
 
+// TestRequest_ReplyLink_ServerAttrs verifies the reply-link span carries
+// server.address (and server.port, since the test server binds a random
+// non-default port), matching the "send"/"process"/"receive" spans otelnats
+// itself emits and the NATS attribute set docs/semconv.md documents — without
+// this, the reply-link span would be the one NATS span in a trace that can't
+// be filtered by broker.
+func TestRequest_ReplyLink_ServerAttrs(t *testing.T) {
+	enableNATSTracing(t)
+
+	_, url := startTestServer(t)
+	tp, prop, sr := newTestProviders()
+
+	responder, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer responder.Close()
+
+	requester, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer requester.Close()
+
+	subject := "test.reqreply.serverattrs"
+
+	_, err = responder.Subscribe(context.Background(), subject, func(ctx context.Context, msg *nats.Msg) {
+		assert.NoError(t, responder.Respond(ctx, msg, []byte("pong")))
+	})
+	require.NoError(t, err)
+	require.NoError(t, responder.NatsConn().FlushTimeout(2*time.Second))
+
+	reply, err := requester.Request(context.Background(), subject, []byte("ping"), 2*time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+
+	var found bool
+	for _, s := range sr.Ended() {
+		if s.Name() != "receive "+subject {
+			continue
+		}
+		var hasServerAddress bool
+		for _, a := range s.Attributes() {
+			if a.Key == semconv.ServerAddressKey {
+				hasServerAddress = true
+				assert.NotEmpty(t, a.Value.AsString())
+			}
+		}
+		assert.True(t, hasServerAddress, "reply-link span should carry server.address")
+		found = true
+	}
+	assert.True(t, found, "a %q consumer span should be recorded", "receive "+subject)
+}
+
 // TestRequest_ReplyLink_CustomAttrs verifies the variadic attrs on Request
 // land on the reply-link span. This is the hook applications use to make the
 // span searchable on domain identifiers the SDK cannot infer on its own

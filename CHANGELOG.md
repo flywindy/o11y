@@ -67,6 +67,21 @@ adopters can plan their upgrades.
   `Extract` were only ever used against each other. Both now use a
   case-sensitive carrier backed directly by `nats.Header`.
 
+### Breaking Changes (Migration Guide)
+
+- `nats.Conn.Request` gained a trailing variadic `attrs ...attribute.KeyValue`
+  parameter. Direct calls are unaffected (the parameter is optional), but a
+  variadic method has a different method type than a non-variadic one in Go:
+  code that assigns `conn.Request` to a `func(context.Context, string, []byte,
+  time.Duration) (*nats.Msg, error)`-shaped variable, or asserts `*nats.Conn`
+  against a hand-written interface with that exact method signature (a common
+  pattern for mocking in tests), needs the interface/variable type updated to
+  include the variadic parameter.
+- `nats.Consumer` gained three new methods (`Fetch`, `FetchBytes`,
+  `FetchNoWait`). Any test double/fake that implements `nats.Consumer` for
+  JetStream worker tests needs those three methods added to keep satisfying
+  the interface, even if the test doesn't exercise batch pull.
+
 ---
 
 ## [0.7.1] - 2026-06-23
