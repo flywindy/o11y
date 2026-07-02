@@ -69,6 +69,13 @@ function extractCarrierFromHeaders(msgHeaders) {
 // so a collision can never silently corrupt them. callback receives the
 // started span so it can read spanContext().traceId for its own correlation
 // needs (e.g. matching a locally pending producer span).
+//
+// callback may be sync or async: if it returns a thenable, the span stays
+// open until that promise settles (recording/rethrowing a rejection the same
+// way a thrown exception is handled) rather than ending immediately after
+// callback returns — otherwise the span would report a near-zero duration
+// covering only the synchronous kick-off of async dispatch work, not the
+// work itself.
 export function receiveWithSpan(msg, { name, attributes = {} }, callback) {
   const parentCtx = propagation.extract(ROOT_CONTEXT, extractCarrierFromHeaders(msg.headers));
   const span = tracer.startSpan(name, {
@@ -81,14 +88,35 @@ export function receiveWithSpan(msg, { name, attributes = {} }, callback) {
     },
   }, parentCtx);
 
-  try {
-    return callback(span);
-  } catch (err) {
+  const fail = (err) => {
     const message = err instanceof Error ? err.message : String(err);
     span.recordException(err instanceof Error ? err : new Error(message));
     span.setStatus({ code: SpanStatusCode.ERROR, message });
-    throw err;
-  } finally {
+  };
+
+  let result;
+  try {
+    result = callback(span);
+  } catch (err) {
+    fail(err);
     span.end();
+    throw err;
   }
+
+  if (result && typeof result.then === 'function') {
+    return result.then(
+      (value) => {
+        span.end();
+        return value;
+      },
+      (err) => {
+        fail(err);
+        span.end();
+        throw err;
+      },
+    );
+  }
+
+  span.end();
+  return result;
 }

@@ -229,15 +229,20 @@ func (c *Conn) linkReply(ctx context.Context, subject string, reply *natsgo.Msg,
 // started by linkReply. Mirrors otelnats' own receiveAttrs shape (messaging
 // system/destination/operation, body size) so the new span reads consistently
 // with the "send"/"process"/"receive" spans otelnats already emits.
+//
+// messaging.message.body.size is always included, even when bodySize is 0:
+// linkReply relies on every one of these base keys being present so a
+// caller-supplied attrs collision is always overridden (see linkReply) — if
+// this were only appended for a non-empty body, a caller-supplied
+// messaging.message.body.size would go unchallenged whenever the reply
+// happens to be empty, silently breaking the "built-in wins" guarantee for
+// that one key in that one case.
 func replyAttrs(subject string, bodySize int) []attribute.KeyValue {
-	attrs := []attribute.KeyValue{
+	return []attribute.KeyValue{
 		semconv.MessagingSystemKey.String("nats"),
 		semconv.MessagingDestinationNameKey.String(subject),
 		semconv.MessagingOperationTypeKey.String("receive"),
 		semconv.MessagingOperationNameKey.String("receive"),
+		semconv.MessagingMessageBodySize(bodySize),
 	}
-	if bodySize > 0 {
-		attrs = append(attrs, semconv.MessagingMessageBodySize(bodySize))
-	}
-	return attrs
 }

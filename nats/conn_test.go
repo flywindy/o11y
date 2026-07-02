@@ -416,6 +416,54 @@ func TestRequest_ReplyLink_BaseAttrsWinCollision(t *testing.T) {
 	assert.True(t, found, "a %q consumer span should be recorded", "receive "+subject)
 }
 
+// TestRequest_ReplyLink_EmptyBodyBaseAttrWinsCollision covers the edge case
+// TestRequest_ReplyLink_BaseAttrsWinCollision doesn't reach: an empty reply
+// body. replyAttrs must always include messaging.message.body.size (even
+// when bodySize is 0) so a caller-supplied collision on that specific key is
+// still overridden — omitting the base attribute whenever the body happens to
+// be empty would let a caller-supplied value through unchallenged in exactly
+// that case, breaking the "built-in wins" guarantee for that one key.
+func TestRequest_ReplyLink_EmptyBodyBaseAttrWinsCollision(t *testing.T) {
+	enableNATSTracing(t)
+
+	_, url := startTestServer(t)
+	tp, prop, sr := newTestProviders()
+
+	responder, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer responder.Close()
+
+	requester, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer requester.Close()
+
+	subject := "test.reqreply.emptybody"
+
+	_, err = responder.Subscribe(context.Background(), subject, func(ctx context.Context, msg *nats.Msg) {
+		assert.NoError(t, responder.Respond(ctx, msg, nil))
+	})
+	require.NoError(t, err)
+	require.NoError(t, responder.NatsConn().FlushTimeout(2*time.Second))
+
+	reply, err := requester.Request(context.Background(), subject, []byte("ping"), 2*time.Second,
+		semconv.MessagingMessageBodySize(999),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+	require.Empty(t, reply.Data, "responder replied with an empty body")
+
+	var found bool
+	for _, s := range sr.Ended() {
+		if s.Name() != "receive "+subject {
+			continue
+		}
+		assert.Contains(t, s.Attributes(), semconv.MessagingMessageBodySize(0),
+			"the SDK's own (zero) body size must win over a caller-supplied collision")
+		found = true
+	}
+	assert.True(t, found, "a %q consumer span should be recorded", "receive "+subject)
+}
+
 // TestRequest_NoReplyHeader_NoLinkSpan verifies Request degrades cleanly when
 // the reply carries no trace context — e.g. an untraced responder, or one
 // that replied with the raw msg.Respond instead of Conn.Respond. No span

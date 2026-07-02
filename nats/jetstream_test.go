@@ -205,13 +205,25 @@ func TestJetStream_Fetch_TracePropagation(t *testing.T) {
 	require.NoError(t, err)
 
 	var fetched o11ynats.FetchedMessage
-	select {
-	case fetched = <-batch.Messages():
-	case <-time.After(3 * time.Second):
-		t.Fatal("Fetch did not deliver a message within timeout")
+	var got int
+	timeout := time.After(3 * time.Second)
+drain:
+	for {
+		select {
+		case m, ok := <-batch.Messages():
+			if !ok {
+				break drain
+			}
+			fetched = m
+			got++
+		case <-timeout:
+			t.Fatal("Fetch did not deliver a message within timeout")
+		}
 	}
+	require.Equal(t, 1, got, "Fetch(ctx, 1) should deliver exactly one message")
 	require.NotNil(t, fetched.Msg)
 	require.NoError(t, fetched.Msg.Ack())
+	require.NoError(t, batch.Error(), "batch should complete without a terminal error")
 
 	gotTraceID := oteltrace.SpanFromContext(fetched.Ctx).SpanContext().TraceID()
 	assert.True(t, gotTraceID.IsValid(), "fetched message ctx should carry a valid trace ID")

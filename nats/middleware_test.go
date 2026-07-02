@@ -127,3 +127,28 @@ func TestExtract_LiteralCaseHeaderKey(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, wantTraceID, got.TraceID())
 }
+
+// TestExtract_CanonicalCaseHeaderKeyFallback locks down backward compatibility
+// with messages written by a pre-fix SDK version: before this package's
+// Inject switched to the case-sensitive headerCarrier, it went through
+// propagation.HeaderCarrier (http.Header-backed), which canonicalizes
+// "traceparent" to "Traceparent" on write. A JetStream message sitting
+// unconsumed in a durable stream across an SDK upgrade would carry that
+// canonicalized key; Extract must still find it via the MIME-canonical
+// fallback rather than silently losing the trace link.
+func TestExtract_CanonicalCaseHeaderKeyFallback(t *testing.T) {
+	prop := newProp()
+	msg := &gonnats.Msg{
+		Header: gonnats.Header{
+			"Traceparent": []string{"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"},
+		},
+	}
+
+	extracted := o11ynats.Extract(context.Background(), prop, msg)
+
+	got := trace.SpanContextFromContext(extracted)
+	require.True(t, got.IsValid(), "Extract must fall back to the MIME-canonical Traceparent key")
+	wantTraceID, err := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	require.NoError(t, err)
+	assert.Equal(t, wantTraceID, got.TraceID())
+}

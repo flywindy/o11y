@@ -2,6 +2,7 @@ package nats
 
 import (
 	"context"
+	"net/textproto"
 
 	"github.com/nats-io/nats.go"
 	"go.opentelemetry.io/otel/propagation"
@@ -22,7 +23,21 @@ type headerCarrier struct {
 	h nats.Header
 }
 
-func (c headerCarrier) Get(key string) string { return c.h.Get(key) }
+// Get looks up key verbatim first (the literal-case form otel-nats and this
+// package's own Inject write), then falls back to the MIME-canonical form.
+// The fallback exists for already-persisted JetStream messages written by a
+// pre-fix SDK version, whose Inject went through propagation.HeaderCarrier
+// (http.Header-backed, canonicalizing "traceparent" to "Traceparent") before
+// this case-sensitivity fix landed: without it, a message sitting unconsumed
+// in a durable stream across an SDK upgrade would silently lose its trace
+// link the moment this Extract runs, even though the header is present under
+// its canonicalized key.
+func (c headerCarrier) Get(key string) string {
+	if v := c.h.Get(key); v != "" {
+		return v
+	}
+	return c.h.Get(textproto.CanonicalMIMEHeaderKey(key))
+}
 
 func (c headerCarrier) Set(key, value string) { c.h.Set(key, value) }
 

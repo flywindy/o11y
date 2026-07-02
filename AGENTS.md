@@ -265,7 +265,7 @@ conn, err := o11ynats.Connect(ctx, natsURL, sdk.TracerProvider(), sdk.Propagator
 conn.Publish(ctx, "o11y.events", payload)
 
 // Subscribe — ctx in the handler already carries the publisher's trace.
-conn.Subscribe("o11y.events", func(ctx context.Context, msg *nats.Msg) {
+conn.Subscribe(ctx, "o11y.events", func(ctx context.Context, msg *nats.Msg) {
     _, span := tracer.Start(ctx, "process-event")
     defer span.End()
     slog.InfoContext(ctx, "received", slog.String("payload", string(msg.Data)))
@@ -279,7 +279,7 @@ base attributes and cannot be forked for this (ADR 0022), but its span
 accepts extra attributes like any other:
 
 ```go
-conn.Subscribe("o11y.events", func(ctx context.Context, msg *nats.Msg) {
+conn.Subscribe(ctx, "o11y.events", func(ctx context.Context, msg *nats.Msg) {
     trace.SpanFromContext(ctx).SetAttributes(
         attribute.String("app.room_id", roomID),
     )

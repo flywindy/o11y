@@ -871,9 +871,10 @@ creates no extra span and behaves exactly like a plain request/reply call.
 `conn.JetStream()` returns an o11y-owned JetStream handle. Configuration types
 (`StreamConfig`, `ConsumerConfig`, `AckExplicitPolicy`, publish/consume options)
 come from `github.com/nats-io/nats.go/jetstream` directly; callers never import
-the upstream instrumentation package. Consume callbacks and the `Messages` /
-`Next` iterators deliver the native `jetstream.Msg` plus a `ctx` carrying the
-consumer span — the same `(ctx, msg)` shape as core `Subscribe`.
+the upstream instrumentation package. Consume callbacks and the `Messages`
+pull iterator deliver the native `jetstream.Msg` plus a `ctx` carrying the
+consumer span — the same `(ctx, msg)` shape as core `Subscribe`. (Single-message
+`Consumer.Next` is a different case — deferred, not wrapped; see below.)
 
 ```go
 import "github.com/nats-io/nats.go/jetstream"
