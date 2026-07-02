@@ -55,7 +55,13 @@ adopters can plan their upgrades.
   (a request ID, a room/site ID) the SDK cannot infer on its own; a supplied
   attr that reuses one of the span's own base keys is dropped in favor of the
   base value, matching the `redis.WithAttributes` / `cassandra.WithAttributes`
-  "built-in wins" precedent elsewhere in the SDK.
+  "built-in wins" precedent elsewhere in the SDK. Known limitation (documented,
+  not code-worked-around): the reply-link span only lands in the same trace
+  as the call's own send span when `ctx` already carries an active span at
+  the `Request` call site — a bare `ctx` (e.g. a background worker's own
+  top-level request loop) gets two disconnected root traces tied together
+  only by a Link. Open a span before calling `Request` if that round trip
+  needs to appear as one trace; see `docs/guide.md`'s Request section.
 - `examples/nats-ws-browser`: extracted the inline browser receive-span logic
   into a reusable `receiveWithSpan(msg, { name, attributes }, callback)`
   helper in `src/tracing.js`, documented as the pattern for any nats.ws

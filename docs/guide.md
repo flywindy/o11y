@@ -866,6 +866,29 @@ reply publish. If the reply carries no trace context — an untraced responder,
 or one that used the raw `msg.Respond` instead of `conn.Respond` — `Request`
 creates no extra span and behaves exactly like a plain request/reply call.
 
+**Known limitation:** that full round trip only lands in *one* trace when
+`ctx` already carries an active span at the `conn.Request` call site — both
+the send span and the reply-link span are parented on the same `ctx`. Calling
+`conn.Request` from inside an HTTP handler or a message-consumer callback
+(where `ctx` already has one) works as described above. A bare `ctx`
+(`context.Background()`, or any `ctx` with no ambient span — e.g. a
+background worker's own top-level request loop) makes the send span and the
+reply-link span two disconnected root traces instead, tied together only by
+a Link rather than a shared trace. If your service makes request/reply calls
+from that kind of bare-ctx call site and you want the full round trip visible
+as one trace, open a span first:
+
+```go
+ctx, span := obs.Tracer("worker").Start(ctx, "request orders.get")
+defer span.End()
+reply, err := conn.Request(ctx, "orders.get", []byte("42"), 2*time.Second)
+```
+
+When auditing a service for this, check any request/reply call made from a
+background loop, cron job, or startup path rather than from within a handler
+or consumer callback — those are the call sites most likely to be passing a
+bare `ctx`.
+
 #### JetStream
 
 `conn.JetStream()` returns an o11y-owned JetStream handle. Configuration types

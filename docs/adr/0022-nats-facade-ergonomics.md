@@ -581,6 +581,50 @@ behaves exactly like the embedded method, so this is purely additive.
 attached to the reply-link span only (see item 4 below for why it can't reach
 the other spans in the exchange).
 
+**Known limitation, found in review (codex, 2026-07-02):** "child-of-ctx"
+only delivers a single shared trace when `ctx` already carries an active span
+at the `Request` call site. Both the embedded send span and the reply-link
+span are parented on the *same* `ctx` — so when `ctx` is bare
+(`context.Background()`, or any ctx with no ambient span), they become two
+disconnected root traces, correlated only by the Link, not by shared
+ancestry. This works exactly as advertised for the expected common case
+(`Request` called from inside an HTTP handler or a consumer callback, where
+`ctx` already has one), but silently degrades for a bare-ctx caller (e.g. a
+background worker's own top-level request loop) to "two separate one-hop
+traces, connected by a Link" rather than one cohesive round-trip trace.
+
+Considered and rejected two code-level fixes: (a) when `ctx` has no active
+span, parent the reply-link span on the trace context extracted from the
+reply instead of `ctx`, making it a real child of the responder's reply-send
+span — closes the gap without re-instrumentation, but introduces conditional
+parenting logic (different behavior depending on whether `ctx` already has a
+span) and nests the reply-link span under the responder's side of the trace
+rather than the requester's own call site, inconsistent with the "new trace +
+link, never actual parent" pattern this SDK uses for other async consumer
+spans; (b) stop delegating to embedded `otelnats.Conn.Request` and create the
+send span in this package instead, so both spans' parenting is controlled
+unconditionally — guarantees correlation in every case, but is a real T3
+re-instrumentation this ADR has deliberately avoided everywhere else (adds
+maintenance burden duplicating otel-nats's send-span/header-injection logic
+for a P2-severity gap).
+
+Decision: document the limitation rather than code around it (`Request`'s and
+`linkReply`'s doc comments in `nats/conn.go`, and `docs/guide.md`'s Request
+section), with the recommended workaround for affected callers — open a span
+before calling `Request`:
+
+```go
+ctx, span := tracer.Start(ctx, "request "+subject)
+defer span.End()
+reply, err := conn.Request(ctx, subject, payload, timeout)
+```
+
+Downstream services adopting this SDK should audit request/reply call sites
+made from a background loop, cron job, or startup path (not from within a
+handler or consumer callback) when upgrading, since those are the call sites
+most likely to be passing a bare `ctx` and losing round-trip trace
+correlation silently.
+
 ### 3. Browser receive-side helper — documented pattern, not new Go code
 
 A browser frontend on `nats.ws` is outside this SDK's surface (Go-only, per

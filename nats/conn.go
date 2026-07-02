@@ -172,6 +172,22 @@ func (c *Conn) Respond(ctx context.Context, msg *natsgo.Msg, data []byte) error 
 // of Conn.Respond), no span is created and reply is returned unchanged —
 // Request behaves exactly like the embedded method.
 //
+// Known limitation: the reply-link span lands in the same trace as this
+// call's own "send" span only when ctx already carries an active span when
+// Request is called — both the embedded send span and the reply-link span
+// are parented on the same ctx, so a bare ctx (context.Background(), or any
+// ctx with no ambient span) makes them two disconnected root traces, with
+// only a Link — not a shared trace — tying the reply-link span back to the
+// responder's reply-send span. Callers that need the full round trip visible
+// as one trace, and don't already have an ambient span at the call site
+// (e.g. a background worker's own top-level request loop, not a request
+// initiated from within an HTTP handler or a message-consumer callback),
+// should open one first:
+//
+//	ctx, span := tracer.Start(ctx, "request "+subject)
+//	defer span.End()
+//	reply, err := conn.Request(ctx, subject, payload, timeout)
+//
 // attrs are attached to the reply-link span as extra searchable attributes
 // (e.g. a request/correlation ID, a room/site ID) — domain identifiers the
 // SDK has no way to know on its own. They are ignored when no span is
@@ -195,6 +211,8 @@ func (c *Conn) Request(ctx context.Context, subject string, data []byte, timeout
 // linkReply starts and immediately ends a short CONSUMER-kind "receive"
 // span, as a child of ctx, linking to the trace context carried on reply's
 // headers (if any). It is a no-op when reply carries no valid trace context.
+// See Request's doc comment for the known limitation this ctx-parenting
+// implies when the caller's ctx has no ambient span of its own.
 //
 // Extraction uses headerCarrier (nats.Header's own case-sensitive Get), not
 // propagation.HeaderCarrier — the reply was written by otel-nats's Respond →
