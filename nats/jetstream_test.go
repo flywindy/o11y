@@ -2,6 +2,8 @@ package nats_test
 
 import (
 	"context"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -382,6 +384,72 @@ func TestJetStream_Fetch_ContextGuard(t *testing.T) {
 	require.Error(t, err)
 	_, err = cons.FetchNoWait(canceled, 1)
 	require.Error(t, err)
+}
+
+// TestJetStream_Fetch_NoGoroutineLeakOnEarlyAbandon locks down the
+// wrapMessageBatch buffering fix: batch is Fetch's own hard cap on message
+// count, so sizing the forwarding channel's buffer to batch lets the
+// background goroutine drain the entire upstream batch and exit on its own,
+// even when the caller reads only part of it and abandons the rest. Before
+// the fix, abandoning early left that goroutine blocked forever trying to
+// send the next message to nobody.
+func TestJetStream_Fetch_NoGoroutineLeakOnEarlyAbandon(t *testing.T) {
+	_, url := startJetStreamServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	const streamName, subject, consumerName = "EVENTS_LEAK", "events.leak.created", "leak-test"
+	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	const batchSize = 5
+	for i := 0; i < batchSize; i++ {
+		_, err = js.Publish(context.Background(), subject, []byte("m"))
+		require.NoError(t, err)
+	}
+	require.NoError(t, conn.NatsConn().FlushTimeout(2*time.Second))
+
+	batch, err := cons.Fetch(context.Background(), batchSize)
+	require.NoError(t, err)
+
+	// Read only the first message, then deliberately abandon the rest —
+	// nobody ever reads batch.Messages() again after this.
+	select {
+	case m, ok := <-batch.Messages():
+		require.True(t, ok, "batch should deliver at least one message")
+		require.NoError(t, m.Msg.Ack())
+	case <-time.After(3 * time.Second):
+		t.Fatal("Fetch did not deliver the first message within timeout")
+	}
+
+	// The forwarding goroutine must still finish and exit on its own: with
+	// the buffer sized to batchSize, it can drain the remaining messages
+	// into the buffer without a reader and then return. Check for its stack
+	// frame directly (rather than a raw runtime.NumGoroutine() count, which
+	// is too noisy here — the embedded NATS server's own background timers
+	// and expiration loops churn independently of anything this test does)
+	// so the assertion targets exactly the goroutine this fix is about.
+	assert.Eventually(t, func() bool {
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		return !strings.Contains(string(buf[:n]), "nats.wrapMessageBatch")
+	}, 3*time.Second, 20*time.Millisecond,
+		"wrapMessageBatch's forwarding goroutine should exit on its own after the batch is abandoned early, not leak")
 }
 
 // TestJetStream_Consume_NilHandler locks down the one validation guard the

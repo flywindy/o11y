@@ -66,15 +66,18 @@ type FetchedMessage struct {
 // range over the channel until it closes, then call Error for the terminal
 // batch error (matching the native jetstream.MessageBatch contract).
 //
-// Always drain Messages() to completion (range until the channel closes),
-// even if the caller only needs the first few messages of a larger batch.
-// Each message is forwarded onto the channel by a background goroutine one at
-// a time; abandoning the range early leaves that goroutine blocked on the
-// next send, with nothing left to receive it, until the underlying fetch's
-// own expiry elapses (unbounded for Fetch/FetchBytes unless a
-// jetstream.FetchMaxWait option is set). There is no Stop/cancel escape hatch
-// on MessageBatch — draining to completion is the only way to release it
-// promptly.
+// Each message is forwarded onto the channel by a background goroutine, into
+// a buffer sized to the request's own message-count bound where one exists.
+// For Fetch and FetchNoWait, batch is that bound, so the goroutine can always
+// drain the entire batch into the buffer and exit cleanly — abandoning
+// Messages() before reading everything is safe, no goroutine or message is
+// leaked. FetchBytes has no message-count bound (only a byte budget, which
+// an unbounded number of small messages could satisfy), so its buffer is a
+// best-effort fixed size: a batch with more messages than that can still
+// leave the forwarding goroutine blocked on a send with nothing left to
+// receive it, until the caller resumes reading or the process exits — there
+// is no Stop/cancel escape hatch on MessageBatch. Prefer Fetch/FetchNoWait
+// over FetchBytes when early abandonment is a realistic caller pattern.
 type MessageBatch interface {
 	Messages() <-chan FetchedMessage
 	Error() error
@@ -300,7 +303,11 @@ func (c *consumer) Fetch(ctx context.Context, batch int, opts ...jetstream.Fetch
 	if err != nil {
 		return nil, err
 	}
-	return wrapMessageBatch(mb), nil
+	// batch is Fetch's own hard cap on message count, so a same-sized buffer
+	// guarantees the forwarding goroutine below can drain the entire batch
+	// without blocking, even if the caller never reads Messages() at all —
+	// see wrapMessageBatch.
+	return wrapMessageBatch(mb, batch), nil
 }
 
 func (c *consumer) FetchBytes(ctx context.Context, maxBytes int, opts ...jetstream.FetchOpt) (MessageBatch, error) {
@@ -311,7 +318,11 @@ func (c *consumer) FetchBytes(ctx context.Context, maxBytes int, opts ...jetstre
 	if err != nil {
 		return nil, err
 	}
-	return wrapMessageBatch(mb), nil
+	// FetchBytes has no message-count cap (only a byte budget, which a
+	// single small message could satisfy many times over), so unlike Fetch
+	// there is no buffer size that provably fits the whole batch — see the
+	// fetchBytesBatchBuf doc comment.
+	return wrapMessageBatch(mb, fetchBytesBatchBuf), nil
 }
 
 func (c *consumer) FetchNoWait(ctx context.Context, batch int) (MessageBatch, error) {
@@ -322,14 +333,31 @@ func (c *consumer) FetchNoWait(ctx context.Context, batch int) (MessageBatch, er
 	if err != nil {
 		return nil, err
 	}
-	return wrapMessageBatch(mb), nil
+	// Same reasoning as Fetch: batch is a hard cap here too.
+	return wrapMessageBatch(mb, batch), nil
 }
+
+// fetchBytesBatchBuf is the best-effort forwarding buffer size for
+// FetchBytes (see wrapMessageBatch): unlike Fetch/FetchNoWait, FetchBytes has
+// no message-count bound to size the buffer against exactly, so this is a
+// judgment call sized for the common case (many small-to-medium messages
+// under a byte budget), not a guarantee. A batch with more messages than
+// this can still leave the forwarding goroutine blocked if the caller
+// abandons Messages() early — see the MessageBatch doc comment.
+const fetchBytesBatchBuf = 256
 
 // wrapMessageBatch adapts the upstream oteljetstream.MessageBatch (a channel
 // of oteljetstream.Msg) to the o11y MessageBatch (a channel of
 // FetchedMessage), forwarding each message's consumer-span ctx unchanged.
-func wrapMessageBatch(mb oteljetstream.MessageBatch) MessageBatch {
-	out := make(chan FetchedMessage)
+//
+// out is buffered to bufSize so the forwarding goroutine can drain the
+// upstream channel into the buffer and exit cleanly on its own, rather than
+// blocking forever on a send once the caller stops reading Messages() —
+// see the MessageBatch doc comment for the goroutine-leak this closes (fully,
+// when bufSize is a true upper bound on message count; best-effort
+// otherwise).
+func wrapMessageBatch(mb oteljetstream.MessageBatch, bufSize int) MessageBatch {
+	out := make(chan FetchedMessage, bufSize)
 	go func() {
 		defer close(out)
 		for m := range mb.Messages() {

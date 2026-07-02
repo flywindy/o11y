@@ -21,11 +21,13 @@ adopters can plan their upgrades.
   upstream `oteljetstream` package directly to get trace context, or got none
   at all. Each delivered message arrives as a `FetchedMessage{Ctx, Msg}` on
   the new `MessageBatch.Messages()` channel, mirroring the `(ctx, msg)` shape
-  `Consume`/`Messages` already deliver. `Messages()` must be drained to
-  completion — there is no `Stop`/cancel escape hatch, and abandoning the
-  range early leaves the forwarding goroutine blocked until the underlying
-  fetch's own expiry elapses; see the new `examples/jetstream/fetch-worker`
-  for the full pattern.
+  `Consume`/`Messages` already deliver. The forwarding channel is buffered to
+  each request's own message-count bound where one exists (`batch` for
+  `Fetch`/`FetchNoWait`), so abandoning `Messages()` before reading everything
+  is safe for those two — the forwarding goroutine always drains the whole
+  batch and exits on its own. `FetchBytes` has no message-count bound, so its
+  buffer is a fixed best-effort size; see the new `examples/jetstream/fetch-worker`
+  for the full drain pattern and `docs/guide.md` for the full caveat.
 - `nats`: `Conn.Request` now closes the requester-side half of the
   request/reply round trip. When the reply carries a trace context (the
   responder replied via `Conn.Respond`), `Request` starts a `receive

@@ -939,12 +939,17 @@ if err := batch.Error(); err != nil {
 `FetchNoWait` returns only currently-available messages and never blocks
 waiting for new ones.
 
-Always range `Messages()` to completion, even if you only need the first few
-messages of a batch. A background goroutine forwards one message at a time
-onto the channel; abandoning the loop early leaves it blocked on the next send
-with no reader, until the underlying fetch's own expiry elapses. `MessageBatch`
-has no `Stop`/cancel method — draining fully is the only way to release it
-promptly. `examples/jetstream/fetch-worker` shows the full pattern.
+A background goroutine forwards messages onto the channel, buffered to the
+request's own message-count bound where one exists. For `Fetch`/`FetchNoWait`,
+`batch` is that bound, so it's safe to abandon `Messages()` before reading
+everything — the goroutine drains the whole batch into the buffer and exits
+on its own either way. `FetchBytes` has no message-count bound (only a byte
+budget), so its buffer is a best-effort fixed size: a batch with more messages
+than that can still leave the goroutine blocked on a send with no reader.
+Prefer `Fetch`/`FetchNoWait` over `FetchBytes` when early abandonment is a
+realistic caller pattern; `MessageBatch` has no `Stop`/cancel method, so
+draining fully is the only way to guarantee prompt release in the `FetchBytes`
+case. `examples/jetstream/fetch-worker` shows the full drain pattern.
 
 Not yet wrapped (use a later facade addition or, if needed sooner, the upstream
 package directly): single-message `Consumer.Next` (upstream v0.2.11 returns the
