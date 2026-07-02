@@ -103,52 +103,44 @@ func TestInjectExtract_RoundTrip(t *testing.T) {
 	assert.Equal(t, spanID, got.SpanID(), "SpanID must survive round trip")
 }
 
-// TestExtract_LiteralCaseHeaderKey locks down the interop fix at the heart of
-// this package: Extract must read a header keyed by the literal lowercase
-// "traceparent" nats.go's case-sensitive Header uses — the exact form
-// otel-nats itself writes, and the form a W3C-compliant non-Go client (e.g.
-// the nats.ws browser example) would also use. Before this fix, Extract went
-// through propagation.HeaderCarrier, which is backed by http.Header and
-// canonicalizes lookups to "Traceparent", silently missing this header and
-// returning ctx unchanged instead of the extracted span context.
-func TestExtract_LiteralCaseHeaderKey(t *testing.T) {
-	prop := newProp()
-	msg := &gonnats.Msg{
-		Header: gonnats.Header{
-			"traceparent": []string{"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"},
-		},
-	}
-
-	extracted := o11ynats.Extract(context.Background(), prop, msg)
-
-	got := trace.SpanContextFromContext(extracted)
-	require.True(t, got.IsValid(), "Extract must read a literal-case lowercase traceparent header")
+// TestExtract_HeaderCasing locks down both halves of the interop fix at the
+// heart of this package: Extract must read a header keyed by the literal
+// lowercase "traceparent" nats.go's case-sensitive Header uses — the exact
+// form otel-nats itself writes, and the form a W3C-compliant non-Go client
+// (e.g. the nats.ws browser example) would also use (before this fix,
+// Extract went through propagation.HeaderCarrier, which is backed by
+// http.Header and canonicalizes lookups to "Traceparent", silently missing
+// this header). It must also still find the MIME-canonical "Traceparent" key
+// via fallback, for backward compatibility with messages written by a
+// pre-fix SDK version — a JetStream message sitting unconsumed in a durable
+// stream across an SDK upgrade would carry that canonicalized key, and
+// without the fallback would silently lose its trace link.
+func TestExtract_HeaderCasing(t *testing.T) {
 	wantTraceID, err := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
 	require.NoError(t, err)
-	assert.Equal(t, wantTraceID, got.TraceID())
-}
 
-// TestExtract_CanonicalCaseHeaderKeyFallback locks down backward compatibility
-// with messages written by a pre-fix SDK version: before this package's
-// Inject switched to the case-sensitive headerCarrier, it went through
-// propagation.HeaderCarrier (http.Header-backed), which canonicalizes
-// "traceparent" to "Traceparent" on write. A JetStream message sitting
-// unconsumed in a durable stream across an SDK upgrade would carry that
-// canonicalized key; Extract must still find it via the MIME-canonical
-// fallback rather than silently losing the trace link.
-func TestExtract_CanonicalCaseHeaderKeyFallback(t *testing.T) {
-	prop := newProp()
-	msg := &gonnats.Msg{
-		Header: gonnats.Header{
-			"Traceparent": []string{"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"},
-		},
+	tests := []struct {
+		name      string
+		headerKey string
+	}{
+		{name: "literal case", headerKey: "traceparent"},
+		{name: "MIME-canonical fallback", headerKey: "Traceparent"},
 	}
 
-	extracted := o11ynats.Extract(context.Background(), prop, msg)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prop := newProp()
+			msg := &gonnats.Msg{
+				Header: gonnats.Header{
+					tt.headerKey: []string{"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"},
+				},
+			}
 
-	got := trace.SpanContextFromContext(extracted)
-	require.True(t, got.IsValid(), "Extract must fall back to the MIME-canonical Traceparent key")
-	wantTraceID, err := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
-	require.NoError(t, err)
-	assert.Equal(t, wantTraceID, got.TraceID())
+			extracted := o11ynats.Extract(context.Background(), prop, msg)
+
+			got := trace.SpanContextFromContext(extracted)
+			require.True(t, got.IsValid(), "Extract must find the %s header", tt.headerKey)
+			assert.Equal(t, wantTraceID, got.TraceID())
+		})
+	}
 }

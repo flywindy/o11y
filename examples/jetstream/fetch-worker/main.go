@@ -31,6 +31,10 @@ const (
 	natsURL      = nats.DefaultURL
 	batchSize    = 5
 	fetchMaxWait = 3 * time.Second
+	// fetchErrorBackoff bounds the retry rate after a non-cancellation Fetch
+	// error, so a persistent failure (consumer deleted, auth failure, ...)
+	// doesn't spin the loop at full CPU logging the same error forever.
+	fetchErrorBackoff = 1 * time.Second
 )
 
 func metricsAddr(ctx context.Context) string {
@@ -138,7 +142,15 @@ func main() {
 				logger.InfoContext(ctx, "shutting down fetch worker")
 				return
 			}
+			// A persistent non-cancellation error (consumer deleted, auth
+			// failure, ...) would otherwise retry immediately forever,
+			// spinning the loop at full CPU and flooding the logs. This
+			// backoff still exits promptly on shutdown via ctx.Done().
 			logger.ErrorContext(ctx, "fetch failed", slog.Any("error", err))
+			select {
+			case <-time.After(fetchErrorBackoff):
+			case <-ctx.Done():
+			}
 			continue
 		}
 

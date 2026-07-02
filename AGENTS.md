@@ -292,7 +292,7 @@ conn.Subscribe(ctx, "o11y.events", func(ctx context.Context, msg *nats.Msg) {
 `conn.JetStream()` returns an o11y-owned facade (ADR 0022 Phase 2); configuration types come straight from `github.com/nats-io/nats.go/jetstream`, so callers never import the upstream `oteljetstream` package.
 
 ```go
-js, err := conn.JetStream()
+js, _ := conn.JetStream()
 
 // Idempotent stream creation — safe to call on every startup.
 js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{

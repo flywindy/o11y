@@ -926,7 +926,7 @@ if err != nil {
     return err
 }
 for m := range batch.Messages() {
-    slog.InfoContext(m.Ctx, "event", slog.String("subject", m.Msg.Subject()))
+    obs.Logger.InfoContext(m.Ctx, "event", slog.String("subject", m.Msg.Subject()))
     _ = m.Msg.Ack()
 }
 if err := batch.Error(); err != nil {
