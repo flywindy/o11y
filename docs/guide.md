@@ -1005,6 +1005,17 @@ package directly): single-message `Consumer.Next` (upstream v0.2.11 returns the
 producer's remote context, not the local receive span — use
 `cons.Messages(ctx, jetstream.PullMaxMessages(1))` for single fetch), push
 consumers, and ordered consumers.
+
+`Consume`/`Messages`/`Fetch`/`FetchBytes`/`FetchNoWait` extract per-message
+trace context entirely inside the vendored `oteljetstream` package, using a
+carrier that (unlike this SDK's own `Extract`) has no fallback for a
+canonicalized header key ("Traceparent" instead of the literal lowercase
+"traceparent" this SDK's own `Publish` always writes). A message written by a
+pre-`headerCarrier`-fix version of this SDK, or by any other canonicalizing
+producer, arrives unlinked from its producer's trace when consumed through
+any of these five methods — this facade has no hook into that internal
+extraction to fix it (ADR 0022 amendment, 2026-07-03). Self-resolves once
+such messages have drained from any durable streams.
 The **legacy** `nats.JetStreamContext` API (`js.PullSubscribe()` +
 `sub.FetchBatch()`) is a different, un-instrumented API; for it, propagate trace
 context manually with `nats.Inject` / `nats.Extract`.

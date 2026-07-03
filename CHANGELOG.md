@@ -111,6 +111,17 @@ adopters can plan their upgrades.
   the send/process spans for the same request/reply exchange. Fixed by
   passing the reply's own `Subject` (the inbox it was delivered to) through
   to `replyAttrs`.
+- `nats`: documented (not fixed — outside this package's control) that
+  `Consume`/`Messages`/`Fetch`/`FetchBytes`/`FetchNoWait` extract per-message
+  trace context entirely inside the vendored `oteljetstream` package, whose
+  own header carrier has no fallback for a canonicalized key ("Traceparent"),
+  unlike this package's own `Extract`. A message written by a
+  pre-`headerCarrier`-fix version of this SDK (or by any other canonicalizing
+  producer) arrives unlinked from its producer's trace when consumed through
+  those five methods. Self-resolves once such messages drain from any durable
+  streams; see `nats/jetstream.go`'s package doc comment and the ADR 0022
+  amendment for the full explanation of why this can't be fixed from this
+  facade without reimplementing `oteljetstream`'s consumer-span creation.
 
 ### Breaking Changes (Migration Guide)
 

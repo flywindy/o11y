@@ -722,3 +722,47 @@ approach `otelnats.HeaderCarrier` already uses — so extraction is correct
 against headers written by `otel-nats`, this package's own `Inject`, or any
 other W3C-compliant writer (e.g. the `nats.ws` browser client). Locked down
 by `TestExtract_HeaderCasing`.
+
+---
+
+## Amendment (2026-07-03) — header-casing fix's scope, found in review
+
+Item 5 above fixed this package's *own* `Inject`/`Extract` (used by the
+legacy `nats.JetStreamContext` API and internally by `Conn.Request`'s
+reply-link span). Codex correctly pointed out that scope doesn't cover
+everything: the JetStream consume paths this facade wraps —
+`Consumer.Consume` / `Messages` / `Fetch` / `FetchBytes` / `FetchNoWait` —
+extract per-message trace context entirely *inside* the vendored
+`oteljetstream` package, using its own `otelnats.HeaderCarrier`. Confirmed
+against the vendored source (`otelnats/propagation.go`): that carrier is
+case-sensitive with **no** MIME-canonical fallback — the doc comment on it
+even says "used by oteljetstream and by Conn internally," meaning it's the
+one carrier both the core and JetStream paths share, entirely inside the
+third-party package. This facade has no hook into that internal extraction:
+it calls `oteljetstream`'s public `Fetch`/`Consume`/etc. and receives back a
+`(ctx, msg)` pair with the span already built.
+
+Practical consequence: a message whose trace header sits under a
+canonicalized key ("Traceparent") rather than the literal lowercase
+"traceparent" this SDK's own `Publish` always writes — written by any
+pre-`headerCarrier`-fix version of this SDK, or by any other producer that
+canonicalizes — will not be linked to its producer's trace when consumed via
+any of the five methods above, even though this package's own `Extract` (item
+5) already handles that exact case correctly for the paths it owns.
+
+Considered and rejected fixing this: it would require reimplementing
+`oteljetstream`'s consumer-span creation ourselves so we control the header
+extraction — the same T3 re-instrumentation this ADR has consistently
+avoided (see the 2026-06-16 amendment §2 on `Consumer.Next`, and the
+2026-07-01 amendment's `Conn.Request` and `MessageBatch` span-lifecycle
+decisions, for the same reasoning applied elsewhere). No test was added
+locking this down, unlike other documented limitations in this ADR: this one
+lives entirely in vendored code, not in anything this package's own tests
+exercise, and constructing it cleanly would require bypassing this SDK's own
+`Publish` (which always injects its own literal-case header on top of
+whatever the caller pre-set) down to the raw `nats.go`/`jetstream` client —
+testing `otelnats`'s behavior, not this facade's. Documented instead, in
+`nats/jetstream.go`'s package doc comment and here. Self-resolves once
+messages predating the header-casing fix have drained from any durable
+streams; worth reporting upstream to `Marz32onE/instrumentation-go` as a
+`otelnats.HeaderCarrier` interop gap independent of this SDK.

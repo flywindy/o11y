@@ -43,6 +43,26 @@ import (
 // only. Per-message trace context flows from the message headers, not from
 // this registration ctx (see ADR 0022 amendment).
 //
+// Known limitation: the per-message trace-context extraction above is
+// performed entirely inside the vendored oteljetstream package, using its own
+// otelnats.HeaderCarrier — a case-sensitive, exact-match-only carrier with no
+// MIME-canonical fallback (unlike this package's own headerCarrier, see
+// nats/middleware.go). This facade has no hook into that internal extraction;
+// it only receives the (ctx, msg) pair oteljetstream has already constructed.
+// A message whose trace header is stored under a canonicalized key (e.g.
+// "Traceparent" rather than the literal lowercase "traceparent" this SDK's
+// own Publish always writes) — written by any pre-fix version of this SDK, or
+// by any other producer that canonicalizes — will not be linked to its
+// producer's trace when consumed via Consume/Messages/Fetch/FetchBytes/
+// FetchNoWait, even though this package's own Extract/Inject (used by the
+// legacy nats.JetStreamContext API and internally by Conn.Request's
+// reply-link span) already handles this correctly. Fixing this would require
+// reimplementing oteljetstream's consumer-span creation ourselves — the T3
+// re-instrumentation this ADR has deliberately avoided everywhere else — so
+// it is documented rather than worked around (ADR 0022 amendment,
+// 2026-07-03). Self-resolves once messages predating this SDK's header-
+// casing fix have drained from any durable streams.
+//
 // Scope: this facade wraps the JetStream surface o11y consumers use today
 // (stream/consumer management, Publish, and the pull consume modes Consume /
 // Messages / Fetch / FetchBytes / FetchNoWait). Deferred until a consumer
