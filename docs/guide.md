@@ -970,7 +970,12 @@ caller's own deadline without setting `FetchMaxWait`. If `opts` already
 includes an explicit `jetstream.FetchMaxWait`, that takes precedence (the two
 are mutually exclusive in the native API) and `ctx` reverts to a
 registration-time guard only, same as before. `FetchNoWait` takes no
-`FetchOpt`, so it stays a registration-time guard regardless.
+`FetchOpt`, so it stays a registration-time guard regardless. Passing your
+own `jetstream.FetchContext` in `opts` is unsupported and not detected —
+unlike `FetchMaxWait`, the native API has no double-set guard for it, so it
+silently overrides this `ctx` parameter's cancellation wiring with no error.
+Pass the `ctx` you want to govern cancellation as `Fetch`'s/`FetchBytes`' own
+`ctx` argument, never as a `FetchContext` opt.
 
 A background goroutine forwards messages onto the channel, buffered to the
 request's own message-count bound where one exists. For `Fetch`/`FetchNoWait`,

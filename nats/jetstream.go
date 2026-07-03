@@ -170,7 +170,12 @@ type Consumer interface {
 	// registration-time guard only — the two options are mutually exclusive
 	// in the native API. Any other invalid combination (e.g. a ctx deadline
 	// too tight for an explicit jetstream.FetchHeartbeat) is returned as an
-	// error rather than silently falling back to an unbounded fetch.
+	// error rather than silently falling back to an unbounded fetch. Passing
+	// your own jetstream.FetchContext in opts is unsupported and not
+	// detected: the native API has no double-set guard for that option (only
+	// for FetchMaxWait), so it silently overrides this ctx parameter's
+	// cancellation wiring with no error — pass the ctx you want to govern
+	// cancellation as this method's ctx argument, not as an opt.
 	Fetch(ctx context.Context, batch int, opts ...jetstream.FetchOpt) (MessageBatch, error)
 	// FetchBytes is the byte-budgeted variant of Fetch: the server stops
 	// delivering once maxBytes is reached rather than once batch messages
@@ -377,6 +382,15 @@ func (c *consumer) FetchBytes(ctx context.Context, maxBytes int, opts ...jetstre
 // retrying on any of those would silently drop the caller's real
 // cancellation/deadline instead of surfacing the actual problem — so those
 // are returned to the caller as-is.
+//
+// Not defended against: opts also containing the caller's own
+// jetstream.FetchContext. fetchOptsWithCtx always applies this package's
+// FetchContext(ctx) first, but unlike FetchMaxWait, the native pullRequest
+// has no "already set" guard for FetchContext — a later FetchContext in opts
+// just overwrites req.ctx with no error, silently taking over cancellation
+// from the ctx parameter Fetch/FetchBytes actually document as authoritative.
+// Callers should pass the ctx they want to govern cancellation as Fetch's/
+// FetchBytes' own ctx argument, never as a FetchContext opt.
 func fetchWithCtxFallback(ctx context.Context, opts []jetstream.FetchOpt, call func([]jetstream.FetchOpt) (oteljetstream.MessageBatch, error)) (oteljetstream.MessageBatch, error) {
 	mb, err := call(fetchOptsWithCtx(ctx, opts))
 	if isFetchMaxWaitCollision(err) {

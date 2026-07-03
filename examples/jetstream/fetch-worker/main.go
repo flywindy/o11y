@@ -134,20 +134,13 @@ func main() {
 		//    loop iteration) open for the library's default wait on every pass.
 		batch, err := consumer.Fetch(ctx, batchSize, jetstream.FetchMaxWait(fetchMaxWait))
 		if err != nil {
-			// A cancelled ctx makes Fetch fail immediately (not after
-			// fetchMaxWait), so without this check a shutdown signal arriving
-			// here (rather than being caught by the <-quit case above) would
-			// spin the loop at full CPU logging the same error forever.
-			if ctx.Err() != nil {
-				logger.InfoContext(ctx, "shutting down fetch worker")
-				return
-			}
-			// A persistent non-cancellation error (consumer deleted, auth
-			// failure, ...) would otherwise retry immediately forever,
-			// spinning the loop at full CPU and flooding the logs. ctx is
-			// only cancelled by main's deferred cancel() on return, so <-quit
-			// (not <-ctx.Done()) is what makes this backoff exit promptly on
-			// a SIGINT/SIGTERM that arrives mid-sleep.
+			// A persistent error (consumer deleted, auth failure, ...) would
+			// otherwise retry immediately forever, spinning the loop at full
+			// CPU and flooding the logs. ctx is only cancelled by main's
+			// deferred cancel() on return — which happens after this loop has
+			// already exited via one of the <-quit cases — so <-quit, not
+			// ctx.Done(), is what makes this backoff exit promptly on a
+			// SIGINT/SIGTERM that arrives mid-sleep.
 			logger.ErrorContext(ctx, "fetch failed", slog.Any("error", err))
 			select {
 			case <-time.After(fetchErrorBackoff):

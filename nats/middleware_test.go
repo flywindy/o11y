@@ -7,6 +7,7 @@ import (
 	gonnats "github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
@@ -143,4 +144,30 @@ func TestExtract_HeaderCasing(t *testing.T) {
 			assert.Equal(t, wantTraceID, got.TraceID())
 		})
 	}
+}
+
+// TestExtract_MultiValueBaggage locks down headerCarrier's propagation.
+// ValuesGetter support: propagation.Baggage.Extract type-asserts the carrier
+// against ValuesGetter and, when present, reads every repeated header
+// instance for "baggage" (propagation.HeaderCarrier, the type this package
+// replaced, implements ValuesGetter over http.Header — headerCarrier must
+// match that capability). Without a Values method, Baggage.Extract falls
+// back to single-value extraction via Get, silently dropping every baggage
+// member carried on a second or later "baggage" header instance. Here the
+// message carries two separate "baggage" header values (as a W3C-compliant
+// client splitting baggage across repeated header instances would), each
+// with one member; both must survive extraction.
+func TestExtract_MultiValueBaggage(t *testing.T) {
+	prop := newProp()
+	msg := &gonnats.Msg{
+		Header: gonnats.Header{
+			"baggage": []string{"k1=v1", "k2=v2"},
+		},
+	}
+
+	extracted := o11ynats.Extract(context.Background(), prop, msg)
+
+	bag := baggage.FromContext(extracted)
+	assert.Equal(t, "v1", bag.Member("k1").Value(), "first baggage header instance's member must survive")
+	assert.Equal(t, "v2", bag.Member("k2").Value(), "second baggage header instance's member must survive")
 }

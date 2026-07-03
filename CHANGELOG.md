@@ -91,6 +91,18 @@ adopters can plan their upgrades.
   lowercase key) — the bug was self-masked as long as both `Inject` and
   `Extract` were only ever used against each other. Both now use a
   case-sensitive carrier backed directly by `nats.Header`.
+- `nats`: the new case-sensitive header carrier didn't implement
+  `propagation.ValuesGetter` (`propagation.HeaderCarrier`, the type it
+  replaced, does), so `propagation.Baggage.Extract` silently fell back to
+  single-value extraction and dropped every baggage member after the first
+  whenever a message carried baggage split across more than one repeated
+  `baggage` header instance. Fixed by adding a `Values` method.
+- `examples/jetstream/fetch-worker`: removed a dead `ctx.Err() != nil` check
+  after a failed `Fetch` — `ctx` is only cancelled by `main`'s deferred
+  `cancel()`, which runs after the loop has already returned via `<-quit`, so
+  the branch could never fire; its misleading comment claimed otherwise.
+  Shutdown was already handled correctly by the `<-quit` cases elsewhere in
+  the loop, so this is a dead-code removal, not a behavior change.
 
 ### Breaking Changes (Migration Guide)
 

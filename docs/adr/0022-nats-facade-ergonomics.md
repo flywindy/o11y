@@ -562,6 +562,23 @@ a live ctx plus an explicit `FetchMaxWait` retries transparently and
 actually honors that `FetchMaxWait` (confirmed to fail the same way if the
 fallback is removed).
 
+**Not defended against, found in a self-review pass:** a caller passing their
+own `jetstream.FetchContext` directly in `opts` (redundant with, and
+different from, the `ctx` parameter `Fetch`/`FetchBytes` already take —
+unlikely, but nothing stops it). Unlike `FetchMaxWait`, the native
+`pullRequest` has no "already set" guard for `FetchContext`: `fetchOptsWithCtx`
+always applies this package's own `FetchContext(ctx)` first, so a
+caller-supplied `FetchContext` later in `opts` just silently overwrites
+`req.ctx`, taking over cancellation from the documented `ctx` parameter with
+no error. Detecting this from outside the `jetstream` package isn't possible
+without probing `pullRequest`'s unexported fields, which this facade
+deliberately doesn't reach into (see the header-carrier and `FetchMaxWait`
+decisions above for the same "wrap, don't reimplement" boundary). Documented
+as a caveat on `Consumer.Fetch`'s doc comment, `fetchWithCtxFallback`'s doc
+comment, and `docs/guide.md`'s Fetch section instead: pass the `ctx` meant to
+govern cancellation as the method's own `ctx` argument, not as a
+`FetchContext` opt.
+
 **Upstream-upgrade note:** `isFetchMaxWaitCollision` couples to that exact
 upstream message string — there is no typed/sentinel error more specific
 than `jetstream.ErrInvalidOption` for this one collision (confirmed against
@@ -704,4 +721,4 @@ directly by `nats.Header`'s own case-sensitive `Get`/`Set` — the same
 approach `otelnats.HeaderCarrier` already uses — so extraction is correct
 against headers written by `otel-nats`, this package's own `Inject`, or any
 other W3C-compliant writer (e.g. the `nats.ws` browser client). Locked down
-by `TestExtract_LiteralCaseHeaderKey`.
+by `TestExtract_HeaderCasing`.

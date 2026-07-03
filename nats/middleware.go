@@ -23,6 +23,11 @@ type headerCarrier struct {
 	h nats.Header
 }
 
+// Compile-time check that headerCarrier implements propagation.ValuesGetter,
+// the same way propagation.HeaderCarrier does — see Values for why this
+// matters.
+var _ propagation.ValuesGetter = headerCarrier{}
+
 // Get looks up key verbatim first (the literal-case form otel-nats and this
 // package's own Inject write), then falls back to the MIME-canonical form.
 // The fallback exists for already-persisted JetStream messages written by a
@@ -37,6 +42,22 @@ func (c headerCarrier) Get(key string) string {
 		return v
 	}
 	return c.h.Get(textproto.CanonicalMIMEHeaderKey(key))
+}
+
+// Values returns every value stored under key, checked the same
+// verbatim-then-canonical way as Get. propagation.Baggage.Extract type-asserts
+// the carrier against propagation.ValuesGetter and, when it's implemented,
+// reads every repeated header instance for "baggage" instead of only the
+// first (propagation.TextMapCarrier.Get returns a single string). Without
+// this method, headerCarrier would silently fall back to single-value
+// extraction and drop any baggage members carried on a second or later
+// "baggage" header instance — a real (if rare) capability regression from
+// propagation.HeaderCarrier, which implements ValuesGetter over http.Header.
+func (c headerCarrier) Values(key string) []string {
+	if v := c.h.Values(key); len(v) > 0 {
+		return v
+	}
+	return c.h.Values(textproto.CanonicalMIMEHeaderKey(key))
 }
 
 func (c headerCarrier) Set(key, value string) { c.h.Set(key, value) }
