@@ -13,6 +13,10 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+---
+
+## [0.8.0] - 2026-07-03
+
 ### Added
 
 - `nats`: JetStream `Consumer.Fetch` / `FetchBytes` / `FetchNoWait` are now
