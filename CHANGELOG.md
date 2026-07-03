@@ -103,6 +103,14 @@ adopters can plan their upgrades.
   the branch could never fire; its misleading comment claimed otherwise.
   Shutdown was already handled correctly by the `<-quit` cases elsewhere in
   the loop, so this is a dead-code removal, not a behavior change.
+- `nats`: `Conn.Request`'s reply-link span was missing
+  `messaging.message.conversation_id` (the request/reply inbox), even though
+  `docs/semconv.md` already documented it as part of this span's attribute
+  set and `otel-nats`'s own send span emits it via `msg.Reply`. Without it,
+  the reply-link span couldn't be correlated or filtered by inbox alongside
+  the send/process spans for the same request/reply exchange. Fixed by
+  passing the reply's own `Subject` (the inbox it was delivered to) through
+  to `replyAttrs`.
 
 ### Breaking Changes (Migration Guide)
 

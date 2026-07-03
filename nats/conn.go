@@ -233,9 +233,9 @@ func (c *Conn) linkReply(ctx context.Context, subject string, reply *natsgo.Msg,
 	// the SDK-owned base attrs after the caller-supplied ones guarantees they
 	// always win a collision, never silently get overwritten by it.
 	serverAttrs := c.ServerAttrs()
-	spanAttrs := make([]attribute.KeyValue, 0, len(extraAttrs)+5+len(serverAttrs))
+	spanAttrs := make([]attribute.KeyValue, 0, len(extraAttrs)+6+len(serverAttrs))
 	spanAttrs = append(spanAttrs, extraAttrs...)
-	spanAttrs = append(spanAttrs, replyAttrs(subject, len(reply.Data), serverAttrs)...)
+	spanAttrs = append(spanAttrs, replyAttrs(subject, reply.Subject, len(reply.Data), serverAttrs)...)
 	_, span := tracer.Start(ctx, "receive "+subject,
 		trace.WithSpanKind(trace.SpanKindConsumer),
 		trace.WithAttributes(spanAttrs...),
@@ -246,27 +246,30 @@ func (c *Conn) linkReply(ctx context.Context, subject string, reply *natsgo.Msg,
 
 // replyAttrs builds the attributes for the requester-side reply-receive span
 // started by linkReply. Mirrors otelnats' own receiveAttrs shape (messaging
-// system/destination/operation, body size, server.address/server.port) so
-// the new span reads consistently with the "send"/"process"/"receive" spans
-// otelnats already emits — including being filterable by broker, per
-// docs/semconv.md's documented NATS attribute set.
+// system/destination/operation, body size, conversation ID, server.address/
+// server.port) so the new span reads consistently with the "send"/"process"/
+// "receive" spans otelnats already emits — including being filterable by
+// broker and correlatable by request/reply inbox, per docs/semconv.md's
+// documented NATS attribute set.
 //
-// messaging.message.body.size is always included, even when bodySize is 0:
-// linkReply relies on every one of these base keys being present so a
-// caller-supplied attrs collision is always overridden (see linkReply) — if
-// this were only appended for a non-empty body, a caller-supplied
-// messaging.message.body.size would go unchallenged whenever the reply
-// happens to be empty, silently breaking the "built-in wins" guarantee for
-// that one key in that one case. serverAttrs (server.address, and
-// server.port when non-default) come from the connection itself, so they
-// carry the same guarantee for the same reason.
-func replyAttrs(subject string, bodySize int, serverAttrs []attribute.KeyValue) []attribute.KeyValue {
+// messaging.message.body.size and messaging.message.conversation_id are
+// always included — the latter even though reply.Subject (the inbox) is,
+// in practice, never empty for a valid reply. linkReply relies on every one
+// of these base keys being present so a caller-supplied attrs collision is
+// always overridden (see linkReply) — if either were only conditionally
+// appended, a caller-supplied value for that key would go unchallenged
+// whenever the condition happens to be false, silently breaking the
+// "built-in wins" guarantee for that one key in that one case. serverAttrs
+// (server.address, and server.port when non-default) come from the
+// connection itself, so they carry the same guarantee for the same reason.
+func replyAttrs(subject, conversationID string, bodySize int, serverAttrs []attribute.KeyValue) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{
 		semconv.MessagingSystemKey.String("nats"),
 		semconv.MessagingDestinationNameKey.String(subject),
 		semconv.MessagingOperationTypeKey.String("receive"),
 		semconv.MessagingOperationNameKey.String("receive"),
 		semconv.MessagingMessageBodySize(bodySize),
+		semconv.MessagingMessageConversationID(conversationID),
 	}
 	return append(attrs, serverAttrs...)
 }

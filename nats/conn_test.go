@@ -374,6 +374,52 @@ func TestRequest_ReplyLink_ServerAttrs(t *testing.T) {
 	assert.True(t, found, "a %q consumer span should be recorded", "receive "+subject)
 }
 
+// TestRequest_ReplyLink_ConversationID verifies the reply-link span carries
+// messaging.message.conversation_id set to the reply's own Subject (the
+// request/reply inbox NATS generated for this call) — the same value
+// otelnats' own send span emits via msg.Reply, and the key docs/semconv.md
+// documents as part of the attribute set this span reuses. Without it, the
+// reply-link span couldn't be correlated or filtered by inbox alongside the
+// send/process spans for the same request/reply exchange.
+func TestRequest_ReplyLink_ConversationID(t *testing.T) {
+	enableNATSTracing(t)
+
+	_, url := startTestServer(t)
+	tp, prop, sr := newTestProviders()
+
+	responder, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer responder.Close()
+
+	requester, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer requester.Close()
+
+	subject := "test.reqreply.conversationid"
+
+	_, err = responder.Subscribe(context.Background(), subject, func(ctx context.Context, msg *nats.Msg) {
+		assert.NoError(t, responder.Respond(ctx, msg, []byte("pong")))
+	})
+	require.NoError(t, err)
+	require.NoError(t, responder.NatsConn().FlushTimeout(2*time.Second))
+
+	reply, err := requester.Request(context.Background(), subject, []byte("ping"), 2*time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+	require.NotEmpty(t, reply.Subject, "a valid reply always carries the inbox subject it was delivered to")
+
+	var found bool
+	for _, s := range sr.Ended() {
+		if s.Name() != "receive "+subject {
+			continue
+		}
+		assert.Contains(t, s.Attributes(), semconv.MessagingMessageConversationID(reply.Subject),
+			"reply-link span should carry messaging.message.conversation_id set to the reply's inbox subject")
+		found = true
+	}
+	assert.True(t, found, "a %q consumer span should be recorded", "receive "+subject)
+}
+
 // TestRequest_ReplyLink_CustomAttrs verifies the variadic attrs on Request
 // land on the reply-link span. This is the hook applications use to make the
 // span searchable on domain identifiers the SDK cannot infer on its own
@@ -450,6 +496,7 @@ func TestRequest_ReplyLink_BaseAttrsWinCollision(t *testing.T) {
 
 	reply, err := requester.Request(context.Background(), subject, []byte("ping"), 2*time.Second,
 		semconv.MessagingSystemKey.String("not-nats"),
+		semconv.MessagingMessageConversationID("not-the-real-inbox"),
 		attribute.String("app.request_id", "req-123"),
 	)
 	require.NoError(t, err)
@@ -463,6 +510,8 @@ func TestRequest_ReplyLink_BaseAttrsWinCollision(t *testing.T) {
 		attrs := s.Attributes()
 		assert.Contains(t, attrs, semconv.MessagingSystemKey.String("nats"),
 			"the SDK's own messaging.system value must win over a caller-supplied collision")
+		assert.Contains(t, attrs, semconv.MessagingMessageConversationID(reply.Subject),
+			"the SDK's own conversation ID (the real reply inbox) must win over a caller-supplied collision")
 		assert.Contains(t, attrs, attribute.String("app.request_id", "req-123"),
 			"a non-colliding caller attr must still be attached")
 		found = true
