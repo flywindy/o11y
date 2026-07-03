@@ -11,6 +11,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -260,6 +261,348 @@ func TestRespond_TracePropagation(t *testing.T) {
 		return false
 	}, 2*time.Second, 10*time.Millisecond,
 		"a producer send span should be recorded for the reply publish, proving Respond uses the traced Publish path")
+}
+
+// TestRequest_ReplyLink verifies the requester-side gap closed by
+// Conn.Request (ADR 0022 amendment, 2026-07-01): once the reply carrying the
+// responder's trace context (injected by Conn.Respond) comes back, Request
+// must start a CONSUMER-kind span that links to that context, closing the
+// handler → requester leg of the round trip in the trace view.
+func TestRequest_ReplyLink(t *testing.T) {
+	enableNATSTracing(t)
+
+	_, url := startTestServer(t)
+	tp, prop, sr := newTestProviders()
+
+	responder, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer responder.Close()
+
+	requester, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer requester.Close()
+
+	subject := "test.reqreply.link"
+
+	_, err = responder.Subscribe(context.Background(), subject, func(ctx context.Context, msg *nats.Msg) {
+		assert.NoError(t, responder.Respond(ctx, msg, []byte("pong")))
+	})
+	require.NoError(t, err)
+	require.NoError(t, responder.NatsConn().FlushTimeout(2*time.Second))
+
+	tracer := tp.Tracer("test")
+	reqCtx, span := tracer.Start(context.Background(), "test-request")
+	requestTraceID := span.SpanContext().TraceID()
+
+	reply, err := requester.Request(reqCtx, subject, []byte("ping"), 2*time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+	span.End()
+
+	// The reply-receive span must be a child of the request's own trace (it
+	// runs synchronously right after Request returns, in the same local flow)
+	// while also carrying a link to the responder's reply-send span context —
+	// the cross-service correlation that makes the round trip visible.
+	var found bool
+	for _, s := range sr.Ended() {
+		if s.Name() != "receive "+subject {
+			continue
+		}
+		assert.Equal(t, requestTraceID, s.SpanContext().TraceID(),
+			"reply-receive span should stay in the requester's own trace")
+		require.Len(t, s.Links(), 1, "reply-receive span should carry exactly one link")
+		assert.True(t, s.Links()[0].SpanContext.IsValid(),
+			"the link should point at a valid remote span context")
+		assert.NotEqual(t, requestTraceID, s.Links()[0].SpanContext.TraceID(),
+			"the link should point at the responder's trace, not loop back to the requester's own")
+		found = true
+	}
+	assert.True(t, found, "a %q consumer span should be recorded", "receive "+subject)
+}
+
+// TestRequest_ReplyLink_ServerAttrs verifies the reply-link span carries
+// server.address (and server.port, since the test server binds a random
+// non-default port), matching the "send"/"process"/"receive" spans otelnats
+// itself emits and the NATS attribute set docs/semconv.md documents — without
+// this, the reply-link span would be the one NATS span in a trace that can't
+// be filtered by broker.
+func TestRequest_ReplyLink_ServerAttrs(t *testing.T) {
+	enableNATSTracing(t)
+
+	_, url := startTestServer(t)
+	tp, prop, sr := newTestProviders()
+
+	responder, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer responder.Close()
+
+	requester, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer requester.Close()
+
+	subject := "test.reqreply.serverattrs"
+
+	_, err = responder.Subscribe(context.Background(), subject, func(ctx context.Context, msg *nats.Msg) {
+		assert.NoError(t, responder.Respond(ctx, msg, []byte("pong")))
+	})
+	require.NoError(t, err)
+	require.NoError(t, responder.NatsConn().FlushTimeout(2*time.Second))
+
+	reply, err := requester.Request(context.Background(), subject, []byte("ping"), 2*time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+
+	var found bool
+	for _, s := range sr.Ended() {
+		if s.Name() != "receive "+subject {
+			continue
+		}
+		var hasServerAddress, hasServerPort bool
+		for _, a := range s.Attributes() {
+			if a.Key == semconv.ServerAddressKey {
+				hasServerAddress = true
+				assert.NotEmpty(t, a.Value.AsString())
+			}
+			if a.Key == semconv.ServerPortKey {
+				hasServerPort = true
+			}
+		}
+		assert.True(t, hasServerAddress, "reply-link span should carry server.address")
+		assert.True(t, hasServerPort, "reply-link span should carry server.port for a non-default port")
+		found = true
+	}
+	assert.True(t, found, "a %q consumer span should be recorded", "receive "+subject)
+}
+
+// TestRequest_ReplyLink_ConversationID verifies the reply-link span carries
+// messaging.message.conversation_id set to the reply's own Subject (the
+// request/reply inbox NATS generated for this call) — the same value
+// otelnats' own send span emits via msg.Reply, and the key docs/semconv.md
+// documents as part of the attribute set this span reuses. Without it, the
+// reply-link span couldn't be correlated or filtered by inbox alongside the
+// send/process spans for the same request/reply exchange.
+func TestRequest_ReplyLink_ConversationID(t *testing.T) {
+	enableNATSTracing(t)
+
+	_, url := startTestServer(t)
+	tp, prop, sr := newTestProviders()
+
+	responder, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer responder.Close()
+
+	requester, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer requester.Close()
+
+	subject := "test.reqreply.conversationid"
+
+	_, err = responder.Subscribe(context.Background(), subject, func(ctx context.Context, msg *nats.Msg) {
+		assert.NoError(t, responder.Respond(ctx, msg, []byte("pong")))
+	})
+	require.NoError(t, err)
+	require.NoError(t, responder.NatsConn().FlushTimeout(2*time.Second))
+
+	reply, err := requester.Request(context.Background(), subject, []byte("ping"), 2*time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+	require.NotEmpty(t, reply.Subject, "a valid reply always carries the inbox subject it was delivered to")
+
+	var found bool
+	for _, s := range sr.Ended() {
+		if s.Name() != "receive "+subject {
+			continue
+		}
+		assert.Contains(t, s.Attributes(), semconv.MessagingMessageConversationID(reply.Subject),
+			"reply-link span should carry messaging.message.conversation_id set to the reply's inbox subject")
+		found = true
+	}
+	assert.True(t, found, "a %q consumer span should be recorded", "receive "+subject)
+}
+
+// TestRequest_ReplyLink_CustomAttrs verifies the variadic attrs on Request
+// land on the reply-link span. This is the hook applications use to make the
+// span searchable on domain identifiers the SDK cannot infer on its own
+// (request/correlation ID, room ID, site ID, …).
+func TestRequest_ReplyLink_CustomAttrs(t *testing.T) {
+	enableNATSTracing(t)
+
+	_, url := startTestServer(t)
+	tp, prop, sr := newTestProviders()
+
+	responder, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer responder.Close()
+
+	requester, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer requester.Close()
+
+	subject := "test.reqreply.attrs"
+
+	_, err = responder.Subscribe(context.Background(), subject, func(ctx context.Context, msg *nats.Msg) {
+		assert.NoError(t, responder.Respond(ctx, msg, []byte("pong")))
+	})
+	require.NoError(t, err)
+	require.NoError(t, responder.NatsConn().FlushTimeout(2*time.Second))
+
+	reply, err := requester.Request(context.Background(), subject, []byte("ping"), 2*time.Second,
+		attribute.String("app.request_id", "req-123"),
+		attribute.String("app.room_id", "room-42"),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+
+	var found bool
+	for _, s := range sr.Ended() {
+		if s.Name() != "receive "+subject {
+			continue
+		}
+		attrs := s.Attributes()
+		assert.Contains(t, attrs, attribute.String("app.request_id", "req-123"))
+		assert.Contains(t, attrs, attribute.String("app.room_id", "room-42"))
+		found = true
+	}
+	assert.True(t, found, "a %q consumer span should be recorded", "receive "+subject)
+}
+
+// TestRequest_ReplyLink_BaseAttrsWinCollision verifies that a caller-supplied
+// attr reusing one of the span's own semconv keys cannot override it — the
+// same "built-in wins" guarantee redis.WithAttributes / cassandra.WithAttributes
+// document elsewhere in this SDK. Without this, a caller could silently
+// corrupt messaging.system/destination.name/operation.type/operation.name on
+// the reply-link span.
+func TestRequest_ReplyLink_BaseAttrsWinCollision(t *testing.T) {
+	enableNATSTracing(t)
+
+	_, url := startTestServer(t)
+	tp, prop, sr := newTestProviders()
+
+	responder, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer responder.Close()
+
+	requester, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer requester.Close()
+
+	subject := "test.reqreply.collision"
+
+	_, err = responder.Subscribe(context.Background(), subject, func(ctx context.Context, msg *nats.Msg) {
+		assert.NoError(t, responder.Respond(ctx, msg, []byte("pong")))
+	})
+	require.NoError(t, err)
+	require.NoError(t, responder.NatsConn().FlushTimeout(2*time.Second))
+
+	reply, err := requester.Request(context.Background(), subject, []byte("ping"), 2*time.Second,
+		semconv.MessagingSystemKey.String("not-nats"),
+		semconv.MessagingMessageConversationID("not-the-real-inbox"),
+		attribute.String("app.request_id", "req-123"),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+
+	var found bool
+	for _, s := range sr.Ended() {
+		if s.Name() != "receive "+subject {
+			continue
+		}
+		attrs := s.Attributes()
+		assert.Contains(t, attrs, semconv.MessagingSystemKey.String("nats"),
+			"the SDK's own messaging.system value must win over a caller-supplied collision")
+		assert.Contains(t, attrs, semconv.MessagingMessageConversationID(reply.Subject),
+			"the SDK's own conversation ID (the real reply inbox) must win over a caller-supplied collision")
+		assert.Contains(t, attrs, attribute.String("app.request_id", "req-123"),
+			"a non-colliding caller attr must still be attached")
+		found = true
+	}
+	assert.True(t, found, "a %q consumer span should be recorded", "receive "+subject)
+}
+
+// TestRequest_ReplyLink_EmptyBodyBaseAttrWinsCollision covers the edge case
+// TestRequest_ReplyLink_BaseAttrsWinCollision doesn't reach: an empty reply
+// body. replyAttrs must always include messaging.message.body.size (even
+// when bodySize is 0) so a caller-supplied collision on that specific key is
+// still overridden — omitting the base attribute whenever the body happens to
+// be empty would let a caller-supplied value through unchallenged in exactly
+// that case, breaking the "built-in wins" guarantee for that one key.
+func TestRequest_ReplyLink_EmptyBodyBaseAttrWinsCollision(t *testing.T) {
+	enableNATSTracing(t)
+
+	_, url := startTestServer(t)
+	tp, prop, sr := newTestProviders()
+
+	responder, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer responder.Close()
+
+	requester, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer requester.Close()
+
+	subject := "test.reqreply.emptybody"
+
+	_, err = responder.Subscribe(context.Background(), subject, func(ctx context.Context, msg *nats.Msg) {
+		assert.NoError(t, responder.Respond(ctx, msg, nil))
+	})
+	require.NoError(t, err)
+	require.NoError(t, responder.NatsConn().FlushTimeout(2*time.Second))
+
+	reply, err := requester.Request(context.Background(), subject, []byte("ping"), 2*time.Second,
+		semconv.MessagingMessageBodySize(999),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+	require.Empty(t, reply.Data, "responder replied with an empty body")
+
+	var found bool
+	for _, s := range sr.Ended() {
+		if s.Name() != "receive "+subject {
+			continue
+		}
+		assert.Contains(t, s.Attributes(), semconv.MessagingMessageBodySize(0),
+			"the SDK's own (zero) body size must win over a caller-supplied collision")
+		found = true
+	}
+	assert.True(t, found, "a %q consumer span should be recorded", "receive "+subject)
+}
+
+// TestRequest_NoReplyHeader_NoLinkSpan verifies Request degrades cleanly when
+// the reply carries no trace context — e.g. an untraced responder, or one
+// that replied with the raw msg.Respond instead of Conn.Respond. No span
+// should be created, and Request must still return the reply as-is.
+func TestRequest_NoReplyHeader_NoLinkSpan(t *testing.T) {
+	enableNATSTracing(t)
+
+	_, url := startTestServer(t)
+	tp, prop, sr := newTestProviders()
+
+	responder, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer responder.Close()
+
+	requester, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer requester.Close()
+
+	subject := "test.reqreply.nolink"
+
+	// Reply via the raw NATS msg.Respond, which does not inject trace headers.
+	_, err = responder.Subscribe(context.Background(), subject, func(_ context.Context, msg *nats.Msg) {
+		assert.NoError(t, msg.Respond([]byte("pong")))
+	})
+	require.NoError(t, err)
+	require.NoError(t, responder.NatsConn().FlushTimeout(2*time.Second))
+
+	reply, err := requester.Request(context.Background(), subject, []byte("ping"), 2*time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+	assert.Equal(t, "pong", string(reply.Data))
+
+	for _, s := range sr.Ended() {
+		assert.NotEqual(t, "receive "+subject, s.Name(),
+			"no reply-receive span should be recorded when the reply carries no trace context")
+	}
 }
 
 // TestRespond_Validation locks down the registration-time guards on

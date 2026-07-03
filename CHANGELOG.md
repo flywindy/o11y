@@ -15,6 +15,58 @@ adopters can plan their upgrades.
 
 ### Added
 
+- `nats`: JetStream `Consumer.Fetch` / `FetchBytes` / `FetchNoWait` are now
+  wrapped (ADR 0022 amendment, 2026-07-01), closing the largest remaining
+  chat-integration gap — batch pull consumers previously had to import the
+  upstream `oteljetstream` package directly to get trace context, or got none
+  at all. Each delivered message arrives as a `FetchedMessage{Ctx, Msg}` on
+  the new `MessageBatch.Messages()` channel, mirroring the `(ctx, msg)` shape
+  `Consume`/`Messages` already deliver. The forwarding channel is buffered to
+  each request's own message-count bound where one exists (`batch` for
+  `Fetch`/`FetchNoWait`), so abandoning `Messages()` before reading everything
+  is safe for those two — the forwarding goroutine always drains the whole
+  batch and exits on its own. `FetchBytes` has no message-count bound, so its
+  buffer is a fixed best-effort size; see the new `examples/jetstream/fetch-worker`
+  for the full drain pattern and `docs/guide.md` for the full caveat. `Fetch`
+  and `FetchBytes` also plumb `ctx` into the native pull request via
+  `jetstream.FetchContext`, so cancelling `ctx` after the call returns ends
+  the fetch early instead of running to the default/`FetchMaxWait` timeout
+  (falls back to the caller's own `FetchMaxWait`, unmodified, when one is set
+  explicitly — the two are mutually exclusive upstream); `FetchNoWait` has no
+  `FetchOpt` to plumb `ctx` into, so it stays a registration-time guard only,
+  same as `Consume`/`Messages`. The fallback is scoped precisely to that one
+  collision (not any `jetstream.ErrInvalidOption`): pairing a tight ctx
+  deadline with an explicit `jetstream.FetchHeartbeat`, for example, triggers
+  a different native rejection, and is surfaced as an error rather than
+  silently falling back to an unbounded fetch that ignores the caller's
+  deadline. Documented caveat (no code change, upstream behavior): buffering
+  the forwarding channel means a batch message's receive span (`m.Ctx`) may
+  already be ended by the time your loop body runs for messages after the
+  first — `trace.SpanFromContext(m.Ctx).SetAttributes(...)` is unreliable
+  there; use log correlation or a child span instead, as
+  `examples/jetstream/fetch-worker` does.
+- `nats`: `Conn.Request` now closes the requester-side half of the
+  request/reply round trip. When the reply carries a trace context (the
+  responder replied via `Conn.Respond`), `Request` starts a `receive
+  {subject}` span, as a child of the caller's ctx, linking back to the
+  responder's reply-send span — previously the handler → requester leg was
+  invisible in Grafana Tempo. `Request` also takes an optional variadic
+  `attrs ...attribute.KeyValue` attached to that span, for domain identifiers
+  (a request ID, a room/site ID) the SDK cannot infer on its own; a supplied
+  attr that reuses one of the span's own base keys is dropped in favor of the
+  base value, matching the `redis.WithAttributes` / `cassandra.WithAttributes`
+  "built-in wins" precedent elsewhere in the SDK. Known limitation (documented,
+  not code-worked-around): the reply-link span only lands in the same trace
+  as the call's own send span when `ctx` already carries an active span at
+  the `Request` call site — a bare `ctx` (e.g. a background worker's own
+  top-level request loop) gets two disconnected root traces tied together
+  only by a Link. Open a span before calling `Request` if that round trip
+  needs to appear as one trace; see `docs/guide.md`'s Request section.
+- `examples/nats-ws-browser`: extracted the inline browser receive-span logic
+  into a reusable `receiveWithSpan(msg, { name, attributes }, callback)`
+  helper in `src/tracing.js`, documented as the pattern for any nats.ws
+  consumer that needs to appear correlated with a Go backend's distributed
+  trace. Same "built-in wins" collision protection as `Conn.Request` above.
 - `redis`: command-noise filtering (ADR 0013 amendment). The wrapper now
   unconditionally skips connection-lifecycle commands the go-redis client
   issues itself (`AUTH`, `HELLO`, `SELECT`, `READONLY`, and the auto-issued
@@ -27,6 +79,64 @@ adopters can plan their upgrades.
   without an active parent span (background probes, keepalive, topology
   refreshes). Both suppress the span and the `db.client.operation.duration`
   sample. Deliberate `CLIENT` subcommands such as `LIST` remain instrumented.
+
+### Fixed
+
+- `nats`: `Inject`/`Extract` (and the new `Conn.Request` reply-link
+  extraction) previously used `propagation.HeaderCarrier`, which
+  canonicalizes header keys to MIME form (`"traceparent"` →
+  `"Traceparent"`). `nats.Header.Get`/`Set` is case-sensitive with no
+  canonicalization, so this silently failed to read back headers written by
+  `otel-nats` itself (or by any other W3C-compliant writer using the literal
+  lowercase key) — the bug was self-masked as long as both `Inject` and
+  `Extract` were only ever used against each other. Both now use a
+  case-sensitive carrier backed directly by `nats.Header`.
+- `nats`: the new case-sensitive header carrier didn't implement
+  `propagation.ValuesGetter` (`propagation.HeaderCarrier`, the type it
+  replaced, does), so `propagation.Baggage.Extract` silently fell back to
+  single-value extraction and dropped every baggage member after the first
+  whenever a message carried baggage split across more than one repeated
+  `baggage` header instance. Fixed by adding a `Values` method.
+- `examples/jetstream/fetch-worker`: removed a dead `ctx.Err() != nil` check
+  after a failed `Fetch` — `ctx` is only cancelled by `main`'s deferred
+  `cancel()`, which runs after the loop has already returned via `<-quit`, so
+  the branch could never fire; its misleading comment claimed otherwise.
+  Shutdown was already handled correctly by the `<-quit` cases elsewhere in
+  the loop, so this is a dead-code removal, not a behavior change.
+- `nats`: `Conn.Request`'s reply-link span was missing
+  `messaging.message.conversation_id` (the request/reply inbox), even though
+  `docs/semconv.md` already documented it as part of this span's attribute
+  set and `otel-nats`'s own send span emits it via `msg.Reply`. Without it,
+  the reply-link span couldn't be correlated or filtered by inbox alongside
+  the send/process spans for the same request/reply exchange. Fixed by
+  passing the reply's own `Subject` (the inbox it was delivered to) through
+  to `replyAttrs`.
+- `nats`: documented (not fixed — outside this package's control) that
+  `Consume`/`Messages`/`Fetch`/`FetchBytes`/`FetchNoWait` extract per-message
+  trace context entirely inside the vendored `oteljetstream` package, whose
+  own header carrier has no fallback for a canonicalized key ("Traceparent"),
+  unlike this package's own `Extract`. A message written by a
+  pre-`headerCarrier`-fix version of this SDK (or by any other canonicalizing
+  producer) arrives unlinked from its producer's trace when consumed through
+  those five methods. Self-resolves once such messages drain from any durable
+  streams; see `nats/jetstream.go`'s package doc comment and the ADR 0022
+  amendment for the full explanation of why this can't be fixed from this
+  facade without reimplementing `oteljetstream`'s consumer-span creation.
+
+### Breaking Changes (Migration Guide)
+
+- `nats.Conn.Request` gained a trailing variadic `attrs ...attribute.KeyValue`
+  parameter. Direct calls are unaffected (the parameter is optional), but a
+  variadic method has a different method type than a non-variadic one in Go:
+  code that assigns `conn.Request` to a `func(context.Context, string, []byte,
+  time.Duration) (*nats.Msg, error)`-shaped variable, or asserts `*nats.Conn`
+  against a hand-written interface with that exact method signature (a common
+  pattern for mocking in tests), needs the interface/variable type updated to
+  include the variadic parameter.
+- `nats.Consumer` gained three new methods (`Fetch`, `FetchBytes`,
+  `FetchNoWait`). Any test double/fake that implements `nats.Consumer` for
+  JetStream worker tests needs those three methods added to keep satisfying
+  the interface, even if the test doesn't exercise batch pull.
 
 ---
 

@@ -7,6 +7,7 @@ import (
 	gonnats "github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
@@ -45,9 +46,11 @@ func TestInject_SetsTraceparentHeader(t *testing.T) {
 	o11ynats.Inject(ctx, prop, msg)
 
 	require.NotNil(t, msg.Header)
-	// nats.Header.Get is case-sensitive; the W3C propagator stores the key in
-	// MIME canonical form ("Traceparent") via propagation.HeaderCarrier.
-	assert.NotEmpty(t, msg.Header["Traceparent"], "traceparent header must be set")
+	// nats.Header.Get/Set is case-sensitive (unlike http.Header); Inject uses
+	// headerCarrier, which writes the literal-case key the W3C propagator
+	// passes in ("traceparent", lowercase per the W3C spec) with no MIME
+	// canonicalization, matching how otel-nats itself writes NATS headers.
+	assert.NotEmpty(t, msg.Header["traceparent"], "traceparent header must be set")
 }
 
 // TestInject_InitializesNilHeader verifies that Inject handles a nil Header map.
@@ -99,4 +102,72 @@ func TestInjectExtract_RoundTrip(t *testing.T) {
 	assert.True(t, got.IsValid(), "extracted span context must be valid")
 	assert.Equal(t, traceID, got.TraceID(), "TraceID must survive round trip")
 	assert.Equal(t, spanID, got.SpanID(), "SpanID must survive round trip")
+}
+
+// TestExtract_HeaderCasing locks down both halves of the interop fix at the
+// heart of this package: Extract must read a header keyed by the literal
+// lowercase "traceparent" nats.go's case-sensitive Header uses — the exact
+// form otel-nats itself writes, and the form a W3C-compliant non-Go client
+// (e.g. the nats.ws browser example) would also use (before this fix,
+// Extract went through propagation.HeaderCarrier, which is backed by
+// http.Header and canonicalizes lookups to "Traceparent", silently missing
+// this header). It must also still find the MIME-canonical "Traceparent" key
+// via fallback, for backward compatibility with messages written by a
+// pre-fix SDK version — a JetStream message sitting unconsumed in a durable
+// stream across an SDK upgrade would carry that canonicalized key, and
+// without the fallback would silently lose its trace link.
+func TestExtract_HeaderCasing(t *testing.T) {
+	wantTraceID, err := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	require.NoError(t, err)
+
+	tests := []struct {
+		name      string
+		headerKey string
+	}{
+		{name: "literal case", headerKey: "traceparent"},
+		{name: "MIME-canonical fallback", headerKey: "Traceparent"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prop := newProp()
+			msg := &gonnats.Msg{
+				Header: gonnats.Header{
+					tt.headerKey: []string{"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"},
+				},
+			}
+
+			extracted := o11ynats.Extract(context.Background(), prop, msg)
+
+			got := trace.SpanContextFromContext(extracted)
+			require.True(t, got.IsValid(), "Extract must find the %s header", tt.headerKey)
+			assert.Equal(t, wantTraceID, got.TraceID())
+		})
+	}
+}
+
+// TestExtract_MultiValueBaggage locks down headerCarrier's propagation.
+// ValuesGetter support: propagation.Baggage.Extract type-asserts the carrier
+// against ValuesGetter and, when present, reads every repeated header
+// instance for "baggage" (propagation.HeaderCarrier, the type this package
+// replaced, implements ValuesGetter over http.Header — headerCarrier must
+// match that capability). Without a Values method, Baggage.Extract falls
+// back to single-value extraction via Get, silently dropping every baggage
+// member carried on a second or later "baggage" header instance. Here the
+// message carries two separate "baggage" header values (as a W3C-compliant
+// client splitting baggage across repeated header instances would), each
+// with one member; both must survive extraction.
+func TestExtract_MultiValueBaggage(t *testing.T) {
+	prop := newProp()
+	msg := &gonnats.Msg{
+		Header: gonnats.Header{
+			"baggage": []string{"k1=v1", "k2=v2"},
+		},
+	}
+
+	extracted := o11ynats.Extract(context.Background(), prop, msg)
+
+	bag := baggage.FromContext(extracted)
+	assert.Equal(t, "v1", bag.Member("k1").Value(), "first baggage header instance's member must survive")
+	assert.Equal(t, "v2", bag.Member("k2").Value(), "second baggage header instance's member must survive")
 }

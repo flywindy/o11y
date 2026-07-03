@@ -120,9 +120,19 @@ On publish:
 2. Each key is copied to the NATS `MsgHdrs` object and sent with the message.
 3. The Go backend extracts those headers with `obs.Propagator.Extract` and starts `process-frontend-event` as a child span.
 
-On reply, the backend starts `send demo.frontend.replies`, explicitly injects that span context into a NATS message header, and publishes through the raw NATS connection. The browser subscriber extracts that header and starts `nats.receive` as a child span.
+On reply, the backend starts `send demo.frontend.replies`, explicitly injects that span context into a NATS message header, and publishes through the raw NATS connection. The browser subscriber extracts that header and starts `nats.receive` as a child span, via the `receiveWithSpan` helper in `src/tracing.js`.
 
 Note: the normal `o11ynats.Subscribe` and `conn.Publish` wrapper methods intentionally follow `otel-nats` behavior, including env-gated NATS instrumentation and OTel messaging correlation through span links. This example uses raw NATS subscribe/publish plus explicit extraction/injection because its purpose is to show one parent-child trace tree in Tempo.
+
+### `receiveWithSpan`: the reusable browser receive-side helper
+
+The o11y Go SDK only instruments Go NATS clients; a browser frontend on `nats.ws` has to extract trace context and start its own consumer span itself. `src/tracing.js` exports `receiveWithSpan(msg, { name, attributes }, callback)` as a small, reusable pattern for that:
+
+1. Extracts the `traceparent`/`tracestate` carried on `msg.headers` (nats.ws `MsgHdrs`) using `propagation.extract`.
+2. Starts a `SpanKind.CONSUMER` span named `name`, parented on the extracted context, with `messaging.system` / `messaging.operation.type` / `messaging.operation.name` set plus any caller-supplied `attributes` (e.g. `messaging.destination.name`, or app-specific fields like a room/site ID).
+3. Runs `callback(span)` — the actual message-handling / render-dispatch work — inside that span, recording and re-throwing any exception the callback throws, and always ending the span in a `finally`.
+
+`src/main.js`'s `listenForReplies` uses it for every inbound reply: the callback body is exactly the "decode payload, log it to the UI" render dispatch, wrapped by the span. Reuse this helper (or the same three-step pattern) for any other nats.ws consumer in a browser frontend that needs to appear correlated in the same distributed trace as its Go backend.
 
 ## Known limitations
 

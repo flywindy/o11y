@@ -816,6 +816,23 @@ if err != nil {
 defer func() { _ = sub.Drain() }() // gracefully drain on shutdown
 ```
 
+To make the *consumer* span itself searchable on domain identifiers the SDK
+has no way to know — a room ID, a site ID, a request ID pulled from the
+payload — set them on the span the handler was handed, via the standard OTel
+API. `conn.Subscribe`'s consumer span (and the JetStream consume spans below)
+are created and named by `otel-nats` and cannot take a caller-supplied name or
+be forked for extra baked-in attributes (ADR 0022 amendment, 2026-07-01), but
+any span accepts more attributes after the fact:
+
+```go
+sub, err := conn.Subscribe(ctx, "orders.created", func(ctx context.Context, msg *gonats.Msg) {
+    trace.SpanFromContext(ctx).SetAttributes(
+        attribute.String("app.order_id", orderID),
+    )
+    // ...
+})
+```
+
 For **request/reply**, reply with `conn.Respond` from inside the handler so the
 reply message carries trace context. Do not use `msg.Respond` — it routes
 through the raw NATS connection, skips header injection, and breaks reply-side
@@ -830,29 +847,57 @@ _, err = conn.Subscribe(ctx, "orders.get", func(ctx context.Context, msg *gonats
     }
 })
 
-// Requester: conn.Request injects the active trace into the request headers.
-// The reply returned here carries trace headers if the responder used
-// conn.Respond, but conn.Request does not extract them or create a requester-
-// side receive span.
+// Requester: conn.Request injects the active trace into the request headers,
+// then — when the reply carries a trace context (the responder used
+// conn.Respond) — starts a short "receive orders.get" span, as a child of
+// ctx, linking back to that context. attrs (optional, variadic) land on that
+// span: use them for domain identifiers the SDK has no way to know, such as
+// a request/correlation ID or a room/site ID, so the span is searchable.
+_, err = conn.Request(ctx, "orders.get", []byte("42"), 2*time.Second,
+    attribute.String("app.request_id", requestID),
+)
+```
+
+`Respond` guarantees the reply carries trace context, and `Request` completes
+the requester-side half of the round trip (ADR 0022 amendment, 2026-07-01): in
+Tempo you should see request publish, responder processing, responder reply
+publish, and a requester-side "receive orders.get" span linking back to the
+reply publish. If the reply carries no trace context — an untraced responder,
+or one that used the raw `msg.Respond` instead of `conn.Respond` — `Request`
+creates no extra span and behaves exactly like a plain request/reply call.
+
+**Known limitation:** that full round trip only lands in *one* trace when
+`ctx` already carries an active span at the `conn.Request` call site — both
+the send span and the reply-link span are parented on the same `ctx`. Calling
+`conn.Request` from inside an HTTP handler or a message-consumer callback
+(where `ctx` already has one) works as described above. A bare `ctx`
+(`context.Background()`, or any `ctx` with no ambient span — e.g. a
+background worker's own top-level request loop) makes the send span and the
+reply-link span two disconnected root traces instead, tied together only by
+a Link rather than a shared trace. If your service makes request/reply calls
+from that kind of bare-ctx call site and you want the full round trip visible
+as one trace, open a span first:
+
+```go
+ctx, span := obs.Tracer("worker").Start(ctx, "request orders.get")
+defer span.End()
 reply, err := conn.Request(ctx, "orders.get", []byte("42"), 2*time.Second)
 ```
 
-`Respond` guarantees the reply carries trace context; it does not complete the
-requester-side half of the round trip. In Tempo you should expect request
-publish, responder processing, and responder reply publish spans, but not a
-separate requester-side "received reply" span linked to that reply publish. That
-would require `Request` (or a future helper such as `RequestTraced`) to extract
-reply headers and start/link a receive span; ADR 0022 tracks that as a follow-up
-open question rather than part of Phase 1.
+When auditing a service for this, check any request/reply call made from a
+background loop, cron job, or startup path rather than from within a handler
+or consumer callback — those are the call sites most likely to be passing a
+bare `ctx`.
 
 #### JetStream
 
 `conn.JetStream()` returns an o11y-owned JetStream handle. Configuration types
 (`StreamConfig`, `ConsumerConfig`, `AckExplicitPolicy`, publish/consume options)
 come from `github.com/nats-io/nats.go/jetstream` directly; callers never import
-the upstream instrumentation package. Consume callbacks and the `Messages` /
-`Next` iterators deliver the native `jetstream.Msg` plus a `ctx` carrying the
-consumer span — the same `(ctx, msg)` shape as core `Subscribe`.
+the upstream instrumentation package. Consume callbacks and the `Messages`
+pull iterator deliver the native `jetstream.Msg` plus a `ctx` carrying the
+consumer span — the same `(ctx, msg)` shape as core `Subscribe`. (Single-message
+`Consumer.Next` is a different case — deferred, not wrapped; see below.)
 
 ```go
 import "github.com/nats-io/nats.go/jetstream"
@@ -892,11 +937,85 @@ graceful shutdown: its `MessagesContext` exposes `Drain()`, whereas the
 `Consume` `ConsumeContext` only exposes `Stop()` (an upstream limitation —
 `Stop()` interrupts in-flight pulls, leaving unacked messages to be redelivered).
 
+The batch pull forms — `cons.Fetch(ctx, batch, …)`, `cons.FetchBytes(ctx,
+maxBytes, …)`, `cons.FetchNoWait(ctx, batch)` — return a `MessageBatch` whose
+`Messages()` channel yields `FetchedMessage{Ctx, Msg}` pairs, mirroring the
+same `(ctx, msg)` shape delivered per message rather than per callback/iterator
+call:
+
+```go
+batch, err := cons.Fetch(ctx, 10) // up to 10 messages
+if err != nil {
+    return err
+}
+for m := range batch.Messages() {
+    obs.Logger.InfoContext(m.Ctx, "event", slog.String("subject", m.Msg.Subject()))
+    _ = m.Msg.Ack()
+}
+if err := batch.Error(); err != nil {
+    // terminal batch error, checked after the channel closes
+}
+```
+
+`FetchBytes` stops once `maxBytes` is reached *or* its wait expires — pass
+`jetstream.FetchMaxWait(d)` to bound how long an under-budget batch stays open.
+`FetchNoWait` returns only currently-available messages and never blocks
+waiting for new ones.
+
+Unlike `Consume`/`Messages`, `ctx` on `Fetch`/`FetchBytes` is more than a
+registration-time guard: it is also passed into the native pull request, so
+cancelling or timing out `ctx` after the call returns ends the in-flight
+fetch early and closes the batch channel — useful for bounding a fetch by the
+caller's own deadline without setting `FetchMaxWait`. If `opts` already
+includes an explicit `jetstream.FetchMaxWait`, that takes precedence (the two
+are mutually exclusive in the native API) and `ctx` reverts to a
+registration-time guard only, same as before. `FetchNoWait` takes no
+`FetchOpt`, so it stays a registration-time guard regardless. Passing your
+own `jetstream.FetchContext` in `opts` is unsupported and not detected —
+unlike `FetchMaxWait`, the native API has no double-set guard for it, so it
+silently overrides this `ctx` parameter's cancellation wiring with no error.
+Pass the `ctx` you want to govern cancellation as `Fetch`'s/`FetchBytes`' own
+`ctx` argument, never as a `FetchContext` opt.
+
+A background goroutine forwards messages onto the channel, buffered to the
+request's own message-count bound where one exists. For `Fetch`/`FetchNoWait`,
+`batch` is that bound, so it's safe to abandon `Messages()` before reading
+everything — the goroutine drains the whole batch into the buffer and exits
+on its own either way. `FetchBytes` has no message-count bound (only a byte
+budget), so its buffer is a best-effort fixed size: a batch with more messages
+than that can still leave the goroutine blocked on a send with no reader.
+Prefer `Fetch`/`FetchNoWait` over `FetchBytes` when early abandonment is a
+realistic caller pattern; `MessageBatch` has no `Stop`/cancel method, so
+draining fully is the only way to guarantee prompt release in the `FetchBytes`
+case. `examples/jetstream/fetch-worker` shows the full drain pattern.
+
+That same buffering has a tracing consequence: `m.Ctx`'s receive span may
+already be ended by the time your loop body runs it for message 2 and later
+in a batch (upstream ends message N's span as soon as its own internal
+forwarding reads message N+1, and buffering lets that race ahead of your
+processing) — so unlike the `Subscribe` pattern above,
+`trace.SpanFromContext(m.Ctx).SetAttributes(...)` is unreliable here. Two
+things still work: `obs.Logger.*Context(m.Ctx, ...)` log correlation (reads
+only the immutable trace/span IDs, not the span's live state), and starting
+your own child span via `tracer.Start(m.Ctx, ...)` for per-message work —
+the pattern `examples/jetstream/fetch-worker` actually uses.
+
 Not yet wrapped (use a later facade addition or, if needed sooner, the upstream
 package directly): single-message `Consumer.Next` (upstream v0.2.11 returns the
 producer's remote context, not the local receive span — use
-`cons.Messages(ctx, jetstream.PullMaxMessages(1))` for single fetch),
-`Fetch` / `FetchBytes` / `FetchNoWait`, push consumers, and ordered consumers.
+`cons.Messages(ctx, jetstream.PullMaxMessages(1))` for single fetch), push
+consumers, and ordered consumers.
+
+`Consume`/`Messages`/`Fetch`/`FetchBytes`/`FetchNoWait` extract per-message
+trace context entirely inside the vendored `oteljetstream` package, using a
+carrier that (unlike this SDK's own `Extract`) has no fallback for a
+canonicalized header key ("Traceparent" instead of the literal lowercase
+"traceparent" this SDK's own `Publish` always writes). A message written by a
+pre-`headerCarrier`-fix version of this SDK, or by any other canonicalizing
+producer, arrives unlinked from its producer's trace when consumed through
+any of these five methods — this facade has no hook into that internal
+extraction to fix it (ADR 0022 amendment, 2026-07-03). Self-resolves once
+such messages have drained from any durable streams.
 The **legacy** `nats.JetStreamContext` API (`js.PullSubscribe()` +
 `sub.FetchBatch()`) is a different, un-instrumented API; for it, propagate trace
 context manually with `nats.Inject` / `nats.Extract`.

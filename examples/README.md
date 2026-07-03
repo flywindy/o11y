@@ -229,17 +229,17 @@ go run examples/nats-core/requester/main.go
 
 The responder replies with `conn.Respond`, which routes the reply through the
 traced publish path so the reply message carries the responder's trace context
-(unlike raw `msg.Respond`). The requester uses `conn.Request` and logs the
-reply from its request span context.
+(unlike raw `msg.Respond`). The requester uses `conn.Request`, which extracts
+that trace context from the reply and starts a `receive {subject}` span, as a
+child of the request's own span, linking back to the responder's reply-send
+span (ADR 0022 amendment, 2026-07-01).
 
-This example proves reply header propagation, not a fully closed requester-side
-round trip. Today `conn.Request` returns the reply without extracting its
-headers or creating a requester-side receive span, so Tempo will show the
-request publish, responder processing, and traced reply publish, but not a
-separate "requester received reply" span linked back to the responder. That
-requester-side reply linkage is tracked as an ADR 0022 follow-up.
+This example demonstrates the full round trip: in Tempo you should see the
+request publish, responder processing, the responder's traced reply publish,
+and the requester's `receive o11y.rpc.greet` span carrying a link back to that
+reply publish — so the handler → requester leg is no longer a dead end.
 
-### JetStream (two terminals; requires JetStream-enabled NATS server)
+### JetStream (two or three terminals; requires JetStream-enabled NATS server)
 
 Requires NATS — apply and port-forward it as shown in the NATS Core section above if not already running.
 
@@ -255,12 +255,25 @@ go run examples/jetstream/publisher/main.go
 
 # Terminal 2 — subscriber attaches a durable consumer and processes messages
 go run examples/jetstream/subscriber/main.go
+
+# Terminal 3 (optional) — fetch-worker pulls the same stream in batches via its
+# own durable consumer; run it alongside or instead of Terminal 2
+go run examples/jetstream/fetch-worker/main.go
 ```
 
 The subscriber's `Consume` handler receives the native `jetstream.Msg` plus a
 `ctx` carrying the consumer span (linked to the publisher's trace), and config
 types come from `github.com/nats-io/nats.go/jetstream` — no upstream
 instrumentation import.
+
+The fetch-worker demonstrates the batch-pull path (`Consumer.Fetch`) instead of
+the push-style `Consume` the subscriber uses — the pattern a bulk-processing
+worker (e.g. syncing a batch of events to a search index per round trip) needs
+instead of one callback invocation per message. Each `FetchedMessage` on the
+returned `MessageBatch` channel pairs the native `jetstream.Msg` with the same
+kind of consumer-span `ctx` `Consume`/`Messages` deliver — range the channel to
+completion (as this example does) so the batch's forwarding goroutine isn't
+left blocked waiting for a reader that never comes back.
 
 ### NATS over WebSocket (browser)
 

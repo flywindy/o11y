@@ -1,6 +1,6 @@
 import { connect, StringCodec, headers } from 'nats.ws';
-import { propagation, context, trace, ROOT_CONTEXT, SpanKind, SpanStatusCode } from '@opentelemetry/api';
-import { tracer } from './tracing.js';
+import { propagation, context, trace, SpanKind, SpanStatusCode } from '@opentelemetry/api';
+import { tracer, receiveWithSpan } from './tracing.js';
 
 const NATS_WS_URL = 'ws://localhost:4223';
 const PUB_SUBJECT = 'demo.frontend.events';
@@ -51,23 +51,6 @@ function copyCarrierToHeaders(carrier) {
   return h;
 }
 
-function extractCarrierFromHeaders(msgHeaders) {
-  const carrier = {};
-  if (
-    msgHeaders &&
-    typeof msgHeaders.keys === 'function' &&
-    typeof msgHeaders.get === 'function'
-  ) {
-    for (const key of msgHeaders.keys()) {
-      const value = msgHeaders.get(key);
-      if (typeof value === 'string') {
-        carrier[key] = value;
-      }
-    }
-  }
-  return carrier;
-}
-
 function publish() {
   if (!nc) return;
 
@@ -115,32 +98,27 @@ function publish() {
 
 async function listenForReplies(sub) {
   for await (const msg of sub) {
-    const parentCtx = propagation.extract(ROOT_CONTEXT, extractCarrierFromHeaders(msg.headers));
-
-    const span = tracer.startSpan('nats.receive', {
-      kind: SpanKind.CONSUMER,
-      attributes: {
-        'messaging.system': 'nats',
-        'messaging.destination.name': SUB_SUBJECT,
-        'messaging.operation.type': 'receive',
-        'messaging.operation.name': 'receive',
-      },
-    }, parentCtx);
-
+    // receiveWithSpan (tracing.js) extracts the traceparent from msg.headers,
+    // starts a CONSUMER span linked into that trace, and wraps the callback —
+    // here, the render/log dispatch — inside it; it records/rethrows any
+    // callback error onto the span and always ends it.
+    let traceId;
     try {
-      if (!(msg.data instanceof Uint8Array)) {
-        throw new Error('invalid reply payload type');
-      }
-      addLogItem(`reply: "${codec.decode(msg.data)}"`, span.spanContext().traceId, 'received');
+      receiveWithSpan(msg, {
+        name: 'nats.receive',
+        attributes: { 'messaging.destination.name': SUB_SUBJECT },
+      }, (span) => {
+        traceId = span.spanContext().traceId;
+        if (!(msg.data instanceof Uint8Array)) {
+          throw new Error('invalid reply payload type');
+        }
+        addLogItem(`reply: "${codec.decode(msg.data)}"`, traceId, 'received');
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      addLogItem(`reply handling error: ${message}`, span.spanContext().traceId, 'error');
-      span.recordException(err instanceof Error ? err : new Error(message));
-      span.setStatus({ code: SpanStatusCode.ERROR, message });
+      addLogItem(`reply handling error: ${message}`, traceId, 'error');
     } finally {
-      span.end();
-      const traceId = span.spanContext().traceId;
-      const pending = pendingPublishSpans.get(traceId);
+      const pending = traceId && pendingPublishSpans.get(traceId);
       if (pending) {
         window.clearTimeout(pending.timeoutId);
         pending.span.end();
