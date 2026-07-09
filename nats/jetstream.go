@@ -213,8 +213,15 @@ type Consumer interface {
 	// carry one), matching the (ctx, msg) shape of Messages().Next — the
 	// receive span is already ended by the time Next returns, so start your
 	// own child span via tracer.Start(ctx, ...) for per-message work rather
-	// than enriching the receive span. ctx is plumbed into the native pull
-	// via the upstream layer, so cancelling it aborts the wait.
+	// than enriching the receive span.
+	//
+	// ctx semantics: a ctx DEADLINE is honored — the upstream layer converts
+	// it to jetstream.FetchMaxWait, so Next returns once the deadline passes.
+	// Live CANCELLATION is not: upstream checks ctx only before the native
+	// call (no jetstream.FetchContext is wired), so cancelling a
+	// deadline-less ctx mid-wait does not abort it. Bound the wait with a
+	// deadline (or a jetstream.FetchMaxWait opt) rather than relying on
+	// cancel; tracked upstream in docs/upstream-otel-nats.md.
 	Next(ctx context.Context, opts ...jetstream.FetchOpt) (context.Context, jetstream.Msg, error)
 	Info(ctx context.Context) (*jetstream.ConsumerInfo, error)
 	CachedInfo() *jetstream.ConsumerInfo
@@ -491,9 +498,21 @@ func wrapMessageBatch(mb oteljetstream.MessageBatch, bufSize int) MessageBatch {
 	done := make(chan struct{})
 	go func() {
 		defer close(out)
-		for m := range mb.Messages() {
+		for {
+			// Select on the upstream receive as well as the send: a batch
+			// still waiting for messages parks this goroutine on the receive,
+			// and Stop must release it (and close out) promptly from there
+			// too, not only when it is blocked on a full out buffer.
 			select {
-			case out <- FetchedMessage{Ctx: m.Ctx, Msg: m.Msg}:
+			case m, ok := <-mb.Messages():
+				if !ok {
+					return
+				}
+				select {
+				case out <- FetchedMessage{Ctx: m.Ctx, Msg: m.Msg}:
+				case <-done:
+					return
+				}
 			case <-done:
 				return
 			}

@@ -137,6 +137,36 @@ upstream release.
   the guide).
 - **Friction**: medium — API-shape discussion.
 
+#### F3. `Consumer.Next`: honor live ctx cancellation, not just the deadline
+
+- **What**: `tracedConsumer.Next` converts a ctx deadline to
+  `jetstream.FetchMaxWait` (`applyCtxDeadlineToFetchOpts`) but wires no
+  `jetstream.FetchContext`, so cancelling a deadline-less ctx mid-wait does
+  not abort the pull — only an up-front `ctx.Err()` check runs. Wire the ctx
+  itself (with the same FetchMaxWait-collision care the o11y facade applies
+  on Fetch/FetchBytes).
+- **Evidence**: v0.6.0 `oteljetstream/consumer_traced.go` (`Next` →
+  `applyCtxDeadlineToFetchOpts`).
+- **Unlocks**: the facade `Consumer.Next` doc can drop its "deadline yes,
+  cancellation no" caveat.
+- **Friction**: low-medium — behavior fix, needs the FetchContext/FetchMaxWait
+  mutual-exclusion handling.
+
+#### F4. Batch forwarding goroutine: select `done` on the receive side too
+
+- **What**: `newTracedMessageBatch` / `newDirectMessageBatch` check their
+  `done` channel only around the send; a goroutine parked on the
+  `raw.Messages()` receive (batch still waiting for messages) does not
+  observe `Stop()` until the native channel produces or closes. The o11y
+  facade fixed the identical pattern in its own wrapper
+  (`nats/jetstream.go` `wrapMessageBatch`); the same nested-select fix
+  applies upstream.
+- **Evidence**: v0.6.0 `oteljetstream/consumer.go` (`for msg := range
+  raw.Messages()` with `select` only on the send).
+- **Unlocks**: `MessageBatch.Stop()` becomes promptly effective end to end
+  (today the upstream leg can lag until the native pull expires).
+- **Friction**: low — mechanical, mirrors a fix already proven in the facade.
+
 #### R5. Batch receive-span lifecycle: end at handover
 
 - **What**: `newTracedMessageBatch` (and `MessagesContext.Next`) end message
@@ -184,8 +214,8 @@ the constant against the release tag would close the remaining gap from
 1. **Umbrella issue** on the upstream repo: link this document's items, state
    the intent to contribute, and ask the two blocking preferences (PR
    granularity; R1/R3 design direction).
-2. **Bundle A — consumer-path fixes** (F1, F2): low-friction PR with tests;
-   can go out immediately after the umbrella issue.
+2. **Bundle A — consumer-path fixes** (F1, F2, F3, F4): low-friction PR with
+   tests; can go out immediately after the umbrella issue.
 3. **Bundle B — configuration surface** (R1): issue-first; PR after ack.
 4. **Bundle C — request/reply API** (R2, R4): issue-first; PR after ack.
 5. R3, R5, D1–D3 ride the umbrella issue discussion until a direction exists.

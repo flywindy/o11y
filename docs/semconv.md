@@ -140,7 +140,7 @@ reply-link span (ADR 0022 amendment, 2026-07-01; superseded 2026-07-09). See
 | `messaging.system` | string | Constant `"nats"`. |
 | `messaging.destination.name` | string | NATS subject (e.g. `events.created`). |
 | `messaging.operation.type` | string | `send`, `receive`, or `process`. |
-| `messaging.operation.name` | string | `publish`, `receive`, or `process`. |
+| `messaging.operation.name` | string | `publish`, `request`, `receive`, or `process`. `request` is emitted (with operation.type `send`) on `Conn.Request`'s producer span since otel-nats v0.6.0; plain publishes stay `publish`. |
 | `messaging.message.body.size` | int | Emitted when payload is non-empty. |
 | `messaging.message.conversation_id` | string | Request/reply inbox, when present. |
 | `messaging.consumer.group.name` | string | Queue group, when present. |

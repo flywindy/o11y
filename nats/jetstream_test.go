@@ -148,6 +148,53 @@ func TestJetStream_Consume_DrainClosed(t *testing.T) {
 	}
 }
 
+// TestJetStream_FetchBytes_StopUnblocksWaitingBatch is the regression test
+// for MessageBatch.Stop releasing a batch that is still WAITING for messages
+// (empty stream, pull request open): the facade's forwarding goroutine parks
+// on the upstream channel receive in that state, so Stop must be selected on
+// the receive side too — without that, Messages() would not close until the
+// native pull expires (tens of seconds), despite Stop's contract.
+func TestJetStream_FetchBytes_StopUnblocksWaitingBatch(t *testing.T) {
+	_, url := startJetStreamServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	const streamName, subject, consumerName = "EVENTS_SU", "events.su.created", "stop-unblock-test"
+	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	// Nothing has been published: the batch stays open waiting for messages.
+	batch, err := cons.FetchBytes(context.Background(), 1024)
+	require.NoError(t, err)
+
+	// Give the forwarding goroutine a moment to park on the upstream receive,
+	// so Stop is exercised against the waiting state, not the setup window.
+	time.Sleep(100 * time.Millisecond)
+	batch.Stop()
+
+	select {
+	case _, ok := <-batch.Messages():
+		assert.False(t, ok, "Messages channel should close after Stop, not deliver")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Messages channel did not close promptly after Stop on a waiting batch")
+	}
+}
+
 // TestJetStream_Messages_TracePropagation exercises the pull-iterator path
 // (the one chat uses): Messages().Next() must yield a ctx carrying the consumer
 // span and the native jetstream.Msg.
