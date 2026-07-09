@@ -847,34 +847,36 @@ _, err = conn.Subscribe(ctx, "orders.get", func(ctx context.Context, msg *gonats
     }
 })
 
-// Requester: conn.Request injects the active trace into the request headers,
-// then — when the reply carries a trace context (the responder used
-// conn.Respond) — starts a short "receive orders.get" span, as a child of
-// ctx, linking back to that context. attrs (optional, variadic) land on that
-// span: use them for domain identifiers the SDK has no way to know, such as
-// a request/correlation ID or a room/site ID, so the span is searchable.
-_, err = conn.Request(ctx, "orders.get", []byte("42"), 2*time.Second,
-    attribute.String("app.request_id", requestID),
-)
+// Requester: conn.Request injects the active trace into the request headers.
+// Since otel-nats v0.6.0 the upstream layer also records the requester-side
+// reply-receive span itself: a "receive {inbox}" CONSUMER span that, when the
+// reply carries a trace context (the responder used conn.Respond), is
+// parented under — and linked to — the responder's reply-send context.
+_, err = conn.Request(ctx, "orders.get", []byte("42"), 2*time.Second)
 ```
 
-`Respond` guarantees the reply carries trace context, and `Request` completes
-the requester-side half of the round trip (ADR 0022 amendment, 2026-07-01): in
-Tempo you should see request publish, responder processing, responder reply
-publish, and a requester-side "receive orders.get" span linking back to the
+`Respond` guarantees the reply carries trace context, and upstream `Request`
+completes the requester-side half of the round trip: in Tempo you should see
+request publish, responder processing, responder reply publish, and a
+requester-side "receive {inbox}" span in the responder's trace, linked to the
 reply publish. If the reply carries no trace context — an untraced responder,
-or one that used the raw `msg.Respond` instead of `conn.Respond` — `Request`
-creates no extra span and behaves exactly like a plain request/reply call.
+or one that used the raw `msg.Respond` instead of `conn.Respond` — the
+receive span is still recorded (in the requester's own trace) but carries no
+link.
 
-**Known limitation:** that full round trip only lands in *one* trace when
-`ctx` already carries an active span at the `conn.Request` call site — both
-the send span and the reply-link span are parented on the same `ctx`. Calling
-`conn.Request` from inside an HTTP handler or a message-consumer callback
-(where `ctx` already has one) works as described above. A bare `ctx`
-(`context.Background()`, or any `ctx` with no ambient span — e.g. a
-background worker's own top-level request loop) makes the send span and the
-reply-link span two disconnected root traces instead, tied together only by
-a Link rather than a shared trace. If your service makes request/reply calls
+Migration note (pre-1.0 API change, otel-nats v0.6.0 upgrade): `Request`'s
+optional variadic `attrs` parameter was removed — the reply span is now
+created inside otel-nats, which has no caller-attribute injection point.
+Attach domain identifiers (request/correlation IDs, room/site IDs) to your
+own ambient span instead.
+
+**Known limitation:** the requester-side spans land in the caller's trace
+only when `ctx` already carries an active span at the `conn.Request` call
+site. Calling `conn.Request` from inside an HTTP handler or a
+message-consumer callback (where `ctx` already has one) works as described
+above. A bare `ctx` (`context.Background()`, or any `ctx` with no ambient
+span — e.g. a background worker's own top-level request loop) makes the send
+span a disconnected root trace. If your service makes request/reply calls
 from that kind of bare-ctx call site and you want the full round trip visible
 as one trace, open a span first:
 
@@ -932,10 +934,11 @@ context arrives on the handler's `ctx`, and you stop via `ConsumeContext.Stop` /
 `MessagesContext.Stop`/`Drain`.
 
 The pull-iterator form (`cons.Messages(ctx, …)` → `iter.Next()`) delivers the
-same `(ctx, msg)` per message. Prefer it when you need **drain-and-wait**
-graceful shutdown: its `MessagesContext` exposes `Drain()`, whereas the
-`Consume` `ConsumeContext` only exposes `Stop()` (an upstream limitation —
-`Stop()` interrupts in-flight pulls, leaving unacked messages to be redelivered).
+same `(ctx, msg)` per message. Since the otel-nats v0.6.0 upgrade, `Consume`'s
+`ConsumeContext` exposes the full native teardown surface — `Stop()`
+(immediate, discards buffered messages), `Drain()` (drain-and-wait), and
+`Closed()` (a channel to await full teardown) — so `Consume` no longer forces
+a choice between callback ergonomics and graceful shutdown.
 
 The batch pull forms — `cons.Fetch(ctx, batch, …)`, `cons.FetchBytes(ctx,
 maxBytes, …)`, `cons.FetchNoWait(ctx, batch)` — return a `MessageBatch` whose
@@ -982,12 +985,11 @@ request's own message-count bound where one exists. For `Fetch`/`FetchNoWait`,
 `batch` is that bound, so it's safe to abandon `Messages()` before reading
 everything — the goroutine drains the whole batch into the buffer and exits
 on its own either way. `FetchBytes` has no message-count bound (only a byte
-budget), so its buffer is a best-effort fixed size: a batch with more messages
-than that can still leave the goroutine blocked on a send with no reader.
-Prefer `Fetch`/`FetchNoWait` over `FetchBytes` when early abandonment is a
-realistic caller pattern; `MessageBatch` has no `Stop`/cancel method, so
-draining fully is the only way to guarantee prompt release in the `FetchBytes`
-case. `examples/jetstream/fetch-worker` shows the full drain pattern.
+budget), so its buffer is a best-effort fixed size. When abandoning a batch
+early, call `batch.Stop()` (added with the otel-nats v0.6.0 upgrade): it
+discards undelivered messages and releases both this facade's forwarding
+goroutine and the upstream one. Draining fully remains equally supported —
+`examples/jetstream/fetch-worker` shows the full drain pattern.
 
 That same buffering has a tracing consequence: `m.Ctx`'s receive span may
 already be ended by the time your loop body runs it for message 2 and later
@@ -1000,11 +1002,10 @@ only the immutable trace/span IDs, not the span's live state), and starting
 your own child span via `tracer.Start(m.Ctx, ...)` for per-message work —
 the pattern `examples/jetstream/fetch-worker` actually uses.
 
-Not yet wrapped (use a later facade addition or, if needed sooner, the upstream
-package directly): single-message `Consumer.Next` (upstream v0.2.11 returns the
-producer's remote context, not the local receive span — use
-`cons.Messages(ctx, jetstream.PullMaxMessages(1))` for single fetch), push
-consumers, and ordered consumers.
+Single-message `Consumer.Next` is wrapped since the otel-nats v0.6.0 upgrade
+(upstream fixed it to return the local receive-span context). Not yet wrapped
+(use a later facade addition or, if needed sooner, the upstream package
+directly): push consumers and ordered consumers.
 
 `Consume`/`Messages`/`Fetch`/`FetchBytes`/`FetchNoWait` extract per-message
 trace context entirely inside the vendored `oteljetstream` package, using a

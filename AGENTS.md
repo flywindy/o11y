@@ -128,7 +128,7 @@ go run examples/nats-core/subscriber/main.go
 go run examples/nats-core/publisher/main.go
 
 # Run the NATS Core request/reply examples (two terminals; responder replies via conn.Respond)
-# Export both gates first, or otel-nats v0.2.11 injects no traceparent (replies work but untraced):
+# Export both gates first, or otel-nats v0.6.0 stays on its untraced passthrough impl (replies work but untraced):
 export OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true OTEL_NATS_TRACING_ENABLED=true
 go run examples/nats-core/responder/main.go
 go run examples/nats-core/requester/main.go
@@ -243,7 +243,7 @@ Full ADR documents live in [`docs/adr/`](docs/adr/).
 | Log format strategy | Option B — align stdout `traceId`/`spanId` field names | Preserves existing log reading habits; minimal blast radius. See [ADR 0001](docs/adr/0001-log-format-strategy.md) |
 | Metrics strategy | Prometheus pull (default `:2112`) + OTLP push opt-in (`WithMetricsOTLPEndpoint`) | Prometheus pull requires zero Collector config; OTLP push covers serverless. Exemplars enabled by default (OTel SDK `SampledFilter`). See [ADR 0002](docs/adr/0002-metrics-strategy.md) |
 | Global state policy | SDK packages must not mutate OTel globals; third-party instrumentation libraries are verified per-version before adoption | See [ADR 0003](docs/adr/0003-global-state-policy.md) |
-| NATS integration | `github.com/Marz32onE/instrumentation-go/otel-nats` — verified at v0.2.11 not to mutate globals; wrapped by the `nats/` package | Covers NATS Core + all JetStream consumer patterns with OTel semconv v1.39.0. See [ADR 0004](docs/adr/0004-nats-integration.md) |
+| NATS integration | `github.com/akira-core/instrumentation-go/otel-nats` — verified at v0.6.0 not to mutate global providers/propagators (module path renamed from `Marz32onE` upstream); wrapped by the `nats/` package | Covers NATS Core + all JetStream consumer patterns with OTel semconv v1.39.0. See [ADR 0004](docs/adr/0004-nats-integration.md) |
 | MongoDB integration | `go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/v2/mongo/otelmongo` — wrapped by the `mongo/` package | Wires SDK providers explicitly through a driver `CommandMonitor`, emits command spans and operation metrics, adds SDK-owned connection-pool metrics through `PoolMonitor`, and does not inject `_oteltrace` into persisted documents. See [ADR 0014](docs/adr/0014-mongodb-metrics.md) and [ADR 0021](docs/adr/0021-mongodb-instrumentation-mechanism.md) |
 | Semconv version policy | Pin v1.39.0; upgrade only when concrete triggers fire | Single SDK-owned pin avoids cognitive cost and dashboard breakage. Upgrade triggers and process documented to keep version moves deliberate. See [ADR 0006](docs/adr/0006-semconv-upgrade-strategy.md) |
 | HTTP integration | `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` — wrapped by the `http/` package | Provides `NewServerHandler` and `NewTransport` with SDK providers and propagator wired explicitly. See [ADR 0009](docs/adr/0009-replace-http-with-otelhttp.md) |

@@ -123,16 +123,15 @@ package is the authoritative source and changes across contrib versions.
 ## Messaging - NATS (package `github.com/flywindy/o11y/nats`)
 
 Spans are emitted by
-`github.com/Marz32onE/instrumentation-go/otel-nats` v0.2.11 (Core Subscribe /
-Publish / Request, and JetStream Consume / Messages / Fetch / FetchBytes /
-FetchNoWait). The upstream package imports
-`go.opentelemetry.io/otel/semconv/v1.39.0`.
+`github.com/akira-core/instrumentation-go/otel-nats` v0.6.0 (Core Subscribe /
+Publish / Request — including the requester-side reply-receive span — and
+JetStream Consume / Messages / Next / Fetch / FetchBytes / FetchNoWait). The
+upstream package imports `go.opentelemetry.io/otel/semconv/v1.39.0`.
 
-**`Conn.Request`'s reply-link span is o11y-owned** (ADR 0022 amendment,
-2026-07-01): it closes the requester-side half of request/reply correlation
-that `otel-nats` itself does not cover (see "Reply-Link Span" below). It
-reuses the same attribute set as the table below — no new keys — so it reads
-consistently with the upstream-emitted spans.
+**`Conn.Request`'s reply-receive span moved upstream in v0.6.0**: the
+`recordReply` path inside `otel-nats` now emits it, replacing the o11y-owned
+reply-link span (ADR 0022 amendment, 2026-07-01; superseded 2026-07-09). See
+"Reply-Receive Span" below for the topology this implies.
 
 ### Core and JetStream Attributes
 
@@ -156,28 +155,26 @@ pinned `semconv/v1.39.0` package (which carries only
 the upstream hardcodes the string literal. Re-evaluate when the messaging
 semconv stabilizes a consumer-name key or when `otel-nats` is bumped.
 
-### Reply-Link Span (`Conn.Request`, o11y-owned)
+### Reply-Receive Span (`Conn.Request`, upstream-owned since v0.6.0)
 
-`Conn.Request` performs the request exactly as `otel-nats`'s own `Request`
-(producer "send" span, header injection), then — when the reply carries a
-trace context, i.e. the responder replied via `Conn.Respond` — starts a short
-`receive {subject}` span (`SpanKind` CONSUMER) as a **child of the caller's
-own ctx**, carrying a **link** to the trace context extracted from the
-reply's headers. This differs from the JetStream/Core consumer spans above,
-which start a *new* trace and link back to the producer (OTel messaging
-correlation convention): here, the span deliberately stays in the requester's
-own trace (it is a synchronous continuation of the request the caller is
-already tracking), while the link supplies the cross-service correlation to
-the responder's reply-send span. No span is created if the reply has no
-headers or no valid trace context (untraced responder, or one that replied
-via the raw `msg.Respond` instead of `Conn.Respond`).
+On every successful `Request`, upstream `recordReply` emits a short
+`receive {inbox}` span (`SpanKind` CONSUMER) named after the reply's inbox
+subject, with `messaging.destination.name` set to that inbox — the same value
+the send span carries as `messaging.message.conversation_id`, which is how
+the two sides of a request/reply exchange are correlated. When the reply
+carries a trace context (the responder replied via `Conn.Respond` or any
+traced publish path), the span is **parented under the responder's remote
+reply-send context and carries a link to it**, so it lands in the responder's
+trace; when the reply has no trace context (raw `msg.Respond`, untraced
+responder) the span is still emitted, parented on the caller's ctx, with no
+link.
 
-One deviation from the table above: this span always emits
-`messaging.message.body.size` (even `0` for an empty reply), rather than
-omitting it for an empty payload — every base attribute on this span,
-including body size, must always be present so a caller-supplied
-`attrs` collision on any of them is always overridden (see `nats/conn.go`'s
-`replyAttrs`).
+Two changes from the pre-v0.6.0 o11y-owned reply-link span: the span now
+lives in the responder's trace rather than the requester's (the link still
+provides cross-trace correlation in both directions), and the facade's
+variadic `attrs` injection point was removed — upstream offers no
+caller-attribute hook on this span (an enhancement is being proposed
+upstream). Attach domain identifiers to your own ambient span instead.
 
 ### Upstream NATS Trace-Event Attributes
 
