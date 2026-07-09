@@ -15,7 +15,8 @@ concurrency:
 
 env:
   # Review this pin when Go publishes a new 1.25.x security patch.
-  GOVULNCHECK_GOTOOLCHAIN: go1.25.11
+  # go1.25.12 picks up the GO-2026-5856 crypto/tls (ECH privacy leak) fix.
+  GOVULNCHECK_GOTOOLCHAIN: go1.25.12
 
 jobs:
   test:

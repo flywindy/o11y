@@ -184,5 +184,5 @@ func (c *Conn) Respond(ctx context.Context, msg *natsgo.Msg, data []byte) error 
 func (c *Conn) Request(ctx context.Context, subject string, data []byte, timeout time.Duration) (*natsgo.Msg, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return c.Conn.RequestWithContext(reqCtx, subject, data)
+	return c.RequestWithContext(reqCtx, subject, data)
 }

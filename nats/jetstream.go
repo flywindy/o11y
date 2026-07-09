@@ -521,9 +521,16 @@ func (m *messageBatch) Stop() {
 
 func (c *consumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (context.Context, jetstream.Msg, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, nil, fmt.Errorf("nats jetstream next: %w", err)
+		return ctx, nil, fmt.Errorf("nats jetstream next: %w", err)
 	}
-	return c.c.Next(ctx, opts...)
+	// Never return a nil context: the upstream Next returns (nil, nil, err) on
+	// failure, which risks nil-dereference in callers that touch ctx before
+	// checking err. Substitute the caller's own ctx on the error path.
+	msgCtx, msg, err := c.c.Next(ctx, opts...)
+	if err != nil {
+		return ctx, nil, err
+	}
+	return msgCtx, msg, nil
 }
 
 func (c *consumer) Info(ctx context.Context) (*jetstream.ConsumerInfo, error) { return c.c.Info(ctx) }

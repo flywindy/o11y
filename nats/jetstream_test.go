@@ -88,6 +88,66 @@ func TestJetStream_Consume_TracePropagation(t *testing.T) {
 		"a consumer span should link back to the publisher's trace")
 }
 
+// TestJetStream_Consume_DrainClosed covers the teardown surface added when
+// the facade ConsumeContext widened to mirror the native interface (otel-nats
+// v0.6.0): Drain lets an in-flight message finish processing, and Closed
+// signals once the consume loop has fully shut down.
+func TestJetStream_Consume_DrainClosed(t *testing.T) {
+	_, url := startJetStreamServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	const streamName, subject, consumerName = "EVENTS_DC", "events.dc.created", "drain-test"
+	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	received := make(chan struct{}, 1)
+	cc, err := cons.Consume(context.Background(), func(_ context.Context, m jetstream.Msg) {
+		_ = m.Ack()
+		select {
+		case received <- struct{}{}:
+		default:
+		}
+	})
+	require.NoError(t, err)
+
+	_, err = js.Publish(context.Background(), subject, []byte("hello"))
+	require.NoError(t, err)
+
+	// The message published before Drain must still be delivered and handled.
+	select {
+	case <-received:
+	case <-time.After(3 * time.Second):
+		t.Fatal("consumer did not receive message within timeout")
+	}
+
+	cc.Drain()
+
+	// Closed must signal completion after a drain — this is the graceful
+	// drain-and-wait shutdown that was impossible when the facade exposed
+	// only Stop().
+	select {
+	case <-cc.Closed():
+	case <-time.After(3 * time.Second):
+		t.Fatal("ConsumeContext.Closed did not signal within timeout after Drain")
+	}
+}
+
 // TestJetStream_Messages_TracePropagation exercises the pull-iterator path
 // (the one chat uses): Messages().Next() must yield a ctx carrying the consumer
 // span and the native jetstream.Msg.
