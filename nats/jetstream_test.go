@@ -203,6 +203,47 @@ func TestJetStream_FetchBytes_StopUnblocksWaitingBatch(t *testing.T) {
 	}
 }
 
+// TestJetStream_Next_CanceledContext locks down the guard on Consumer.Next:
+// an already-canceled caller ctx must produce an error AND a non-nil returned
+// context (the caller's own ctx), so a caller that reads the returned ctx
+// before checking the error cannot nil-dereference. The upstream Next returns
+// (nil, nil, err) on failure; the facade substitutes the caller ctx on both
+// the guard and the upstream error path.
+func TestJetStream_Next_CanceledContext(t *testing.T) {
+	_, url := startJetStreamServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	const streamName, subject, consumerName = "EVENTS_NX", "events.nx.created", "next-cancel-test"
+	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	gotCtx, msg, err := cons.Next(canceled)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, msg)
+	assert.NotNil(t, gotCtx, "Next must return a non-nil context even on the error path")
+	assert.Equal(t, canceled, gotCtx, "Next should return the caller's own ctx on the guard error path")
+}
+
 // TestJetStream_Messages_TracePropagation exercises the pull-iterator path
 // (the one chat uses): Messages().Next() must yield a ctx carrying the consumer
 // span and the native jetstream.Msg.
