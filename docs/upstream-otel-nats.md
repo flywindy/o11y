@@ -152,20 +152,26 @@ upstream release.
 - **Friction**: low-medium — behavior fix, needs the FetchContext/FetchMaxWait
   mutual-exclusion handling.
 
-#### F4. Batch forwarding goroutine: select `done` on the receive side too
+#### F4. `MessageBatch.Stop` leaves the forwarding goroutine parked on a waiting batch
 
-- **What**: `newTracedMessageBatch` / `newDirectMessageBatch` check their
-  `done` channel only around the send; a goroutine parked on the
-  `raw.Messages()` receive (batch still waiting for messages) does not
-  observe `Stop()` until the native channel produces or closes. The o11y
-  facade fixed the identical pattern in its own wrapper
-  (`nats/jetstream.go` `wrapMessageBatch`); the same nested-select fix
-  applies upstream.
-- **Evidence**: v0.6.0 `oteljetstream/consumer.go` (`for msg := range
-  raw.Messages()` with `select` only on the send).
-- **Unlocks**: `MessageBatch.Stop()` becomes promptly effective end to end
-  (today the upstream leg can lag until the native pull expires).
-- **Friction**: low — mechanical, mirrors a fix already proven in the facade.
+- **What**: `newTracedMessageBatch` / `newDirectMessageBatch` range over
+  `raw.Messages()` and only select `done` around the *send* onto their own
+  channel. A batch still *waiting* for messages parks the goroutine on the
+  `raw.Messages()` *receive*, where `Stop()` (which only closes `done`) is
+  never observed — the goroutine and its NATS pull subscription stay parked
+  until the native pull expires (default ~30s). Two complementary fixes:
+  (a) select `done` on the receive side too; and/or (b) have `Stop()` cancel
+  the fetch context so the native pull aborts and `raw.Messages()` closes.
+- **Evidence**: v0.6.0 `oteljetstream/consumer.go` — `for msg := range
+  raw.Messages()` with `select` only on the send; `messageBatchTrace.Stop`
+  only does `close(m.done)`.
+- **o11y-side status**: worked around in the facade — `wrapMessageBatch`
+  now derives a cancelable fetch context per Fetch/FetchBytes call and
+  cancels it from `Stop`, which closes the native channel and drains the
+  upstream goroutine. The upstream fix is still wanted so direct upstream
+  users (and the `FetchMaxWait` path, where no fetch context is wired) get
+  the same prompt release.
+- **Friction**: low — either fix is mechanical.
 
 #### R5. Batch receive-span lifecycle: end at handover
 

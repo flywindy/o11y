@@ -149,11 +149,19 @@ func TestJetStream_Consume_DrainClosed(t *testing.T) {
 }
 
 // TestJetStream_FetchBytes_StopUnblocksWaitingBatch is the regression test
-// for MessageBatch.Stop releasing a batch that is still WAITING for messages
-// (empty stream, pull request open): the facade's forwarding goroutine parks
-// on the upstream channel receive in that state, so Stop must be selected on
-// the receive side too — without that, Messages() would not close until the
-// native pull expires (tens of seconds), despite Stop's contract.
+// for MessageBatch.Stop closing the facade's Messages channel on a batch that
+// is still WAITING for messages (empty stream, pull request open): the
+// forwarding goroutine parks on the upstream channel receive in that state,
+// so Stop must be selected on the receive side too — without that, Messages()
+// would not close until the native pull expires (tens of seconds).
+//
+// This asserts the facade contract (the caller-visible channel closes). The
+// companion fix that Stop also cancels the fetch context — so the upstream
+// forwarding goroutine and its NATS pull subscription are released rather
+// than left parked until expiry — is a resource-lifecycle concern one layer
+// down that this black-box test cannot directly observe; it is covered by the
+// wrapMessageBatch/Stop implementation and documented in
+// docs/upstream-otel-nats.md (F4).
 func TestJetStream_FetchBytes_StopUnblocksWaitingBatch(t *testing.T) {
 	_, url := startJetStreamServer(t)
 	tp, prop, _ := newTestProviders()

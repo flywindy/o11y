@@ -124,10 +124,15 @@ type MessageBatch interface {
 	Messages() <-chan FetchedMessage
 	Error() error
 	// Stop abandons the batch: undelivered messages are discarded and the
-	// forwarding goroutines (this facade's and upstream's) are released.
-	// After Stop, the Messages channel closes once any in-flight send
-	// completes. Reading the channel to exhaustion instead of calling Stop
-	// remains fully supported.
+	// Messages channel closes once any in-flight send completes. It releases
+	// both this facade's forwarding goroutine and — by cancelling the native
+	// pull's fetch context — the upstream one and its NATS pull subscription,
+	// so an abandoned still-waiting batch is not left parked until the pull
+	// expires. The upstream release is immediate for Fetch/FetchBytes calls
+	// whose fetch context was wired (the default); when the caller supplied
+	// their own jetstream.FetchMaxWait the fetch context is not wired, so the
+	// upstream leg instead unwinds when that FetchMaxWait elapses. Reading the
+	// channel to exhaustion instead of calling Stop remains fully supported.
 	Stop()
 }
 
@@ -376,34 +381,41 @@ func (c *consumer) Fetch(ctx context.Context, batch int, opts ...jetstream.Fetch
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("nats jetstream fetch: %w", err)
 	}
-	mb, err := fetchWithCtxFallback(ctx, opts, func(o []jetstream.FetchOpt) (oteljetstream.MessageBatch, error) {
+	// Derive a cancelable fetch ctx so Stop can abort the in-flight native
+	// pull, not just the facade's own forwarding goroutine — see
+	// wrapMessageBatch and messageBatch.Stop.
+	fetchCtx, cancel := context.WithCancel(ctx)
+	mb, err := fetchWithCtxFallback(fetchCtx, opts, func(o []jetstream.FetchOpt) (oteljetstream.MessageBatch, error) {
 		return c.c.Fetch(batch, o...)
 	})
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	// batch is Fetch's own hard cap on message count, so a same-sized buffer
 	// guarantees the forwarding goroutine below can drain the entire batch
 	// without blocking, even if the caller never reads Messages() at all —
 	// see wrapMessageBatch.
-	return wrapMessageBatch(mb, batch), nil
+	return wrapMessageBatch(mb, batch, cancel), nil
 }
 
 func (c *consumer) FetchBytes(ctx context.Context, maxBytes int, opts ...jetstream.FetchOpt) (MessageBatch, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("nats jetstream fetch-bytes: %w", err)
 	}
-	mb, err := fetchWithCtxFallback(ctx, opts, func(o []jetstream.FetchOpt) (oteljetstream.MessageBatch, error) {
+	fetchCtx, cancel := context.WithCancel(ctx)
+	mb, err := fetchWithCtxFallback(fetchCtx, opts, func(o []jetstream.FetchOpt) (oteljetstream.MessageBatch, error) {
 		return c.c.FetchBytes(maxBytes, o...)
 	})
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	// FetchBytes has no message-count cap (only a byte budget, which a
 	// single small message could satisfy many times over), so unlike Fetch
 	// there is no buffer size that provably fits the whole batch — see the
 	// fetchBytesBatchBuf doc comment.
-	return wrapMessageBatch(mb, fetchBytesBatchBuf), nil
+	return wrapMessageBatch(mb, fetchBytesBatchBuf, cancel), nil
 }
 
 // fetchWithCtxFallback calls call with jetstream.FetchContext(ctx) prepended
@@ -467,8 +479,13 @@ func (c *consumer) FetchNoWait(ctx context.Context, batch int) (MessageBatch, er
 	if err != nil {
 		return nil, err
 	}
+	// FetchNoWait takes no FetchOpt, so there is no cancelable fetch ctx to
+	// wire — but it never blocks waiting for new messages (it returns only
+	// what is already buffered), so the upstream forwarding goroutine drains
+	// and exits on its own without a pull to abort. A no-op cancel keeps the
+	// wrapMessageBatch contract uniform.
 	// Same reasoning as Fetch: batch is a hard cap here too.
-	return wrapMessageBatch(mb, batch), nil
+	return wrapMessageBatch(mb, batch, func() {}), nil
 }
 
 // fetchBytesBatchBuf is the best-effort forwarding buffer size for
@@ -489,15 +506,23 @@ const fetchBytesBatchBuf = 256
 // blocking forever on a send once the caller stops reading Messages() —
 // see the MessageBatch doc comment for the goroutine-leak this closes (fully,
 // when bufSize is a true upper bound on message count; best-effort
-// otherwise). Stop closes the done channel to release a forwarding goroutine
-// blocked on a full buffer, and propagates to the upstream batch's own Stop
-// (added in otel-nats v0.6.0) so its unbuffered forwarding goroutine is
-// released too.
-func wrapMessageBatch(mb oteljetstream.MessageBatch, bufSize int) MessageBatch {
+// otherwise).
+//
+// cancel aborts the native pull that backs this batch. Stop invokes it so an
+// abandoned, still-waiting Fetch/FetchBytes batch does not leave the upstream
+// forwarding goroutine (and its NATS pull subscription) parked until the pull
+// expires: cancelling the fetch ctx closes the native message channel, which
+// drains upstream. It is also invoked when this goroutine exits on its own
+// (normal drain) so the fetch ctx is not leaked. cancel is a no-op on the
+// FetchMaxWait-collision path (where the fetch ctx was not wired) and for
+// FetchNoWait (which never blocks); Stop still releases this facade's
+// goroutine via done in those cases.
+func wrapMessageBatch(mb oteljetstream.MessageBatch, bufSize int, cancel context.CancelFunc) MessageBatch {
 	out := make(chan FetchedMessage, bufSize)
 	done := make(chan struct{})
 	go func() {
 		defer close(out)
+		defer cancel()
 		for {
 			// Select on the upstream receive as well as the send: a batch
 			// still waiting for messages parks this goroutine on the receive,
@@ -518,13 +543,14 @@ func wrapMessageBatch(mb oteljetstream.MessageBatch, bufSize int) MessageBatch {
 			}
 		}
 	}()
-	return &messageBatch{ch: out, mb: mb, done: done}
+	return &messageBatch{ch: out, mb: mb, done: done, cancel: cancel}
 }
 
 type messageBatch struct {
 	ch       chan FetchedMessage
 	mb       oteljetstream.MessageBatch
 	done     chan struct{}
+	cancel   context.CancelFunc
 	stopOnce sync.Once
 }
 
@@ -534,6 +560,10 @@ func (m *messageBatch) Error() error                    { return m.mb.Error() }
 func (m *messageBatch) Stop() {
 	m.stopOnce.Do(func() {
 		close(m.done)
+		// Abort the native pull first so the upstream forwarding goroutine's
+		// blocking receive on raw.Messages() unblocks (its channel closes),
+		// then call the upstream Stop to close its own done channel.
+		m.cancel()
 		m.mb.Stop()
 	})
 }
