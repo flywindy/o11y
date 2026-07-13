@@ -3,8 +3,9 @@
 // span and logs the reply.
 // Run together with examples/nats-core/responder to verify the full round
 // trip: replies sent by conn.Respond carry trace headers, and conn.Request
-// extracts them to start a "receive {subject}" span, as a child of the
-// request's own span, linking back to the responder's reply-send span.
+// (via otel-nats v0.6.0) records a "receive {inbox}" span for the reply —
+// named for the reply inbox, parented under the responder's trace and linked
+// back to the reply-send span.
 package main
 
 import (
@@ -78,10 +79,10 @@ func main() {
 
 		case <-ticker.C:
 			// Each request lives inside its own root span. conn.Request injects
-			// the active trace context into the request headers, then — since
-			// the responder replies via conn.Respond — extracts the reply's
-			// trace context and starts a "receive {subject}" span linking back
-			// to it, closing the round trip in Tempo.
+			// the active trace context into the request headers; the upstream
+			// otel-nats layer then records a "receive {inbox}" span for the
+			// reply — parented under the responder's trace and linked back to
+			// its reply-send span, closing the round trip in Tempo.
 			reqCtx, span := tracer.Start(ctx, "send-request")
 
 			reply, err := conn.Request(reqCtx, subject, []byte("o11y"), requestTimeout)
