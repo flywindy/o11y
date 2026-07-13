@@ -186,3 +186,22 @@ func (c *Conn) Request(ctx context.Context, subject string, data []byte, timeout
 	defer cancel()
 	return c.RequestWithContext(reqCtx, subject, data)
 }
+
+// RequestMsg sends a pre-built request message — use it to set headers on the
+// request — and waits for a reply, with the same ctx-first tracing contract as
+// Request: ctx carries the trace context and cancellation, timeout bounds the
+// wait, and the producer "send" and reply "receive" spans parent to ctx.
+//
+// This shadows the embedded otelnats.Conn.RequestMsg(msg, timeout), whose
+// ctx-less signature parents its producer span to context.Background() and so
+// orphans the trace (the issue #72 footgun the facade's ctx-first Request
+// shim exists to prevent). Always use this ctx-first form; the embedded
+// ctx-less method is intentionally shadowed and unreachable through the facade.
+func (c *Conn) RequestMsg(ctx context.Context, msg *natsgo.Msg, timeout time.Duration) (*natsgo.Msg, error) {
+	if msg == nil {
+		return nil, fmt.Errorf("nats request-msg: msg must not be nil")
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return c.RequestMsgWithContext(reqCtx, msg)
+}

@@ -122,6 +122,12 @@ type FetchedMessage struct {
 // pattern rather than enriching the receive span directly.
 type MessageBatch interface {
 	Messages() <-chan FetchedMessage
+	// Error returns the batch's terminal error after the Messages channel
+	// closes, matching the native jetstream.MessageBatch contract. A batch
+	// abandoned via Stop reports no error for the fetch-context cancellation
+	// Stop itself triggers (that is expected teardown, not a fetch failure);
+	// a context.Canceled originating from the caller's own ctx, without a
+	// Stop, is still surfaced.
 	Error() error
 	// Stop abandons the batch: undelivered messages are discarded and the
 	// Messages channel closes once any in-flight send completes. It releases
@@ -555,7 +561,23 @@ type messageBatch struct {
 }
 
 func (m *messageBatch) Messages() <-chan FetchedMessage { return m.ch }
-func (m *messageBatch) Error() error                    { return m.mb.Error() }
+
+func (m *messageBatch) Error() error {
+	err := m.mb.Error()
+	// Stop cancels the fetch ctx, which the native pull surfaces as
+	// context.Canceled. After an explicit Stop that is expected teardown, not
+	// a batch failure, so it is not reported. A context.Canceled seen without
+	// a Stop (the caller's own ctx was canceled) is a real terminal condition
+	// and is returned unchanged.
+	if err != nil && errors.Is(err, context.Canceled) {
+		select {
+		case <-m.done:
+			return nil
+		default:
+		}
+	}
+	return err
+}
 
 func (m *messageBatch) Stop() {
 	m.stopOnce.Do(func() {

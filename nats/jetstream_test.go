@@ -244,6 +244,74 @@ func TestJetStream_Next_CanceledContext(t *testing.T) {
 	assert.Equal(t, canceled, gotCtx, "Next should return the caller's own ctx on the guard error path")
 }
 
+// TestJetStream_Next_TracePropagation covers the happy path of Consumer.Next
+// — the #69.1 fix that motivated wrapping it: the returned ctx must carry the
+// local receive span, linked back to the publisher's trace, rather than the
+// producer's remote ctx. TestJetStream_Next_CanceledContext covers only the
+// guard error path, so without this a future upstream regression to the old
+// producer-ctx behavior would go uncaught.
+func TestJetStream_Next_TracePropagation(t *testing.T) {
+	enableNATSTracing(t)
+	_, url := startJetStreamServer(t)
+	tp, prop, sr := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	const streamName, subject, consumerName = "EVENTS_NXT", "events.nxt.created", "next-trace-test"
+	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	tracer := tp.Tracer("test")
+	pubCtx, span := tracer.Start(context.Background(), "publish-event")
+	pubTraceID := span.SpanContext().TraceID()
+	_, err = js.Publish(pubCtx, subject, []byte("hi"))
+	require.NoError(t, err)
+	span.End()
+
+	// Bound the fetch with a ctx deadline so Next returns even if delivery is
+	// slow. (Upstream Next honors a deadline via FetchMaxWait, not live
+	// cancellation — see the facade doc; the deadline is the reliable bound.)
+	fetchCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	msgCtx, msg, err := cons.Next(fetchCtx)
+	require.NoError(t, err)
+	require.NotNil(t, msg)
+	require.NoError(t, msg.Ack())
+
+	gotTraceID := oteltrace.SpanFromContext(msgCtx).SpanContext().TraceID()
+	assert.True(t, gotTraceID.IsValid(), "Next ctx should carry a valid trace ID")
+	assert.NotEqual(t, pubTraceID, gotTraceID,
+		"the receive span starts a new trace and links to the producer, per OTel messaging semantics")
+
+	// The single-shot receive span is ended immediately by upstream, so it is
+	// already in Ended() by the time Next returns; poll for robustness.
+	assert.Eventually(t, func() bool {
+		for _, s := range sr.Ended() {
+			for _, link := range s.Links() {
+				if link.SpanContext.TraceID() == pubTraceID {
+					return true
+				}
+			}
+		}
+		return false
+	}, 3*time.Second, 10*time.Millisecond,
+		"the Next receive span should link back to the publisher's trace")
+}
+
 // TestJetStream_Messages_TracePropagation exercises the pull-iterator path
 // (the one chat uses): Messages().Next() must yield a ctx carrying the consumer
 // span and the native jetstream.Msg.

@@ -497,6 +497,84 @@ func TestRequest_NoReplyHeader_NoLinkSpan(t *testing.T) {
 	assert.True(t, found, "upstream records the reply-receive span even for an untraced reply")
 }
 
+// TestRequestMsg_CtxFirstTracing verifies the RequestMsg shim routes through
+// the ctx-first path: the producer send span parents to the caller's ctx
+// trace, not context.Background() (the embedded ctx-less RequestMsg footgun
+// this shadow method exists to prevent). It also confirms a header set on the
+// pre-built request message reaches the responder — proving RequestMsg sends
+// the caller's *nats.Msg rather than a fresh one.
+func TestRequestMsg_CtxFirstTracing(t *testing.T) {
+	enableNATSTracing(t)
+
+	_, url := startTestServer(t)
+	tp, prop, sr := newTestProviders()
+
+	responder, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer responder.Close()
+
+	requester, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer requester.Close()
+
+	subject := "test.requestmsg"
+
+	gotHeaderCh := make(chan string, 1)
+	_, err = responder.Subscribe(context.Background(), subject, func(ctx context.Context, msg *nats.Msg) {
+		gotHeaderCh <- msg.Header.Get("X-Custom")
+		assert.NoError(t, responder.Respond(ctx, msg, []byte("pong")))
+	})
+	require.NoError(t, err)
+	require.NoError(t, responder.NatsConn().FlushTimeout(2*time.Second))
+
+	tracer := tp.Tracer("test")
+	reqCtx, span := tracer.Start(context.Background(), "test-request-msg")
+	reqTraceID := span.SpanContext().TraceID()
+
+	msg := &nats.Msg{Subject: subject, Data: []byte("ping"), Header: nats.Header{}}
+	msg.Header.Set("X-Custom", "hdr-val")
+	reply, err := requester.RequestMsg(reqCtx, msg, 2*time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+	span.End()
+	assert.Equal(t, "pong", string(reply.Data))
+
+	select {
+	case got := <-gotHeaderCh:
+		assert.Equal(t, "hdr-val", got, "the custom request header must reach the responder")
+	case <-time.After(2 * time.Second):
+		t.Fatal("responder did not run")
+	}
+
+	// The CLIENT send span (name "{subject} request", per upstream
+	// startRequestSpan) must live in the requester's own trace (ctx-first
+	// path), not a disconnected background root trace (the ctx-less footgun).
+	var found bool
+	for _, s := range sr.Ended() {
+		if s.SpanKind() == oteltrace.SpanKindClient && s.SpanContext().TraceID() == reqTraceID {
+			found = true
+		}
+	}
+	assert.True(t, found,
+		"RequestMsg send span should parent to the caller's ctx trace, not context.Background()")
+}
+
+// TestRequestMsg_NilMsg locks down the nil-message guard on Conn.RequestMsg,
+// matching Conn.Respond's guard rather than delegating a nil-deref to upstream.
+func TestRequestMsg_NilMsg(t *testing.T) {
+	_, url := startTestServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	reply, err := conn.RequestMsg(context.Background(), nil, time.Second)
+	require.Error(t, err)
+	assert.Nil(t, reply)
+	assert.Contains(t, err.Error(), "msg must not be nil")
+}
+
 // TestRespond_Validation locks down the registration-time guards on
 // Conn.Respond: a nil message and a message with no reply subject both return
 // an error rather than panicking or silently publishing nowhere.
