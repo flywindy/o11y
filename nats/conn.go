@@ -189,8 +189,11 @@ func (c *Conn) Request(ctx context.Context, subject string, data []byte, timeout
 
 // RequestMsg sends a pre-built request message — use it to set headers on the
 // request — and waits for a reply, with the same ctx-first tracing contract as
-// Request: ctx carries the trace context and cancellation, timeout bounds the
-// wait, and the producer "send" and reply "receive" spans parent to ctx.
+// Request: ctx carries the trace context and cancellation, and timeout bounds
+// the wait. The producer "send" span parents to ctx; as with Request, the
+// upstream layer records the reply "receive" span under the responder's trace,
+// linked back to the request when the reply carries trace context and recorded
+// without a link when it does not.
 //
 // This shadows the embedded otelnats.Conn.RequestMsg(msg, timeout), whose
 // ctx-less signature parents its producer span to context.Background() and so
