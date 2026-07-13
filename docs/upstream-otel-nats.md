@@ -173,6 +173,42 @@ upstream release.
   the same prompt release.
 - **Friction**: low — either fix is mechanical.
 
+#### F5. `recordReply` overwrites the request span's `messaging.message.body.size` with the reply size
+
+- **What**: `recordReply` starts with
+  `sendSpan.SetAttributes(MessagingMessageBodySize(len(reply.Data)))`, which
+  overwrites the request payload size that `requestAttrs` set on the same
+  CLIENT "send" span at span-start. After a round trip, a request/reply
+  "send" span reports the reply body size (or `0` for an empty reply), not
+  the request size — so any dashboard or check reading body size off that
+  span is wrong. Either drop the overwrite (the reply size already lives on
+  the reply "receive" span via `receiveAttrs`) or record the reply size
+  under a distinct key rather than clobbering the request's.
+- **Evidence**: v0.6.0 `otelnats/conn_traced.go` `recordReply` first line;
+  `requestAttrs` sets `MessagingMessageBodySize(len(msg.Data))` at span-start.
+- **o11y-side status**: documented in `docs/semconv.md`; the facade cannot
+  correct it without reimplementing the reply path.
+- **Friction**: low — a one-line removal, plus a test for the send span's
+  body size.
+
+#### F6. Request "send" span never carries `messaging.message.conversation_id`
+
+- **What**: `requestAttrs` emits `messaging.message.conversation_id` only
+  when `msg.Reply` is non-empty at span-start, but the standard
+  `Request`/`RequestMsg` path leaves `msg.Reply` empty — nats.go allocates
+  the generated reply inbox *after* the span starts and does not write it
+  back onto the caller's message. So ordinary request/reply "send" spans
+  never carry the inbox as a conversation ID, leaving span-link the only
+  correlation between the two sides. If a conversation ID is wanted on the
+  send span, capture the inbox after nats.go assigns it and set it on the
+  span before End.
+- **Evidence**: v0.6.0 `otelnats/conn.go` `requestAttrs` (`if msg.Reply != ""`)
+  vs the `RequestWithContext`/`requestWithCtx` ordering that starts the span
+  before `nc.RequestMsgWithContext` runs.
+- **o11y-side status**: documented in `docs/semconv.md` (correlation is via
+  span link, not conversation_id).
+- **Friction**: medium — requires reading back the assigned inbox from nats.go.
+
 #### R5. Batch receive-span lifecycle: end at handover
 
 - **What**: `newTracedMessageBatch` (and `MessagesContext.Next`) end message
@@ -223,7 +259,10 @@ the constant against the release tag would close the remaining gap from
 2. **Bundle A — consumer-path fixes** (F1, F2, F3, F4): low-friction PR with
    tests; can go out immediately after the umbrella issue.
 3. **Bundle B — configuration surface** (R1): issue-first; PR after ack.
-4. **Bundle C — request/reply API** (R2, R4): issue-first; PR after ack.
+4. **Bundle C — request/reply API + attrs** (R2, R4, F5, F6): issue-first; PR
+   after ack. F5 (body-size overwrite) and F6 (missing conversation_id) are
+   small but touch the request-span attribute contract, so they ride the same
+   discussion as the request/reply API shape.
 5. R3, R5, D1–D3 ride the umbrella issue discussion until a direction exists.
 
 ## o11y issue cross-reference

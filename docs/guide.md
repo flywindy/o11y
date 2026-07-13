@@ -870,15 +870,20 @@ created inside otel-nats, which has no caller-attribute injection point.
 Attach domain identifiers (request/correlation IDs, room/site IDs) to your
 own ambient span instead.
 
-**Known limitation:** the requester-side spans land in the caller's trace
-only when `ctx` already carries an active span at the `conn.Request` call
-site. Calling `conn.Request` from inside an HTTP handler or a
-message-consumer callback (where `ctx` already has one) works as described
-above. A bare `ctx` (`context.Background()`, or any `ctx` with no ambient
-span — e.g. a background worker's own top-level request loop) makes the send
-span a disconnected root trace. If your service makes request/reply calls
-from that kind of bare-ctx call site and you want the full round trip visible
-as one trace, open a span first:
+**Cross-trace topology (not a single trace):** under the v0.6.0 upstream
+path the two sides of a request/reply do **not** share one trace. The
+requester's "send" span parents to `ctx`; the reply "receive" span (and the
+responder's own processing) parent under the responder's trace, tied back to
+the request only by a **span link**. In Tempo you follow the link between the
+two traces — there is no single trace containing both sides. (The pre-v0.6.0
+facade parented the receive span in the requester's trace; that is what
+changed.)
+
+What opening an ambient span at the call site *does* buy you: it gives the
+requester "send" span an application parent instead of a disconnected root
+trace, so a background worker's request operations group under its own trace
+rather than scattering as orphan roots. It does not, and cannot, pull the
+responder side into that trace.
 
 ```go
 ctx, span := obs.Tracer("worker").Start(ctx, "request orders.get")
@@ -886,10 +891,10 @@ defer span.End()
 reply, err := conn.Request(ctx, "orders.get", []byte("42"), 2*time.Second)
 ```
 
-When auditing a service for this, check any request/reply call made from a
-background loop, cron job, or startup path rather than from within a handler
-or consumer callback — those are the call sites most likely to be passing a
-bare `ctx`.
+When auditing a service, check any request/reply call made from a background
+loop, cron job, or startup path rather than from within a handler or consumer
+callback — those are the call sites most likely to be passing a bare `ctx`,
+where the "send" span would otherwise be an orphan root.
 
 #### JetStream
 

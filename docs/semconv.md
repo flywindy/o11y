@@ -159,15 +159,30 @@ semconv stabilizes a consumer-name key or when `otel-nats` is bumped.
 
 On every successful `Request`, upstream `recordReply` emits a short
 `receive {inbox}` span (`SpanKind` CONSUMER) named after the reply's inbox
-subject, with `messaging.destination.name` set to that inbox — the same value
-the send span carries as `messaging.message.conversation_id`, which is how
-the two sides of a request/reply exchange are correlated. When the reply
-carries a trace context (the responder replied via `Conn.Respond` or any
-traced publish path), the span is **parented under the responder's remote
-reply-send context and carries a link to it**, so it lands in the responder's
-trace; when the reply has no trace context (raw `msg.Respond`, untraced
-responder) the span is still emitted, parented on the caller's ctx, with no
-link.
+subject, with `messaging.destination.name` set to that inbox. The two sides
+of a request/reply exchange are correlated by a **span link**, not by a
+shared attribute value: when the reply carries a trace context (the responder
+replied via `Conn.Respond` or any traced publish path), this span is
+**parented under the responder's remote reply-send context and carries a link
+to it**, so it lands in the responder's trace; when the reply has no trace
+context (raw `msg.Respond`, untraced responder) the span is still emitted,
+parented on the caller's ctx, with no link.
+
+Note on `messaging.message.conversation_id`: it is **not** present on an
+ordinary request's "send" span. Upstream `requestAttrs` emits it only when
+`msg.Reply` is already non-empty at span-start, but the standard
+`Request`/`RequestMsg` path leaves `msg.Reply` empty — nats.go allocates the
+generated reply inbox only after the span starts and does not write it back
+onto the message. So do not build correlation on `conversation_id` for
+request/reply; use the span link (or the inbox on `messaging.destination.name`).
+
+Note on `messaging.message.body.size` of the "send" span: upstream
+`recordReply` overwrites it with the **reply** payload size (`len(reply.Data)`,
+so `0` for an empty reply), replacing the request payload size `requestAttrs`
+set at span-start. A dashboard reading body size off a request/reply "send"
+span therefore sees the response size, not the request size. This is an
+upstream behavior (tracked in `docs/upstream-otel-nats.md`), not something
+the facade can correct without reimplementing the reply path.
 
 Two changes from the pre-v0.6.0 o11y-owned reply-link span: the span now
 lives in the responder's trace rather than the requester's (the link still
