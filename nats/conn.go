@@ -10,11 +10,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Marz32onE/instrumentation-go/otel-nats/otelnats"
+	"github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 	natsgo "github.com/nats-io/nats.go"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
-	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -154,122 +152,59 @@ func (c *Conn) Respond(ctx context.Context, msg *natsgo.Msg, data []byte) error 
 	return nil
 }
 
-// Request sends subject/data and waits for a reply, exactly like the
-// embedded otelnats.Conn.Request (producer "send" span, W3C header
-// injection, timeout applied to the wait). It additionally closes the
-// requester-side half of the request/reply round trip left open by ADR 0022:
-// when the reply carries a trace context — which it does whenever the
-// responder replied via Conn.Respond — Request starts a short CONSUMER-kind
-// span, as a child of ctx, that links to that context.
+// Request sends subject/data and waits for a reply. ctx carries the trace
+// context and cancellation; timeout bounds the wait. The upstream otel-nats
+// layer (v0.6.0+) emits the producer "send" span, injects W3C headers, and
+// emits the requester-side CONSUMER "receive" span for the reply — linked to
+// the responder's trace whenever the responder replied via Conn.Respond (or
+// any traced publish path). Earlier SDK versions created that reply span in
+// this facade; it is now delegated to upstream so the round trip is recorded
+// exactly once.
 //
-// Without this, the handler → requester leg of every request/reply exchange
-// is invisible in Grafana Tempo: the distributed trace stops at the
-// responder's reply-send span and the requester side shows nothing for the
-// reply it actually received.
+// The upstream primary Request method mirrors nats.Conn.Request and takes no
+// ctx (its producer span would parent to context.Background()), so this
+// facade routes through RequestWithContext with a timeout-derived deadline,
+// preserving the o11y ctx-first contract: the send span parents to ctx and
+// cancelling ctx aborts the wait early.
 //
-// If the reply has no headers or carries no valid trace context (an
-// untraced responder, or one that replied with the raw msg.Respond instead
-// of Conn.Respond), no span is created and reply is returned unchanged —
-// Request behaves exactly like the embedded method.
-//
-// Known limitation: the reply-link span lands in the same trace as this
-// call's own "send" span only when ctx already carries an active span when
-// Request is called — both the embedded send span and the reply-link span
-// are parented on the same ctx, so a bare ctx (context.Background(), or any
-// ctx with no ambient span) makes them two disconnected root traces, with
-// only a Link — not a shared trace — tying the reply-link span back to the
-// responder's reply-send span. Callers that need the full round trip visible
-// as one trace, and don't already have an ambient span at the call site
-// (e.g. a background worker's own top-level request loop, not a request
-// initiated from within an HTTP handler or a message-consumer callback),
-// should open one first:
+// Known limitation (unchanged): the request-side spans land in the caller's
+// trace only when ctx already carries an active span. Callers without an
+// ambient span at the call site (e.g. a background worker's own top-level
+// request loop) should open one first:
 //
 //	ctx, span := tracer.Start(ctx, "request "+subject)
 //	defer span.End()
 //	reply, err := conn.Request(ctx, subject, payload, timeout)
 //
-// attrs are attached to the reply-link span as extra searchable attributes
-// (e.g. a request/correlation ID, a room/site ID) — domain identifiers the
-// SDK has no way to know on its own. They are ignored when no span is
-// created. Keep them low-to-medium cardinality per the usual span-attribute
-// guidance; see docs/semconv.md for the base attribute set this span always
-// carries. If attrs reuses one of those base keys (messaging.system,
-// messaging.destination.name, messaging.operation.type/name,
-// messaging.message.body.size), the base value wins and the supplied one is
-// dropped — matching the redis.WithAttributes / cassandra.WithAttributes
-// precedent elsewhere in this SDK, so a caller can never corrupt the span's
-// own semantic-convention attributes.
-func (c *Conn) Request(ctx context.Context, subject string, data []byte, timeout time.Duration, attrs ...attribute.KeyValue) (*natsgo.Msg, error) {
-	reply, err := c.Conn.Request(ctx, subject, data, timeout)
-	if err != nil || !c.TracingEnabled() {
-		return reply, err
-	}
-	c.linkReply(ctx, subject, reply, attrs)
-	return reply, nil
+// Migration note (pre-1.0 API change, otel-nats v0.6.0 upgrade): the
+// variadic attrs parameter was removed. The reply receive span is now
+// created inside otel-nats, which currently offers no caller-attribute
+// injection point; attach domain identifiers (request/correlation IDs,
+// room/site IDs) to your own ambient span instead.
+func (c *Conn) Request(ctx context.Context, subject string, data []byte, timeout time.Duration) (*natsgo.Msg, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return c.RequestWithContext(reqCtx, subject, data)
 }
 
-// linkReply starts and immediately ends a short CONSUMER-kind "receive"
-// span, as a child of ctx, linking to the trace context carried on reply's
-// headers (if any). It is a no-op when reply carries no valid trace context.
-// See Request's doc comment for the known limitation this ctx-parenting
-// implies when the caller's ctx has no ambient span of its own.
+// RequestMsg sends a pre-built request message — use it to set headers on the
+// request — and waits for a reply, with the same ctx-first tracing contract as
+// Request: ctx carries the trace context and cancellation, and timeout bounds
+// the wait. The producer "send" span parents to ctx; as with Request, the
+// upstream layer records the reply "receive" span under the responder's trace,
+// linked back to the request when the reply carries trace context and recorded
+// without a link when it does not.
 //
-// Extraction uses headerCarrier (nats.Header's own case-sensitive Get), not
-// propagation.HeaderCarrier — the reply was written by otel-nats's Respond →
-// Publish path with a literal-case "traceparent" key, which
-// propagation.HeaderCarrier's MIME-canonicalizing Get would fail to find.
-func (c *Conn) linkReply(ctx context.Context, subject string, reply *natsgo.Msg, extraAttrs []attribute.KeyValue) {
-	if reply == nil || reply.Header == nil {
-		return
+// This shadows the embedded otelnats.Conn.RequestMsg(msg, timeout), whose
+// ctx-less signature parents its producer span to context.Background() and so
+// orphans the trace (the issue #72 footgun the facade's ctx-first Request
+// shim exists to prevent). Always use this ctx-first form; the embedded
+// ctx-less method is intentionally shadowed and unreachable through the facade.
+func (c *Conn) RequestMsg(ctx context.Context, msg *natsgo.Msg, timeout time.Duration) (*natsgo.Msg, error) {
+	if msg == nil {
+		return nil, fmt.Errorf("nats request-msg: msg must not be nil")
 	}
-	tracer, prop := c.TraceContext()
-	replyCtx := prop.Extract(context.Background(), headerCarrier{h: reply.Header})
-	originSpanCtx := trace.SpanContextFromContext(replyCtx)
-	if !originSpanCtx.IsValid() {
-		return
-	}
-	// extraAttrs first, base attrs last: the OTel SDK keeps the last value on
-	// a duplicate key (sdk/trace/span.go dedupeAttrsFromRecord), so ordering
-	// the SDK-owned base attrs after the caller-supplied ones guarantees they
-	// always win a collision, never silently get overwritten by it.
-	serverAttrs := c.ServerAttrs()
-	spanAttrs := make([]attribute.KeyValue, 0, len(extraAttrs)+6+len(serverAttrs))
-	spanAttrs = append(spanAttrs, extraAttrs...)
-	spanAttrs = append(spanAttrs, replyAttrs(subject, reply.Subject, len(reply.Data), serverAttrs)...)
-	_, span := tracer.Start(ctx, "receive "+subject,
-		trace.WithSpanKind(trace.SpanKindConsumer),
-		trace.WithAttributes(spanAttrs...),
-		trace.WithLinks(trace.Link{SpanContext: originSpanCtx}),
-	)
-	span.End()
-}
-
-// replyAttrs builds the attributes for the requester-side reply-receive span
-// started by linkReply. Mirrors otelnats' own receiveAttrs shape (messaging
-// system/destination/operation, body size, conversation ID, server.address/
-// server.port) so the new span reads consistently with the "send"/"process"/
-// "receive" spans otelnats already emits — including being filterable by
-// broker and correlatable by request/reply inbox, per docs/semconv.md's
-// documented NATS attribute set.
-//
-// messaging.message.body.size and messaging.message.conversation_id are
-// always included — the latter even though reply.Subject (the inbox) is,
-// in practice, never empty for a valid reply. linkReply relies on every one
-// of these base keys being present so a caller-supplied attrs collision is
-// always overridden (see linkReply) — if either were only conditionally
-// appended, a caller-supplied value for that key would go unchallenged
-// whenever the condition happens to be false, silently breaking the
-// "built-in wins" guarantee for that one key in that one case. serverAttrs
-// (server.address, and server.port when non-default) come from the
-// connection itself, so they carry the same guarantee for the same reason.
-func replyAttrs(subject, conversationID string, bodySize int, serverAttrs []attribute.KeyValue) []attribute.KeyValue {
-	attrs := []attribute.KeyValue{
-		semconv.MessagingSystemKey.String("nats"),
-		semconv.MessagingDestinationNameKey.String(subject),
-		semconv.MessagingOperationTypeKey.String("receive"),
-		semconv.MessagingOperationNameKey.String("receive"),
-		semconv.MessagingMessageBodySize(bodySize),
-		semconv.MessagingMessageConversationID(conversationID),
-	}
-	return append(attrs, serverAttrs...)
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return c.RequestMsgWithContext(reqCtx, msg)
 }

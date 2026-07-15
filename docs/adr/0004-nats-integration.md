@@ -253,3 +253,39 @@ Re-open this decision when **any** of the following holds:
 
 At that point evaluate a justified-T3 metrics layer (consumer-lag via
 `consumer.Info()` polling being the highest-value target) in its own ADR.
+
+---
+
+## Amendment (2026-07-09): upstream v0.6.0 upgrade and module-path cutover
+
+The upstream module renamed its path from
+`github.com/Marz32onE/instrumentation-go/otel-nats` to
+`github.com/akira-core/instrumentation-go/otel-nats` in v0.6.0 (repo
+transferred to the `akira-core` org; the go.mod cutover landed in the same
+release). The SDK now pins **v0.6.0** under the new path.
+
+Re-audit summary (same discipline as the original v0.2.11 audit; v0.5.x was
+skipped after a review found regressions — see issues #69–#73):
+
+- **Fixed upstream in v0.6.0**: semconv restored to v1.39.0 (the v0.5.x line
+  had regressed to v1.37.0); `Consumer.Next` returns the local receive-span
+  context; `ConsumeContext` mirrors the full native surface (Stop/Drain/
+  Closed); the v0.5.1 propagation env gate was removed (inject/extract follow
+  the tracing gate unconditionally); `MessageBatch` gained a `Stop()` escape
+  hatch; `Version()` is guarded by a test; **the requester-side reply-receive
+  span is now emitted upstream** (`recordReply`), replacing the o11y-owned
+  reply-link span from the ADR 0022 2026-07-01 amendment.
+- **Still present, tracked upstream**: tracing is gated by two process-wide
+  env vars (`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` +
+  `OTEL_NATS_TRACING_ENABLED`, default off) latched by a `sync.Once` at first
+  Connect, with no exported reset (v0.5.1's `ResetGatesForTest` was removed —
+  downstream test suites must set the env in `TestMain`); the deliver-span
+  path still builds its own TracerProvider/exporter from
+  `OTEL_EXPORTER_OTLP_ENDPOINT` with no sampler; `messaging.consumer.name`
+  remains a non-semconv literal; the upstream `HeaderCarrier` remains
+  exact-case with no canonical fallback (the ADR 0022 2026-07-03 documented
+  limitation stands).
+- **Facade changes**: `Conn.Request` drops its variadic `attrs` parameter and
+  shims ctx+timeout over upstream `RequestWithContext` (the upstream primary
+  `Request` is ctx-less); `linkReply`/`replyAttrs` deleted; `Consumer.Next`
+  wrapped; `ConsumeContext` widened; `MessageBatch.Stop` added.

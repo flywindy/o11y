@@ -88,6 +88,230 @@ func TestJetStream_Consume_TracePropagation(t *testing.T) {
 		"a consumer span should link back to the publisher's trace")
 }
 
+// TestJetStream_Consume_DrainClosed covers the teardown surface added when
+// the facade ConsumeContext widened to mirror the native interface (otel-nats
+// v0.6.0): Drain lets an in-flight message finish processing, and Closed
+// signals once the consume loop has fully shut down.
+func TestJetStream_Consume_DrainClosed(t *testing.T) {
+	_, url := startJetStreamServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	const streamName, subject, consumerName = "EVENTS_DC", "events.dc.created", "drain-test"
+	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	received := make(chan struct{}, 1)
+	cc, err := cons.Consume(context.Background(), func(_ context.Context, m jetstream.Msg) {
+		_ = m.Ack()
+		select {
+		case received <- struct{}{}:
+		default:
+		}
+	})
+	require.NoError(t, err)
+
+	_, err = js.Publish(context.Background(), subject, []byte("hello"))
+	require.NoError(t, err)
+
+	// The message published before Drain must still be delivered and handled.
+	select {
+	case <-received:
+	case <-time.After(3 * time.Second):
+		t.Fatal("consumer did not receive message within timeout")
+	}
+
+	cc.Drain()
+
+	// Closed must signal completion after a drain — this is the graceful
+	// drain-and-wait shutdown that was impossible when the facade exposed
+	// only Stop().
+	select {
+	case <-cc.Closed():
+	case <-time.After(3 * time.Second):
+		t.Fatal("ConsumeContext.Closed did not signal within timeout after Drain")
+	}
+}
+
+// TestJetStream_FetchBytes_StopUnblocksWaitingBatch is the regression test
+// for MessageBatch.Stop closing the facade's Messages channel on a batch that
+// is still WAITING for messages (empty stream, pull request open): the
+// forwarding goroutine parks on the upstream channel receive in that state,
+// so Stop must be selected on the receive side too — without that, Messages()
+// would not close until the native pull expires (tens of seconds).
+//
+// This asserts the facade contract (the caller-visible channel closes). The
+// companion fix that Stop also cancels the fetch context — so the upstream
+// forwarding goroutine and its NATS pull subscription are released rather
+// than left parked until expiry — is a resource-lifecycle concern one layer
+// down that this black-box test cannot directly observe; it is covered by the
+// wrapMessageBatch/Stop implementation and documented in
+// docs/upstream-otel-nats.md (F4).
+func TestJetStream_FetchBytes_StopUnblocksWaitingBatch(t *testing.T) {
+	_, url := startJetStreamServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	const streamName, subject, consumerName = "EVENTS_SU", "events.su.created", "stop-unblock-test"
+	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	// Nothing has been published: the batch stays open waiting for messages.
+	batch, err := cons.FetchBytes(context.Background(), 1024)
+	require.NoError(t, err)
+
+	// Give the forwarding goroutine a moment to park on the upstream receive,
+	// so Stop is exercised against the waiting state, not the setup window.
+	time.Sleep(100 * time.Millisecond)
+	batch.Stop()
+
+	select {
+	case _, ok := <-batch.Messages():
+		assert.False(t, ok, "Messages channel should close after Stop, not deliver")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Messages channel did not close promptly after Stop on a waiting batch")
+	}
+}
+
+// TestJetStream_Next_CanceledContext locks down the guard on Consumer.Next:
+// an already-canceled caller ctx must produce an error AND a non-nil returned
+// context (the caller's own ctx), so a caller that reads the returned ctx
+// before checking the error cannot nil-dereference. The upstream Next returns
+// (nil, nil, err) on failure; the facade substitutes the caller ctx on both
+// the guard and the upstream error path.
+func TestJetStream_Next_CanceledContext(t *testing.T) {
+	_, url := startJetStreamServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	const streamName, subject, consumerName = "EVENTS_NX", "events.nx.created", "next-cancel-test"
+	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	gotCtx, msg, err := cons.Next(canceled)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, msg)
+	assert.NotNil(t, gotCtx, "Next must return a non-nil context even on the error path")
+	assert.Equal(t, canceled, gotCtx, "Next should return the caller's own ctx on the guard error path")
+}
+
+// TestJetStream_Next_TracePropagation covers the happy path of Consumer.Next
+// — the #69.1 fix that motivated wrapping it: the returned ctx must carry the
+// local receive span, linked back to the publisher's trace, rather than the
+// producer's remote ctx. TestJetStream_Next_CanceledContext covers only the
+// guard error path, so without this a future upstream regression to the old
+// producer-ctx behavior would go uncaught.
+func TestJetStream_Next_TracePropagation(t *testing.T) {
+	enableNATSTracing(t)
+	_, url := startJetStreamServer(t)
+	tp, prop, sr := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	const streamName, subject, consumerName = "EVENTS_NXT", "events.nxt.created", "next-trace-test"
+	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	tracer := tp.Tracer("test")
+	pubCtx, span := tracer.Start(context.Background(), "publish-event")
+	pubTraceID := span.SpanContext().TraceID()
+	_, err = js.Publish(pubCtx, subject, []byte("hi"))
+	require.NoError(t, err)
+	span.End()
+
+	// Bound the fetch with a ctx deadline so Next returns even if delivery is
+	// slow. (Upstream Next honors a deadline via FetchMaxWait, not live
+	// cancellation — see the facade doc; the deadline is the reliable bound.)
+	fetchCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	msgCtx, msg, err := cons.Next(fetchCtx)
+	require.NoError(t, err)
+	require.NotNil(t, msg)
+	require.NoError(t, msg.Ack())
+
+	gotTraceID := oteltrace.SpanFromContext(msgCtx).SpanContext().TraceID()
+	assert.True(t, gotTraceID.IsValid(), "Next ctx should carry a valid trace ID")
+	assert.NotEqual(t, pubTraceID, gotTraceID,
+		"the receive span starts a new trace and links to the producer, per OTel messaging semantics")
+
+	// The single-shot receive span is ended immediately by upstream, so it is
+	// already in Ended() by the time Next returns; poll for robustness.
+	assert.Eventually(t, func() bool {
+		for _, s := range sr.Ended() {
+			for _, link := range s.Links() {
+				if link.SpanContext.TraceID() == pubTraceID {
+					return true
+				}
+			}
+		}
+		return false
+	}, 3*time.Second, 10*time.Millisecond,
+		"the Next receive span should link back to the publisher's trace")
+}
+
 // TestJetStream_Messages_TracePropagation exercises the pull-iterator path
 // (the one chat uses): Messages().Next() must yield a ctx carrying the consumer
 // span and the native jetstream.Msg.

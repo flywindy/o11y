@@ -766,3 +766,29 @@ testing `otelnats`'s behavior, not this facade's. Documented instead, in
 messages predating the header-casing fix have drained from any durable
 streams; worth reporting upstream to `Marz32onE/instrumentation-go` as a
 `otelnats.HeaderCarrier` interop gap independent of this SDK.
+
+---
+
+## Amendment (2026-07-09): otel-nats v0.6.0 — reply-link span superseded, Next wrapped, teardown surface completed
+
+Upstream v0.6.0 absorbs three decisions this ADR previously worked around:
+
+1. **The 2026-07-01 `Conn.Request` reply-link span is superseded.** Upstream
+   `recordReply` now emits the requester-side reply-receive span itself —
+   named `receive {inbox}`, parented under (and linked to) the responder's
+   remote reply-send context when the reply carries one, emitted without a
+   link otherwise. The facade's `linkReply`/`replyAttrs` are deleted to avoid
+   a duplicate span; `Request`'s variadic `attrs` parameter is removed with
+   them (upstream offers no caller-attribute hook on that span — proposed
+   upstream as an enhancement). Topology note: the receive span now lands in
+   the responder's trace rather than the requester's.
+2. **`Consumer.Next` is now wrapped** (the 2026-06-16 §2 deferral is lifted):
+   upstream returns the local receive-span context, consistent with
+   `Messages().Next`.
+3. **`ConsumeContext` mirrors the native Stop/Drain/Closed** and the facade
+   interface widened to match; `MessageBatch` gained `Stop()` upstream and the
+   facade propagates it, so FetchBytes early abandonment no longer risks a
+   parked forwarding goroutine.
+
+The 2026-07-03 canonical-header extraction limitation remains (upstream
+carrier still exact-case, verified in v0.6.0) and its documentation stands.

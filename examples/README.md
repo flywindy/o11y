@@ -229,14 +229,15 @@ go run examples/nats-core/requester/main.go
 
 The responder replies with `conn.Respond`, which routes the reply through the
 traced publish path so the reply message carries the responder's trace context
-(unlike raw `msg.Respond`). The requester uses `conn.Request`, which extracts
-that trace context from the reply and starts a `receive {subject}` span, as a
-child of the request's own span, linking back to the responder's reply-send
-span (ADR 0022 amendment, 2026-07-01).
+(unlike raw `msg.Respond`). The requester uses `conn.Request`; the upstream
+otel-nats v0.6.0 layer records a `receive {inbox}` span for the reply — named
+for the reply inbox, parented under the responder's trace and linked back to
+its reply-send span (the reply-span recording moved from this SDK's facade to
+upstream in the v0.6.0 upgrade; see ADR 0022's 2026-07-09 amendment).
 
 This example demonstrates the full round trip: in Tempo you should see the
 request publish, responder processing, the responder's traced reply publish,
-and the requester's `receive o11y.rpc.greet` span carrying a link back to that
+and the requester-side `receive {inbox}` span carrying a link back to that
 reply publish — so the handler → requester leg is no longer a dead end.
 
 ### JetStream (two or three terminals; requires JetStream-enabled NATS server)

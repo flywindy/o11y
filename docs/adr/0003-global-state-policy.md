@@ -134,7 +134,7 @@ Before introducing any `github.com/<vendor>/otel-<thing>` library, verify:
 
 | Library | Version | Verified | Behavior | Notes |
 |---|---|---|---|---|
-| `Marz32onE/instrumentation-go/otel-nats` | v0.2.11 | ✅ | Reads globals as fallback only; never sets. Safe when `WithTracerProvider` / `WithPropagators` options are supplied. | See ADR 0004 |
+| `akira-core/instrumentation-go/otel-nats` | v0.6.0 | ✅ | Reads provider globals as fallback only; never sets them. Safe when `WithTracerProvider` / `WithPropagators` options are supplied. The opt-in deliver-span path builds its own private TracerProvider/exporter from `OTEL_EXPORTER_OTLP_ENDPOINT` (no globals mutated; tracked upstream). Module path renamed from `Marz32onE` upstream in v0.6.0. | See ADR 0004 (2026-07-09 amendment) |
 | `go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/v2/mongo/otelmongo` | v0.0.0-20260622212340-49857026d46e | ✅ | Reads globals as fallback only; never sets. Safe when `WithTracerProvider` and `WithMeterProvider` are supplied explicitly. Emits semconv-compatible MongoDB command spans and operation metrics; source imports semconv v1.41.0, with the emitted keys documented in `docs/semconv.md`. | See ADR 0014 and ADR 0021 |
 | `go.opentelemetry.io/contrib/instrumentation/runtime` | v0.68.0 | ✅ | Runtime metrics are started with an explicit MeterProvider. No OTel provider globals are set. | Used by `internal/metrics` |
 | `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` | v0.68.0 | ✅ | Reads globals as fallback only; safe when `WithTracerProvider`, `WithMeterProvider`, and `WithPropagators` are supplied. | See ADR 0009 |

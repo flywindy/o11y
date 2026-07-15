@@ -13,6 +13,67 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+### Changed
+
+- `nats`: upgraded the underlying instrumentation from
+  `github.com/Marz32onE/instrumentation-go/otel-nats` v0.2.11 to
+  `github.com/akira-core/instrumentation-go/otel-nats` **v0.6.0** (upstream
+  renamed its module path to the `akira-core` org in the same release). The
+  v0.5.x line was skipped; see `docs/upstream-otel-nats.md` and ADR 0004's
+  2026-07-09 amendment for the re-audit.
+- `nats`: the requester-side reply "receive" span is now recorded by upstream
+  `recordReply` instead of the facade. Its topology changed accordingly — it
+  is named for the reply **inbox** (`receive {inbox}`, not `receive
+  {subject}`) and parents under the **responder's** trace with a link back to
+  the request, rather than as a child of the caller's ctx. The two sides are
+  now two linked traces, not one. It is also emitted (without a link) for
+  replies that carry no trace context. See `docs/semconv.md` and
+  `docs/guide.md`.
+
+### Added
+
+- `nats`: `Conn.RequestMsg(ctx, msg, timeout)` — a ctx-first shadow of the
+  embedded upstream `RequestMsg(msg, timeout)`, whose ctx-less signature
+  parents its producer span to `context.Background()` and orphans the trace.
+  Use it for requests that must carry headers.
+- `nats`: `Consumer.Next(ctx, opts...)` is now wrapped (upstream v0.6.0 fixed
+  it to return the local receive-span context).
+- `nats`: `ConsumeContext` now exposes `Drain()` and `Closed()` in addition to
+  `Stop()` (upstream now mirrors the native `jetstream.ConsumeContext`).
+- `nats`: `MessageBatch.Stop()` abandons an in-flight `Fetch`/`FetchBytes`
+  batch, releasing the facade's forwarding goroutine and — by cancelling the
+  fetch context — the upstream goroutine and its NATS pull subscription.
+
+### Fixed
+
+- `nats`: an abandoned, still-waiting `Fetch`/`FetchBytes` batch no longer
+  leaves a forwarding goroutine and NATS pull subscription parked until the
+  pull expires; `MessageBatch.Stop()` now cancels the fetch context to drain
+  them promptly. `MessageBatch.Error()` no longer reports the
+  `context.Canceled` that Stop itself triggers (a caller-ctx cancellation
+  without Stop is still surfaced).
+
+### Breaking Changes (Migration Guide)
+
+- `nats.Conn.Request`'s trailing variadic `attrs ...attribute.KeyValue`
+  parameter (added in 0.8.0) was **removed**. The reply "receive" span is now
+  created inside otel-nats v0.6.0, which offers no caller-attribute injection
+  point. Call sites passing `attrs` no longer compile: drop the extra
+  arguments and attach domain identifiers (request/correlation IDs, room/site
+  IDs) to your own ambient span instead. Interfaces/variables typed against
+  the 0.8.0 variadic signature revert to the non-variadic
+  `func(context.Context, string, []byte, time.Duration) (*nats.Msg, error)`.
+- `nats.ConsumeContext` gained `Drain()` and `Closed() <-chan struct{}`. Any
+  test double/fake implementing this interface must add those two methods.
+- `nats.MessageBatch` gained `Stop()`, and `nats.Consumer` gained
+  `Next(ctx, opts...)`. Test doubles implementing either interface must add
+  the new method(s).
+- The import path for the NATS instrumentation dependency changed from
+  `github.com/Marz32onE/...` to `github.com/akira-core/...`. Services import
+  `github.com/flywindy/o11y/nats` (not the upstream directly), so this is
+  transparent; only code that imported the upstream package directly (against
+  policy) is affected.
+
 ---
 
 ## [0.8.0] - 2026-07-03

@@ -5,21 +5,22 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
-	"github.com/Marz32onE/instrumentation-go/otel-nats/oteljetstream"
+	"github.com/akira-core/instrumentation-go/otel-nats/oteljetstream"
 	natsgo "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
 // This file is the o11y-owned JetStream facade (ADR 0022 Phase 2). It wraps the
 // upstream oteljetstream types in o11y interfaces so callers import only
-// github.com/flywindy/o11y/nats, never the Marz oteljetstream package, while
-// still getting its trace propagation and consumer span-links for free.
+// github.com/flywindy/o11y/nats, never the upstream oteljetstream package,
+// while still getting its trace propagation and consumer span-links for free.
 //
 // Configuration types (StreamConfig, ConsumerConfig, AckExplicitPolicy, PubAck,
 // PullConsumeOpt, PullMessagesOpt, NextOpt, FetchOpt, PublishOpt, …) are taken
 // directly from github.com/nats-io/nats.go/jetstream — they are plain stdlib
-// types, not a Marz dependency.
+// types, not an upstream-instrumentation dependency.
 //
 // The Consume callback and the Messages iterator deliver the native
 // jetstream.Msg together with a ctx carrying the consumer span (matching the
@@ -55,22 +56,21 @@ import (
 // by any other producer that canonicalizes — will not be linked to its
 // producer's trace when consumed via Consume/Messages/Fetch/FetchBytes/
 // FetchNoWait, even though this package's own Extract/Inject (used by the
-// legacy nats.JetStreamContext API and internally by Conn.Request's
-// reply-link span) already handles this correctly. Fixing this would require
-// reimplementing oteljetstream's consumer-span creation ourselves — the T3
-// re-instrumentation this ADR has deliberately avoided everywhere else — so
-// it is documented rather than worked around (ADR 0022 amendment,
-// 2026-07-03). Self-resolves once messages predating this SDK's header-
-// casing fix have drained from any durable streams.
+// legacy nats.JetStreamContext API) already handles this correctly. Fixing
+// this would require reimplementing oteljetstream's consumer-span creation
+// ourselves — the T3 re-instrumentation this ADR has deliberately avoided
+// everywhere else — so it is documented rather than worked around (ADR 0022
+// amendment, 2026-07-03; still present in otel-nats v0.6.0). Self-resolves
+// once messages predating this SDK's header-casing fix have drained from any
+// durable streams.
 //
 // Scope: this facade wraps the JetStream surface o11y consumers use today
-// (stream/consumer management, Publish, and the pull consume modes Consume /
-// Messages / Fetch / FetchBytes / FetchNoWait). Deferred until a consumer
-// needs them: single-message Consumer.Next (upstream v0.2.11 returns the
-// producer's remote context rather than the local receive span — use
-// Messages with jetstream.PullMaxMessages(1) for single fetch), PushConsumer,
-// ordered consumers, and the admin surface (Pause/Resume/List/Unpin). Wrapped
-// on demand later.
+// (stream/consumer management, Publish, the pull consume modes Consume /
+// Messages / Fetch / FetchBytes / FetchNoWait, and single-message Next —
+// wrappable since otel-nats v0.6.0 fixed Next to return the receive-span
+// context). Deferred until a consumer needs them: PushConsumer, ordered
+// consumers, and the admin surface (Pause/Resume/List/Unpin). Wrapped on
+// demand later.
 
 // JetStreamMsgHandler is the Consume callback signature. ctx carries the
 // consumer span extracted from the message headers by the upstream layer, so
@@ -102,11 +102,11 @@ type FetchedMessage struct {
 // Messages() before reading everything is safe, no goroutine or message is
 // leaked. FetchBytes has no message-count bound (only a byte budget, which
 // an unbounded number of small messages could satisfy), so its buffer is a
-// best-effort fixed size: a batch with more messages than that can still
-// leave the forwarding goroutine blocked on a send with nothing left to
-// receive it, until the caller resumes reading or the process exits — there
-// is no Stop/cancel escape hatch on MessageBatch. Prefer Fetch/FetchNoWait
-// over FetchBytes when early abandonment is a realistic caller pattern.
+// best-effort fixed size. Callers that abandon a FetchBytes batch early
+// should call Stop: it releases this facade's forwarding goroutine and the
+// upstream one (otel-nats v0.6.0 added the matching upstream escape hatch),
+// discarding undelivered messages. Stop is idempotent and safe to call after
+// the channel has closed.
 //
 // That same buffering means each FetchedMessage's receive span (m.Ctx) may
 // already be ended by the time your loop body runs: the upstream oteljetstream
@@ -122,7 +122,24 @@ type FetchedMessage struct {
 // pattern rather than enriching the receive span directly.
 type MessageBatch interface {
 	Messages() <-chan FetchedMessage
+	// Error returns the batch's terminal error after the Messages channel
+	// closes, matching the native jetstream.MessageBatch contract. A batch
+	// abandoned via Stop reports no error for the fetch-context cancellation
+	// Stop itself triggers (that is expected teardown, not a fetch failure);
+	// a context.Canceled originating from the caller's own ctx, without a
+	// Stop, is still surfaced.
 	Error() error
+	// Stop abandons the batch: undelivered messages are discarded and the
+	// Messages channel closes once any in-flight send completes. It releases
+	// both this facade's forwarding goroutine and — by cancelling the native
+	// pull's fetch context — the upstream one and its NATS pull subscription,
+	// so an abandoned still-waiting batch is not left parked until the pull
+	// expires. The upstream release is immediate for Fetch/FetchBytes calls
+	// whose fetch context was wired (the default); when the caller supplied
+	// their own jetstream.FetchMaxWait the fetch context is not wired, so the
+	// upstream leg instead unwinds when that FetchMaxWait elapses. Reading the
+	// channel to exhaustion instead of calling Stop remains fully supported.
+	Stop()
 }
 
 // JetStream is a tracing-aware JetStream context. Obtain one from Conn.JetStream.
@@ -167,13 +184,10 @@ type Consumer interface {
 	//
 	// ctx is a registration-time guard only (consistent with Subscribe): an
 	// already-cancelled ctx is rejected up front, but ctx is not plumbed
-	// downstream and does NOT stop a running loop — use ConsumeContext.Stop for
-	// that. Per-message trace context arrives via the handler's ctx argument,
-	// extracted from the message headers.
-	//
-	// Note: the returned ConsumeContext exposes only Stop (an upstream
-	// limitation — see ConsumeContext). If you need drain-and-wait graceful
-	// shutdown, use Messages instead, whose MessagesContext also offers Drain.
+	// downstream and does NOT stop a running loop — use the returned
+	// ConsumeContext (Stop for immediate teardown, Drain for drain-and-wait,
+	// Closed to await completion). Per-message trace context arrives via the
+	// handler's ctx argument, extracted from the message headers.
 	Consume(ctx context.Context, handler JetStreamMsgHandler, opts ...jetstream.PullConsumeOpt) (ConsumeContext, error)
 	// Messages returns a pull iterator. Each Next yields a ctx carrying the
 	// consumer span plus the native jetstream.Msg. ctx is a registration-time
@@ -205,16 +219,35 @@ type Consumer interface {
 	// returns without waiting for more to arrive (no jetstream.FetchOpt —
 	// matches the native jetstream.Consumer.FetchNoWait signature).
 	FetchNoWait(ctx context.Context, batch int) (MessageBatch, error)
+	// Next fetches a single message. The returned ctx carries the consumer
+	// receive span (linked to the producer's trace when the message headers
+	// carry one), matching the (ctx, msg) shape of Messages().Next — the
+	// receive span is already ended by the time Next returns, so start your
+	// own child span via tracer.Start(ctx, ...) for per-message work rather
+	// than enriching the receive span.
+	//
+	// ctx semantics: a ctx DEADLINE is honored — the upstream layer converts
+	// it to jetstream.FetchMaxWait, so Next returns once the deadline passes.
+	// Live CANCELLATION is not: upstream checks ctx only before the native
+	// call (no jetstream.FetchContext is wired), so cancelling a
+	// deadline-less ctx mid-wait does not abort it. Bound the wait with a
+	// deadline (or a jetstream.FetchMaxWait opt) rather than relying on
+	// cancel; tracked upstream in docs/upstream-otel-nats.md.
+	Next(ctx context.Context, opts ...jetstream.FetchOpt) (context.Context, jetstream.Msg, error)
 	Info(ctx context.Context) (*jetstream.ConsumerInfo, error)
 	CachedInfo() *jetstream.ConsumerInfo
 }
 
-// ConsumeContext controls a Consume call. It exposes only Stop because the
-// upstream oteljetstream layer narrows the native jetstream.ConsumeContext
-// (Stop/Drain/Closed) down to Stop. For drain-and-wait shutdown, prefer
-// Messages, whose MessagesContext exposes both Stop and Drain.
+// ConsumeContext controls a Consume call. Since otel-nats v0.6.0 the
+// upstream layer mirrors the native jetstream.ConsumeContext in full, so all
+// three teardown primitives are available: Stop halts immediately and
+// discards buffered messages; Drain stops new pulls but lets already-buffered
+// messages be handled before shutdown completes; Closed returns a channel
+// that closes once consuming has fully stopped or drained.
 type ConsumeContext interface {
 	Stop()
+	Drain()
+	Closed() <-chan struct{}
 }
 
 // MessagesContext is the pull iterator returned by Consumer.Messages. Next
@@ -354,34 +387,41 @@ func (c *consumer) Fetch(ctx context.Context, batch int, opts ...jetstream.Fetch
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("nats jetstream fetch: %w", err)
 	}
-	mb, err := fetchWithCtxFallback(ctx, opts, func(o []jetstream.FetchOpt) (oteljetstream.MessageBatch, error) {
+	// Derive a cancelable fetch ctx so Stop can abort the in-flight native
+	// pull, not just the facade's own forwarding goroutine — see
+	// wrapMessageBatch and messageBatch.Stop.
+	fetchCtx, cancel := context.WithCancel(ctx)
+	mb, err := fetchWithCtxFallback(fetchCtx, opts, func(o []jetstream.FetchOpt) (oteljetstream.MessageBatch, error) {
 		return c.c.Fetch(batch, o...)
 	})
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	// batch is Fetch's own hard cap on message count, so a same-sized buffer
 	// guarantees the forwarding goroutine below can drain the entire batch
 	// without blocking, even if the caller never reads Messages() at all —
 	// see wrapMessageBatch.
-	return wrapMessageBatch(mb, batch), nil
+	return wrapMessageBatch(mb, batch, cancel), nil
 }
 
 func (c *consumer) FetchBytes(ctx context.Context, maxBytes int, opts ...jetstream.FetchOpt) (MessageBatch, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("nats jetstream fetch-bytes: %w", err)
 	}
-	mb, err := fetchWithCtxFallback(ctx, opts, func(o []jetstream.FetchOpt) (oteljetstream.MessageBatch, error) {
+	fetchCtx, cancel := context.WithCancel(ctx)
+	mb, err := fetchWithCtxFallback(fetchCtx, opts, func(o []jetstream.FetchOpt) (oteljetstream.MessageBatch, error) {
 		return c.c.FetchBytes(maxBytes, o...)
 	})
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	// FetchBytes has no message-count cap (only a byte budget, which a
 	// single small message could satisfy many times over), so unlike Fetch
 	// there is no buffer size that provably fits the whole batch — see the
 	// fetchBytesBatchBuf doc comment.
-	return wrapMessageBatch(mb, fetchBytesBatchBuf), nil
+	return wrapMessageBatch(mb, fetchBytesBatchBuf, cancel), nil
 }
 
 // fetchWithCtxFallback calls call with jetstream.FetchContext(ctx) prepended
@@ -445,8 +485,13 @@ func (c *consumer) FetchNoWait(ctx context.Context, batch int) (MessageBatch, er
 	if err != nil {
 		return nil, err
 	}
+	// FetchNoWait takes no FetchOpt, so there is no cancelable fetch ctx to
+	// wire — but it never blocks waiting for new messages (it returns only
+	// what is already buffered), so the upstream forwarding goroutine drains
+	// and exits on its own without a pull to abort. A no-op cancel keeps the
+	// wrapMessageBatch contract uniform.
 	// Same reasoning as Fetch: batch is a hard cap here too.
-	return wrapMessageBatch(mb, batch), nil
+	return wrapMessageBatch(mb, batch, func() {}), nil
 }
 
 // fetchBytesBatchBuf is the best-effort forwarding buffer size for
@@ -468,24 +513,96 @@ const fetchBytesBatchBuf = 256
 // see the MessageBatch doc comment for the goroutine-leak this closes (fully,
 // when bufSize is a true upper bound on message count; best-effort
 // otherwise).
-func wrapMessageBatch(mb oteljetstream.MessageBatch, bufSize int) MessageBatch {
+//
+// cancel aborts the native pull that backs this batch. Stop invokes it so an
+// abandoned, still-waiting Fetch/FetchBytes batch does not leave the upstream
+// forwarding goroutine (and its NATS pull subscription) parked until the pull
+// expires: cancelling the fetch ctx closes the native message channel, which
+// drains upstream. It is also invoked when this goroutine exits on its own
+// (normal drain) so the fetch ctx is not leaked. cancel is a no-op on the
+// FetchMaxWait-collision path (where the fetch ctx was not wired) and for
+// FetchNoWait (which never blocks); Stop still releases this facade's
+// goroutine via done in those cases.
+func wrapMessageBatch(mb oteljetstream.MessageBatch, bufSize int, cancel context.CancelFunc) MessageBatch {
 	out := make(chan FetchedMessage, bufSize)
+	done := make(chan struct{})
 	go func() {
 		defer close(out)
-		for m := range mb.Messages() {
-			out <- FetchedMessage{Ctx: m.Ctx, Msg: m.Msg}
+		defer cancel()
+		for {
+			// Select on the upstream receive as well as the send: a batch
+			// still waiting for messages parks this goroutine on the receive,
+			// and Stop must release it (and close out) promptly from there
+			// too, not only when it is blocked on a full out buffer.
+			select {
+			case m, ok := <-mb.Messages():
+				if !ok {
+					return
+				}
+				select {
+				case out <- FetchedMessage{Ctx: m.Ctx, Msg: m.Msg}:
+				case <-done:
+					return
+				}
+			case <-done:
+				return
+			}
 		}
 	}()
-	return &messageBatch{ch: out, mb: mb}
+	return &messageBatch{ch: out, mb: mb, done: done, cancel: cancel}
 }
 
 type messageBatch struct {
-	ch chan FetchedMessage
-	mb oteljetstream.MessageBatch
+	ch       chan FetchedMessage
+	mb       oteljetstream.MessageBatch
+	done     chan struct{}
+	cancel   context.CancelFunc
+	stopOnce sync.Once
 }
 
 func (m *messageBatch) Messages() <-chan FetchedMessage { return m.ch }
-func (m *messageBatch) Error() error                    { return m.mb.Error() }
+
+func (m *messageBatch) Error() error {
+	err := m.mb.Error()
+	// Stop cancels the fetch ctx, which the native pull surfaces as
+	// context.Canceled. After an explicit Stop that is expected teardown, not
+	// a batch failure, so it is not reported. A context.Canceled seen without
+	// a Stop (the caller's own ctx was canceled) is a real terminal condition
+	// and is returned unchanged.
+	if err != nil && errors.Is(err, context.Canceled) {
+		select {
+		case <-m.done:
+			return nil
+		default:
+		}
+	}
+	return err
+}
+
+func (m *messageBatch) Stop() {
+	m.stopOnce.Do(func() {
+		close(m.done)
+		// Abort the native pull first so the upstream forwarding goroutine's
+		// blocking receive on raw.Messages() unblocks (its channel closes),
+		// then call the upstream Stop to close its own done channel.
+		m.cancel()
+		m.mb.Stop()
+	})
+}
+
+func (c *consumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (context.Context, jetstream.Msg, error) {
+	if err := ctx.Err(); err != nil {
+		return ctx, nil, fmt.Errorf("nats jetstream next: %w", err)
+	}
+	// Never return a nil context: the upstream Next returns (nil, nil, err) on
+	// failure, which risks nil-dereference in callers that touch ctx before
+	// checking err. Substitute the caller's own ctx on the error path.
+	msgCtx, msg, err := c.c.Next(ctx, opts...)
+	if err != nil {
+		return ctx, nil, err
+	}
+	return msgCtx, msg, nil
+}
 
 func (c *consumer) Info(ctx context.Context) (*jetstream.ConsumerInfo, error) { return c.c.Info(ctx) }
 

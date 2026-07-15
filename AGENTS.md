@@ -128,7 +128,7 @@ go run examples/nats-core/subscriber/main.go
 go run examples/nats-core/publisher/main.go
 
 # Run the NATS Core request/reply examples (two terminals; responder replies via conn.Respond)
-# Export both gates first, or otel-nats v0.2.11 injects no traceparent (replies work but untraced):
+# Export both gates first, or otel-nats v0.6.0 stays on its untraced passthrough impl (replies work but untraced):
 export OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true OTEL_NATS_TRACING_ENABLED=true
 go run examples/nats-core/responder/main.go
 go run examples/nats-core/requester/main.go
@@ -243,7 +243,7 @@ Full ADR documents live in [`docs/adr/`](docs/adr/).
 | Log format strategy | Option B — align stdout `traceId`/`spanId` field names | Preserves existing log reading habits; minimal blast radius. See [ADR 0001](docs/adr/0001-log-format-strategy.md) |
 | Metrics strategy | Prometheus pull (default `:2112`) + OTLP push opt-in (`WithMetricsOTLPEndpoint`) | Prometheus pull requires zero Collector config; OTLP push covers serverless. Exemplars enabled by default (OTel SDK `SampledFilter`). See [ADR 0002](docs/adr/0002-metrics-strategy.md) |
 | Global state policy | SDK packages must not mutate OTel globals; third-party instrumentation libraries are verified per-version before adoption | See [ADR 0003](docs/adr/0003-global-state-policy.md) |
-| NATS integration | `github.com/Marz32onE/instrumentation-go/otel-nats` — verified at v0.2.11 not to mutate globals; wrapped by the `nats/` package | Covers NATS Core + all JetStream consumer patterns with OTel semconv v1.39.0. See [ADR 0004](docs/adr/0004-nats-integration.md) |
+| NATS integration | `github.com/akira-core/instrumentation-go/otel-nats` — verified at v0.6.0 not to mutate global providers/propagators (module path renamed from `Marz32onE` upstream); wrapped by the `nats/` package | Covers NATS Core + all JetStream consumer patterns with OTel semconv v1.39.0. See [ADR 0004](docs/adr/0004-nats-integration.md) |
 | MongoDB integration | `go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/v2/mongo/otelmongo` — wrapped by the `mongo/` package | Wires SDK providers explicitly through a driver `CommandMonitor`, emits command spans and operation metrics, adds SDK-owned connection-pool metrics through `PoolMonitor`, and does not inject `_oteltrace` into persisted documents. See [ADR 0014](docs/adr/0014-mongodb-metrics.md) and [ADR 0021](docs/adr/0021-mongodb-instrumentation-mechanism.md) |
 | Semconv version policy | Pin v1.39.0; upgrade only when concrete triggers fire | Single SDK-owned pin avoids cognitive cost and dashboard breakage. Upgrade triggers and process documented to keep version moves deliberate. See [ADR 0006](docs/adr/0006-semconv-upgrade-strategy.md) |
 | HTTP integration | `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` — wrapped by the `http/` package | Provides `NewServerHandler` and `NewTransport` with SDK providers and propagator wired explicitly. See [ADR 0009](docs/adr/0009-replace-http-with-otelhttp.md) |
@@ -331,7 +331,7 @@ Not yet wrapped: single-message `Consumer.Next` (use `Messages(ctx, jetstream.Pu
 
 When replying to a message inside a `Subscribe` handler, do **not** use `msg.Respond(data)` if you need the reply to carry trace context. `msg.Respond` routes through the raw NATS connection and skips header injection. Use `conn.Respond(ctx, msg, data)` (or `conn.Publish(ctx, msg.Reply, data)`) instead — `Respond` validates the reply subject and routes through the traced publish path.
 
-On the requester side, `conn.Request(ctx, subject, data, timeout, attrs...)` closes the round trip: when the reply carries a trace context (i.e. the responder replied via `conn.Respond`), `Request` starts a short `receive {subject}` span linking back to it, so the handler → requester leg is visible in Grafana Tempo instead of the trace stopping at the responder's reply-send span. The optional `attrs` land on that span — use them for domain identifiers the SDK can't infer on its own (a request/correlation ID, a room/site ID) so the span is searchable in Tempo. No span is created if the reply carries no trace context (untraced responder, or one that used raw `msg.Respond`).
+On the requester side, `conn.Request(ctx, subject, data, timeout)` closes the round trip. Since the otel-nats v0.6.0 upgrade the reply "receive" span is recorded by the upstream layer (not the facade): a `receive {inbox}` span named for the reply inbox, parented under the responder's trace and linked back to the request when the reply carries a trace context (i.e. the responder replied via `conn.Respond`). When the reply carries no trace context (untraced responder, or one that used raw `msg.Respond`) the span is still recorded, with no link. Note the topology is two linked traces, not one: the request "send" span lives in the requester's trace and the reply "receive" span in the responder's — follow the span link in Tempo to cross between them. The pre-v0.6.0 variadic `attrs` parameter was removed (upstream offers no caller-attribute hook on that span); attach domain identifiers to your own ambient span instead. For a request that must carry headers, use `conn.RequestMsg(ctx, msg, timeout)`, the ctx-first shadow of the embedded ctx-less `RequestMsg`.
 
 ---
 
