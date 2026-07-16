@@ -41,8 +41,14 @@ type Conn struct {
 // support context cancellation during an in-progress dial; canceling ctx
 // after Connect returns has no effect on an established connection.
 //
-// tp and prop are wired directly into the underlying otelnats layer;
-// no global OTel state is read or modified.
+// tp and prop must be non-nil; they are wired directly into the underlying
+// otelnats layer, and supplied this way no global OTel state is read or
+// modified. SDK callers pass obs.TracerProvider() / obs.Propagator, which are
+// always non-nil (obs.TracerProvider() is a noop provider — never nil — when
+// the trace pillar is off). Passing a literal nil would let the upstream layer
+// fall back to the process-global provider/propagator (otel.GetTracerProvider /
+// otel.GetTextMapPropagator), which is exactly the ambient global state ADR
+// 0003 keeps this SDK away from — so don't.
 //
 // Tracing is enabled explicitly via otelnats.WithTracingEnabled(true), so it
 // does NOT depend on the OTEL_INSTRUMENTATION_GO_TRACING_ENABLED /

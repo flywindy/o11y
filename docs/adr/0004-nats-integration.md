@@ -302,8 +302,12 @@ global-state or provider-routing concerns.
     `WithTracingEnabled(true)` unconditionally**, so NATS tracing follows the
     SDK's own toggle instead of requiring two process-wide env vars. With a
     real TracerProvider this emits spans and propagates context; with the noop
-    provider (SDK tracing disabled) spans are noop but W3C headers still flow —
-    matching the SDK's feature-toggle semantics and removing a production
+    provider (SDK tracing disabled) NATS spans are non-recording and carry no
+    span context, so no active trace is propagated while the pillar is off
+    (upstream starts each publish/consume span from a fresh context, so a noop
+    tracer yields nothing to inject) — cross-service correlation is inactive,
+    not broken, and resumes when the trace pillar is enabled. This matches the
+    SDK's feature-toggle semantics and removes the two-env-var production
     footgun. Tests no longer need a `TestMain` env-var setup.
   - **Deliver spans removed entirely** — the implicit `OTEL_EXPORTER_OTLP_ENDPOINT`-
     gated second TracerProvider/exporter (no sampler) is gone, closing the
