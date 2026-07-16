@@ -44,6 +44,16 @@ type Conn struct {
 // tp and prop are wired directly into the underlying otelnats layer;
 // no global OTel state is read or modified.
 //
+// Tracing is enabled explicitly via otelnats.WithTracingEnabled(true), so it
+// does NOT depend on the OTEL_INSTRUMENTATION_GO_TRACING_ENABLED /
+// OTEL_NATS_TRACING_ENABLED environment variables the upstream package gates
+// on by default — passing a real TracerProvider through this SDK is a clear
+// enough signal of intent (ADR 0003: explicit config over ambient env state).
+// When the SDK's trace pillar is disabled, obs.TracerProvider() is a no-op
+// provider: spans become no-ops but W3C traceparent/baggage headers are still
+// injected and extracted, so downstream services stay correlated (matching the
+// SDK's documented trace-toggle behavior).
+//
 // Typical usage with the o11y SDK:
 //
 //	conn, err := nats.Connect(ctx, url, obs.TracerProvider(), obs.Propagator)
@@ -54,6 +64,7 @@ func Connect(ctx context.Context, url string, tp trace.TracerProvider, prop prop
 	nc, err := otelnats.ConnectWithOptions(url, natsOpts,
 		otelnats.WithTracerProvider(tp),
 		otelnats.WithPropagators(prop),
+		otelnats.WithTracingEnabled(true),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("nats connect %s: %w", url, err)

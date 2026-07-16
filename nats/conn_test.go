@@ -2,7 +2,6 @@ package nats_test
 
 import (
 	"context"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -62,30 +61,10 @@ func newTestProviders() (oteltrace.TracerProvider, propagation.TextMapPropagator
 	return tp, prop, sr
 }
 
-// TestMain sets the otel-nats tracing env gates before any test runs.
-// otel-nats v0.6.0 latches the gates process-wide (sync.Once inside its
-// internal flags package) at the first Connect and no longer exports a reset
-// hook (v0.5.1's ResetGatesForTest was removed), so per-test t.Setenv cannot
-// enable tracing once any earlier test has dialed a connection — the gates
-// must be set for the whole test binary up front.
-func TestMain(m *testing.M) {
-	os.Setenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", "true")
-	os.Setenv("OTEL_NATS_TRACING_ENABLED", "true")
-	os.Exit(m.Run())
-}
-
-// enableNATSTracing documents, at each trace-asserting test's entry point,
-// that the otel-nats env gates must be on. The actual values are set in
-// TestMain (see above — v0.6.0 latches them process-wide before the first
-// Connect); this helper only verifies the invariant still holds.
-func enableNATSTracing(t *testing.T) {
-	t.Helper()
-	for _, key := range []string{"OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", "OTEL_NATS_TRACING_ENABLED"} {
-		if os.Getenv(key) != "true" {
-			t.Fatalf("%s must be set by TestMain before any test dials a connection", key)
-		}
-	}
-}
+// Tracing in these tests is enabled by o11ynats.Connect itself (via
+// otelnats.WithTracingEnabled(true)), not by process-wide env gates — that is
+// the whole point of the enhancement, so the tests deliberately set no
+// OTEL_*_ENABLED variables and still observe spans.
 
 func TestConnect(t *testing.T) {
 	_, url := startTestServer(t)
@@ -108,8 +87,6 @@ func TestConnect_InvalidURL(t *testing.T) {
 }
 
 func TestSubscribe_ContextPropagation(t *testing.T) {
-	enableNATSTracing(t)
-
 	_, url := startTestServer(t)
 	tp, prop, sr := newTestProviders()
 
@@ -213,8 +190,6 @@ func TestQueueSubscribe(t *testing.T) {
 // raw msg.Respond. The responder replies via conn.Respond and the requester
 // asserts the reply message headers contain a traceparent.
 func TestRespond_TracePropagation(t *testing.T) {
-	enableNATSTracing(t)
-
 	_, url := startTestServer(t)
 	tp, prop, sr := newTestProviders()
 
@@ -299,8 +274,6 @@ func TestRespond_TracePropagation(t *testing.T) {
 // receive span now lands in the responder's trace (remote parent) rather than
 // the requester's, with the link still providing the cross-trace correlation.
 func TestRequest_ReplyLink(t *testing.T) {
-	enableNATSTracing(t)
-
 	_, url := startTestServer(t)
 	tp, prop, sr := newTestProviders()
 
@@ -335,8 +308,8 @@ func TestRequest_ReplyLink(t *testing.T) {
 		if s.Name() != "receive "+reply.Subject {
 			continue
 		}
-		assert.Equal(t, oteltrace.SpanKindConsumer, s.SpanKind(),
-			"reply-receive span should be CONSUMER-kind")
+		assert.Equal(t, oteltrace.SpanKindClient, s.SpanKind(),
+			"reply-receive span should be CLIENT-kind (otel-nats v0.7.0 corrected the span kinds)")
 		require.Len(t, s.Links(), 1, "reply-receive span should carry exactly one link")
 		assert.True(t, s.Links()[0].SpanContext.IsValid(),
 			"the link should point at a valid remote span context")
@@ -356,8 +329,6 @@ func TestRequest_ReplyLink(t *testing.T) {
 // without this, the reply-receive span would be the one NATS span in a trace
 // that can't be filtered by broker.
 func TestRequest_ReplyLink_ServerAttrs(t *testing.T) {
-	enableNATSTracing(t)
-
 	_, url := startTestServer(t)
 	tp, prop, sr := newTestProviders()
 
@@ -413,8 +384,6 @@ func TestRequest_ReplyLink_ServerAttrs(t *testing.T) {
 // span; upstream v0.6.0's recordReply uses the destination attribute of its
 // receive span instead.)
 func TestRequest_ReplyReceive_DestinationIsInbox(t *testing.T) {
-	enableNATSTracing(t)
-
 	_, url := startTestServer(t)
 	tp, prop, sr := newTestProviders()
 
@@ -457,8 +426,6 @@ func TestRequest_ReplyReceive_DestinationIsInbox(t *testing.T) {
 // v0.6.0 still records the reply-receive span (recordReply is unconditional)
 // but it must carry no link, and Request must return the reply as-is.
 func TestRequest_NoReplyHeader_NoLinkSpan(t *testing.T) {
-	enableNATSTracing(t)
-
 	_, url := startTestServer(t)
 	tp, prop, sr := newTestProviders()
 
@@ -504,8 +471,6 @@ func TestRequest_NoReplyHeader_NoLinkSpan(t *testing.T) {
 // pre-built request message reaches the responder — proving RequestMsg sends
 // the caller's *nats.Msg rather than a fresh one.
 func TestRequestMsg_CtxFirstTracing(t *testing.T) {
-	enableNATSTracing(t)
-
 	_, url := startTestServer(t)
 	tp, prop, sr := newTestProviders()
 

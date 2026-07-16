@@ -20,7 +20,6 @@ import (
 // asserts that the Consume handler receives a ctx carrying a valid consumer
 // span, and that a recorded consumer span links back to the publisher's trace.
 func TestJetStream_Consume_TracePropagation(t *testing.T) {
-	enableNATSTracing(t)
 	_, url := startJetStreamServer(t)
 	tp, prop, sr := newTestProviders()
 
@@ -251,7 +250,6 @@ func TestJetStream_Next_CanceledContext(t *testing.T) {
 // guard error path, so without this a future upstream regression to the old
 // producer-ctx behavior would go uncaught.
 func TestJetStream_Next_TracePropagation(t *testing.T) {
-	enableNATSTracing(t)
 	_, url := startJetStreamServer(t)
 	tp, prop, sr := newTestProviders()
 
@@ -316,7 +314,6 @@ func TestJetStream_Next_TracePropagation(t *testing.T) {
 // (the one chat uses): Messages().Next() must yield a ctx carrying the consumer
 // span and the native jetstream.Msg.
 func TestJetStream_Messages_TracePropagation(t *testing.T) {
-	enableNATSTracing(t)
 	_, url := startJetStreamServer(t)
 	tp, prop, sr := newTestProviders()
 
@@ -396,7 +393,6 @@ func TestJetStream_Messages_TracePropagation(t *testing.T) {
 // each FetchedMessage delivered on the MessageBatch channel must carry a ctx
 // with a valid consumer span that links back to the publisher's trace.
 func TestJetStream_Fetch_TracePropagation(t *testing.T) {
-	enableNATSTracing(t)
 	_, url := startJetStreamServer(t)
 	tp, prop, sr := newTestProviders()
 
@@ -943,7 +939,6 @@ func TestJetStream_Consume_NilHandler(t *testing.T) {
 // lookup, Info / CachedInfo, PublishMsg, the single-message Consumer.Next, the
 // Messages Drain path, and DeleteConsumer / DeleteStream.
 func TestJetStream_ManagementRoundTrip(t *testing.T) {
-	enableNATSTracing(t)
 	_, url := startJetStreamServer(t)
 	tp, prop, _ := newTestProviders()
 

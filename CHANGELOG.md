@@ -17,10 +17,27 @@ adopters can plan their upgrades.
 
 - `nats`: upgraded the underlying instrumentation from
   `github.com/Marz32onE/instrumentation-go/otel-nats` v0.2.11 to
-  `github.com/akira-core/instrumentation-go/otel-nats` **v0.6.0** (upstream
-  renamed its module path to the `akira-core` org in the same release). The
-  v0.5.x line was skipped; see `docs/upstream-otel-nats.md` and ADR 0004's
-  2026-07-09 amendment for the re-audit.
+  `github.com/akira-core/instrumentation-go/otel-nats` **v0.7.0** (upstream
+  renamed its module path to the `akira-core` org in v0.6.0). The v0.5.x line
+  was skipped; see `docs/upstream-otel-nats.md` and ADR 0004's 2026-07-09 and
+  2026-07-16 amendments for the re-audits. v0.7.0 cleared almost the entire
+  upstream backlog — see the dedicated items below.
+- `nats`: **NATS tracing is now on by default.** `o11ynats.Connect` passes
+  `otelnats.WithTracingEnabled(true)` (new in upstream v0.7.0), so tracing
+  follows the SDK's own tracer toggle instead of the two process-wide env vars
+  (`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` + `OTEL_NATS_TRACING_ENABLED`) the
+  upstream previously required, default off. With a real TracerProvider you get
+  spans and W3C context propagation; with the noop provider (SDK tracing
+  disabled) spans are noop but headers still propagate. No env vars are needed
+  for the NATS examples or tests any more.
+- `nats`: **span kinds corrected** (upstream v0.7.0). The reply "receive" span
+  and the JetStream pull-consume spans (`Consume`/`Fetch`/`Messages`) are now
+  `CLIENT` (were `CONSUMER`); `publish` stays `PRODUCER`, push `process` stays
+  `CONSUMER`. Pull-receive spans also carry `messaging.operation.type=receive`.
+- `nats`: JetStream consumer spans now attach the consumer/durable name under
+  the semconv v1.39.0 key `messaging.consumer.group.name` (was the non-semconv
+  literal `messaging.consumer.name`), resolving the last deviation in
+  `docs/semconv.md`.
 - `nats`: the requester-side reply "receive" span is now recorded by upstream
   `recordReply` instead of the facade. Its topology changed accordingly — it
   is named for the reply **inbox** (`receive {inbox}`, not `receive
@@ -51,7 +68,25 @@ adopters can plan their upgrades.
   pull expires; `MessageBatch.Stop()` now cancels the fetch context to drain
   them promptly. `MessageBatch.Error()` no longer reports the
   `context.Canceled` that Stop itself triggers (a caller-ctx cancellation
-  without Stop is still surfaced).
+  without Stop is still surfaced). Upstream v0.7.0 additionally fixes the
+  forwarding goroutine to observe `Stop` while parked *receiving* from the
+  native batch (not just while sending), so the facade's fetch-context
+  workaround is belt-and-braces rather than load-bearing.
+- `nats`: JetStream trace-context extraction now links messages whose trace
+  headers were written under a canonicalized key (e.g. `Traceparent` rather
+  than lowercase `traceparent`). Upstream v0.7.0's `HeaderCarrier` implements
+  `propagation.ValuesGetter` and falls back to MIME-canonical and case-folded
+  lookups, resolving the header-casing limitation previously documented in
+  `nats/jetstream.go` (ADR 0022 2026-07-03 amendment).
+- `nats`: `Consumer.Next` now honors live context cancellation (upstream wires
+  `jetstream.FetchContext`), so cancelling a deadline-less ctx mid-wait aborts
+  the pull promptly instead of blocking for the ~30s default max wait.
+- `nats`: request/reply "send" (CLIENT) spans no longer overwrite
+  `messaging.message.body.size` with the reply payload size after the round
+  trip — it now always reports the request size. Core request/reply send spans
+  additionally carry `messaging.message.conversation_id` (the reply inbox),
+  joining the requester's send/receive spans and the responder's process span
+  by attribute query, not just by span link.
 
 ### Breaking Changes (Migration Guide)
 
@@ -73,6 +108,33 @@ adopters can plan their upgrades.
   `github.com/flywindy/o11y/nats` (not the upstream directly), so this is
   transparent; only code that imported the upstream package directly (against
   policy) is affected.
+- **Span kinds changed (v0.7.0).** The reply "receive" span and the JetStream
+  pull-consume spans (`Consume`/`Fetch`/`Messages`) moved from `CONSUMER` to
+  `CLIENT`. Update any Tempo/dashboard queries or span-metrics rules that
+  filter NATS spans by `SpanKind`.
+- **`messaging.consumer.name` → `messaging.consumer.group.name` (v0.7.0).**
+  The consumer/durable name now lives under the semconv v1.39.0 key. Update
+  dashboards/queries keyed on the old attribute.
+- **Batch / `Messages` receive-span durations shortened (v0.7.0).** These
+  spans now end at handover (before the message reaches your loop body) instead
+  of when the next message arrives. Any per-message enrichment via
+  `trace.SpanFromContext(m.Ctx).SetAttributes(...)` was already a no-op and
+  stays one — start your own child span with `tracer.Start(m.Ctx, ...)` for
+  per-message work. Latency panels reading these span durations will show
+  shorter values (receive-to-handover, not receive-to-processing).
+- **`Consumer.Next` + `FetchMaxWait` (v0.7.0).** Calling `Next` with a
+  cancelable ctx (`WithCancel`/`WithTimeout`/`WithDeadline`) *and* a
+  caller-supplied `jetstream.FetchMaxWait` opt now returns
+  `jetstream.ErrInvalidOption` (upstream rejects `FetchContext` + `FetchMaxWait`
+  together). Migration: express the bound via the ctx deadline
+  (`context.WithTimeout`) instead of a separate `FetchMaxWait`;
+  `context.Background()` + `FetchMaxWait` keeps working unchanged.
+- **Deliver spans removed (v0.7.0).** The upstream synthetic "deliver" span
+  (an implicit `OTEL_EXPORTER_OTLP_ENDPOINT`-gated second exporter with no
+  sampler) is gone, and the package no longer reads that env var for span
+  emission. Deployments that had set the env var to opt into deliver spans (or
+  had avoided setting it to suppress them) will no longer see the Grafana
+  service-graph broker node those spans produced.
 
 ---
 

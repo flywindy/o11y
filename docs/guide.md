@@ -780,12 +780,13 @@ producer's trace.
 
 Use `obs.Propagator` together with the `nats` sub-package to propagate trace context across NATS messages.
 
-> **Tracing must be enabled.** The underlying `otel-nats` gates all NATS trace
-> propagation behind two environment variables — set **both**
-> `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true` and
-> `OTEL_NATS_TRACING_ENABLED=true`. When they are unset, `Publish`, `Subscribe`,
-> and `Respond` fall back to raw NATS paths that inject no `traceparent`, so
-> messages flow but carry no trace context.
+> **Tracing is on by default.** `o11ynats.Connect` enables NATS tracing
+> explicitly (`otelnats.WithTracingEnabled(true)`), so it does not depend on the
+> `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` / `OTEL_NATS_TRACING_ENABLED`
+> environment variables the upstream package gates on by default. When the SDK's
+> trace pillar is disabled, `obs.TracerProvider()` is a no-op provider: spans
+> become no-ops but `traceparent`/baggage headers are still injected and
+> extracted, so downstream services stay correlated.
 
 ```go
 import (
@@ -849,9 +850,10 @@ _, err = conn.Subscribe(ctx, "orders.get", func(ctx context.Context, msg *gonats
 
 // Requester: conn.Request injects the active trace into the request headers.
 // Since otel-nats v0.6.0 the upstream layer also records the requester-side
-// reply-receive span itself: a "receive {inbox}" CONSUMER span that, when the
-// reply carries a trace context (the responder used conn.Respond), is
-// parented under — and linked to — the responder's reply-send context.
+// reply-receive span itself: a "receive {inbox}" CLIENT span (v0.7.0 corrected
+// the kind from CONSUMER) that, when the reply carries a trace context (the
+// responder used conn.Respond), is parented under — and linked to — the
+// responder's reply-send context.
 _, err = conn.Request(ctx, "orders.get", []byte("42"), 2*time.Second)
 ```
 
@@ -996,16 +998,19 @@ discards undelivered messages and releases both this facade's forwarding
 goroutine and the upstream one. Draining fully remains equally supported —
 `examples/jetstream/fetch-worker` shows the full drain pattern.
 
-That same buffering has a tracing consequence: `m.Ctx`'s receive span may
-already be ended by the time your loop body runs it for message 2 and later
-in a batch (upstream ends message N's span as soon as its own internal
-forwarding reads message N+1, and buffering lets that race ahead of your
-processing) — so unlike the `Subscribe` pattern above,
-`trace.SpanFromContext(m.Ctx).SetAttributes(...)` is unreliable here. Two
-things still work: `obs.Logger.*Context(m.Ctx, ...)` log correlation (reads
-only the immutable trace/span IDs, not the span's live state), and starting
-your own child span via `tracer.Start(m.Ctx, ...)` for per-message work —
-the pattern `examples/jetstream/fetch-worker` actually uses.
+There is a tracing consequence: `m.Ctx`'s receive span is already ended by the
+time your loop body runs. Since otel-nats v0.7.0 upstream ends every batch
+message's receive span *at handover* (just before putting it on the channel),
+so `IsRecording()` is deterministically false at delivery for every message —
+unlike the `Subscribe` pattern above, `trace.SpanFromContext(m.Ctx).
+SetAttributes(...)` is a no-op here. (Before v0.7.0 upstream ended message N's
+span only when it read message N+1, so the no-op was racy rather than
+guaranteed; v0.7.0 makes it consistent, and the receive-span durations shorter,
+measuring receive-to-handover only.) Two things still work:
+`obs.Logger.*Context(m.Ctx, ...)` log correlation (reads only the immutable
+trace/span IDs, not the span's live state), and starting your own child span
+via `tracer.Start(m.Ctx, ...)` for per-message work — the pattern
+`examples/jetstream/fetch-worker` actually uses.
 
 Single-message `Consumer.Next` is wrapped since the otel-nats v0.6.0 upgrade
 (upstream fixed it to return the local receive-span context). Not yet wrapped
@@ -1013,15 +1018,14 @@ Single-message `Consumer.Next` is wrapped since the otel-nats v0.6.0 upgrade
 directly): push consumers and ordered consumers.
 
 `Consume`/`Messages`/`Fetch`/`FetchBytes`/`FetchNoWait` extract per-message
-trace context entirely inside the vendored `oteljetstream` package, using a
-carrier that (unlike this SDK's own `Extract`) has no fallback for a
-canonicalized header key ("Traceparent" instead of the literal lowercase
-"traceparent" this SDK's own `Publish` always writes). A message written by a
-pre-`headerCarrier`-fix version of this SDK, or by any other canonicalizing
-producer, arrives unlinked from its producer's trace when consumed through
-any of these five methods — this facade has no hook into that internal
-extraction to fix it (ADR 0022 amendment, 2026-07-03). Self-resolves once
-such messages have drained from any durable streams.
+trace context entirely inside the upstream `oteljetstream` package. Since
+otel-nats v0.7.0 its `HeaderCarrier` matches the verbatim key first and then
+falls back to MIME-canonical and case-folded lookups, so a message whose trace
+header was written under a canonicalized key ("Traceparent" rather than the
+literal lowercase "traceparent" this SDK's own `Publish` writes) — by any
+canonicalizing producer — is still linked to its producer's trace when consumed
+through any of these five methods. (Earlier versions had no such fallback; that
+was the ADR 0022 2026-07-03 documented limitation, now resolved upstream.)
 The **legacy** `nats.JetStreamContext` API (`js.PullSubscribe()` +
 `sub.FetchBatch()`) is a different, un-instrumented API; for it, propagate trace
 context manually with `nats.Inject` / `nats.Extract`.

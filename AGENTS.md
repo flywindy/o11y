@@ -128,8 +128,7 @@ go run examples/nats-core/subscriber/main.go
 go run examples/nats-core/publisher/main.go
 
 # Run the NATS Core request/reply examples (two terminals; responder replies via conn.Respond)
-# Export both gates first, or otel-nats v0.6.0 stays on its untraced passthrough impl (replies work but untraced):
-export OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true OTEL_NATS_TRACING_ENABLED=true
+# No env vars needed: o11ynats.Connect enables tracing via otelnats.WithTracingEnabled(true).
 go run examples/nats-core/responder/main.go
 go run examples/nats-core/requester/main.go
 
