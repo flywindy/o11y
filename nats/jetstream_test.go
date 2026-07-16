@@ -762,19 +762,18 @@ func TestJetStream_Fetch_FetchMaxWaitCollision_Retries(t *testing.T) {
 		"should resolve close to the caller's 300ms FetchMaxWait, not the 30s default")
 }
 
-// TestJetStream_Fetch_ReceiveSpanEndsBeforeConsumption documents a known
-// trade-off of the goroutine-leak fix (see MessageBatch's doc comment):
-// buffering the forwarding channel to bufSize lets the forwarding goroutine
-// race ahead through the whole upstream batch — and upstream ends message N's
-// receive span as soon as it reads message N+1 off its own channel — well
-// ahead of the caller's own processing pace. So by the time a caller's loop
-// gets to later messages in a batch, those receive spans are typically
-// already ended, and trace.SpanFromContext(m.Ctx).SetAttributes(...) on them
-// is a silent no-op; log correlation and child spans (see
-// examples/jetstream/fetch-worker) are unaffected and remain the supported
-// pattern. If upstream oteljetstream ever changes this span-lifecycle
-// behavior, this test breaks as a prompt to update the doc comments that
-// describe it.
+// TestJetStream_Fetch_ReceiveSpanEndsBeforeConsumption documents the
+// receive-span lifecycle a caller sees (see MessageBatch's doc comment): since
+// otel-nats v0.7.0 the upstream oteljetstream library ends every message's
+// receive span BEFORE handing it to the channel (end-at-handover), so the span
+// is deterministically already ended by the time the caller's loop observes
+// the message — for every message, not just the ones a buffered forwarding
+// goroutine happened to race ahead of (the earlier v0.6.0 end-when-N+1-is-read
+// behavior). So trace.SpanFromContext(m.Ctx).SetAttributes(...) is a silent
+// no-op; log correlation and child spans (see examples/jetstream/fetch-worker)
+// are unaffected and remain the supported pattern. If upstream oteljetstream
+// ever changes this span-lifecycle behavior, this test breaks as a prompt to
+// update the doc comments that describe it.
 func TestJetStream_Fetch_ReceiveSpanEndsBeforeConsumption(t *testing.T) {
 	_, url := startJetStreamServer(t)
 	tp, prop, _ := newTestProviders()
@@ -820,10 +819,10 @@ drain:
 			}
 			last = m
 			got++
-			// Simulate realistic per-message processing time, giving the
-			// forwarding goroutine room to race ahead through the rest of
-			// the already-buffered batch before this loop reads the next
-			// message — the condition under which spans end early.
+			// Simulate realistic per-message processing time. Under v0.7.0's
+			// end-at-handover the receive span is already ended regardless of
+			// pace; the sleep just keeps the test representative of a caller
+			// doing real work between reads.
 			time.Sleep(20 * time.Millisecond)
 		case <-time.After(3 * time.Second):
 			t.Fatal("Fetch did not deliver the full batch within timeout")
