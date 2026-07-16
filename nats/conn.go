@@ -50,9 +50,14 @@ type Conn struct {
 // on by default — passing a real TracerProvider through this SDK is a clear
 // enough signal of intent (ADR 0003: explicit config over ambient env state).
 // When the SDK's trace pillar is disabled, obs.TracerProvider() is a no-op
-// provider: spans become no-ops but W3C traceparent/baggage headers are still
-// injected and extracted, so downstream services stay correlated (matching the
-// SDK's documented trace-toggle behavior).
+// provider: the traced code path still runs, but every span is non-recording
+// and carries no span context. Because upstream starts each publish/consume
+// span from a fresh context, a no-op provider yields no active trace to inject,
+// so cross-service trace correlation is simply inactive while the pillar is off
+// (not broken) and resumes automatically once the trace pillar is enabled.
+// WithTracingEnabled(true) ties NATS tracing to the SDK's own toggle rather
+// than to the two OTEL_*_ENABLED env vars; it does not attempt to propagate a
+// trace the disabled pillar is not producing.
 //
 // Typical usage with the o11y SDK:
 //

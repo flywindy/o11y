@@ -765,7 +765,7 @@ func TestJetStream_Fetch_FetchMaxWaitCollision_Retries(t *testing.T) {
 // TestJetStream_Fetch_ReceiveSpanEndsBeforeConsumption documents the
 // receive-span lifecycle a caller sees (see MessageBatch's doc comment): since
 // otel-nats v0.7.0 the upstream oteljetstream library ends every message's
-// receive span BEFORE handing it to the channel (end-at-handover), so the span
+// receive span BEFORE handing it to the channel (end-at-handover), the span
 // is deterministically already ended by the time the caller's loop observes
 // the message — for every message, not just the ones a buffered forwarding
 // goroutine happened to race ahead of (the earlier v0.6.0 end-when-N+1-is-read

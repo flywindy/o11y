@@ -784,9 +784,10 @@ Use `obs.Propagator` together with the `nats` sub-package to propagate trace con
 > explicitly (`otelnats.WithTracingEnabled(true)`), so it does not depend on the
 > `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` / `OTEL_NATS_TRACING_ENABLED`
 > environment variables the upstream package gates on by default. When the SDK's
-> trace pillar is disabled, `obs.TracerProvider()` is a no-op provider: spans
-> become no-ops but `traceparent`/baggage headers are still injected and
-> extracted, so downstream services stay correlated.
+> trace pillar is disabled, `obs.TracerProvider()` is a no-op provider: NATS
+> spans are non-recording and carry no span context, so no active trace is
+> propagated while the pillar is off — cross-service trace correlation is
+> inactive (not broken) and resumes as soon as the trace pillar is enabled.
 
 ```go
 import (
@@ -1001,7 +1002,7 @@ goroutine and the upstream one. Draining fully remains equally supported —
 There is a tracing consequence: `m.Ctx`'s receive span is already ended by the
 time your loop body runs. Since otel-nats v0.7.0 upstream ends every batch
 message's receive span *at handover* (just before putting it on the channel),
-so `IsRecording()` is deterministically false at delivery for every message —
+`IsRecording()` is deterministically false at delivery for every message —
 unlike the `Subscribe` pattern above, `trace.SpanFromContext(m.Ctx).
 SetAttributes(...)` is a no-op here. (Before v0.7.0 upstream ended message N's
 span only when it read message N+1, so the no-op was racy rather than
@@ -1020,7 +1021,7 @@ directly): push consumers and ordered consumers.
 `Consume`/`Messages`/`Fetch`/`FetchBytes`/`FetchNoWait` extract per-message
 trace context entirely inside the upstream `oteljetstream` package. Since
 otel-nats v0.7.0 its `HeaderCarrier` matches the verbatim key first and then
-falls back to MIME-canonical and case-folded lookups, so a message whose trace
+falls back to MIME-canonical and case-folded lookups, a message whose trace
 header was written under a canonicalized key ("Traceparent" rather than the
 literal lowercase "traceparent" this SDK's own `Publish` writes) — by any
 canonicalizing producer — is still linked to its producer's trace when consumed

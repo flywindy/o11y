@@ -48,7 +48,7 @@ import (
 // performed entirely inside the upstream oteljetstream package, using its own
 // otelnats.HeaderCarrier. Since otel-nats v0.7.0 that carrier matches the
 // verbatim key first and then falls back to a MIME-canonical and a
-// case-folded lookup, so a message whose trace header is stored under a
+// case-folded lookup, a message whose trace header is stored under a
 // canonicalized key (e.g. "Traceparent" rather than the literal lowercase
 // "traceparent" this SDK's own Publish writes) — written by any producer that
 // canonicalizes — is still linked to its producer's trace when consumed via

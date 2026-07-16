@@ -320,8 +320,10 @@ global-state or provider-routing concerns.
     size and now carries `conversation_id`; `MessageBatch.Stop` releases the
     upstream goroutine even while it is parked receiving.
 - **Behavioral changes to note (BREAKING for observers)**: span kinds
-  corrected — reply-receive and JetStream pull-consume spans are now `CLIENT`
-  (were `CONSUMER`); batch/`Messages` receive spans end at handover (shorter
+  corrected — reply-receive and the JetStream pull-**receive** spans (`Next`/
+  `Messages`/`Fetch`/`FetchBytes`/`FetchNoWait`) are now `CLIENT` (were
+  `CONSUMER`); the `Consume` callback and core Subscribe `process` spans stay
+  `CONSUMER` (unchanged); batch/`Messages` receive spans end at handover (shorter
   durations); `Consumer.Next` with a cancelable ctx can no longer be combined
   with a caller `FetchMaxWait` (returns `jetstream.ErrInvalidOption`). See the
   o11y CHANGELOG's v0.7.0 entry for migration notes.

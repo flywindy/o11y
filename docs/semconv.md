@@ -134,10 +134,14 @@ reply-link span (ADR 0022 amendment, 2026-07-01; superseded 2026-07-09). See
 "Reply-Receive Span" below for the topology this implies.
 
 **Span kinds (corrected in otel-nats v0.7.0)**: the reply-receive span and the
-JetStream pull-consume spans (`Consume` / `Fetch` / `Messages`) are `CLIENT`
-(they were `CONSUMER` in v0.6.0); `publish` is `PRODUCER`; a push consumer's
-`process` span is `CONSUMER`. Dashboards that filtered NATS pull/reply spans by
-`CONSUMER` kind must switch to `CLIENT`.
+JetStream pull-**receive** spans (`Next` / `Messages` / `Fetch` / `FetchBytes` /
+`FetchNoWait`) are `CLIENT` (they were `CONSUMER` in v0.6.0); `publish` is
+`PRODUCER`. The JetStream `Consume` callback's `process` span — like a core
+Subscribe `process` span — is and stays `CONSUMER` (it did **not** change):
+`Consume` is a message-processing operation, not a synchronous receive.
+Dashboards that filtered the pull-receive / reply spans by `CONSUMER` kind must
+switch to `CLIENT`; filters for `Consume` (durable-consumer processing) spans
+stay on `CONSUMER`.
 
 ### Core and JetStream Attributes
 
@@ -145,7 +149,7 @@ JetStream pull-consume spans (`Consume` / `Fetch` / `Messages`) are `CLIENT`
 |---|---|---|
 | `messaging.system` | string | Constant `"nats"`. |
 | `messaging.destination.name` | string | NATS subject (e.g. `events.created`). |
-| `messaging.operation.type` | string | `send`, `receive`, or `process`. JetStream pull-consume spans carry `receive` since otel-nats v0.7.0. |
+| `messaging.operation.type` | string | `send`, `receive`, or `process`. The JetStream pull-**receive** spans (`Next`/`Messages`/`Fetch`/`FetchBytes`/`FetchNoWait`) carry `receive` since otel-nats v0.7.0; the `Consume` callback span carries `process`. |
 | `messaging.operation.name` | string | `publish`, `request`, `receive`, or `process`. `request` is emitted (with operation.type `send`) on `Conn.Request`'s producer span since otel-nats v0.6.0; plain publishes stay `publish`. |
 | `messaging.message.body.size` | int | Emitted when payload is non-empty. |
 | `messaging.message.conversation_id` | string | Request/reply inbox. On the requester's "send" span it is set (late) once a reply arrives; see the Reply-Receive Span section. |

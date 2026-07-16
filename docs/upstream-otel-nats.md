@@ -37,11 +37,15 @@ response.
 | `Version()` tag-consistency not automated | **D3** / [#73](https://github.com/flywindy/o11y/issues/73) remainder | A release-tag CI guard now keeps the version constant and the release tag in sync (noted in the CHANGELOG coverage note); the constant reads `0.7.0` |
 
 Span kinds were also corrected to the OTel spec in v0.7.0: reply-receive and
-JetStream pull-consume (`Consume`/`Fetch`/`Messages`) spans are now `CLIENT`
-(were `CONSUMER`); `publish` stays `PRODUCER`, push `process` stays
-`CONSUMER`. Pull-receive spans additionally carry
-`messaging.operation.type=receive`. This is reflected in `docs/semconv.md` and
-the o11y test assertions.
+the JetStream pull-**receive** spans (`Next`/`Messages`/`Fetch`/`FetchBytes`/
+`FetchNoWait`) are now `CLIENT` (were `CONSUMER`); `publish` stays `PRODUCER`.
+The JetStream `Consume` callback span and the core Subscribe handler span keep
+`process` semantics and stay `CONSUMER` (unchanged) — upstream's own CHANGELOG
+lumps `Consume` in with the CLIENT group, but the code
+(`oteljetstream.tracedConsumeHandler`) still starts it `SpanKindConsumer`, so
+only the pull-receive/reply paths actually changed. Pull-receive spans
+additionally carry `messaging.operation.type=receive`. This is reflected in
+`docs/semconv.md` and the o11y test assertions.
 
 ### Resolved earlier, by upstream v0.6.0 (for the record)
 

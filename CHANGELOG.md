@@ -28,12 +28,16 @@ adopters can plan their upgrades.
   (`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` + `OTEL_NATS_TRACING_ENABLED`) the
   upstream previously required, default off. With a real TracerProvider you get
   spans and W3C context propagation; with the noop provider (SDK tracing
-  disabled) spans are noop but headers still propagate. No env vars are needed
-  for the NATS examples or tests any more.
+  disabled) NATS spans are noop and, because there is no recording span, no
+  active trace context is propagated while the pillar is off — correlation is
+  inactive, not broken, and resumes when the trace pillar is enabled. No env
+  vars are needed for the NATS examples or tests anymore.
 - `nats`: **span kinds corrected** (upstream v0.7.0). The reply "receive" span
-  and the JetStream pull-consume spans (`Consume`/`Fetch`/`Messages`) are now
-  `CLIENT` (were `CONSUMER`); `publish` stays `PRODUCER`, push `process` stays
-  `CONSUMER`. Pull-receive spans also carry `messaging.operation.type=receive`.
+  and the JetStream pull-**receive** spans (`Next`/`Messages`/`Fetch`/
+  `FetchBytes`/`FetchNoWait`) are now `CLIENT` (were `CONSUMER`); `publish`
+  stays `PRODUCER`. The JetStream `Consume` callback span and the core Subscribe
+  handler span keep `process` semantics and stay `CONSUMER` (they did **not**
+  change). Pull-receive spans also carry `messaging.operation.type=receive`.
 - `nats`: JetStream consumer spans now attach the consumer/durable name under
   the semconv v1.39.0 key `messaging.consumer.group.name` (was the non-semconv
   literal `messaging.consumer.name`), resolving the last deviation in
@@ -109,9 +113,12 @@ adopters can plan their upgrades.
   transparent; only code that imported the upstream package directly (against
   policy) is affected.
 - **Span kinds changed (v0.7.0).** The reply "receive" span and the JetStream
-  pull-consume spans (`Consume`/`Fetch`/`Messages`) moved from `CONSUMER` to
-  `CLIENT`. Update any Tempo/dashboard queries or span-metrics rules that
-  filter NATS spans by `SpanKind`.
+  pull-**receive** spans (`Next`/`Messages`/`Fetch`/`FetchBytes`/`FetchNoWait`)
+  moved from `CONSUMER` to `CLIENT`. The JetStream `Consume` callback span and
+  the core Subscribe handler span stay `CONSUMER` (they are `process` spans and
+  did not change) — do not move their dashboard filters. Update any
+  Tempo/dashboard queries or span-metrics rules that filter the pull-receive /
+  reply spans by `SpanKind`.
 - **`messaging.consumer.name` → `messaging.consumer.group.name` (v0.7.0).**
   The consumer/durable name now lives under the semconv v1.39.0 key. Update
   dashboards/queries keyed on the old attribute.
