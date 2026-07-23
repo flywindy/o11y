@@ -41,8 +41,29 @@ type Conn struct {
 // support context cancellation during an in-progress dial; canceling ctx
 // after Connect returns has no effect on an established connection.
 //
-// tp and prop are wired directly into the underlying otelnats layer;
-// no global OTel state is read or modified.
+// tp and prop must be non-nil; they are wired directly into the underlying
+// otelnats layer, and supplied this way no global OTel state is read or
+// modified. SDK callers pass obs.TracerProvider() / obs.Propagator, which are
+// always non-nil (obs.TracerProvider() is a noop provider — never nil — when
+// the trace pillar is off). Passing a literal nil would let the upstream layer
+// fall back to the process-global provider/propagator (otel.GetTracerProvider /
+// otel.GetTextMapPropagator), which is exactly the ambient global state ADR
+// 0003 keeps this SDK away from — so don't.
+//
+// Tracing is enabled explicitly via otelnats.WithTracingEnabled(true), so it
+// does NOT depend on the OTEL_INSTRUMENTATION_GO_TRACING_ENABLED /
+// OTEL_NATS_TRACING_ENABLED environment variables the upstream package gates
+// on by default — passing a real TracerProvider through this SDK is a clear
+// enough signal of intent (ADR 0003: explicit config over ambient env state).
+// When the SDK's trace pillar is disabled, obs.TracerProvider() is a no-op
+// provider: the traced code path still runs, but every span is non-recording
+// and carries no span context. Because upstream starts each publish/consume
+// span from a fresh context, a no-op provider yields no active trace to inject,
+// so cross-service trace correlation is simply inactive while the pillar is off
+// (not broken) and resumes automatically once the trace pillar is enabled.
+// WithTracingEnabled(true) ties NATS tracing to the SDK's own toggle rather
+// than to the two OTEL_*_ENABLED env vars; it does not attempt to propagate a
+// trace the disabled pillar is not producing.
 //
 // Typical usage with the o11y SDK:
 //
@@ -54,6 +75,7 @@ func Connect(ctx context.Context, url string, tp trace.TracerProvider, prop prop
 	nc, err := otelnats.ConnectWithOptions(url, natsOpts,
 		otelnats.WithTracerProvider(tp),
 		otelnats.WithPropagators(prop),
+		otelnats.WithTracingEnabled(true),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("nats connect %s: %w", url, err)

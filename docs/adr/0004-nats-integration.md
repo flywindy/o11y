@@ -289,3 +289,49 @@ skipped after a review found regressions — see issues #69–#73):
   shims ctx+timeout over upstream `RequestWithContext` (the upstream primary
   `Request` is ctx-less); `linkReply`/`replyAttrs` deleted; `Consumer.Next`
   wrapped; `ConsumeContext` widened; `MessageBatch.Stop` added.
+
+## Amendment (2026-07-16): upstream v0.7.0 upgrade
+
+The SDK now pins **v0.7.0**. This release cleared almost the entire upstream
+backlog tracked in `docs/upstream-otel-nats.md`; the re-audit found no new
+global-state or provider-routing concerns.
+
+- **Fixed upstream in v0.7.0** (retiring the "still present" list above):
+  - `WithTracingEnabled(v bool) Option` added — a per-`Conn` override of the
+    env-gate default, in either direction. **`o11ynats.Connect` now passes
+    `WithTracingEnabled(true)` unconditionally**, so NATS tracing follows the
+    SDK's own toggle instead of requiring two process-wide env vars. With a
+    real TracerProvider this emits spans and propagates context; with the noop
+    provider (SDK tracing disabled) NATS spans are non-recording and carry no
+    span context, so no active trace is propagated while the pillar is off
+    (upstream starts each publish/consume span from a fresh context, so a noop
+    tracer yields nothing to inject) — cross-service correlation is inactive,
+    not broken, and resumes when the trace pillar is enabled. This matches the
+    SDK's feature-toggle semantics and removes the two-env-var production
+    footgun. Tests no longer need a `TestMain` env-var setup.
+  - **Deliver spans removed entirely** — the implicit `OTEL_EXPORTER_OTLP_ENDPOINT`-
+    gated second TracerProvider/exporter (no sampler) is gone, closing the
+    sampling-inconsistency concern (issue #70) by deletion. The corresponding
+    caveat in ADR 0003's approved-integrations row is dropped.
+  - `messaging.consumer.name` → `messaging.consumer.group.name` (the semconv
+    v1.39.0 key), resolving the last open part of #69.
+  - `HeaderCarrier` gained `propagation.ValuesGetter` plus MIME-canonical and
+    case-folded read fallbacks, so the ADR 0022 2026-07-03 canonical-header
+    limitation is resolved; the `nats/jetstream.go` known-limitation block is
+    deleted.
+  - `Consumer.Next` honors live ctx cancellation (`jetstream.FetchContext`);
+    the request/reply send span no longer overwrites `body.size` with the reply
+    size and now carries `conversation_id`; `MessageBatch.Stop` releases the
+    upstream goroutine even while it is parked receiving.
+- **Behavioral changes to note (BREAKING for observers)**: span kinds
+  corrected — reply-receive and the JetStream pull-**receive** spans (`Next`/
+  `Messages`/`Fetch`/`FetchBytes`/`FetchNoWait`) are now `CLIENT` (were
+  `CONSUMER`); the `Consume` callback and core Subscribe `process` spans stay
+  `CONSUMER` (unchanged); batch/`Messages` receive spans end at handover (shorter
+  durations); `Consumer.Next` with a cancelable ctx can no longer be combined
+  with a caller `FetchMaxWait` (returns `jetstream.ErrInvalidOption`). See the
+  o11y CHANGELOG's v0.7.0 entry for migration notes.
+- **Facade changes**: none structural — `Connect` adds the
+  `WithTracingEnabled(true)` option; `Conn.Request` keeps its ctx+timeout shim
+  (upstream `Request` is still ctx-less, tracked as R2/#72). Docs and test
+  assertions updated for the corrected span kinds and span-lifecycle behavior.

@@ -212,14 +212,11 @@ go run examples/nats-core/publisher/main.go
 
 Requires NATS — apply and port-forward it as shown in the NATS Core section above if not already running.
 
-`otel-nats` gates trace propagation behind two env vars; export them in **both**
-terminals or no `traceparent` is injected and you will see replies without
-NATS trace correlation:
+`o11ynats.Connect` enables NATS tracing for you (it passes
+`otelnats.WithTracingEnabled(true)`), so no environment variables are needed —
+just run the two programs:
 
 ```bash
-export OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true
-export OTEL_NATS_TRACING_ENABLED=true
-
 # Terminal 1 — start responder first
 go run examples/nats-core/responder/main.go
 
@@ -230,10 +227,10 @@ go run examples/nats-core/requester/main.go
 The responder replies with `conn.Respond`, which routes the reply through the
 traced publish path so the reply message carries the responder's trace context
 (unlike raw `msg.Respond`). The requester uses `conn.Request`; the upstream
-otel-nats v0.6.0 layer records a `receive {inbox}` span for the reply — named
+otel-nats v0.7.0 layer records a `receive {inbox}` span for the reply — named
 for the reply inbox, parented under the responder's trace and linked back to
 its reply-send span (the reply-span recording moved from this SDK's facade to
-upstream in the v0.6.0 upgrade; see ADR 0022's 2026-07-09 amendment).
+upstream in the v0.6.0 upgrade; see ADR 0022's amendments).
 
 This example demonstrates the full round trip: in Tempo you should see the
 request publish, responder processing, the responder's traced reply publish,
@@ -244,13 +241,10 @@ reply publish — so the handler → requester leg is no longer a dead end.
 
 Requires NATS — apply and port-forward it as shown in the NATS Core section above if not already running.
 
-As with the core examples, export both tracing gates in each terminal or no
-`traceparent` is injected:
+As with the core examples, `o11ynats.Connect` enables tracing itself, so no
+environment variables are needed:
 
 ```bash
-export OTEL_INSTRUMENTATION_GO_TRACING_ENABLED=true
-export OTEL_NATS_TRACING_ENABLED=true
-
 # Terminal 1 — publisher creates the stream and publishes
 go run examples/jetstream/publisher/main.go
 

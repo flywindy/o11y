@@ -44,25 +44,17 @@ import (
 // only. Per-message trace context flows from the message headers, not from
 // this registration ctx (see ADR 0022 amendment).
 //
-// Known limitation: the per-message trace-context extraction above is
-// performed entirely inside the vendored oteljetstream package, using its own
-// otelnats.HeaderCarrier — a case-sensitive, exact-match-only carrier with no
-// MIME-canonical fallback (unlike this package's own headerCarrier, see
-// nats/middleware.go). This facade has no hook into that internal extraction;
-// it only receives the (ctx, msg) pair oteljetstream has already constructed.
-// A message whose trace header is stored under a canonicalized key (e.g.
-// "Traceparent" rather than the literal lowercase "traceparent" this SDK's
-// own Publish always writes) — written by any pre-fix version of this SDK, or
-// by any other producer that canonicalizes — will not be linked to its
-// producer's trace when consumed via Consume/Messages/Fetch/FetchBytes/
-// FetchNoWait, even though this package's own Extract/Inject (used by the
-// legacy nats.JetStreamContext API) already handles this correctly. Fixing
-// this would require reimplementing oteljetstream's consumer-span creation
-// ourselves — the T3 re-instrumentation this ADR has deliberately avoided
-// everywhere else — so it is documented rather than worked around (ADR 0022
-// amendment, 2026-07-03; still present in otel-nats v0.6.0). Self-resolves
-// once messages predating this SDK's header-casing fix have drained from any
-// durable streams.
+// Header-casing note: the per-message trace-context extraction above is
+// performed entirely inside the upstream oteljetstream package, using its own
+// otelnats.HeaderCarrier. Since otel-nats v0.7.0 that carrier matches the
+// verbatim key first and then falls back to a MIME-canonical and a
+// case-folded lookup, a message whose trace header is stored under a
+// canonicalized key (e.g. "Traceparent" rather than the literal lowercase
+// "traceparent" this SDK's own Publish writes) — written by any producer that
+// canonicalizes — is still linked to its producer's trace when consumed via
+// Consume/Messages/Fetch/FetchBytes/FetchNoWait. This resolves the header-
+// casing gap that earlier versions documented here (ADR 0022 amendment,
+// fixed upstream in v0.7.0).
 //
 // Scope: this facade wraps the JetStream surface o11y consumers use today
 // (stream/consumer management, Publish, the pull consume modes Consume /
@@ -108,13 +100,14 @@ type FetchedMessage struct {
 // discarding undelivered messages. Stop is idempotent and safe to call after
 // the channel has closed.
 //
-// That same buffering means each FetchedMessage's receive span (m.Ctx) may
-// already be ended by the time your loop body runs: the upstream oteljetstream
-// library ends message N's span as soon as it reads message N+1 off its own
-// channel, and buffering lets the forwarding goroutine race ahead through the
-// whole batch well before the caller has processed message N — so
-// trace.SpanFromContext(m.Ctx).SetAttributes(...) is a silent no-op for most
-// messages in a batch of more than one. Two things are unaffected by this and
+// Each FetchedMessage's receive span (m.Ctx) is already ended by the time your
+// loop body runs: since otel-nats v0.7.0 the upstream oteljetstream library
+// ends every message's receive span BEFORE handing it to the channel (a
+// deterministic, spec-compliant handover — IsRecording() == false at delivery,
+// matching single-shot Consumer.Next), rather than the earlier
+// end-when-N+1-is-read behavior. So trace.SpanFromContext(m.Ctx).
+// SetAttributes(...) is a silent no-op for every delivered message, not just
+// most of a multi-message batch. Two things are unaffected by this and
 // remain safe: obs.Logger.*Context(m.Ctx, ...) log correlation (it only reads
 // the immutable trace/span IDs off ctx, not the span's recording state), and
 // starting your own child span via tracer.Start(m.Ctx, ...) for per-message
@@ -226,13 +219,19 @@ type Consumer interface {
 	// own child span via tracer.Start(ctx, ...) for per-message work rather
 	// than enriching the receive span.
 	//
-	// ctx semantics: a ctx DEADLINE is honored — the upstream layer converts
-	// it to jetstream.FetchMaxWait, so Next returns once the deadline passes.
-	// Live CANCELLATION is not: upstream checks ctx only before the native
-	// call (no jetstream.FetchContext is wired), so cancelling a
-	// deadline-less ctx mid-wait does not abort it. Bound the wait with a
-	// deadline (or a jetstream.FetchMaxWait opt) rather than relying on
-	// cancel; tracked upstream in docs/upstream-otel-nats.md.
+	// ctx semantics (otel-nats v0.7.0): a genuinely cancelable ctx
+	// (WithCancel/WithTimeout/WithDeadline) is wired into the native pull
+	// via jetstream.FetchContext, so BOTH a ctx deadline AND live
+	// cancellation abort an in-flight Next promptly — cancelling a
+	// deadline-less ctx mid-wait now unblocks it, unlike earlier versions
+	// (which only checked ctx before the native call). A non-cancelable ctx
+	// (context.Background/TODO, whose Done channel never fires) skips that
+	// wiring, so a caller-supplied jetstream.FetchMaxWait opt still bounds
+	// the wait. Passing a cancelable ctx AND your own jetstream.FetchMaxWait
+	// is rejected upstream with jetstream.ErrInvalidOption (the two are
+	// mutually exclusive in the native API) — express the bound via the ctx
+	// deadline instead of a separate FetchMaxWait opt when you also need
+	// cancellation.
 	Next(ctx context.Context, opts ...jetstream.FetchOpt) (context.Context, jetstream.Msg, error)
 	Info(ctx context.Context) (*jetstream.ConsumerInfo, error)
 	CachedInfo() *jetstream.ConsumerInfo

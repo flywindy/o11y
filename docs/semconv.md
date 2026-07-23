@@ -123,7 +123,7 @@ package is the authoritative source and changes across contrib versions.
 ## Messaging - NATS (package `github.com/flywindy/o11y/nats`)
 
 Spans are emitted by
-`github.com/akira-core/instrumentation-go/otel-nats` v0.6.0 (Core Subscribe /
+`github.com/akira-core/instrumentation-go/otel-nats` v0.7.0 (Core Subscribe /
 Publish / Request — including the requester-side reply-receive span — and
 JetStream Consume / Messages / Next / Fetch / FetchBytes / FetchNoWait). The
 upstream package imports `go.opentelemetry.io/otel/semconv/v1.39.0`.
@@ -133,63 +133,69 @@ upstream package imports `go.opentelemetry.io/otel/semconv/v1.39.0`.
 reply-link span (ADR 0022 amendment, 2026-07-01; superseded 2026-07-09). See
 "Reply-Receive Span" below for the topology this implies.
 
+**Span kinds (corrected in otel-nats v0.7.0)**: the reply-receive span and the
+JetStream pull-**receive** spans (`Next` / `Messages` / `Fetch` / `FetchBytes` /
+`FetchNoWait`) are `CLIENT` (they were `CONSUMER` in v0.6.0); `publish` is
+`PRODUCER`. The JetStream `Consume` callback's `process` span — like a core
+Subscribe `process` span — is and stays `CONSUMER` (it did **not** change):
+`Consume` is a message-processing operation, not a synchronous receive.
+Dashboards that filtered the pull-receive / reply spans by `CONSUMER` kind must
+switch to `CLIENT`; filters for `Consume` (durable-consumer processing) spans
+stay on `CONSUMER`.
+
 ### Core and JetStream Attributes
 
 | Key | Type | Notes |
 |---|---|---|
 | `messaging.system` | string | Constant `"nats"`. |
 | `messaging.destination.name` | string | NATS subject (e.g. `events.created`). |
-| `messaging.operation.type` | string | `send`, `receive`, or `process`. |
+| `messaging.operation.type` | string | `send`, `receive`, or `process`. The JetStream pull-**receive** spans (`Next`/`Messages`/`Fetch`/`FetchBytes`/`FetchNoWait`) carry `receive` since otel-nats v0.7.0; the `Consume` callback span carries `process`. |
 | `messaging.operation.name` | string | `publish`, `request`, `receive`, or `process`. `request` is emitted (with operation.type `send`) on `Conn.Request`'s producer span since otel-nats v0.6.0; plain publishes stay `publish`. |
 | `messaging.message.body.size` | int | Emitted when payload is non-empty. |
-| `messaging.message.conversation_id` | string | Request/reply inbox, when present. |
-| `messaging.consumer.group.name` | string | Queue group, when present. |
-| `messaging.consumer.name` | string | JetStream consumer name. **Deviation** — see below. |
+| `messaging.message.conversation_id` | string | Request/reply inbox. On the requester's "send" span it is set (late) once a reply arrives; see the Reply-Receive Span section. |
+| `messaging.consumer.group.name` | string | Queue group, and the JetStream consumer/durable name (otel-nats v0.7.0 moved the consumer name onto this standard key). |
 | `server.address` | string | NATS endpoint host. |
 | `server.port` | int | NATS endpoint port, omitted for default port 4222. |
 
-`messaging.consumer.name` is emitted by `otel-nats` on every JetStream consumer
-span (`Consume` / `Messages` / `Next` / `Fetch`) but is **not** a key in the
-pinned `semconv/v1.39.0` package (which carries only
-`messaging.consumer.group.name`). It is listed here as a documented deviation;
-the upstream hardcodes the string literal. Re-evaluate when the messaging
-semconv stabilizes a consumer-name key or when `otel-nats` is bumped.
+As of otel-nats v0.7.0 the JetStream consumer/durable name is attached under
+the semconv v1.39.0 key `messaging.consumer.group.name` (v0.6.0 used the
+non-semconv literal `messaging.consumer.name`, which the SDK previously
+documented as a deviation — that deviation is now resolved). Dashboards keyed
+on the old `messaging.consumer.name` attribute must be updated.
 
 ### Reply-Receive Span (`Conn.Request`, upstream-owned since v0.6.0)
 
 On every successful `Request`, upstream `recordReply` emits a short
-`receive {inbox}` span (`SpanKind` CONSUMER) named after the reply's inbox
-subject, with `messaging.destination.name` set to that inbox. The two sides
-of a request/reply exchange are correlated by a **span link**, not by a
-shared attribute value: when the reply carries a trace context (the responder
-replied via `Conn.Respond` or any traced publish path), this span is
-**parented under the responder's remote reply-send context and carries a link
-to it**, so it lands in the responder's trace; when the reply has no trace
-context (raw `msg.Respond`, untraced responder) the span is still emitted,
-parented on the caller's ctx, with no link.
+`receive {inbox}` span (`SpanKind` **CLIENT** since v0.7.0; was CONSUMER in
+v0.6.0) named after the reply's inbox subject, with
+`messaging.destination.name` set to that inbox. When the reply carries a trace
+context (the responder replied via `Conn.Respond` or any traced publish
+path), this span is **parented under the responder's remote reply-send context
+and carries a link to it**, so it lands in the responder's trace; when the
+reply has no trace context (raw `msg.Respond`, untraced responder) the span is
+still emitted, parented on the caller's ctx, with no link.
 
-Note on `messaging.message.conversation_id`: it is **not** present on an
-ordinary request's "send" span. Upstream `requestAttrs` emits it only when
-`msg.Reply` is already non-empty at span-start, but the standard
-`Request`/`RequestMsg` path leaves `msg.Reply` empty — nats.go allocates the
-generated reply inbox only after the span starts and does not write it back
-onto the message. So do not build correlation on `conversation_id` for
-request/reply; use the span link (or the inbox on `messaging.destination.name`).
+Correlation across the exchange (v0.7.0): the requester's "send" span, this
+reply-receive span, and the responder's process span are joinable by
+`messaging.message.conversation_id` (the reply inbox) as well as by the span
+link. On the "send" span the inbox is set **late** — after a reply arrives, via
+a `SetAttributes` call before `End()` — so a request that times out or errors
+never records `conversation_id`, and samplers (which only see span-start
+attributes) never observe it. This is spec-conformant (the key is Recommended,
+not Required). JetStream spans deliberately omit it: a JetStream message's
+`Reply` is the native `$JS.ACK.…` subject, not a conversation ID.
 
-Note on `messaging.message.body.size` of the "send" span: upstream
-`recordReply` overwrites it with the **reply** payload size (`len(reply.Data)`,
-so `0` for an empty reply), replacing the request payload size `requestAttrs`
-set at span-start. A dashboard reading body size off a request/reply "send"
-span therefore sees the response size, not the request size. This is an
-upstream behavior (tracked in `docs/upstream-otel-nats.md`), not something
-the facade can correct without reimplementing the reply path.
+`messaging.message.body.size` on the "send" span reports the **request**
+payload size (v0.7.0 fixed a v0.6.0 bug where `recordReply` overwrote it with
+the reply size). The reply size lives on this reply-receive span, where it
+belongs.
 
 Two changes from the pre-v0.6.0 o11y-owned reply-link span: the span now
 lives in the responder's trace rather than the requester's (the link still
 provides cross-trace correlation in both directions), and the facade's
 variadic `attrs` injection point was removed — upstream offers no
-caller-attribute hook on this span (an enhancement is being proposed
-upstream). Attach domain identifiers to your own ambient span instead.
+caller-attribute hook on this span. Attach domain identifiers to your own
+ambient span instead.
 
 ### Upstream NATS Trace-Event Attributes
 
