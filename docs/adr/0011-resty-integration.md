@@ -368,6 +368,14 @@ this package.
 
 ### 9. Golden trace tests for retry / timeout
 
+> **Superseded by the "Implementation note (as shipped)" at the end of this
+> section.** The byte-for-byte golden-JSON harness described below (committed
+> `resty/testdata/golden/<scenario>.json` snapshots + an `UPDATE_GOLDEN`
+> regenerator) was **not** the approach shipped. The scenarios were instead
+> covered by programmatic `tracetest.SpanRecorder` assertions plus a
+> table-driven taxonomy unit test. Read the plan below for the intended
+> coverage, but treat the implementation note for what actually exists.
+
 Retry and timeout flows are the highest-value resty behaviors and the
 most likely to regress when resty's hook ordering shifts between
 versions or when our error classification logic drifts. The

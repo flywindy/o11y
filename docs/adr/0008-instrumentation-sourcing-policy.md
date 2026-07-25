@@ -200,9 +200,10 @@ weight when the ecosystem catches up.
 ### 7. CI gate
 
 The policy is enforced at PR time by a small check that runs in CI.
-The gate has three concrete responsibilities; implementation detail
-is deferred to the PR introducing it (target: same PR as ADR 0009),
-but the contract is fixed here:
+The gate has three concrete responsibilities. The contract is fixed
+here; the implementation shipped in `scripts/check_integrations.go`
+(originally targeted at the ADR 0009 PR) and is described as-built in
+the "Implementation note (as shipped)" under responsibility 3 below:
 
 1. **OTel instrumentation imports must appear in ADR 0003.**
    The check parses `go.mod` for module paths matching

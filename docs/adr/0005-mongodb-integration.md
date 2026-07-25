@@ -280,6 +280,13 @@ env requirement satisfies that bar.
 
 ## Consequences
 
+> **Historical (superseded by ADR 0021).** The consequences below described the
+> Marz-wrapper design and no longer hold: the SDK no longer depends on the Marz
+> wrapper API, `_oteltrace` propagation was withdrawn, and the synthetic
+> delivery tracer / env-gate trade-offs are gone. For the current design's
+> consequences — single maintained contrib `otelmongo` dependency, plain
+> `*mongo.Client`, always-on sampler-governed spans — see ADR 0021.
+
 **Positive**
 
 - Less SDK-owned instrumentation code to maintain.
