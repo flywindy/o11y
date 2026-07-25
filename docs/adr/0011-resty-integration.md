@@ -402,6 +402,35 @@ an `UPDATE_GOLDEN=1` env-gated regenerator (mirrors a common Go
 testing idiom) so intentional changes to span shape are explicit
 diffs in the PR.
 
+**Implementation note (as shipped) — assertion style diverged from
+byte-for-byte golden files.** The committed tests keep this section's
+capture mechanism (`tracetest.NewSpanRecorder()` wired to the SDK
+`TracerProvider`) but assert **programmatically** on span
+name/attributes/status and the injected `traceparent`, rather than
+diffing against committed `resty/testdata/golden/<scenario>.json`
+snapshots. There is no `resty/testdata/golden/` directory and no
+`UPDATE_GOLDEN` regenerator. The functional coverage the table
+enumerates is present across `resty/client_test.go` (retry success +
+per-attempt `traceparent` injection, transport `retry.exhausted`
+marker, `server_timeout`, HTTP-status preservation, route-from-context)
+plus a table-driven unit test `TestRestyErrorKindTaxonomy` that pins
+the §8 taxonomy — `client_canceled`, `client_timeout`, `tls`,
+`transport`, `protocol`, `unknown` — and the `error.type` string for
+each, over the `restyErrorKind` / `errorType` functions directly. The
+golden-JSON harness was judged higher-maintenance than it was worth for
+this surface; the programmatic assertions cover the same behaviors.
+
+**Implementation note (as shipped) — detection is a superset of the §8
+`errors.As` sketch.** `isTLSError` / `isTransportError` /
+`isProtocolError` in `resty/errors.go` extend the pure `errors.As`
+detection this ADR described with error-chain type-name matching plus
+sentinel checks (`io.ErrUnexpectedEOF`, `http.ErrBodyReadAfterClose`)
+and case-insensitive substring fallbacks (`tls:`, `certificate`,
+`http2:`, `malformed http`, `server gave http response to https
+client`). This catches wrapped or stringly-typed errors that a pure
+`errors.As` chain misses; the closed set of emitted `resty.error.kind`
+values is unchanged from §8.
+
 ### 10. Resty v3 readiness
 
 resty v3 is in pre-release at the time of this ADR. Hook signatures

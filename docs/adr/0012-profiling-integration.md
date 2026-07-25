@@ -69,10 +69,12 @@ This asymmetry is real and worth flagging, but **agent consolidation
 (replacing OTel Collector with Alloy across all four signals) is a
 separate strategic decision** with its own blast radius (it changes
 the critical path for the three signals that already work). It is
-explicitly out of scope here and tracked for a follow-up ADR
-(ADR 0013, agent consolidation strategy). This ADR commits only to
-the narrow fact that profiling — the new signal — uses Alloy as its
-agent.
+explicitly out of scope here and tracked for a future
+agent-consolidation ADR. (This originally read "ADR 0013"; that number
+was subsequently assigned to the Redis/Valkey integration, so the
+agent-consolidation ADR remains unwritten and unnumbered.) This ADR
+commits only to the narrow fact that profiling — the new signal — uses
+Alloy as its agent.
 
 ---
 
@@ -540,7 +542,9 @@ migration. Until then, this ADR is the contract.
 
 - **Agent consolidation.** Whether the entire stack should collapse
   onto Grafana Alloy and retire the standalone OTel Collector is a
-  separate strategic question (ADR 0013). This ADR's scope is
+  separate strategic question (a future agent-consolidation ADR, not
+  yet written — the "0013" this once referenced was reassigned to the
+  Redis/Valkey integration). This ADR's scope is
   bounded to: profiling goes through Alloy because OTel Collector
   has no Pyroscope exporter. The existing OTel Collector routing
   for traces / logs / metrics is unchanged.

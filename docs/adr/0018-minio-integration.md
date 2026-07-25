@@ -1,6 +1,6 @@
 # ADR 0018 — MinIO / S3 Object Storage Integration
 
-**Status**: Proposed
+**Status**: Accepted (implemented)
 **Date**: 2026-05-27
 
 **Applies** ADR 0008 (sourcing policy); **inherits the metric.View

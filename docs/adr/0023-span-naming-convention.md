@@ -1,6 +1,6 @@
 # ADR 0023 — Cross-Package Span Naming Convention for Data-Store Integrations
 
-**Status**: Proposed
+**Status**: Accepted (implemented)
 **Date**: 2026-06-10
 
 **Amends** ADR 0013 (redis), ADR 0018 (minio), ADR 0021 (mongo
