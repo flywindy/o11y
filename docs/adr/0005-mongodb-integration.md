@@ -56,6 +56,12 @@ v1 must migrate before adopting the wrapper.
 
 ### 2. Instrumentation mechanism: adopt upstream wrapper, behind o11y API
 
+> **Superseded by ADR 0021.** The Marz wrapper described below was **dropped**.
+> MongoDB instrumentation now uses the official contrib `otelmongo`
+> `event.CommandMonitor` for both spans and `db.client.operation.duration`, and
+> `mongo.Connect` returns a plain driver `*mongo.Client`. The rest of this
+> section is retained for historical context only; do not implement against it.
+
 The SDK should adopt `github.com/Marz32onE/instrumentation-go/otel-mongo/v2`
 v0.2.11 through a local `mongo/` wrapper package, instead of writing and
 maintaining a native `event.CommandMonitor`.
@@ -98,6 +104,11 @@ func WithDocumentTracePropagation(enabled bool) Option
 The default must be equivalent to upstream `WithTracePropagationEnabled(false)`.
 
 ### 4. Document trace propagation remains opt-in
+
+> **Withdrawn by ADR 0021.** `_oteltrace` document injection, the
+> `WithDocumentTracePropagation` option, and the synthetic delivery tracer are
+> **removed** from this package. Asynchronous trace context is directed to an
+> outbox / message-envelope approach instead. This section is historical.
 
 `_oteltrace` document injection is useful for change streams, outbox patterns,
 delayed jobs, and other asynchronous readers that need to restore trace
@@ -149,6 +160,13 @@ The o11y wrapper must always pass both options.
 
 ## Upstream Env-Gate Semantics (v0.2.11)
 
+> **No longer applies (ADR 0021).** These env gates belonged to the Marz
+> wrapper, which has been dropped. The contrib `otelmongo` monitor reads **no**
+> `OTEL_*_ENABLED` env vars; command spans are always-on and governed solely by
+> the sampler (ADR 0015 / ADR 0021 §7). Do not set
+> `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` / `OTEL_MONGO_TRACING_ENABLED` for
+> this package. Retained for historical context.
+
 Source inspection of `client.go` and `env_flags.go` at v0.2.11 shows three env
 flags that sit in front of every code path the o11y wrapper relies on. These
 were not present when the original ADR was written and change how the wrapper
@@ -186,6 +204,11 @@ Implications for the wrapper:
 ---
 
 ## Synthetic Delivery Tracer Policy
+
+> **No longer applies (ADR 0021).** The synthetic delivery tracer was a Marz
+> `otel-mongo/v2` behavior; that library has been dropped, so this concern is
+> moot. The contrib `otelmongo` monitor creates no independent provider.
+> Retained for historical context.
 
 `otel-mongo/v2` can create an independent `TracerProvider` for synthetic
 delivery spans when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. The o11y wrapper
@@ -256,6 +279,13 @@ env requirement satisfies that bar.
 ---
 
 ## Consequences
+
+> **Historical (superseded by ADR 0021).** The consequences below described the
+> Marz-wrapper design and no longer hold: the SDK no longer depends on the Marz
+> wrapper API, `_oteltrace` propagation was withdrawn, and the synthetic
+> delivery tracer / env-gate trade-offs are gone. For the current design's
+> consequences — single maintained contrib `otelmongo` dependency, plain
+> `*mongo.Client`, always-on sampler-governed spans — see ADR 0021.
 
 **Positive**
 

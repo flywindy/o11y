@@ -318,9 +318,11 @@ pinned contrib `otelmongo` `mongo.go` and the local repo):
     accepts both lines (it passes on either, and the `T3` line is satisfied by
     this ADR mentioning `mongo`). **No gate code change required.**
   - Rejected: T2-only (under-declares self-written code, against ADR 0008
-    spirit); separate package (the gate's `integrationDirs` list is fixed —
-    `{http,nats,mongo,gin,resty,redis}` — so a new dir is unchecked, creating a
-    gate gap, and fragments the package for no benefit).
+    spirit); separate package (the gate's `integrationDirs` list is an explicit
+    include-list — `{http,nats,mongo,gin,resty,redis}` at the time of writing,
+    since expanded to add `minio`, `elasticsearch`, and `cassandra` as those
+    integrations landed — so a new dir is unchecked until the list is updated,
+    creating a gate gap, and fragments the package for no benefit).
 - **Future impact**: contrib `otelmongo` joins the ADR 0008 §6 quarterly
   health-check; the mongo pool observer joins the annual T3 escape-hatch review.
 

@@ -1,6 +1,6 @@
 # ADR 0022 — NATS Facade Ergonomics for Consumer Integration
 
-**Status**: Proposed
+**Status**: Accepted (implemented; see amendments through 2026-07-09)
 **Date**: 2026-06-06
 
 ---

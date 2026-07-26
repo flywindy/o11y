@@ -200,9 +200,10 @@ weight when the ecosystem catches up.
 ### 7. CI gate
 
 The policy is enforced at PR time by a small check that runs in CI.
-The gate has three concrete responsibilities; implementation detail
-is deferred to the PR introducing it (target: same PR as ADR 0009),
-but the contract is fixed here:
+The gate has three concrete responsibilities. The contract is fixed
+here; the implementation shipped in `scripts/check_integrations.go`
+(originally targeted at the ADR 0009 PR) and is described as-built in
+the "Implementation note (as shipped)" under responsibility 3 below:
 
 1. **OTel instrumentation imports must appear in ADR 0003.**
    The check parses `go.mod` for module paths matching
@@ -227,15 +228,23 @@ but the contract is fixed here:
    same PR that adds a new integration package.
 
 3. **No direct `otel.SetX` calls in non-test code.**
-   `grep -E 'otel\.(SetTracerProvider|SetTextMapPropagator|SetMeterProvider|SetLoggerProvider)\b' --include='*.go' --exclude='*_test.go'`
-   under the module root must return zero matches. This enforces ADR
+   No `otel.SetTracerProvider` / `otel.SetTextMapPropagator` /
+   `otel.SetMeterProvider` / `otel.SetLoggerProvider` call may appear
+   in any non-test `.go` file under the module root. This enforces ADR
    0003 at the source level for our own code.
 
-   Caveat: `grep` matches inside comments and string literals. False
-   positives have been rare in practice; if they appear, the
-   pragmatic fix is a `// nolint:o11y-globals` suppression with a
-   review-required comment. Upgrading to an AST-based check (a small
-   `go/analysis` pass) is open future work.
+   **Implementation note (as shipped).** The "open future work" the
+   original draft flagged was done in the first cut of the gate: the
+   check is **AST/`go/types`-based**, not `grep`-based. `checkNoGlobalSetters`
+   in `scripts/check_integrations.go` parses each non-test file with
+   `go/parser` and resolves the `otel` package identity through a
+   `go/types` importer, so a forbidden call is matched only when the
+   selector's receiver actually resolves to `go.opentelemetry.io/otel`.
+   That removes the grep-era false-positive surface (matches inside
+   comments and string literals), so the `// nolint:o11y-globals`
+   suppression the draft proposed has not been needed. `make adr-check`
+   runs this pass together with the go.mod↔ADR-0003 and tier-annotation
+   checks.
 
 The gate runs on every PR via GitHub Actions, plus locally via
 `make adr-check` and `make lint` (the existing `Makefile` target).
