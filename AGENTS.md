@@ -129,6 +129,8 @@ go run examples/nats-core/publisher/main.go
 
 # Run the NATS Core request/reply examples (two terminals; responder replies via conn.Respond)
 # No env vars needed: o11ynats.Connect enables tracing via otelnats.WithTracingEnabled(true).
+# For a hard disabled-observability/native-cost mode, use
+# o11ynats.ConnectWithOptions(..., o11ynats.WithTracingEnabled(false)).
 go run examples/nats-core/responder/main.go
 go run examples/nats-core/requester/main.go
 
@@ -405,7 +407,7 @@ further noise such as health-check PINGs, use `o11yredis.WithIgnoredCommands("pi
 - ❌ Import `github.com/sirupsen/logrus` or `go.uber.org/zap` — we use stdlib `slog`
 - ❌ Commit without running `go fmt` and `go mod tidy`
 - ❌ Add Kubernetes manifests that send traces or logs directly to backends (Tempo, Loki) — traces and logs must go through the OTel Collector; Prometheus scraping `:2112` directly is intentional and correct
-- ❌ Call `otelnats.Connect` or `otelnats.ConnectWithOptions` directly — always go through `o11ynats.Connect` so the SDK providers are wired correctly
+- ❌ Call `otelnats.Connect` or `otelnats.ConnectWithOptions` directly — always go through `o11ynats.Connect` or `o11ynats.ConnectWithOptions` so the SDK providers are wired correctly
 - ❌ Import `go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/v2/mongo/otelmongo` directly from services — always go through `o11ymongo.Connect` or `o11ymongo.Instrument` so SDK providers and monitor composition are wired consistently
 - ❌ Import `go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin` directly from services — always go through `o11ygin.Middleware` so SDK providers, propagator, and typed gin error events are wired consistently
 - ❌ Import `github.com/redis/go-redis/extra/redisotel/v9` directly from services — always go through `o11yredis.Wrap` so SDK-owned semconv v1.39.0 attributes, metrics, and sensitive defaults stay consistent

@@ -16,6 +16,38 @@ import (
 	o11ynats "github.com/flywindy/o11y/nats"
 )
 
+func TestJetStream_TracingDisabledUsesDirectPath(t *testing.T) {
+	_, url := startJetStreamServer(t)
+	tp, prop, sr := newTestProviders()
+
+	conn, err := o11ynats.ConnectWithOptions(context.Background(), url, tp, prop,
+		o11ynats.WithTracingEnabled(false),
+	)
+	require.NoError(t, err)
+	defer conn.Close()
+	require.False(t, conn.TracingEnabled())
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	const streamName, subject = "EVENTS", "events.disabled"
+	_, err = js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+
+	tracer := tp.Tracer("test")
+	pubCtx, span := tracer.Start(context.Background(), "ambient")
+	_, err = js.Publish(pubCtx, subject, []byte("hello"))
+	require.NoError(t, err)
+	span.End()
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1, "only the explicit ambient span should be recorded")
+	assert.Equal(t, "ambient", spans[0].Name())
+}
+
 // TestJetStream_Consume_TracePropagation publishes inside a root span and
 // asserts that the Consume handler receives a ctx carrying a valid consumer
 // span, and that a recorded consumer span links back to the publisher's trace.

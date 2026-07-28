@@ -47,7 +47,7 @@ layered over the **same** Marz `otel-nats` library the SDK wraps:
 
 | chat usage | Marz surface touched | o11y facade today | Gap |
 |---|---|---|---|
-| connect | `otelnats.ConnectWithOptions` / `…WithCredentials…` | `nats.Connect(ctx,url,tp,prop,opts…)` | covered — creds pass through as `nats.UserCredentials(...)` option |
+| connect | `otelnats.ConnectWithOptions` / `…WithCredentials…` | `nats.Connect(ctx,url,tp,prop,opts…)`; `nats.ConnectWithOptions(..., nats.WithTracingEnabled(false), nats.WithNATSOptions(...))` for native-cost disabled modes | covered — creds pass through as `nats.UserCredentials(...)` via `Connect`, or via `WithNATSOptions` on the option-based constructor |
 | router `QueueSubscribe` | `*otelnats.Conn`, `otelnats.Msg` | `QueueSubscribe(ctx,subj,queue, func(ctx,*nats.Msg))` | covered — flattened handler carries ctx + subject + header + reply + data |
 | client request | `Conn.Request(ctx,…)` | available via embedding | covered |
 | **router reply** | raw `msg.Respond(...)` | none | **HOLE ①** — no traced reply primitive |

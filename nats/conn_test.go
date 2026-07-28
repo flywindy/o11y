@@ -76,6 +76,74 @@ func TestConnect(t *testing.T) {
 	conn.Close()
 }
 
+func TestConnectWithOptions_DisablesTracing(t *testing.T) {
+	_, url := startTestServer(t)
+	tp, prop, sr := newTestProviders()
+
+	pub, err := o11ynats.ConnectWithOptions(context.Background(), url, tp, prop,
+		o11ynats.WithTracingEnabled(false),
+	)
+	require.NoError(t, err)
+	defer pub.Close()
+	assert.False(t, pub.TracingEnabled())
+
+	sub, err := o11ynats.ConnectWithOptions(context.Background(), url, tp, prop,
+		o11ynats.WithTracingEnabled(false),
+	)
+	require.NoError(t, err)
+	defer sub.Close()
+	assert.False(t, sub.TracingEnabled())
+
+	subject := "test.tracing.disabled"
+	type receivedMessage struct {
+		ctx    context.Context
+		header nats.Header
+	}
+	received := make(chan receivedMessage, 1)
+
+	_, err = sub.Subscribe(context.Background(), subject, func(ctx context.Context, msg *nats.Msg) {
+		received <- receivedMessage{ctx: ctx, header: msg.Header}
+	})
+	require.NoError(t, err)
+	require.NoError(t, sub.NatsConn().FlushTimeout(2*time.Second))
+
+	tracer := tp.Tracer("test")
+	pubCtx, span := tracer.Start(context.Background(), "ambient")
+	err = pub.Publish(pubCtx, subject, []byte("hello"))
+	require.NoError(t, err)
+	span.End()
+
+	var got receivedMessage
+	select {
+	case got = <-received:
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscriber did not receive message within timeout")
+	}
+
+	assert.False(t, oteltrace.SpanFromContext(got.ctx).SpanContext().IsValid(),
+		"disabled NATS tracing should deliver a background handler context")
+	assert.Empty(t, got.header.Get("traceparent"),
+		"disabled NATS tracing should delegate natively without injecting traceparent")
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1, "only the explicit ambient span should be recorded")
+	assert.Equal(t, "ambient", spans[0].Name())
+}
+
+func TestConnectWithOptions_ForwardsNATSOptions(t *testing.T) {
+	_, url := startTestServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.ConnectWithOptions(context.Background(), url, tp, prop,
+		o11ynats.WithNATSOptions(nats.Name("o11y-test-client")),
+	)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	assert.True(t, conn.TracingEnabled())
+	assert.Equal(t, "o11y-test-client", conn.NatsConn().Opts.Name)
+}
+
 func TestConnect_InvalidURL(t *testing.T) {
 	tp, prop, _ := newTestProviders()
 
