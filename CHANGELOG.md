@@ -19,10 +19,10 @@ adopters can plan their upgrades.
   `WithNATSOptions` so callers can explicitly disable the upstream NATS
   tracing wrapper while keeping the o11y facade. `Connect` still defaults to
   `WithTracingEnabled(true)` for zero-env tracing setup, but services with a
-  hard disabled-observability/native-cost requirement can now call
-  `ConnectWithOptions(..., nats.WithTracingEnabled(false))` to select
-  otel-nats' direct path (no spans, no header propagation, JetStream direct
-  wrappers).
+  hard disabled-observability/native-cost requirement can now pass the SDK's
+  resolved trace toggle (`nats.WithTracingEnabled(sdk.Toggles.Trace)`) to
+  select otel-nats' direct path when tracing is off (no spans, no header
+  propagation, JetStream direct wrappers).
 
 ---
 

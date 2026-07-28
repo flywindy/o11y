@@ -16,7 +16,7 @@ import (
 	o11ynats "github.com/flywindy/o11y/nats"
 )
 
-func TestJetStream_TracingDisabledUsesDirectPath(t *testing.T) {
+func TestJetStream_TracingDisabledPublishConsumeUsesDirectPath(t *testing.T) {
 	_, url := startJetStreamServer(t)
 	tp, prop, sr := newTestProviders()
 
@@ -30,22 +30,87 @@ func TestJetStream_TracingDisabledUsesDirectPath(t *testing.T) {
 	js, err := conn.JetStream()
 	require.NoError(t, err)
 
-	const streamName, subject = "EVENTS", "events.disabled"
-	_, err = js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+	const (
+		streamName     = "EVENTS_DISABLED"
+		consumeSubject = "events.disabled.consume"
+		fetchSubject   = "events.disabled.fetch"
+	)
+	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
 		Name:     streamName,
-		Subjects: []string{subject},
+		Subjects: []string{"events.disabled.>"},
 	})
 	require.NoError(t, err)
 
 	tracer := tp.Tracer("test")
-	pubCtx, span := tracer.Start(context.Background(), "ambient")
-	_, err = js.Publish(pubCtx, subject, []byte("hello"))
+	consumeCtx, consumeSpan := tracer.Start(context.Background(), "ambient-consume")
+	_, err = js.Publish(consumeCtx, consumeSubject, []byte("consume"))
 	require.NoError(t, err)
-	span.End()
+	consumeSpan.End()
+
+	consumeCons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       "disabled-consume-test",
+		FilterSubject: consumeSubject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	type receivedMessage struct {
+		ctx    context.Context
+		header nats.Header
+		ackErr error
+	}
+	received := make(chan receivedMessage, 1)
+	cc, err := consumeCons.Consume(context.Background(), func(ctx context.Context, msg jetstream.Msg) {
+		received <- receivedMessage{ctx: ctx, header: msg.Headers(), ackErr: msg.Ack()}
+	})
+	require.NoError(t, err)
+	defer cc.Stop()
+
+	var consumed receivedMessage
+	select {
+	case consumed = <-received:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Consume did not deliver a message within timeout")
+	}
+	require.NoError(t, consumed.ackErr)
+	assert.Empty(t, consumed.header.Get("traceparent"),
+		"disabled JetStream publish should not inject traceparent")
+	assert.False(t, oteltrace.SpanFromContext(consumed.ctx).SpanContext().IsValid(),
+		"disabled JetStream Consume should deliver a background handler context")
+
+	fetchCons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       "disabled-fetch-test",
+		FilterSubject: fetchSubject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	fetchCtx, fetchSpan := tracer.Start(context.Background(), "ambient-fetch")
+	_, err = js.Publish(fetchCtx, fetchSubject, []byte("fetch"))
+	require.NoError(t, err)
+	fetchSpan.End()
+
+	batch, err := fetchCons.Fetch(context.Background(), 1)
+	require.NoError(t, err)
+	defer batch.Stop()
+
+	var fetched o11ynats.FetchedMessage
+	select {
+	case m, ok := <-batch.Messages():
+		require.True(t, ok, "Fetch should deliver the published message")
+		fetched = m
+	case <-time.After(3 * time.Second):
+		t.Fatal("Fetch did not deliver a message within timeout")
+	}
+	require.NoError(t, fetched.Msg.Ack())
+	assert.Empty(t, fetched.Msg.Headers().Get("traceparent"),
+		"disabled JetStream publish should not inject traceparent")
+	assert.False(t, oteltrace.SpanFromContext(fetched.Ctx).SpanContext().IsValid(),
+		"disabled JetStream Fetch should deliver a background message context")
 
 	spans := sr.Ended()
-	require.Len(t, spans, 1, "only the explicit ambient span should be recorded")
-	assert.Equal(t, "ambient", spans[0].Name())
+	require.Len(t, spans, 2, "only the explicit ambient spans should be recorded")
+	assert.ElementsMatch(t, []string{"ambient-consume", "ambient-fetch"}, []string{spans[0].Name(), spans[1].Name()})
 }
 
 // TestJetStream_Consume_TracePropagation publishes inside a root span and

@@ -790,8 +790,9 @@ Use `obs.Propagator` together with the `nats` sub-package to propagate trace con
 > inactive (not broken) and resumes as soon as the trace pillar is enabled.
 > If your service-level "observability off" mode must also avoid tracing
 > wrapper cost and use the native NATS path, call `ConnectWithOptions` with
-> `o11ynats.WithTracingEnabled(false)` instead. Drive that from explicit
-> application config; do not infer it by inspecting the TracerProvider type.
+> `o11ynats.WithTracingEnabled(obs.Toggles.Trace)` so NATS follows the SDK's
+> resolved trace toggle. Do not re-parse env vars or infer state by inspecting
+> the TracerProvider type.
 
 ```go
 import (
@@ -823,16 +824,17 @@ defer func() { _ = sub.Drain() }() // gracefully drain on shutdown
 ```
 
 For hard-disable modes that require native NATS cost while observability is
-off, use the option-based constructor:
+off, use the option-based constructor and pass the SDK's resolved trace toggle:
 
 ```go
+natsOpts := []gonats.Option{gonats.Name("orders-worker")}
 conn, err := o11ynats.ConnectWithOptions(
     ctx,
     natsURL,
     obs.TracerProvider(),
     obs.Propagator,
-    o11ynats.WithTracingEnabled(false),
-    o11ynats.WithNATSOptions(gonats.Name("orders-worker")),
+    o11ynats.WithTracingEnabled(obs.Toggles.Trace),
+    o11ynats.WithNATSOptions(natsOpts...),
 )
 ```
 

@@ -218,8 +218,10 @@ just run the two programs:
 
 Applications with a hard disabled-observability/native-cost mode can opt out
 explicitly with `o11ynats.ConnectWithOptions(...,
-o11ynats.WithTracingEnabled(false))`; the examples keep tracing on so the
-round trip is visible in Tempo.
+o11ynats.WithTracingEnabled(obs.Toggles.Trace))`, where `obs` is the
+initialized SDK. This keeps NATS tracing aligned with the SDK's master switch,
+`O11Y_TRACE_ENABLED`, and explicit `WithTraceEnabled` options. The examples
+keep tracing on so the round trip is visible in Tempo.
 
 ```bash
 # Terminal 1 — start responder first
@@ -249,9 +251,9 @@ Requires NATS — apply and port-forward it as shown in the NATS Core section ab
 As with the core examples, `o11ynats.Connect` enables tracing itself, so no
 environment variables are needed:
 
-Use `o11ynats.ConnectWithOptions(..., o11ynats.WithTracingEnabled(false))`
-only for application modes that deliberately want the native NATS path instead
-of traced JetStream wrappers.
+Use `o11ynats.ConnectWithOptions(...,
+o11ynats.WithTracingEnabled(obs.Toggles.Trace))` for application modes that
+deliberately want the native NATS path when the SDK trace pillar is disabled.
 
 ```bash
 # Terminal 1 — publisher creates the stream and publishes

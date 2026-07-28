@@ -129,8 +129,9 @@ go run examples/nats-core/publisher/main.go
 
 # Run the NATS Core request/reply examples (two terminals; responder replies via conn.Respond)
 # No env vars needed: o11ynats.Connect enables tracing via otelnats.WithTracingEnabled(true).
-# For a hard disabled-observability/native-cost mode, use
-# o11ynats.ConnectWithOptions(..., o11ynats.WithTracingEnabled(false)).
+# For a hard disabled-observability/native-cost mode, drive NATS tracing from
+# the SDK's resolved toggle:
+# o11ynats.ConnectWithOptions(..., o11ynats.WithTracingEnabled(obs.Toggles.Trace)).
 go run examples/nats-core/responder/main.go
 go run examples/nats-core/requester/main.go
 

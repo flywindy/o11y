@@ -246,8 +246,19 @@ obs, err := o11y.Init(ctx,
 
 `WithTraceEnabled(false)` returns a no-op `TracerProvider`; integration code
 that is already installed may still execute a no-op wrapper path. For NATS
-callers that require native NATS cost while observability is disabled, use
-`nats.ConnectWithOptions(..., nats.WithTracingEnabled(false))`.
+callers that require native NATS cost while observability is disabled, drive
+the NATS wrapper from the SDK's resolved toggle:
+
+```go
+conn, err := o11ynats.ConnectWithOptions(
+    ctx,
+    natsURL,
+    obs.TracerProvider(),
+    obs.Propagator,
+    o11ynats.WithTracingEnabled(obs.Toggles.Trace),
+    o11ynats.WithNATSOptions(natsOpts...),
+)
+```
 
 **Environment-variable control** (useful for staged rollouts without deploys):
 

@@ -308,7 +308,9 @@ global-state or provider-routing concerns.
     to inject) — cross-service correlation is inactive, not broken, and resumes
     when the trace pillar is enabled. Callers with a hard native-cost
     disabled-observability mode can now use `o11ynats.ConnectWithOptions` with
-    `o11ynats.WithTracingEnabled(false)` to select the upstream direct path.
+    `o11ynats.WithTracingEnabled(sdk.Toggles.Trace)` to follow the SDK's
+    resolved trace toggle and select the upstream direct path when tracing is
+    off.
     Tests no longer need a `TestMain` env-var setup.
   - **Deliver spans removed entirely** — the implicit `OTEL_EXPORTER_OTLP_ENDPOINT`-
     gated second TracerProvider/exporter (no sampler) is gone, closing the
@@ -333,7 +335,7 @@ global-state or provider-routing concerns.
   with a caller `FetchMaxWait` (returns `jetstream.ErrInvalidOption`). See the
   o11y CHANGELOG's v0.7.0 entry for migration notes.
 - **Facade changes**: `Connect` defaults to `WithTracingEnabled(true)`, and
-  `ConnectWithOptions` / `WithTracingEnabled(false)` expose the caller-controlled
+  `ConnectWithOptions` / `WithTracingEnabled(v)` expose the caller-controlled
   direct path for disabled-observability modes; `Conn.Request` keeps its
   ctx+timeout shim (upstream `Request` is still ctx-less, tracked as R2/#72).
   Docs and test assertions updated for the corrected span kinds and
