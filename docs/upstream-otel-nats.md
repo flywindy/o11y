@@ -91,18 +91,48 @@ added seven more. Ordered below by (value ÷ expected review friction).
 
 - **What**: otel-nats emits **no metrics at all** — there is not a single
   `metric` / `Meter` / `MeterProvider` reference in either `otelnats` or
-  `oteljetstream`. semconv v1.39.0 already defines the messaging instruments
-  (`messaging.client.operation.duration`,
-  `messaging.client.sent.messages`, `messaging.client.consumed.messages`).
+  `oteljetstream`. semconv v1.39.0 already defines the messaging instruments in
+  its `messagingconv` package (`messaging.client.operation.duration`,
+  `messaging.process.duration`, `messaging.client.sent.messages`,
+  `messaging.client.consumed.messages`).
   Request: emit them from the same call sites that already produce spans,
   behind a `WithMeterProvider(...)` option mirroring `WithTracerProvider`.
+  Note the correct counter name is `messaging.client.sent.messages` —
+  `messaging.client.published.messages` does **not** exist in v1.39.0 and has
+  appeared in at least one internal proposal.
 - **Evidence**: v0.7.0 — `grep -rl "metric\|Meter" otelnats/ oteljetstream/`
   returns nothing outside tests.
-- **Why upstream and not o11y**: the instruments must be recorded at the
-  publish/receive/process boundaries the library already owns. The facade only
-  ever receives an already-constructed `(ctx, msg)` pair, so measuring there
-  would mean re-implementing the instrumentation (the T3 re-instrumentation
-  ADR 0022 has avoided everywhere else).
+- **Why metrics rather than reading it off spans**: this SDK samples
+  (`sdktrace.ParentBased(sdktrace.TraceIDRatioBased(ratio))`, `o11y.go:491`),
+  so counts and rates **cannot** be derived from spans at all, and latency
+  histograms only cover the sampled fraction. Unsampled per-operation counters
+  and histograms are the one thing neither spans nor the server-side exporter
+  can provide. This is the strongest argument for the feature and is easy to
+  omit — ADR 0004's original deferral analysis assessed a `nc.Stats()` snapshot
+  layer, not per-operation instruments at the wrapper seam.
+- **Where each instrument belongs** — the facade is *not* categorically unable
+  to do this (an earlier draft of this entry claimed so; that was wrong). o11y
+  wraps `Subscribe`/`QueueSubscribe`/`Request`/`RequestMsg`/`Respond` and the
+  whole JetStream surface, so it can time and count at those seams. The split
+  is per-instrument:
+
+  | Instrument | Best owner | Why |
+  |---|---|---|
+  | `messaging.process.duration` | **Upstream** | `wrapMsgHandler` / `tracedConsumeHandler` already bracket the handler with `tracer.Start(...)` … `defer span.End()`. Recording a histogram there is nearly free; o11y would have to double-bracket the same call. |
+  | `messaging.client.sent.messages` | **Upstream** | o11y does not currently wrap core `Publish` at all (it is inherited from the embedded `*otelnats.Conn`), and this is the one path with a real cardinality problem — see below. |
+  | `messaging.client.consumed.messages` | Either | Both layers wrap the handler; the low-cardinality label is free at both. |
+  | `messaging.client.operation.duration` (request/reply RTT) | **o11y is trivial** | The facade already owns the ctx-first `Request`/`RequestMsg` shims and brackets the round trip. |
+  | JetStream `delivered` / `redelivered` | Either | Readable at delivery from `msg.Metadata().NumDelivered`, no API change. |
+  | JetStream `ack` / `nak` | **Neither, as things stand** | Both layers hand the caller the **native** `jetstream.Msg` (`nats/jetstream.go:366`, upstream `Msg{Msg: msg, Ctx: ctx}`), so `msg.Ack()` is invoked directly on the native type and is invisible to both. Counting these requires wrapping the message type — an upstream-only, breaking change that also conflicts with ADR 0022's "deliver native types" contract. Treat as out of scope unless separately proposed. |
+
+- **Cardinality is asymmetric** — a single blanket "subject pattern" rule would
+  over-engineer this. Consume is naturally low-cardinality: upstream names the
+  consume span from the **subscription** subject (`spanName := "process " +
+  subject`, `otelnats/conn_traced.go:193`), i.e. the pattern the developer
+  registered (`orders.*`), not `msg.Subject`. JetStream likewise has the durable
+  consumer name (already emitted as `messaging.consumer.group.name`). **Only the
+  publish path takes a concrete caller-supplied subject** and therefore needs a
+  pattern-extraction hook or a caller-supplied label.
 - **Unlocks**: closes ADR 0004's "Metrics scope: deferred" amendment. NATS is
   one of only **two** trace-only integrations in this SDK — the other is
   Elasticsearch (ADR 0020 §6, which explicitly places ES "with NATS") — while
@@ -117,9 +147,30 @@ added seven more. Ordered below by (value ÷ expected review friction).
   server-side metrics story (`prometheus-nats-exporter`) and that per-call
   latency is already visible as span duration. So this is *not* a blind spot in
   the "no data exists" sense; the gain is client-side, per-operation,
-  per-subject latency correlated with traces and exemplars — which the exporter
-  cannot give. Worth stating plainly in the upstream issue rather than
-  overselling the gap.
+  per-subject latency correlated with traces and exemplars — plus the unsampled
+  counts spans structurally cannot give (above). Worth stating plainly in the
+  upstream issue rather than overselling the gap.
+- **How this interacts with ADR 0004 §5's revisit triggers** — that amendment
+  lists three conditions for reopening the o11y-side deferral. Reading them
+  against today:
+  - *"messaging metrics semconv marked stable"* — **unresolved**. v1.39.0 now
+    ships typed constructors in `messagingconv`, which is more mature than when
+    the amendment was written (2026-05-25), but the Go packages carry no
+    stability annotation (`messagingconv` and `dbconv` are structurally
+    identical), so this must be checked against the spec, not the module.
+  - *"a maintained library starts emitting NATS client metrics"* — **do not
+    use this one to argue against R6.** It is a trigger for revisiting whether
+    *o11y* should hand-write metrics; R6 is the request that upstream become
+    that library, so citing it here is circular. (Noted because it was applied
+    that way once.)
+  - *"a concrete need for client-attributed JetStream consumer-lag"* —
+    **not met**; lag lives in `consumer.Info()` / `/jsz` and is explicitly out
+    of scope for a client-side instrument set.
+- **Demand**: no committed consumer today. The internal proposal that prompted
+  this analysis marks itself `OPTIONAL` because the RPC SLOs it cares about are
+  already covered app-side by a router middleware — but that is a statement
+  about one service's needs, not about the platform-wide value, which the same
+  proposal argues for. The blocker here is a decision, not effort.
 - **Friction**: high — a genuine feature with API-surface and cardinality
   decisions (which attributes become metric labels). Issue-first.
 
