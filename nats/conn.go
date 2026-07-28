@@ -177,7 +177,8 @@ func (c *Conn) Respond(ctx context.Context, msg *natsgo.Msg, data []byte) error 
 // Request sends subject/data and waits for a reply. ctx carries the trace
 // context and cancellation; timeout bounds the wait. The upstream otel-nats
 // layer (v0.6.0+) emits the producer "send" span, injects W3C headers, and
-// emits the requester-side CONSUMER "receive" span for the reply — linked to
+// emits the requester-side CLIENT "receive" span for the reply (otel-nats
+// v0.7.0 corrected the kind from CONSUMER) — linked to
 // the responder's trace whenever the responder replied via Conn.Respond (or
 // any traced publish path). Earlier SDK versions created that reply span in
 // this facade; it is now delegated to upstream so the round trip is recorded
