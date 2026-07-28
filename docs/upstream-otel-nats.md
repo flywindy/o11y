@@ -132,14 +132,25 @@ engagement plan below sequences it accordingly.
   | JetStream `delivered` / `redelivered` | Either | Readable at delivery from `msg.Metadata().NumDelivered`, no API change. |
   | JetStream `ack` / `nak` | **Neither, as things stand** | Both layers hand the caller the **native** `jetstream.Msg` (`nats/jetstream.go:366`, upstream `Msg{Msg: msg, Ctx: ctx}`), so `msg.Ack()` is invoked directly on the native type and is invisible to both. Counting these requires wrapping the message type — an upstream-only, breaking change that also conflicts with ADR 0022's "deliver native types" contract. Treat as out of scope unless separately proposed. |
 
-- **Cardinality is asymmetric** — a single blanket "subject pattern" rule would
-  over-engineer this. Consume is naturally low-cardinality: upstream names the
-  consume span from the **subscription** subject (`spanName := "process " +
-  subject`, `otelnats/conn_traced.go:193`), i.e. the pattern the developer
-  registered (`orders.*`), not `msg.Subject`. JetStream likewise has the durable
-  consumer name (already emitted as `messaging.consumer.group.name`). **Only the
-  publish path takes a concrete caller-supplied subject** and therefore needs a
-  pattern-extraction hook or a caller-supplied label.
+- **Cardinality is asymmetric — but the safe set is narrow.** A blanket "subject
+  pattern" rule would over-engineer the consume side, while a publish-only rule
+  (as an earlier draft of this entry said) would under-protect the rest. The
+  split, per path:
+
+  | Path | Destination label source | Safe as a metric label? |
+  |---|---|---|
+  | Core subscribe / queue-subscribe | The **subscription** subject — upstream names the span `"process " + subject` (`otelnats/conn_traced.go:193`), i.e. the pattern the developer registered (`orders.*`), not `msg.Subject` | ✅ naturally low-cardinality |
+  | JetStream consume / pull-receive | Durable consumer name, already emitted as `messaging.consumer.group.name` | ✅ naturally low-cardinality |
+  | Core publish | Concrete caller-supplied subject | ⚠️ high — needs a pattern hook |
+  | `Request` / `RequestMsg` | Concrete caller-supplied subject | ⚠️ high — same as publish |
+  | Reply-receive | The **reply inbox** — `recordReply` names the span `"receive " + reply.Subject` (`otelnats/conn_traced.go:181`) and sets it as `conversation_id` | 🔴 **unbounded** — a fresh inbox per request, so this is strictly worse than publish and must never be a metric label |
+
+  So the pattern-extraction / caller-supplied-label hook must cover **every path
+  that labels a destination**, not just publish; and the reply-receive path
+  needs the destination dropped from its metric labels outright (keep it on the
+  span, where high cardinality is fine). This is also a repo rule, not just a
+  preference — `AGENTS.md` forbids high-cardinality values as metric label
+  values.
 - **Unlocks**: closes ADR 0004's "Metrics scope: deferred" amendment. NATS is
   one of only **two** trace-only integrations in this SDK — the other is
   Elasticsearch (ADR 0020 §6, which explicitly places ES "with NATS") — while
@@ -201,8 +212,25 @@ engagement plan below sequences it accordingly.
   of upstream's own `Next` helper.
 - **Unlocks**: deletes those three helpers and their tests from the facade;
   direct upstream users get cancelable batch pulls for free.
-- **Friction**: low — additive, and the maintainer has already written and
-  shipped the equivalent code for `Next`.
+- **This is NOT additive — plan the shape before proposing it.** An earlier
+  draft called this "low friction, additive, the maintainer already shipped the
+  equivalent for `Next`". That was wrong on both counts. The v0.6.0 and v0.7.0
+  `oteljetstream.Consumer` interfaces are **byte-identical**: `Next` already
+  took a ctx in v0.6.0, so v0.7.0 changed only its *implementation* (wiring
+  `FetchContext`) and needed no signature change at all. Adding ctx to `Fetch` /
+  `FetchBytes` is a different thing — it changes their arity, so every direct
+  caller fails to compile and every external implementation of `Consumer` stops
+  satisfying the interface. Two viable shapes:
+  1. **Additive**: new `FetchWithContext(ctx, batch, opts...)` /
+     `FetchBytesWithContext(ctx, maxBytes, opts...)`, leaving the existing
+     methods untouched. No breakage; costs API surface and a naming decision.
+  2. **Breaking, documented**: change the signatures in a minor bump, which the
+     upstream `VERSIONING.md` pre-1.0 policy permits (breaking → minor), with a
+     CHANGELOG migration note. Cleaner long-term surface; forces a coordinated
+     upgrade.
+- **Friction**: low-medium. The *implementation* is near-mechanical (the `Next`
+  ctx-wiring already exists to copy), but the API-shape decision above needs
+  the maintainer's call, so this is issue-first rather than PR-first.
 
 #### R2. `RequestWithTimeout(ctx, subject, data, timeout)` (name TBD)
 
