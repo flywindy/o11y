@@ -13,6 +13,10 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+---
+
+## [0.9.0] - 2026-07-28
+
 ### Changed
 
 - `nats`: upgraded the underlying instrumentation from
