@@ -104,9 +104,22 @@ added seven more. Ordered below by (value ÷ expected review friction).
   would mean re-implementing the instrumentation (the T3 re-instrumentation
   ADR 0022 has avoided everywhere else).
 - **Unlocks**: closes ADR 0004's "Metrics scope: deferred" amendment. NATS is
-  currently the **only** o11y integration with no metrics — Redis, MongoDB,
-  Cassandra, MinIO and HTTP all emit operation-duration metrics, so NATS is the
-  one blind spot in dashboards built on the SDK's metric conventions.
+  one of only **two** trace-only integrations in this SDK — the other is
+  Elasticsearch (ADR 0020 §6, which explicitly places ES "with NATS") — while
+  Redis, MongoDB, Cassandra, MinIO, HTTP, Gin and Resty all emit
+  operation-duration metrics. Note ADR 0020's own framing of why: for both,
+  *"the first-party instrumentation is trace-only; any metric is self-written"*.
+  That is precisely the condition this request removes — once upstream emits
+  the instruments, the NATS half of that rationale no longer holds and the
+  deferral can be revisited on its merits rather than on the absence of a
+  library to lean on.
+- **Counter-argument to weigh first**: ADR 0020 §6 also notes NATS has a strong
+  server-side metrics story (`prometheus-nats-exporter`) and that per-call
+  latency is already visible as span duration. So this is *not* a blind spot in
+  the "no data exists" sense; the gain is client-side, per-operation,
+  per-subject latency correlated with traces and exemplars — which the exporter
+  cannot give. Worth stating plainly in the upstream issue rather than
+  overselling the gap.
 - **Friction**: high — a genuine feature with API-surface and cardinality
   decisions (which attributes become metric labels). Issue-first.
 
@@ -122,9 +135,10 @@ added seven more. Ordered below by (value ÷ expected review friction).
   The logic to copy already exists at `oteljetstream/consumer_direct.go:77`
   (`applyCtxToFetchOpts`).
 - **o11y-side cost today**: `nats/jetstream.go` carries
-  `fetchWithCtxFallback` + `fetchOptsWithCtx` + `isFetchMaxWaitCollision`
-  (~50 lines plus tests) that exist *solely* to compensate — near-duplicates of
-  upstream's own `Next` helper.
+  `fetchWithCtxFallback` + `fetchOptsWithCtx` + `isFetchMaxWaitCollision` —
+  14 lines of logic wrapped in ~50 lines with the rationale comments, plus
+  dedicated tests — that exist *solely* to compensate, and are near-duplicates
+  of upstream's own `Next` helper.
 - **Unlocks**: deletes those three helpers and their tests from the facade;
   direct upstream users get cancelable batch pulls for free.
 - **Friction**: low — additive, and the maintainer has already written and
