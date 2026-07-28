@@ -70,7 +70,14 @@ additionally carry `messaging.operation.type=receive`. This is reflected in
 
 v0.7.0 cleared the original backlog down to three carried items (R2, R4, D2).
 A fresh surface audit against v0.7.0 (2026-07-16, after the upgrade landed)
-added seven more. Ordered below by (value ÷ expected review friction).
+added seven more.
+
+The table below is ordered by (value ÷ expected review friction), with one
+deliberate exception: **R6 is listed first on value alone**, because it is the
+single largest capability gap in the integration and sets the context for
+everything else — but it is also the highest-friction item and is blocked on a
+decision rather than on effort. **R7 is the better first PR**, and the
+engagement plan below sequences it accordingly.
 
 | Item | Kind | Value | Friction | Status |
 |---|---|---|---|---|
@@ -174,13 +181,15 @@ added seven more. Ordered below by (value ÷ expected review friction).
 - **Friction**: high — a genuine feature with API-surface and cardinality
   decisions (which attributes become metric labels). Issue-first.
 
-#### R7. `Fetch` / `FetchBytes` take no ctx (asymmetric with `Next`)
+#### R7. Upstream `Fetch` / `FetchBytes` take no ctx (asymmetric with `Next`)
 
-- **What**: v0.7.0 wired ctx into `Consumer.Next(ctx, opts...)` via
-  `jetstream.FetchContext`, including the `FetchContext`/`FetchMaxWait`
-  mutual-exclusion handling. `Fetch(batch, opts...)` and
-  `FetchBytes(maxBytes, opts...)` were left with **no ctx parameter at all**.
-  Request: add ctx to both, reusing the `Next` implementation.
+- **What**: on the **upstream `oteljetstream.Consumer` interface**, v0.7.0 wired
+  ctx into `Consumer.Next(ctx, opts...)` via `jetstream.FetchContext`, including
+  the `FetchContext`/`FetchMaxWait` mutual-exclusion handling, but left
+  `Fetch(batch, opts...)` and `FetchBytes(maxBytes, opts...)` with **no ctx
+  parameter at all**. (The o11y facade's own `Fetch`/`FetchBytes` do take ctx
+  and honor it — that is exactly the compensation described below.)
+  Request: add ctx to both upstream methods, reusing the `Next` implementation.
 - **Evidence**: v0.7.0 `oteljetstream/consumer.go:81-83` — `Next(ctx context.Context, …)`
   sits directly above `Fetch(batch int, …)` / `FetchBytes(maxBytes int, …)`.
   The logic to copy already exists at `oteljetstream/consumer_direct.go:77`
@@ -279,11 +288,14 @@ added seven more. Ordered below by (value ÷ expected review friction).
   docs before an automated review caught it.
 - **Friction**: trivial — a CHANGELOG wording fix, high leverage.
 
-#### F9. `Consume` / `Messages` accept no ctx
+#### F9. Upstream `Consume` / `Messages` accept no ctx
 
-- **What**: neither takes a `context.Context`, so there is no way to pass a
-  base context (deadline, cancellation, or ambient values) into the consume
-  loop; per-message context comes only from the message headers.
+- **What**: on the **upstream `oteljetstream.Consumer` interface** neither
+  method takes a `context.Context`, so there is no way to pass a base context
+  (deadline, cancellation, or ambient values) into the consume loop;
+  per-message context comes only from the message headers. (The o11y facade's
+  `Consume`/`Messages` do take ctx — see the status note below for what it
+  does and does not do.)
 - **Evidence**: v0.7.0 `oteljetstream/consumer.go:79-80`.
 - **o11y-side status**: the facade accepts ctx and uses it as a
   registration-time guard only, documenting that it does not stop a running
