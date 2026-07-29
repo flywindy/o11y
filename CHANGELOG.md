@@ -13,6 +13,10 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+---
+
+## [0.9.1] - 2026-07-29
+
 ### Added
 
 - `nats`: added `ConnectWithOptions`, `WithTracingEnabled`, and
