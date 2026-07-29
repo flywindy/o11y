@@ -776,7 +776,7 @@ error rate, and retry rate stay exact where the same breakdown derived from
 traces would be skewed by sampling (tail sampling especially, since it
 preferentially keeps errors and slow requests). It is also the dimension that
 joins these series to the server-side `cassandra-exporter`, whose table-level
-metrics are labelled by `keyspace`/`table`:
+metrics are labeled by `keyspace`/`table`:
 
 ```promql
 # Which table has the worst read latency, client-side?

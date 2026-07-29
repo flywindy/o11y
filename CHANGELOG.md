@@ -23,7 +23,7 @@ adopters can plan their upgrades.
   absence was a conformance gap. This makes per-table latency, error rate, and
   retry rate answerable from metrics rather than from sampled traces, and lets
   the client-side series join the server-side `cassandra-exporter`, whose
-  table-level metrics are labelled by `keyspace`/`table`. See ADR 0019's
+  table-level metrics are labeled by `keyspace`/`table`. See ADR 0019's
   2026-07-29 amendment.
 - `cassandra`: `WithCollectionMetricLabel(bool)` opts a session out of the new
   metric label (spans keep `db.collection.name` either way).
