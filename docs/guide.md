@@ -788,6 +788,11 @@ Use `obs.Propagator` together with the `nats` sub-package to propagate trace con
 > spans are non-recording and carry no span context, so no active trace is
 > propagated while the pillar is off — cross-service trace correlation is
 > inactive (not broken) and resumes as soon as the trace pillar is enabled.
+> If your service-level "observability off" mode must also avoid tracing
+> wrapper cost and use the native NATS path, call `ConnectWithOptions` with
+> `o11ynats.WithTracingEnabled(obs.Toggles.Trace)` so NATS follows the SDK's
+> resolved trace toggle. Do not re-parse env vars or infer state by inspecting
+> the TracerProvider type.
 
 ```go
 import (
@@ -816,6 +821,21 @@ if err != nil {
     return
 }
 defer func() { _ = sub.Drain() }() // gracefully drain on shutdown
+```
+
+For hard-disable modes that require native NATS cost while observability is
+off, use the option-based constructor and pass the SDK's resolved trace toggle:
+
+```go
+natsOpts := []gonats.Option{gonats.Name("orders-worker")}
+conn, err := o11ynats.ConnectWithOptions(
+    ctx,
+    natsURL,
+    obs.TracerProvider(),
+    obs.Propagator,
+    o11ynats.WithTracingEnabled(obs.Toggles.Trace),
+    o11ynats.WithNATSOptions(natsOpts...),
+)
 ```
 
 To make the *consumer* span itself searchable on domain identifiers the SDK

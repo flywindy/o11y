@@ -298,17 +298,20 @@ global-state or provider-routing concerns.
 
 - **Fixed upstream in v0.7.0** (retiring the "still present" list above):
   - `WithTracingEnabled(v bool) Option` added — a per-`Conn` override of the
-    env-gate default, in either direction. **`o11ynats.Connect` now passes
-    `WithTracingEnabled(true)` unconditionally**, so NATS tracing follows the
-    SDK's own toggle instead of requiring two process-wide env vars. With a
-    real TracerProvider this emits spans and propagates context; with the noop
-    provider (SDK tracing disabled) NATS spans are non-recording and carry no
-    span context, so no active trace is propagated while the pillar is off
-    (upstream starts each publish/consume span from a fresh context, so a noop
-    tracer yields nothing to inject) — cross-service correlation is inactive,
-    not broken, and resumes when the trace pillar is enabled. This matches the
-    SDK's feature-toggle semantics and removes the two-env-var production
-    footgun. Tests no longer need a `TestMain` env-var setup.
+    env-gate default, in either direction. `o11ynats.Connect` defaults to
+    `WithTracingEnabled(true)`, so NATS tracing follows the SDK's own toggle
+    instead of requiring two process-wide env vars. With a real TracerProvider
+    this emits spans and propagates context; with the noop provider (SDK tracing
+    disabled) NATS spans are non-recording and carry no span context, so no
+    active trace is propagated while the pillar is off (upstream starts each
+    publish/consume span from a fresh context, so a noop tracer yields nothing
+    to inject) — cross-service correlation is inactive, not broken, and resumes
+    when the trace pillar is enabled. Callers with a hard native-cost
+    disabled-observability mode can now use `o11ynats.ConnectWithOptions` with
+    `o11ynats.WithTracingEnabled(sdk.Toggles.Trace)` to follow the SDK's
+    resolved trace toggle and select the upstream direct path when tracing is
+    off.
+    Tests no longer need a `TestMain` env-var setup.
   - **Deliver spans removed entirely** — the implicit `OTEL_EXPORTER_OTLP_ENDPOINT`-
     gated second TracerProvider/exporter (no sampler) is gone, closing the
     sampling-inconsistency concern (issue #70) by deletion. The corresponding
@@ -331,7 +334,9 @@ global-state or provider-routing concerns.
   durations); `Consumer.Next` with a cancelable ctx can no longer be combined
   with a caller `FetchMaxWait` (returns `jetstream.ErrInvalidOption`). See the
   o11y CHANGELOG's v0.7.0 entry for migration notes.
-- **Facade changes**: none structural — `Connect` adds the
-  `WithTracingEnabled(true)` option; `Conn.Request` keeps its ctx+timeout shim
-  (upstream `Request` is still ctx-less, tracked as R2/#72). Docs and test
-  assertions updated for the corrected span kinds and span-lifecycle behavior.
+- **Facade changes**: `Connect` defaults to `WithTracingEnabled(true)`, and
+  `ConnectWithOptions` / `WithTracingEnabled(v)` expose the caller-controlled
+  direct path for disabled-observability modes; `Conn.Request` keeps its
+  ctx+timeout shim (upstream `Request` is still ctx-less, tracked as R2/#72).
+  Docs and test assertions updated for the corrected span kinds and
+  span-lifecycle behavior.

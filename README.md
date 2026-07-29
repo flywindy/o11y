@@ -244,6 +244,22 @@ obs, err := o11y.Init(ctx,
 | **Log** | `obs.Logger` writes to stdout only (JSON); no OTLP collector connection is attempted |
 | **Profiling** | No Pyroscope profiler is started; the trace-to-profile `pyroscope.profile.id` span attribute is not added. Trace/log/metric pillars are untouched |
 
+`WithTraceEnabled(false)` returns a no-op `TracerProvider`; integration code
+that is already installed may still execute a no-op wrapper path. For NATS
+callers that require native NATS cost while observability is disabled, drive
+the NATS wrapper from the SDK's resolved toggle:
+
+```go
+conn, err := o11ynats.ConnectWithOptions(
+    ctx,
+    natsURL,
+    obs.TracerProvider(),
+    obs.Propagator,
+    o11ynats.WithTracingEnabled(obs.Toggles.Trace),
+    o11ynats.WithNATSOptions(natsOpts...),
+)
+```
+
 **Environment-variable control** (useful for staged rollouts without deploys):
 
 | Env var | Default |
