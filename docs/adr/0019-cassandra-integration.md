@@ -475,3 +475,100 @@ without a live cluster by constructing synthetic `ObservedQuery` /
    through `cassandra.NewSession`, or whether a `Wrap`-style attach-to-existing
    variant is also needed (it cannot attach observers to an already-built
    session, so a config-time seam is required either way).
+
+---
+
+## Amendment (2026-07-29) — `db.collection.name` as a query metric label
+
+**Status**: Accepted (implemented)
+
+§7.A listed the operation-duration label set without `db.collection.name` and
+without recording why. This amendment adds it to both query-path instruments,
+**on by default**, and documents the reasoning the original section omitted.
+
+### Why the original omission was wrong
+
+The exclusion was an unexamined application of the cross-cutting cardinality
+discipline (ADR 0002 §7, ADR 0008 §3) rather than a decision taken against
+Cassandra's actual shape. Three facts, none of which the original §7 weighed:
+
+1. **semconv requires it.** In the pinned `semconv/v1.39.0`, `db.collection.name`
+   is **Conditionally Required** on `db.client.operation.duration` — *"If readily
+   available and if a database call is performed on a single collection."* Both
+   conditions hold: `parseStatement` already extracts the table for the span
+   (readily available), and CQL has no joins (single collection). Omitting it was
+   therefore a conformance gap, not a conservative choice — and the label set we
+   *did* ship spends a per-node cardinality multiplier on `server.address`, which
+   semconv rates only *Recommended*.
+
+2. **Traces cannot substitute, because traces are sampled.** The table is on
+   spans, so "read it off the trace" looks like an answer. It is not: head
+   sampling shrinks every per-table population (low-traffic tables vanish
+   entirely), and tail sampling is *biased* — it typically retains errors and slow
+   requests, so per-table percentiles and error rates derived from spans are
+   skewed by an unknown, uncorrectable factor. Metrics are unsampled; this is
+   precisely the axis on which metrics and traces are not interchangeable.
+
+3. **It breaks the join this ADR itself relies on.** §7 designates the
+   server-side `cassandra-exporter` as the complementary source for cluster
+   health. That exporter is per-table by construction (Cassandra's own JMX
+   `Table` MBeans; every table-level family carries `keyspace`/`table` labels).
+   Without a table dimension on the client side the two halves cannot be joined,
+   so "is this table slow at the server or on the path to it" stays unanswerable.
+   Per-table cardinality is the established norm in Cassandra observability, not
+   an aggressive position.
+
+The point applies with most force to **`cassandra.query.attempts`** (§7.B), which
+this ADR justifies precisely as the signal server-side exporters *cannot*
+provide. Its most common question — which table is driving retries — was
+unanswerable from the metric alone.
+
+### Decision
+
+- `db.collection.name` is a label on `db.client.operation.duration` and
+  `cassandra.query.attempts`, sourced from the same parsed table as the span.
+  Connection-path instruments are unaffected: `ObservedConnect` has no table.
+- **Default on.** `cassandra.WithCollectionMetricLabel(false)` is the opt-out.
+  A staged default-off release was considered and rejected: its only benefit is
+  sparing existing users a silent series-count increase, and at adoption time
+  there is a single known consumer, for whom the missing dimension is an active
+  gap. An opt-in flag also fails the person who needs it most — someone debugging
+  an incident who does not know the flag exists.
+- **Omitted per observation when no single table resolves** (unparsed statement;
+  batch spanning several tables). This is semconv's "single collection" condition
+  failing, and it reuses the batch rule §5 already defines — no new logic.
+- **Capped at the export boundary.** `o11y.WithMaxUniqueCollections` (default
+  `200`) collapses overflow table values to `"other"`, mirroring the `http.route`
+  cap in ADR 0002 §7 layer 3. The `MetricViews` allow-keys filter bounds *which*
+  keys appear; it cannot bound how many values a key takes, so the cap is a
+  distinct layer, not a duplicate of the view.
+
+### Risk this accepts
+
+The exposure is not table count. A Cassandra schema is DDL-fixed and normally in
+the tens of tables, and because verbs and tables are strongly correlated the
+growth stays well below a full operation×table cross-product — roughly ×5 on the
+duration histogram for a ten-table keyspace. That figure is an analytical
+estimate against a typical schema, not a measurement of the consumer's workload.
+
+The real risk is that `parseStatement` is a whitespace tokenizer, not a CQL
+parser. An unrecognized shape returns `""` — safe, the label is omitted — but a
+*plausible-but-wrong* shape could yield a junk token. Promoting that token from a
+span attribute (high-cardinality tolerant) to a metric label changes its blast
+radius, and containing that change is exactly what the cap is for. An `"other"`
+bucket on these metrics should therefore be read as a parser defect to fix, not
+as a cap to raise.
+
+### Consequences for other integrations
+
+The same semconv argument applies to MongoDB, but the fix does not port: its
+`db.client.operation.duration` is emitted by the upstream contrib `otelmongo`
+instrumentation (the SDK only owns a view, and views can filter attributes but
+never add them). Source inspection of the pinned commit shows `db.collection.name`
+is extracted but attached to the span only, and that `db.namespace` is present on
+the success path and **absent on the failure path**. Widening the SDK's allowlist
+alone would therefore produce a label present on successes and missing on errors,
+breaking error-rate grouping — worse than today's symmetric omission. MongoDB
+parity is consequently **upstream-first** and out of scope here; see the
+follow-up note in ADR 0014. Redis has no collection concept, and Elasticsearch's
+gap is an upstream limitation already recorded in ADR 0020 §4 ‡.

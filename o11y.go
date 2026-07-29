@@ -250,6 +250,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 				o11ycassandra.MetricViews(cfg.histogramBuckets)...,
 			),
 			MaxUniqueRoutes:         cfg.maxUniqueRoutes,
+			MaxUniqueCollections:    cfg.maxUniqueCollections,
 			ExtraHTTPServerAttrKeys: cfg.extraHTTPServerAttrKeys,
 			Exemplars:               cfg.exemplars,
 		})

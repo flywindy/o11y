@@ -20,6 +20,12 @@ import (
 // (e.g. the Redis or MongoDB wrapper's), which would otherwise produce a
 // duplicate, conflicting stream when several wrappers are active in the same
 // process. An allow-keys filter bounds the label set (ADR 0019 §7).
+//
+// The query-path views allow db.collection.name; it reaches the series only when
+// the observer emits it (on by default, see cassandra.WithCollectionMetricLabel)
+// and a single table was resolved. Its distinct-value count is capped separately
+// at the export boundary by o11y.WithMaxUniqueCollections — an allow-keys filter
+// bounds which keys appear, not how many values a key takes.
 func MetricViews(histogramBuckets []float64) []sdkmetric.View {
 	return []sdkmetric.View{
 		sdkmetric.NewView(
@@ -35,6 +41,7 @@ func MetricViews(histogramBuckets []float64) []sdkmetric.View {
 					semconv.DBSystemNameKey,
 					semconv.DBOperationNameKey,
 					semconv.DBNamespaceKey,
+					semconv.DBCollectionNameKey,
 					semconv.ServerAddressKey,
 					semconv.ServerPortKey,
 					semconv.ErrorTypeKey,
@@ -73,6 +80,7 @@ func MetricViews(histogramBuckets []float64) []sdkmetric.View {
 					semconv.DBSystemNameKey,
 					semconv.DBOperationNameKey,
 					semconv.DBNamespaceKey,
+					semconv.DBCollectionNameKey,
 					semconv.ServerAddressKey,
 					semconv.ServerPortKey,
 					semconv.ErrorTypeKey,

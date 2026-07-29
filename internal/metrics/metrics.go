@@ -72,6 +72,13 @@ type Config struct {
 	ExtraViews          []sdkmetric.View
 	MaxUniqueRoutes     int
 
+	// MaxUniqueCollections caps distinct db.collection.name values on the
+	// Cassandra client metrics at the export boundary, collapsing the overflow to
+	// "other". A Cassandra schema is DDL-fixed and small, so this guards against
+	// the SDK's CQL tokenizer mis-reading a statement shape rather than against
+	// normal schema growth.
+	MaxUniqueCollections int
+
 	// ExtraHTTPServerAttrKeys augments the SDK-managed attribute allow-list
 	// for the http.server.request.duration view. Promoting caller-controlled
 	// keys onto the exported series (rather than letting them fall through to
@@ -101,6 +108,82 @@ const (
 	sdkCardinalityMethodBudget = 16
 	sdkCardinalityStatusBudget = 64
 )
+
+// cassandraCollectionInstruments are the Cassandra client metrics that carry
+// db.collection.name, paired with the Prometheus family name each is exposed as.
+//
+// db.client.operation.duration is also emitted by the Redis and MongoDB
+// integrations, and metricscap matches rules by instrument name without a scope,
+// so their data points pass through this rule too. That is a no-op: neither
+// emits db.collection.name, and metricscap leaves a data point untouched when
+// the capped key is absent from its attribute set.
+var cassandraCollectionInstruments = []struct {
+	instrument string
+	family     string
+}{
+	{instrument: "db.client.operation.duration", family: "db_client_operation_duration_seconds"},
+	{instrument: "cassandra.query.attempts", family: "cassandra_query_attempts_total"},
+}
+
+// otlpCapRules builds the export-boundary attribute caps for the OTLP push path.
+func otlpCapRules(cfg Config) []metricscap.Rule {
+	var rules []metricscap.Rule
+	if cfg.MaxUniqueRoutes > 0 {
+		rules = append(rules,
+			metricscap.Rule{
+				InstrumentName: "http.server.request.duration",
+				Key:            semconv.HTTPRouteKey,
+				Max:            cfg.MaxUniqueRoutes,
+			},
+			metricscap.Rule{
+				InstrumentName: "http.client.request.duration",
+				Key:            semconv.HTTPRouteKey,
+				Max:            cfg.MaxUniqueRoutes,
+			},
+		)
+	}
+	if cfg.MaxUniqueCollections > 0 {
+		for _, inst := range cassandraCollectionInstruments {
+			rules = append(rules, metricscap.Rule{
+				InstrumentName: inst.instrument,
+				Key:            semconv.DBCollectionNameKey,
+				Max:            cfg.MaxUniqueCollections,
+			})
+		}
+	}
+	return rules
+}
+
+// prometheusCapRules mirrors otlpCapRules for the Prometheus pull path, which
+// caps by rendered metric-family and label name rather than instrument name and
+// attribute key.
+func prometheusCapRules(cfg Config) []metricscap.PrometheusRule {
+	var rules []metricscap.PrometheusRule
+	if cfg.MaxUniqueRoutes > 0 {
+		rules = append(rules,
+			metricscap.PrometheusRule{
+				MetricName: "http_server_request_duration_seconds",
+				LabelName:  "http_route",
+				Max:        cfg.MaxUniqueRoutes,
+			},
+			metricscap.PrometheusRule{
+				MetricName: "http_client_request_duration_seconds",
+				LabelName:  "http_route",
+				Max:        cfg.MaxUniqueRoutes,
+			},
+		)
+	}
+	if cfg.MaxUniqueCollections > 0 {
+		for _, inst := range cassandraCollectionInstruments {
+			rules = append(rules, metricscap.PrometheusRule{
+				MetricName: inst.family,
+				LabelName:  "db_collection_name",
+				Max:        cfg.MaxUniqueCollections,
+			})
+		}
+	}
+	return rules
+}
 
 // InitMeter initializes an OTel MeterProvider and returns it together with a
 // Closer that must be called during SDK shutdown.
@@ -223,19 +306,8 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 	}
 
 	gatherer := prometheus.Gatherer(reg)
-	if cfg.MaxUniqueRoutes > 0 {
-		gatherer = metricscap.NewGatherer(reg,
-			metricscap.PrometheusRule{
-				MetricName: "http_server_request_duration_seconds",
-				LabelName:  "http_route",
-				Max:        cfg.MaxUniqueRoutes,
-			},
-			metricscap.PrometheusRule{
-				MetricName: "http_client_request_duration_seconds",
-				LabelName:  "http_route",
-				Max:        cfg.MaxUniqueRoutes,
-			},
-		)
+	if rules := prometheusCapRules(cfg); len(rules) > 0 {
+		gatherer = metricscap.NewGatherer(reg, rules...)
 	}
 
 	mux := http.NewServeMux()
@@ -274,19 +346,8 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []s
 		return nil, nil, fmt.Errorf("metrics: create OTLP exporter: %w", err)
 	}
 	cappedExporter := sdkmetric.Exporter(exporter)
-	if cfg.MaxUniqueRoutes > 0 {
-		cappedExporter = metricscap.NewExporter(exporter,
-			metricscap.Rule{
-				InstrumentName: "http.server.request.duration",
-				Key:            semconv.HTTPRouteKey,
-				Max:            cfg.MaxUniqueRoutes,
-			},
-			metricscap.Rule{
-				InstrumentName: "http.client.request.duration",
-				Key:            semconv.HTTPRouteKey,
-				Max:            cfg.MaxUniqueRoutes,
-			},
-		)
+	if rules := otlpCapRules(cfg); len(rules) > 0 {
+		cappedExporter = metricscap.NewExporter(exporter, rules...)
 	}
 
 	var initSucceeded bool

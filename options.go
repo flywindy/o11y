@@ -19,6 +19,17 @@ const DefaultMetricsAddr = ":2112"
 // aggregation memory before export.
 const DefaultMaxUniqueRoutes = 1000
 
+// DefaultMaxUniqueCollections is the default export-boundary cap for distinct
+// db.collection.name values on the Cassandra client metrics.
+//
+// A Cassandra schema's table count is fixed by DDL and is normally in the tens,
+// so this is not a budget the label is expected to approach — it is a backstop
+// against a statement shape the SDK's CQL tokenizer mis-reads, which would
+// otherwise turn a bounded label into an unbounded one. It is set well below
+// DefaultMaxUniqueRoutes because a schema is a much smaller keyspace than a
+// service's URL space.
+const DefaultMaxUniqueCollections = 200
+
 // defaultLatencyBuckets is the SLO-friendly histogram boundary set applied
 // to all http.server.* histograms when the caller does not override it.
 // Standardizing these boundaries across the company keeps P99 calculations
@@ -62,6 +73,7 @@ type Config struct {
 	namespace               string
 	disableDefaultViews     bool
 	maxUniqueRoutes         int
+	maxUniqueCollections    int
 	extraHTTPServerAttrKeys []string
 	exemplars               bool
 
@@ -512,6 +524,30 @@ func WithMaxUniqueRoutes(n int) Option {
 	}
 }
 
+// WithMaxUniqueCollections sets the distinct db.collection.name export cap for
+// the Cassandra client metrics (db.client.operation.duration and
+// cassandra.query.attempts). Values <= 0 use DefaultMaxUniqueCollections.
+//
+// Table values beyond the cap are collapsed to the literal label "other" at the
+// export boundary, the same mechanism WithMaxUniqueRoutes applies to http.route.
+// Because a Cassandra schema's tables are DDL-fixed, reaching the cap normally
+// means the SDK's CQL tokenizer mis-read a statement shape rather than that the
+// schema genuinely grew; an "other" bucket appearing on these metrics is worth
+// investigating rather than raising the cap.
+//
+// Callers who would rather not carry the label at all should pass
+// cassandra.WithCollectionMetricLabel(false) to NewSession instead — this cap
+// bounds the label, it does not remove it.
+func WithMaxUniqueCollections(n int) Option {
+	return func(c *Config) {
+		if n <= 0 {
+			c.maxUniqueCollections = DefaultMaxUniqueCollections
+			return
+		}
+		c.maxUniqueCollections = n
+	}
+}
+
 // defaultConfig returns a *Config initialized with the package's built-in
 // defaults. Feature toggles default to true but respect the O11Y_*_ENABLED
 // environment variables so operators can disable pillars without code changes.
@@ -520,13 +556,14 @@ func WithMaxUniqueRoutes(n int) Option {
 // builds its logger.
 func defaultConfig() *Config {
 	cfg := &Config{
-		otlpEndpoint:     "http://localhost:4318",
-		logLevel:         slog.LevelInfo,
-		metricsAddr:      DefaultMetricsAddr,
-		runtimeMetrics:   true,
-		histogramBuckets: cloneFloat64s(defaultLatencyBuckets),
-		maxUniqueRoutes:  DefaultMaxUniqueRoutes,
-		exemplars:        true,
+		otlpEndpoint:         "http://localhost:4318",
+		logLevel:             slog.LevelInfo,
+		metricsAddr:          DefaultMetricsAddr,
+		runtimeMetrics:       true,
+		histogramBuckets:     cloneFloat64s(defaultLatencyBuckets),
+		maxUniqueRoutes:      DefaultMaxUniqueRoutes,
+		maxUniqueCollections: DefaultMaxUniqueCollections,
+		exemplars:            true,
 	}
 	var warn string
 	cfg.traceEnabled, warn = parseBoolEnv("O11Y_TRACE_ENABLED", true)

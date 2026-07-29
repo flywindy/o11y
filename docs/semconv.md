@@ -361,8 +361,8 @@ driver attempt and per page (ADR 0019 §4).
 
 | Name | Kind | Unit | Attributes |
 |---|---|---|---|
-| `db.client.operation.duration` | Float64Histogram | `s` | `db.system.name`, `db.operation.name`, `db.namespace`, `server.address`, `server.port`, `error.type` |
-| `cassandra.query.attempts` | Int64Counter | `{attempt}` | SDK-owned name. `db.system.name`, `db.operation.name`, `db.namespace`, `server.address`, `server.port`, `error.type`. Incremented by 1 per `ObserveQuery` callback (one per attempt/page), so it counts true client-side attempts (retries + speculative execution). |
+| `db.client.operation.duration` | Float64Histogram | `s` | `db.system.name`, `db.operation.name`, `db.namespace`, `db.collection.name` ‡, `server.address`, `server.port`, `error.type` |
+| `cassandra.query.attempts` | Int64Counter | `{attempt}` | SDK-owned name. `db.system.name`, `db.operation.name`, `db.namespace`, `db.collection.name` ‡, `server.address`, `server.port`, `error.type`. Incremented by 1 per `ObserveQuery` callback (one per attempt/page), so it counts true client-side attempts (retries + speculative execution). |
 | `db.client.connection.create_time` | Float64Histogram | `s` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port`. `server.*` is the node actually dialed (`ObservedConnect.Host`), not the contact point. |
 | `cassandra.connection.attempts` | Int64Counter | `{attempt}` | SDK-owned name. `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port`, `error.type`. |
 
@@ -376,11 +376,38 @@ prefix plus semconv's suggested `server.address:server.port/db.namespace` shape
 contact point but target different keyspaces distinct; sessions sharing both
 should pass `cassandra.WithPoolName` to disambiguate.
 
+**‡ `db.collection.name` on the query metrics.** The addressed table is a metric
+label on both query-path instruments, **on by default** (ADR 0019 §7,
+2026-07-29 amendment). semconv v1.39.0 marks it *Conditionally Required* on
+`db.client.operation.duration` — *"if readily available and if a database call is
+performed on a single collection"* — and both conditions hold: the table is
+already parsed for the span, and CQL has no joins. It is omitted per observation
+when no single table resolves (an unparsed statement, or a batch spanning several
+tables), which is that condition failing rather than a cardinality guard.
+
+Two properties motivate it over reading table latency off spans: metrics are not
+sampled (so per-table error rates and percentiles stay exact where traces would
+be biased, especially under tail sampling), and the table dimension is what joins
+these client-side series to the server-side `cassandra-exporter`, whose
+table-level metrics carry `keyspace`/`table` labels. It is also the only way
+`cassandra.query.attempts` can answer *which table is driving retries* — the
+client-side signal no server-side exporter can supply.
+
+Opt out per session with `cassandra.WithCollectionMetricLabel(false)`.
+
 Cardinality is bounded by the `MetricViews()` allowlist installed via
 `o11y.Init`'s `ExtraViews` (mirrors the redis/mongo pattern); every Cassandra
 instrument above — both histograms and both attempt counters — has an allow-keys
 view. Services that build their own MeterProvider must register the same views
 via `sdkmetric.WithView(...)` at construction.
+
+An allow-keys view bounds *which keys* appear, not how many values a key takes,
+so `db.collection.name` additionally carries an export-boundary cap
+(`o11y.WithMaxUniqueCollections`, default `200`) that collapses table values
+beyond it to the literal `"other"` — the same mechanism `http.route` uses. Since
+a Cassandra schema is DDL-fixed and normally in the tens of tables, an `"other"`
+bucket appearing on these metrics indicates the SDK's CQL tokenizer mis-read a
+statement shape and is worth investigating rather than raising the cap.
 
 ### Explicitly NOT Emitted
 

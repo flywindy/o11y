@@ -13,6 +13,48 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+### Added
+
+- `cassandra`: **`db.collection.name` (the addressed table) is now a metric label**
+  on `db.client.operation.duration` and `cassandra.query.attempts`, on by
+  default. semconv v1.39.0 marks it *Conditionally Required* on the duration
+  histogram — *"if readily available and if a database call is performed on a
+  single collection"* — and both conditions hold for CQL, so its previous
+  absence was a conformance gap. This makes per-table latency, error rate, and
+  retry rate answerable from metrics rather than from sampled traces, and lets
+  the client-side series join the server-side `cassandra-exporter`, whose
+  table-level metrics are labelled by `keyspace`/`table`. See ADR 0019's
+  2026-07-29 amendment.
+- `cassandra`: `WithCollectionMetricLabel(bool)` opts a session out of the new
+  metric label (spans keep `db.collection.name` either way).
+- `o11y`: `WithMaxUniqueCollections(n)` / `DefaultMaxUniqueCollections` (200)
+  cap distinct `db.collection.name` values on the Cassandra metrics at the
+  export boundary, collapsing overflow to `"other"` — the same mechanism
+  `WithMaxUniqueRoutes` applies to `http.route`. Because a Cassandra schema is
+  DDL-fixed, an `"other"` bucket here signals that the SDK's CQL tokenizer
+  mis-read a statement shape rather than that the schema grew.
+
+### Changed
+
+- **Series-count impact**: services using the `cassandra` integration will see
+  `db.client.operation.duration` and `cassandra.query.attempts` gain a per-table
+  dimension (roughly ×5 on a ten-table keyspace, since verbs and tables are
+  strongly correlated rather than a full cross-product). Pass
+  `cassandra.WithCollectionMetricLabel(false)` to `NewSession` to keep the
+  previous label set.
+
+### Notes
+
+- ADR 0002 §7 gained a 2026-07-29 addendum defining when a *schema-level* label
+  (table, collection, bucket, topic) is admissible as a metric label, so this is
+  a cross-integration rule rather than a Cassandra one-off.
+- MongoDB parity is **upstream-blocked** and deliberately not shipped: its
+  `db.client.operation.duration` is emitted by contrib `otelmongo`, and views
+  can filter attributes but never add them. Upstream also omits `db.namespace`
+  on the failure path while emitting it on success, so widening the SDK
+  allowlist alone would break error-rate grouping. See ADR 0014's 2026-07-29
+  amendment.
+
 ---
 
 ## [0.9.0] - 2026-07-28

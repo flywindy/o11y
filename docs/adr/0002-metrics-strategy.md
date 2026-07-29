@@ -146,3 +146,51 @@ services keeps P99 comparisons directly comparable in Grafana.
   `NetworkPolicy` that restricts pod-to-pod traffic.
 - Shared Resource means `service.namespace` appears as a resource attribute on traces and logs as well,
   which is desirable for correlation but adds a field that some log consumers may not expect.
+
+---
+
+## Amendment (2026-07-29) — §7 addendum: schema-level labels are bounded, not banned
+
+§7 states the cardinality rule in terms of dimensions with *unbounded* input
+(`http.route`, user ids, request ids). It was being read more broadly than
+written — as a presumption against any label with more than a handful of values —
+and that reading kept a semconv-required attribute off the Cassandra query
+metrics (see ADR 0019's 2026-07-29 amendment). This addendum draws the line
+explicitly.
+
+**A schema-level label is a distinct category.** Names of database tables,
+collections, buckets, or topics are fixed by DDL or configuration, not by request
+input. Their value space is set by a deployment's schema, not by its traffic. The
+existing integrations already treat them this way — MinIO carries
+`object_store.bucket.name` on its operation metric (ADR 0018) — so this is
+codifying practice, not creating an exception.
+
+Such a label is **admissible as a metric label** when all four hold:
+
+1. **semconv asks for it.** It is Required, Conditionally Required, or
+   Recommended on the instrument, and any condition attached to it is satisfied.
+2. **The value space is deployment-fixed**, not request-derived.
+3. **The value's provenance is trustworthy** — read from configuration or a
+   driver-supplied field, or parsed by a parser whose failure mode is to *omit*
+   the label rather than to emit a guess.
+4. **A cap layer exists** — an export-boundary cap collapsing overflow to
+   `"other"` (§7 layer 3), sized to the expected schema rather than to the
+   traffic. The cap is required even when (2) and (3) hold, because it converts
+   a parser or configuration defect from an unbounded-cardinality incident into a
+   visible, bounded `"other"` bucket.
+
+An allow-keys view (§7 layer 2) does **not** satisfy (4): it bounds which keys
+reach the series, not how many values a key takes. The two layers are
+complementary and both are needed.
+
+**Default posture.** Where the four conditions hold, the label ships **on by
+default**, because a Conditionally-Required attribute gated behind an opt-in flag
+is a conformance gap that only the people who already know about it can close.
+Integrations expose a per-instance opt-*out* for callers who would rather not
+carry the series. Where a condition fails, the label is omitted for that
+observation — omission is the correct expression of a semconv condition not being
+met, and is never a substitute for the cap in (4).
+
+**Unchanged.** §7's prohibition is untouched for genuinely unbounded dimensions:
+user ids, request ids, trace ids, raw URL paths, per-request subjects and reply
+inboxes must never be metric label values, regardless of any cap.

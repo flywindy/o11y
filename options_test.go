@@ -210,3 +210,32 @@ func TestNormalizePrometheusLabelName(t *testing.T) {
 			"normalizePrometheusLabelName(%q)", in)
 	}
 }
+
+func TestWithMaxUniqueCollections_DefaultAndClamp(t *testing.T) {
+	// The Cassandra table label ships on (ADR 0019 §7, 2026-07-29 amendment), so
+	// a default cap must be installed without the caller opting in — otherwise a
+	// mis-parsed statement shape would grow db.collection.name without bound.
+	cfg := defaultConfig()
+	assert.Equal(t, DefaultMaxUniqueCollections, cfg.maxUniqueCollections,
+		"the collection cap must be active by default")
+
+	WithMaxUniqueCollections(25)(cfg)
+	assert.Equal(t, 25, cfg.maxUniqueCollections)
+
+	// Non-positive values restore the default rather than disabling the cap,
+	// matching WithMaxUniqueRoutes: an accidental 0 must not silently uncap a
+	// label that is emitted by default.
+	WithMaxUniqueCollections(0)(cfg)
+	assert.Equal(t, DefaultMaxUniqueCollections, cfg.maxUniqueCollections)
+	WithMaxUniqueCollections(-1)(cfg)
+	assert.Equal(t, DefaultMaxUniqueCollections, cfg.maxUniqueCollections)
+}
+
+// The two caps are independent knobs; setting one must not disturb the other.
+func TestWithMaxUniqueCollections_IndependentOfRouteCap(t *testing.T) {
+	cfg := defaultConfig()
+	WithMaxUniqueCollections(25)(cfg)
+	assert.Equal(t, DefaultMaxUniqueRoutes, cfg.maxUniqueRoutes)
+	WithMaxUniqueRoutes(7)(cfg)
+	assert.Equal(t, 25, cfg.maxUniqueCollections)
+}
