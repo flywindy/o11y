@@ -156,20 +156,41 @@ func objectToken(fields []string, start int) (keyspace, table string) {
 
 // normalizeTable strips trailing punctuation/clauses from a parsed table token
 // and splits an explicit keyspace qualifier, returning the keyspace (or "" when
-// unqualified) and the bare table name.
+// unqualified) and the bare table name. Either half is "" when that half is not
+// a complete identifier (see unquoteIdentifier).
 func normalizeTable(token string) (keyspace, table string) {
 	// Cut at the first character that cannot be part of an identifier so a
 	// "table(col,...)" or "table;" token reduces to the table name.
 	if idx := strings.IndexAny(token, "(;,"); idx >= 0 {
 		token = token[:idx]
 	}
-	token = strings.Trim(token, "\"`")
-	// Split a keyspace qualifier: keyspace.table -> keyspace, table.
+	// Split a keyspace qualifier (keyspace.table) before validating, so a
+	// well-formed keyspace still resolves when the table half is unusable.
+	rest := token
 	if idx := strings.LastIndex(token, "."); idx >= 0 {
-		keyspace = strings.Trim(token[:idx], "\"`")
-		token = token[idx+1:]
+		keyspace = unquoteIdentifier(token[:idx])
+		rest = token[idx+1:]
 	}
-	return keyspace, strings.Trim(token, "\"`")
+	return keyspace, unquoteIdentifier(rest)
+}
+
+// unquoteIdentifier returns the bare identifier for a single whitespace-delimited
+// token, or "" when the token does not contain a complete one.
+//
+// CQL allows quoted identifiers containing whitespace (`SELECT * FROM "message
+// archive"`). parseStatement tokenizes on whitespace, so such an identifier
+// arrives here already split — the first token is `"message`, whose stray
+// opening quote is the evidence that the rest was cut off. Trimming quotes
+// blindly would yield `message`: a confident, wrong table name for a table that
+// does not exist. An odd quote count therefore yields "" so the caller omits
+// db.collection.name rather than mislabeling the operation, which matters more
+// now that the value is a metric label and not only a span attribute
+// (ADR 0019 §7, 2026-07-29 amendment).
+func unquoteIdentifier(token string) string {
+	if strings.Count(token, `"`)%2 != 0 || strings.Count(token, "`")%2 != 0 {
+		return ""
+	}
+	return strings.Trim(token, "\"`")
 }
 
 // spanName builds the cross-package span name (ADR 0023):

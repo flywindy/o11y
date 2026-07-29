@@ -20,11 +20,15 @@ adopters can plan their upgrades.
   default. semconv v1.39.0 marks it *Conditionally Required* on the duration
   histogram — *"if readily available and if a database call is performed on a
   single collection"* — and both conditions hold for CQL, so its previous
-  absence was a conformance gap. This makes per-table latency, error rate, and
-  retry rate answerable from metrics rather than from sampled traces, and lets
-  the client-side series join the server-side `cassandra-exporter`, whose
-  table-level metrics are labeled by `keyspace`/`table`. See ADR 0019's
-  2026-07-29 amendment.
+  absence was a conformance gap. This makes per-table latency and error rate
+  answerable from metrics rather than from sampled traces, gives
+  `cassandra.query.attempts` a per-table view of client-side round trips
+  (retries, speculative executions, paging), and lets the client-side series
+  join the server-side `cassandra-exporter`, whose table-level metrics are
+  labeled by `keyspace`/`table`. Note that `cassandra.query.attempts` counts
+  round trips rather than retries — one attempt is recorded per observer
+  callback alongside one duration sample, so their ratio is identically `1`.
+  See ADR 0019's 2026-07-29 amendment.
 - `cassandra`: `WithCollectionMetricLabel(bool)` opts a session out of the new
   metric label (spans keep `db.collection.name` either way).
 - `o11y`: `WithMaxUniqueCollections(n)` / `DefaultMaxUniqueCollections` (200)

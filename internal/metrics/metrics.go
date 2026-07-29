@@ -107,16 +107,32 @@ type Closer func(context.Context) error
 const (
 	sdkCardinalityMethodBudget = 16
 	sdkCardinalityStatusBudget = 64
+
+	// sdkCardinalityCollectionBudget is the per-table envelope for the Cassandra
+	// query metrics: db.operation.name × server.address/port × error.type, the
+	// other bounded dimensions a db.collection.name series is multiplied by.
+	sdkCardinalityCollectionBudget = 128
 )
+
+// cassandraScope is the instrumentation scope the cassandra package records
+// under. The collection cap is restricted to it because instrument names are not
+// unique across scopes: db.client.operation.duration is the standard semconv name
+// and is also emitted by the Redis and MongoDB integrations and by any
+// caller-defined database instrumentation. A name-only rule would rewrite those
+// streams too and make unrelated collections share the Cassandra budget, even in
+// processes that never use Cassandra (the cap is installed by default).
+const cassandraScope = "github.com/flywindy/o11y/cassandra"
+
+// cassandraCollectionBudget makes the two Cassandra instruments share one
+// distinct-value budget. With separate budgets they can disagree about which
+// tables overflowed — a batch records a duration sample but no attempts sample,
+// so the buckets fill differently — and the same table could export as its own
+// name on one instrument and as "other" on the other, which breaks any query
+// that joins them per table.
+const cassandraCollectionBudget = "cassandra/db.collection.name"
 
 // cassandraCollectionInstruments are the Cassandra client metrics that carry
 // db.collection.name, paired with the Prometheus family name each is exposed as.
-//
-// db.client.operation.duration is also emitted by the Redis and MongoDB
-// integrations, and metricscap matches rules by instrument name without a scope,
-// so their data points pass through this rule too. That is a no-op: neither
-// emits db.collection.name, and metricscap leaves a data point untouched when
-// the capped key is absent from its attribute set.
 var cassandraCollectionInstruments = []struct {
 	instrument string
 	family     string
@@ -146,8 +162,10 @@ func otlpCapRules(cfg Config) []metricscap.Rule {
 		for _, inst := range cassandraCollectionInstruments {
 			rules = append(rules, metricscap.Rule{
 				InstrumentName: inst.instrument,
+				ScopeName:      cassandraScope,
 				Key:            semconv.DBCollectionNameKey,
 				Max:            cfg.MaxUniqueCollections,
+				BudgetKey:      cassandraCollectionBudget,
 			})
 		}
 	}
@@ -177,8 +195,10 @@ func prometheusCapRules(cfg Config) []metricscap.PrometheusRule {
 		for _, inst := range cassandraCollectionInstruments {
 			rules = append(rules, metricscap.PrometheusRule{
 				MetricName: inst.family,
+				ScopeName:  cassandraScope,
 				LabelName:  "db_collection_name",
 				Max:        cfg.MaxUniqueCollections,
+				BudgetKey:  cassandraCollectionBudget,
 			})
 		}
 	}
@@ -291,7 +311,7 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 	}()
 
 	provider = sdkmetric.NewMeterProvider(
-		meterProviderOptions(exporter, res, views, cfg.MaxUniqueRoutes)...,
+		meterProviderOptions(exporter, res, views, cfg.MaxUniqueRoutes, cfg.MaxUniqueCollections)...,
 	)
 
 	if cfg.RuntimeMetrics {
@@ -358,7 +378,7 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []s
 	}()
 
 	provider := sdkmetric.NewMeterProvider(
-		meterProviderOptions(sdkmetric.NewPeriodicReader(cappedExporter), res, views, cfg.MaxUniqueRoutes)...,
+		meterProviderOptions(sdkmetric.NewPeriodicReader(cappedExporter), res, views, cfg.MaxUniqueRoutes, cfg.MaxUniqueCollections)...,
 	)
 
 	if cfg.RuntimeMetrics {
@@ -375,25 +395,43 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []s
 	return provider, func(_ context.Context) error { return nil }, nil
 }
 
-func meterProviderOptions(reader sdkmetric.Reader, res *resource.Resource, views []sdkmetric.View, maxUniqueRoutes int) []sdkmetric.Option {
+func meterProviderOptions(reader sdkmetric.Reader, res *resource.Resource, views []sdkmetric.View, maxUniqueRoutes, maxUniqueCollections int) []sdkmetric.Option {
 	opts := []sdkmetric.Option{
 		sdkmetric.WithReader(reader),
 		sdkmetric.WithResource(res),
 		sdkmetric.WithView(views...),
 	}
-	if maxUniqueRoutes > 0 {
-		opts = append(opts, sdkmetric.WithCardinalityLimit(cardinalityLimitBudget(maxUniqueRoutes)))
+	if limit := cardinalityLimitBudget(maxUniqueRoutes, maxUniqueCollections); limit > 0 {
+		opts = append(opts, sdkmetric.WithCardinalityLimit(limit))
 	}
 	return opts
 }
 
-func cardinalityLimitBudget(maxUniqueRoutes int) int {
+// cardinalityLimitBudget derives the in-process SDK cardinality limit, which is
+// a single global per-stream guard rather than a per-instrument one. It must
+// therefore accommodate every capped dimension the SDK exports, not just routes:
+// deriving it from MaxUniqueRoutes alone means a caller who lowers that option
+// (say to 1, giving 1024) can push the Cassandra streams over the limit, and the
+// OTel SDK then collapses the excess into otel.metric.overflow — dropping
+// db.collection.name entirely for data that was well inside MaxUniqueCollections.
+// The limit is the larger of the two budgets so neither dimension can starve the
+// other; at the default settings the route budget dominates and this is a no-op.
+func cardinalityLimitBudget(maxUniqueRoutes, maxUniqueCollections int) int {
+	routes := scaleBudget(maxUniqueRoutes, sdkCardinalityMethodBudget*sdkCardinalityStatusBudget)
+	collections := scaleBudget(maxUniqueCollections, sdkCardinalityCollectionBudget)
+	return max(routes, collections)
+}
+
+// scaleBudget returns n*per, saturating rather than overflowing.
+func scaleBudget(n, per int) int {
 	const maxInt = int(^uint(0) >> 1)
-	perRouteBudget := sdkCardinalityMethodBudget * sdkCardinalityStatusBudget
-	if maxUniqueRoutes > maxInt/perRouteBudget {
+	if n <= 0 {
+		return 0
+	}
+	if n > maxInt/per {
 		return maxInt
 	}
-	return maxUniqueRoutes * perRouteBudget
+	return n * per
 }
 
 // resolveResource returns the Resource to attach to the MeterProvider.

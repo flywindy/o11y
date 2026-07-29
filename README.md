@@ -186,6 +186,7 @@ _Metrics:_
 | `WithHistogramBuckets([]float64)` | SLO defaults | Override HTTP latency histogram boundaries; see `DefaultLatencyBuckets()` |
 | `WithDisableDefaultViews()` | off | Disable SDK-managed HTTP metric label allowlists and bucket views |
 | `WithMaxUniqueRoutes(n)` | `1000` | Cap exported distinct `http.route` values and derive the SDK aggregation cardinality budget |
+| `WithMaxUniqueCollections(n)` | `200` | Cap exported distinct `db.collection.name` values on the Cassandra client metrics, collapsing the overflow to `"other"`. A Cassandra schema is DDL-fixed, so reaching this cap signals a statement shape the SDK's CQL tokenizer mis-read rather than schema growth. To drop the label entirely instead, pass `cassandra.WithCollectionMetricLabel(false)` to `cassandra.NewSession` |
 | `WithExtraHTTPServerAttributeKeys(keys ...string)` | `nil` | Promote caller-controlled attribute keys (e.g. `app_name`, `bot_name`) onto the SDK-managed `http.server.request.duration` series. Pair with `o11ygin.WithMetricAttributesFn` / `otelhttp` equivalent to inject the values per request. Cardinality is the caller's responsibility — use enumerable, bounded keyspaces |
 | `WithExemplars(bool)` | `true` | Enable OpenMetrics negotiation on `/metrics` so per-bucket exemplars carry `trace_id` / `span_id` to Grafana / Tempo. Set `false` only as a temporary mitigation when migrating dashboards that hardcode integer histogram boundaries (`le="1"` → `le="1.0"` under OpenMetrics) |
 

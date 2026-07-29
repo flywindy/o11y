@@ -686,8 +686,10 @@ func TestCollectionMetricLabelOmittedWhenTableUnresolved(t *testing.T) {
 	}
 }
 
-// The attempts counter carries the same label, which is what makes "which table
-// is driving retries" answerable from metrics rather than from sampled traces.
+// The attempts counter carries the same label, which is what makes per-table
+// client-side round-trip volume answerable from metrics rather than from sampled
+// traces. (The counter measures round trips, not retries: one attempt is
+// recorded per observer callback alongside one duration sample.)
 func TestCollectionMetricLabelOnAttemptsCounter(t *testing.T) {
 	obs, _, reader := newTestObserver(t, config{})
 	start := time.Now()

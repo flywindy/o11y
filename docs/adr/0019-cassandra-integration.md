@@ -520,8 +520,19 @@ Cassandra's actual shape. Three facts, none of which the original §7 weighed:
 
 The point applies with most force to **`cassandra.query.attempts`** (§7.B), which
 this ADR justifies precisely as the signal server-side exporters *cannot*
-provide. Its most common question — which table is driving retries — was
-unanswerable from the metric alone.
+provide. Without a table dimension, client-side round-trip amplification could be
+seen only for the keyspace as a whole, never attributed to a table.
+
+**A limit worth stating plainly**, since it was overstated in review: that
+counter measures **round trips, not retries**. §4 establishes that gocql fires
+`ObserveQuery` once per attempt and once per page, and the observer records one
+`db.client.operation.duration` sample and one attempt on every such callback — so
+the two advance in lockstep and their ratio is identically `1` for query traffic.
+Adding the table label makes *per-table round-trip volume* comparable against a
+table's expected request rate, which surfaces amplification; it does not yield a
+retry *rate*. That would require a counter restricted to non-zero attempt
+indexes (or a logical-operation denominator, which the seam cannot supply — §4
+option (b)). Out of scope here and recorded as a follow-up.
 
 ### Decision
 

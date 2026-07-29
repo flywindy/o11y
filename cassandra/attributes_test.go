@@ -67,3 +67,35 @@ func TestContactPoint(t *testing.T) {
 		})
 	}
 }
+
+// A CQL identifier may be quoted and contain whitespace. parseStatement
+// tokenizes on whitespace, so such an identifier arrives already split; the
+// table must then be omitted rather than reported as the truncated first token,
+// which would be a confident, wrong table name. This matters more since
+// db.collection.name became a metric label (ADR 0019 §7, 2026-07-29 amendment).
+func TestParseStatementRejectsSplitQuotedIdentifiers(t *testing.T) {
+	cases := []struct {
+		name         string
+		statement    string
+		wantKeyspace string
+		wantTable    string
+	}{
+		{"quoted table with space", `SELECT * FROM "message archive"`, "", ""},
+		{"quoted table with space and clause", `SELECT * FROM "message archive" WHERE id = ?`, "", ""},
+		{"qualified quoted table with space keeps keyspace", `SELECT * FROM chat."message archive"`, "chat", ""},
+		{"quoted insert target with space", `INSERT INTO "my table" (a) VALUES (?)`, "", ""},
+		{"quoted update target with space", `UPDATE "my table" SET a = ?`, "", ""},
+		// Well-formed identifiers are unaffected, quoted or not.
+		{"quoted single-word table", `SELECT * FROM "messages_by_room"`, "", "messages_by_room"},
+		{"bare table", `SELECT * FROM messages_by_room`, "", "messages_by_room"},
+		{"qualified bare table", `SELECT * FROM chat.messages_by_room`, "chat", "messages_by_room"},
+		{"qualified quoted table", `SELECT * FROM chat."messages_by_room"`, "chat", "messages_by_room"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, ks, tbl := parseStatement(c.statement)
+			assert.Equal(t, c.wantKeyspace, ks, "keyspace")
+			assert.Equal(t, c.wantTable, tbl, "table")
+		})
+	}
+}

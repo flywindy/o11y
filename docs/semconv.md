@@ -389,9 +389,17 @@ Two properties motivate it over reading table latency off spans: metrics are not
 sampled (so per-table error rates and percentiles stay exact where traces would
 be biased, especially under tail sampling), and the table dimension is what joins
 these client-side series to the server-side `cassandra-exporter`, whose
-table-level metrics carry `keyspace`/`table` labels. It is also the only way
-`cassandra.query.attempts` can answer *which table is driving retries* — the
-client-side signal no server-side exporter can supply.
+table-level metrics carry `keyspace`/`table` labels. It also gives
+`cassandra.query.attempts` a per-table breakdown of client-side round trips
+(retries, speculative executions, and paging) — amplification no server-side
+exporter can show, since those are driver decisions.
+
+Note that `cassandra.query.attempts` counts round trips, **not retries**: the SDK
+records one duration sample and one attempt per observer callback, so the two
+advance together and their ratio is identically `1` for query traffic. Comparing
+a table's attempt rate against its expected request rate surfaces amplification;
+an exact per-table retry rate would need a counter restricted to non-zero attempt
+indexes, which v1 does not provide.
 
 Opt out per session with `cassandra.WithCollectionMetricLabel(false)`.
 

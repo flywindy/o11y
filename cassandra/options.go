@@ -43,19 +43,26 @@ func WithQueryText(enabled bool) Option {
 // and both conditions hold for Cassandra: the table is already parsed for the
 // span, and CQL has no joins. Per-table breakdown is also the only way the
 // client-side signals join to the server-side cassandra-exporter, whose
-// table-level metrics carry keyspace/table labels, and the only way
-// cassandra.query.attempts can answer which table is driving retries — a
-// question spans cannot answer reliably, because traces are sampled and metrics
-// are not.
+// table-level metrics carry keyspace/table labels, and it gives
+// cassandra.query.attempts a per-table view of client-side round trips —
+// something spans answer unreliably, because traces are sampled and metrics are
+// not. (That counter counts round trips, not retries: one attempt is recorded
+// per observer callback alongside one duration sample, so the two advance
+// together.)
 //
 // The label is omitted per-observation when no single table can be resolved (an
-// unparsed statement, or a batch spanning several tables), which is the semconv
-// condition failing rather than a cardinality guard.
+// unparsed statement, one whose quoted identifier the tokenizer could not read
+// whole, or a batch spanning several tables), which is the semconv condition
+// failing rather than a cardinality guard.
 //
-// Pass false to keep the metric label set as it was before that amendment. Two
-// backstops bound the label regardless: the MetricViews allow-keys filter, and
-// o11y.WithMaxUniqueCollections, which collapses distinct table values beyond
-// its cap to "other" at the export boundary.
+// Pass false to keep the metric label set as it was before that amendment.
+//
+// Bounding: MetricViews' allow-keys filter governs which keys reach the series,
+// and o11y.WithMaxUniqueCollections collapses table values beyond its cap to
+// "other". The cap lives in the SDK's export pipeline, so it applies only to a
+// MeterProvider built by o11y.Init. A caller passing their own MeterProvider to
+// NewSession gets the view (it travels with MetricViews) but not the cap, and
+// should register an equivalent cap or a cardinality limit on that provider.
 func WithCollectionMetricLabel(enabled bool) Option {
 	return func(cfg *config) {
 		cfg.collectionMetricLabelDisabled = !enabled
