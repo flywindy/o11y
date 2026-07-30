@@ -129,14 +129,20 @@ type bucket struct {
 // observe returns the label value to export for value, admitting it while the
 // budget has room and collapsing it to OverflowValue afterwards.
 //
+// The contract: at most Max distinct *real* values are exported, plus the single
+// shared OverflowValue bucket everything beyond the cap collapses into. Max+1
+// exported series is therefore normal and always has been — the extra one is the
+// overflow bucket, not a leak.
+//
 // A value equal to OverflowValue is deliberately *not* special-cased. A real
 // label value can legitimately be the literal "other" — a Cassandra table or an
 // HTTP route may be named that — and short-circuiting it used to let it skip the
-// budget entirely, so a cap of N could export N+1 distinct values. Running it
-// through the normal path costs it a slot and restores the cap's guarantee. The
-// exported string is unchanged either way ("other" is returned whether the value
-// was admitted or collapsed), so this tightens accounting without moving any
-// label value that dashboards already group on.
+// budget entirely. That broke the contract above: with Max=1, a real "other"
+// followed by "/rooms" admitted *both*, exporting two real values while the
+// budget was never even exhausted. Running it through the normal path costs it a
+// slot and restores the guarantee. The exported string is unchanged either way
+// ("other" is returned whether the value was admitted or collapsed), so this
+// tightens accounting without moving any label value dashboards group on.
 //
 // What this does not fix: a real "other" is still indistinguishable from the
 // overflow bucket once the cap is reached, and their samples merge. That is

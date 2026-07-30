@@ -50,14 +50,17 @@ adopters can plan their upgrades.
 ### Fixed
 
 - `internal/metricscap`: a real label value equal to the overflow sentinel
-  (`"other"`) no longer bypasses the cardinality budget. It previously
-  short-circuited before the budget check, so a cap of N could export N+1
-  distinct values — reproducible on both `db.collection.name` (a Cassandra table
-  may be named `other`) and `http.route`. It now consumes a slot like any other
-  value; no exported label value changes, because `"other"` is what was returned
-  in either case. A real `other` still merges with the overflow bucket once the
-  cap is reached — that half needs an out-of-band sentinel and is tracked
-  separately.
+  (`"other"`) no longer bypasses the cardinality budget. The cap's contract is
+  *at most N distinct real values, plus the single shared overflow bucket*, but
+  the sentinel short-circuited before the budget check: with a cap of 1, a real
+  `other` followed by `/rooms` admitted **both**, exporting two real values while
+  the budget was never exhausted. Reproducible on `db.collection.name` (a
+  Cassandra table may be named `other`) and on `http.route`. It now consumes a
+  slot like any other value; no exported label value changes, because `"other"`
+  is what was returned in either case. A real `other` arriving *after* the budget
+  is full still collapses into the overflow bucket and becomes indistinguishable
+  from it — that half needs an out-of-band sentinel and is tracked in
+  [#83](https://github.com/flywindy/o11y/issues/83).
 
 ### Notes
 

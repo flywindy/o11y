@@ -178,30 +178,31 @@ func routeSet(route string) attribute.Set {
 	return attribute.NewSet(attribute.String("http.route", route))
 }
 
-// A real label value equal to the overflow sentinel must consume a budget slot
-// like any other. It previously short-circuited, so a cap of N could export N+1
-// distinct values — reported against the Cassandra collection cap, where a table
-// may legitimately be named "other", but the same held for http.route.
+// The cap contract is "at most Max distinct real values, plus one shared
+// overflow bucket". A real label value equal to the sentinel must consume a
+// budget slot like any other; it previously short-circuited, so with Max=1 a
+// real "other" and "/rooms" were *both* admitted — two real values exported
+// while the budget was never exhausted. Reported against the Cassandra
+// collection cap, where a table may legitimately be named "other", but the same
+// held for http.route.
 func TestLimiter_OverflowValueAsRealLabelStillConsumesBudget(t *testing.T) {
 	limiter := metricscap.NewLimiter(metricscap.Rule{
 		InstrumentName: durationName,
 		Key:            "http.route",
 		Max:            1,
 	})
-	// The reported reproduction: with Max=1, a real "other" followed by another
-	// value used to yield two distinct exported labels.
 	rm := histogram(metricscap.OverflowValue, "/rooms")
 
 	limiter.Rewrite(&rm)
 
 	routes := routesFrom(t, rm)
-	assert.Len(t, routes, 1, "a cap of 1 must never export two distinct label values, got %v", routes)
-	assert.Equal(t, []string{metricscap.OverflowValue}, routes)
+	assert.Equal(t, []string{metricscap.OverflowValue}, routes,
+		"the real \"other\" takes the only slot and /rooms collapses into it, got %v", routes)
 }
 
-// The same guarantee in the other arrival order: the real value is admitted
-// first and the later one overflows into it.
-func TestLimiter_OverflowValueAdmittedFirstStillCapsOthers(t *testing.T) {
+// The sentinel arriving mid-stream behaves the same: it takes a slot, and later
+// values collapse.
+func TestLimiter_OverflowValueAdmittedMidStreamStillCapsOthers(t *testing.T) {
 	limiter := metricscap.NewLimiter(metricscap.Rule{
 		InstrumentName: durationName,
 		Key:            "http.route",
@@ -212,6 +213,31 @@ func TestLimiter_OverflowValueAdmittedFirstStillCapsOthers(t *testing.T) {
 	limiter.Rewrite(&rm)
 
 	routes := routesFrom(t, rm)
-	assert.Len(t, routes, 2, "distinct exported values must not exceed the cap, got %v", routes)
 	assert.ElementsMatch(t, []string{"/a", metricscap.OverflowValue}, routes)
+}
+
+// Reverse order: the budget is filled by ordinary values before a real "other"
+// arrives, so it collapses into the overflow bucket. The result is identical to
+// ordinary overflow with no real "other" involved — Max real values plus the
+// shared bucket — which is the contract, not a leak. Pinned because review read
+// the Max+1 series count here as a cap violation.
+func TestLimiter_OverflowValueArrivingAfterBudgetIsFullMatchesOrdinaryOverflow(t *testing.T) {
+	newLimiter := func() *metricscap.Limiter {
+		return metricscap.NewLimiter(metricscap.Rule{
+			InstrumentName: durationName,
+			Key:            "http.route",
+			Max:            2,
+		})
+	}
+
+	withRealOther := histogram("/a", "/b", metricscap.OverflowValue)
+	newLimiter().Rewrite(&withRealOther)
+
+	withoutRealOther := histogram("/a", "/b", "/c")
+	newLimiter().Rewrite(&withoutRealOther)
+
+	assert.ElementsMatch(t, routesFrom(t, withoutRealOther), routesFrom(t, withRealOther),
+		"a real \"other\" arriving after the budget is full must behave exactly like any other overflowing value")
+	assert.ElementsMatch(t, []string{"/a", "/b", metricscap.OverflowValue}, routesFrom(t, withRealOther),
+		"Max real values plus the shared overflow bucket is the contract")
 }

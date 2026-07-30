@@ -362,7 +362,7 @@ driver attempt and per page (ADR 0019 §4).
 | Name | Kind | Unit | Attributes |
 |---|---|---|---|
 | `db.client.operation.duration` | Float64Histogram | `s` | `db.system.name`, `db.operation.name`, `db.namespace`, `db.collection.name` ‡, `server.address`, `server.port`, `error.type` |
-| `cassandra.query.attempts` | Int64Counter | `{attempt}` | SDK-owned name. `db.system.name`, `db.operation.name`, `db.namespace`, `db.collection.name` ‡, `server.address`, `server.port`, `error.type`. Incremented by 1 per `ObserveQuery` callback (one per attempt/page), so it counts true client-side attempts (retries + speculative execution). |
+| `cassandra.query.attempts` | Int64Counter | `{attempt}` | SDK-owned name. `db.system.name`, `db.operation.name`, `db.namespace`, `db.collection.name` ‡, `server.address`, `server.port`, `error.type`. Incremented by 1 per `ObserveQuery` callback (one per attempt and per page) — a client-side **round-trip** count covering retries, speculative executions, and paging, **not** a retries-only counter. See the note below the table. |
 | `db.client.connection.create_time` | Float64Histogram | `s` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port`. `server.*` is the node actually dialed (`ObservedConnect.Host`), not the contact point. |
 | `cassandra.connection.attempts` | Int64Counter | `{attempt}` | SDK-owned name. `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port`, `error.type`. |
 
