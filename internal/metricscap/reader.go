@@ -140,9 +140,13 @@ type bucket struct {
 // budget entirely. That broke the contract above: with Max=1, a real "other"
 // followed by "/rooms" admitted *both*, exporting two real values while the
 // budget was never even exhausted. Running it through the normal path costs it a
-// slot and restores the guarantee. The exported string is unchanged either way
-// ("other" is returned whether the value was admitted or collapsed), so this
-// tightens accounting without moving any label value dashboards group on.
+// slot and restores the guarantee.
+//
+// The overflow label's spelling does not move — "other" is returned whether a
+// value was admitted or collapsed — so queries grouping on that literal keep
+// matching. Which real values survive the cap does change, and that is the fix
+// working: in the example above "/rooms" now overflows instead of taking a slot
+// the sentinel failed to consume.
 //
 // What this does not fix: a real "other" is still indistinguishable from the
 // overflow bucket once the cap is reached, and their samples merge. That is

@@ -56,10 +56,20 @@ adopters can plan their upgrades.
   `other` followed by `/rooms` admitted **both**, exporting two real values while
   the budget was never exhausted. Reproducible on `db.collection.name` (a
   Cassandra table may be named `other`) and on `http.route`. It now consumes a
-  slot like any other value; no exported label value changes, because `"other"`
-  is what was returned in either case. A real `other` arriving *after* the budget
-  is full still collapses into the overflow bucket and becomes indistinguishable
-  from it — that half needs an out-of-band sentinel and is tracked in
+  slot like any other value.
+
+  The overflow label's **spelling** is unchanged — `"other"` is returned whether
+  a value was admitted or collapsed — so queries and alerts that group on that
+  literal keep matching. **Which real series survive the cap can change**,
+  though, and that is the point of the fix: in the example above the exported
+  set goes from `other` + `/rooms` down to `other` alone, because `/rooms` now
+  correctly overflows instead of slipping in on a slot the sentinel failed to
+  take. Only a deployment that has a value literally named `other` *and* is at
+  its cap is affected.
+
+  A real `other` arriving *after* the budget is full still collapses into the
+  overflow bucket and becomes indistinguishable from it — that half needs an
+  out-of-band sentinel and is tracked in
   [#83](https://github.com/flywindy/o11y/issues/83).
 
 ### Notes

@@ -116,6 +116,8 @@ func TestParseStatementStripsInlineComments(t *testing.T) {
 		{"dash line comment before table", "SELECT * FROM -- routing tag\n rooms", "", "rooms"},
 		// CQL defines both -- and // as single-line comment forms.
 		{"slash line comment before table", "SELECT * FROM // routing tag\n rooms", "", "rooms"},
+		{"leading slash line comment", "// name: GetRooms\nSELECT * FROM rooms", "", "rooms"},
+		{"leading slash line comment without space", "//name: GetRooms\nSELECT * FROM chat.rooms", "chat", "rooms"},
 		{"slash line comment before update target", "UPDATE // tag\n rooms SET a = ?", "", "rooms"},
 		{"trailing slash line comment", "SELECT * FROM rooms // trailing", "", "rooms"},
 		{"block comment before qualified table", `INSERT INTO /* x */ chat.rooms (id) VALUES (?)`, "chat", "rooms"},
