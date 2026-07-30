@@ -99,3 +99,42 @@ func TestParseStatementRejectsSplitQuotedIdentifiers(t *testing.T) {
 		})
 	}
 }
+
+// CQL comments may sit anywhere, including between the target keyword and the
+// identifier. Stripping only leading comments left `/*` as the token after FROM,
+// so the table resolved to `/*` — the same confident-but-wrong failure mode as a
+// split quoted identifier, and one a varying comment could use to consume the
+// collection cap now that the table is a metric label.
+func TestParseStatementStripsInlineComments(t *testing.T) {
+	cases := []struct {
+		name         string
+		statement    string
+		wantKeyspace string
+		wantTable    string
+	}{
+		{"block comment before table", `SELECT * FROM /* routing tag */ rooms`, "", "rooms"},
+		{"line comment before table", "SELECT * FROM -- routing tag\n rooms", "", "rooms"},
+		{"block comment before qualified table", `INSERT INTO /* x */ chat.rooms (id) VALUES (?)`, "chat", "rooms"},
+		{"block comment before update target", `UPDATE /* x */ rooms SET a = ?`, "", "rooms"},
+		{"block comment without surrounding space", `SELECT * FROM/* tag */rooms`, "", "rooms"},
+		{"leading line comment", "-- name: GetRooms\nSELECT * FROM rooms", "", "rooms"},
+		{"leading block comment", `/* name: GetRooms */ SELECT * FROM rooms`, "", "rooms"},
+		{"trailing unterminated block comment", `SELECT * FROM rooms /* unterminated`, "", "rooms"},
+
+		// Comment markers inside quoted runs are data, not comments, and must
+		// not truncate the statement.
+		{"block marker inside string literal", `SELECT * FROM rooms WHERE name = 'a/*b'`, "", "rooms"},
+		{"line marker inside string literal", `SELECT * FROM rooms WHERE name = 'a--b'`, "", "rooms"},
+		{"doubled quote escape inside literal", `SELECT * FROM rooms WHERE name = 'a''--b'`, "", "rooms"},
+
+		// A statement that is only an unterminated comment yields nothing.
+		{"unterminated leading block comment", `/* unterminated`, "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, ks, tbl := parseStatement(c.statement)
+			assert.Equal(t, c.wantKeyspace, ks, "keyspace")
+			assert.Equal(t, c.wantTable, tbl, "table")
+		})
+	}
+}

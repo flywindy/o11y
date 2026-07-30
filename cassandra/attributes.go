@@ -46,7 +46,7 @@ func contactPoint(hosts []string, defaultPort int) serverAddr {
 // explicitly qualifies the table; callers use it only as a fallback for
 // db.namespace when the driver reports no session keyspace.
 func parseStatement(statement string) (operation, keyspace, table string) {
-	fields := strings.Fields(trimLeadingComments(statement))
+	fields := strings.Fields(stripComments(statement))
 	if len(fields) == 0 {
 		return "", "", ""
 	}
@@ -54,30 +54,61 @@ func parseStatement(statement string) (operation, keyspace, table string) {
 	return strings.ToUpper(fields[0]), keyspace, table
 }
 
-// trimLeadingComments strips leading whitespace and CQL comments so the
-// operation verb and table parse correctly when a statement is prefixed with a
-// query name, routing tag, or ORM annotation. CQL supports line comments (--)
-// and block comments (/* */); the C-style // is not CQL and is left untouched.
-func trimLeadingComments(stmt string) string {
-	for {
-		stmt = strings.TrimSpace(stmt)
+// stripComments removes CQL comments from a statement so the operation verb and
+// table parse correctly around a query name, routing tag, or ORM annotation.
+// CQL supports line comments (--) and block comments (/* */); the C-style // is
+// not CQL and is left untouched.
+//
+// Comments are stripped wherever they appear, not only at the front. A comment
+// sitting between the target keyword and the identifier —
+// `SELECT * FROM /* routing tag */ rooms` — otherwise leaves `/*` as the token
+// after FROM, and the table resolves to `/*` rather than `rooms`. That is the
+// same failure mode as a split quoted identifier: a confident, wrong value, now
+// carried on a metric label where a varying comment could also consume the
+// collection cap (ADR 0019 §7, 2026-07-29 amendment).
+//
+// Quoted runs are copied verbatim so a comment marker inside a string literal or
+// a quoted identifier (`WHERE name = 'a/*b'`) is not mistaken for a comment. CQL
+// escapes a quote by doubling it, which falls out of this loop naturally: the
+// closing quote ends one run and the next character immediately opens another.
+// An unterminated comment ends the statement, since nothing after it is parseable.
+func stripComments(stmt string) string {
+	var b strings.Builder
+	b.Grow(len(stmt))
+	for i := 0; i < len(stmt); {
 		switch {
-		case strings.HasPrefix(stmt, "--"):
-			nl := strings.IndexByte(stmt, '\n')
+		case stmt[i] == '\'' || stmt[i] == '"' || stmt[i] == '`':
+			quote := stmt[i]
+			b.WriteByte(stmt[i])
+			for i++; i < len(stmt); i++ {
+				b.WriteByte(stmt[i])
+				if stmt[i] == quote {
+					i++
+					break
+				}
+			}
+		case strings.HasPrefix(stmt[i:], "--"):
+			nl := strings.IndexByte(stmt[i:], '\n')
 			if nl < 0 {
-				return ""
+				return b.String()
 			}
-			stmt = stmt[nl+1:]
-		case strings.HasPrefix(stmt, "/*"):
-			end := strings.Index(stmt, "*/")
+			// Leave a space behind so the tokens either side do not merge into
+			// one when the comment had no surrounding whitespace.
+			b.WriteByte(' ')
+			i += nl + 1
+		case strings.HasPrefix(stmt[i:], "/*"):
+			end := strings.Index(stmt[i:], "*/")
 			if end < 0 {
-				return ""
+				return b.String()
 			}
-			stmt = stmt[end+2:]
+			b.WriteByte(' ')
+			i += end + 2
 		default:
-			return stmt
+			b.WriteByte(stmt[i])
+			i++
 		}
 	}
+	return b.String()
 }
 
 // parseTableFields is the shared table-parsing core operating on a pre-split
