@@ -56,8 +56,12 @@ func parseStatement(statement string) (operation, keyspace, table string) {
 
 // stripComments removes CQL comments from a statement so the operation verb and
 // table parse correctly around a query name, routing tag, or ORM annotation.
-// CQL supports line comments (--) and block comments (/* */); the C-style // is
-// not CQL and is left untouched.
+//
+// CQL has three comment forms and all three are handled: the two single-line
+// forms -- and //, and the block form /* */. (An earlier version of this file
+// asserted that // "is not CQL"; that was wrong. The Cassandra grammar defines a
+// comment as "a line beginning by either double dashes (--) or double slash
+// (//)", with block comments enclosed in /* */.)
 //
 // Comments are stripped wherever they appear, not only at the front. A comment
 // sitting between the target keyword and the identifier —
@@ -87,7 +91,7 @@ func stripComments(stmt string) string {
 					break
 				}
 			}
-		case strings.HasPrefix(stmt[i:], "--"):
+		case strings.HasPrefix(stmt[i:], "--"), strings.HasPrefix(stmt[i:], "//"):
 			nl := strings.IndexByte(stmt[i:], '\n')
 			if nl < 0 {
 				return b.String()
@@ -217,11 +221,23 @@ func normalizeTable(token string) (keyspace, table string) {
 // db.collection.name rather than mislabeling the operation, which matters more
 // now that the value is a metric label and not only a span attribute
 // (ADR 0019 §7, 2026-07-29 amendment).
+//
+// A balanced token has exactly its outer quote pair removed and CQL's
+// doubled-quote escape decoded: `"room""archive"` names the table `room"archive`.
+// Trimming every outer quote instead (strings.Trim) would leave the escape
+// undecoded and report `room""archive` — again a table that does not exist.
 func unquoteIdentifier(token string) string {
-	if strings.Count(token, `"`)%2 != 0 || strings.Count(token, "`")%2 != 0 {
-		return ""
+	for _, quote := range []string{`"`, "`"} {
+		if strings.Count(token, quote)%2 != 0 {
+			return ""
+		}
 	}
-	return strings.Trim(token, "\"`")
+	for _, quote := range []string{`"`, "`"} {
+		if len(token) >= 2 && strings.HasPrefix(token, quote) && strings.HasSuffix(token, quote) {
+			return strings.ReplaceAll(token[1:len(token)-1], quote+quote, quote)
+		}
+	}
+	return token
 }
 
 // spanName builds the cross-package span name (ADR 0023):

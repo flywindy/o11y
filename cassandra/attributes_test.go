@@ -113,7 +113,11 @@ func TestParseStatementStripsInlineComments(t *testing.T) {
 		wantTable    string
 	}{
 		{"block comment before table", `SELECT * FROM /* routing tag */ rooms`, "", "rooms"},
-		{"line comment before table", "SELECT * FROM -- routing tag\n rooms", "", "rooms"},
+		{"dash line comment before table", "SELECT * FROM -- routing tag\n rooms", "", "rooms"},
+		// CQL defines both -- and // as single-line comment forms.
+		{"slash line comment before table", "SELECT * FROM // routing tag\n rooms", "", "rooms"},
+		{"slash line comment before update target", "UPDATE // tag\n rooms SET a = ?", "", "rooms"},
+		{"trailing slash line comment", "SELECT * FROM rooms // trailing", "", "rooms"},
 		{"block comment before qualified table", `INSERT INTO /* x */ chat.rooms (id) VALUES (?)`, "chat", "rooms"},
 		{"block comment before update target", `UPDATE /* x */ rooms SET a = ?`, "", "rooms"},
 		{"block comment without surrounding space", `SELECT * FROM/* tag */rooms`, "", "rooms"},
@@ -125,10 +129,40 @@ func TestParseStatementStripsInlineComments(t *testing.T) {
 		// not truncate the statement.
 		{"block marker inside string literal", `SELECT * FROM rooms WHERE name = 'a/*b'`, "", "rooms"},
 		{"line marker inside string literal", `SELECT * FROM rooms WHERE name = 'a--b'`, "", "rooms"},
+		{"slash marker inside string literal", `SELECT * FROM rooms WHERE url = 'http://x'`, "", "rooms"},
 		{"doubled quote escape inside literal", `SELECT * FROM rooms WHERE name = 'a''--b'`, "", "rooms"},
 
 		// A statement that is only an unterminated comment yields nothing.
 		{"unterminated leading block comment", `/* unterminated`, "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, ks, tbl := parseStatement(c.statement)
+			assert.Equal(t, c.wantKeyspace, ks, "keyspace")
+			assert.Equal(t, c.wantTable, tbl, "table")
+		})
+	}
+}
+
+// CQL escapes a quote inside a quoted identifier by doubling it, so
+// "room""archive" names the table room"archive. Trimming every outer quote left
+// the escape undecoded and reported room""archive — a table that does not exist,
+// and one that would consume a slot of the collection cap under the wrong value.
+func TestParseStatementDecodesDoubledQuoteIdentifiers(t *testing.T) {
+	cases := []struct {
+		name         string
+		statement    string
+		wantKeyspace string
+		wantTable    string
+	}{
+		{"escaped quote in table", `SELECT * FROM "room""archive"`, "", `room"archive`},
+		{"escaped quote with clause", `SELECT * FROM "room""archive" WHERE id = ?`, "", `room"archive`},
+		{"escaped quote in qualified table", `SELECT * FROM chat."room""archive"`, "chat", `room"archive`},
+		{"escaped quote in insert target", `INSERT INTO "room""archive" (id) VALUES (?)`, "", `room"archive`},
+
+		// Ordinary quoted and bare identifiers are unchanged.
+		{"plain quoted table", `SELECT * FROM "messages_by_room"`, "", "messages_by_room"},
+		{"bare table", `SELECT * FROM messages_by_room`, "", "messages_by_room"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
