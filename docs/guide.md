@@ -814,6 +814,12 @@ since a Cassandra schema is DDL-fixed, an `"other"` bucket means a statement
 shape confused the SDK's CQL tokenizer and is worth reporting rather than
 raising the cap with `o11y.WithMaxUniqueCollections(n)`.
 
+The overflow bucket is the literal label value `"other"`, which is also a legal
+table name. A table actually named `other` consumes a cap slot like any other
+table (so the cap's guarantee holds), but once the cap is reached its samples
+merge into the overflow bucket and the two become indistinguishable. If you have
+such a table and need it broken out, keep the cap above your table count.
+
 ## Messaging
 
 Spans and propagation in this group follow the OTel

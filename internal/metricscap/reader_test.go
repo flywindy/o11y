@@ -177,3 +177,41 @@ func TestLimiter_IsConcurrentSafe(_ *testing.T) {
 func routeSet(route string) attribute.Set {
 	return attribute.NewSet(attribute.String("http.route", route))
 }
+
+// A real label value equal to the overflow sentinel must consume a budget slot
+// like any other. It previously short-circuited, so a cap of N could export N+1
+// distinct values — reported against the Cassandra collection cap, where a table
+// may legitimately be named "other", but the same held for http.route.
+func TestLimiter_OverflowValueAsRealLabelStillConsumesBudget(t *testing.T) {
+	limiter := metricscap.NewLimiter(metricscap.Rule{
+		InstrumentName: durationName,
+		Key:            "http.route",
+		Max:            1,
+	})
+	// The reported reproduction: with Max=1, a real "other" followed by another
+	// value used to yield two distinct exported labels.
+	rm := histogram(metricscap.OverflowValue, "/rooms")
+
+	limiter.Rewrite(&rm)
+
+	routes := routesFrom(t, rm)
+	assert.Len(t, routes, 1, "a cap of 1 must never export two distinct label values, got %v", routes)
+	assert.Equal(t, []string{metricscap.OverflowValue}, routes)
+}
+
+// The same guarantee in the other arrival order: the real value is admitted
+// first and the later one overflows into it.
+func TestLimiter_OverflowValueAdmittedFirstStillCapsOthers(t *testing.T) {
+	limiter := metricscap.NewLimiter(metricscap.Rule{
+		InstrumentName: durationName,
+		Key:            "http.route",
+		Max:            2,
+	})
+	rm := histogram("/a", metricscap.OverflowValue, "/b", "/c")
+
+	limiter.Rewrite(&rm)
+
+	routes := routesFrom(t, rm)
+	assert.Len(t, routes, 2, "distinct exported values must not exceed the cap, got %v", routes)
+	assert.ElementsMatch(t, []string{"/a", metricscap.OverflowValue}, routes)
+}

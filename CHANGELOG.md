@@ -47,6 +47,18 @@ adopters can plan their upgrades.
   `cassandra.WithCollectionMetricLabel(false)` to `NewSession` to keep the
   previous label set.
 
+### Fixed
+
+- `internal/metricscap`: a real label value equal to the overflow sentinel
+  (`"other"`) no longer bypasses the cardinality budget. It previously
+  short-circuited before the budget check, so a cap of N could export N+1
+  distinct values — reproducible on both `db.collection.name` (a Cassandra table
+  may be named `other`) and `http.route`. It now consumes a slot like any other
+  value; no exported label value changes, because `"other"` is what was returned
+  in either case. A real `other` still merges with the overflow bucket once the
+  cap is reached — that half needs an out-of-band sentinel and is tracked
+  separately.
+
 ### Notes
 
 - ADR 0002 §7 gained a 2026-07-29 addendum defining when a *schema-level* label

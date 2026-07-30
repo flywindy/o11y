@@ -126,10 +126,23 @@ type bucket struct {
 	seen map[string]struct{}
 }
 
+// observe returns the label value to export for value, admitting it while the
+// budget has room and collapsing it to OverflowValue afterwards.
+//
+// A value equal to OverflowValue is deliberately *not* special-cased. A real
+// label value can legitimately be the literal "other" — a Cassandra table or an
+// HTTP route may be named that — and short-circuiting it used to let it skip the
+// budget entirely, so a cap of N could export N+1 distinct values. Running it
+// through the normal path costs it a slot and restores the cap's guarantee. The
+// exported string is unchanged either way ("other" is returned whether the value
+// was admitted or collapsed), so this tightens accounting without moving any
+// label value that dashboards already group on.
+//
+// What this does not fix: a real "other" is still indistinguishable from the
+// overflow bucket once the cap is reached, and their samples merge. That is
+// inherent to an in-band sentinel and needs an out-of-band representation to
+// resolve, which would change an exported label value. Tracked separately.
 func (b *bucket) observe(value string) string {
-	if value == OverflowValue {
-		return OverflowValue
-	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if _, ok := b.seen[value]; ok {
