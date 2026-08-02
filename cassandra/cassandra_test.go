@@ -220,6 +220,9 @@ func TestObserveQueryEmitsSemconvSpanAndDuration(t *testing.T) {
 	assertHasAttr(t, dp.Attributes, semconv.DBSystemNameCassandra)
 	assertHasAttr(t, dp.Attributes, semconv.DBOperationName("SELECT"))
 	assertHasAttr(t, dp.Attributes, semconv.DBNamespace("chat"))
+	// db.collection.name is on by default and survives the allow-keys view
+	// (ADR 0019 §7, 2026-07-29 amendment).
+	assertHasAttr(t, dp.Attributes, semconv.DBCollectionName("messages_by_room"))
 	assertHasAttr(t, dp.Attributes, semconv.ServerAddress("10.0.0.5"))
 	assertMissingKey(t, dp.Attributes, semconv.NetworkPeerAddressKey)
 	assertMissingKey(t, dp.Attributes, semconv.CassandraCoordinatorIDKey)
@@ -345,9 +348,9 @@ func TestBatchAttrsMirrorQueryPath(t *testing.T) {
 	assert.Equal(t, "chat", ns)
 	assert.Equal(t, "messages_by_room", tbl)
 
-	attrs := obs.batchAttrs(batch, ns, tbl)
+	attrs := obs.batchAttrs(batch, batchTarget(ns, tbl))
 	start := time.Now()
-	obs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, obs.server, start, start.Add(time.Millisecond), nil, attrs)
+	obs.record(context.Background(), spanName("BATCH", tbl), batchTarget(ns, tbl), obs.server, start, start.Add(time.Millisecond), nil, attrs)
 
 	spans := sr.Ended()
 	require.Len(t, spans, 1)
@@ -420,7 +423,7 @@ func TestBatchTargetsFromQualifiedCQL(t *testing.T) {
 	assert.Equal(t, "events", tbl)
 
 	obs, sr, _ := newTestObserver(t, config{})
-	obs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, obs.server, time.Now(), time.Now(), nil, obs.batchAttrs(batch, ns, tbl))
+	obs.record(context.Background(), spanName("BATCH", tbl), batchTarget(ns, tbl), obs.server, time.Now(), time.Now(), nil, obs.batchAttrs(batch, batchTarget(ns, tbl)))
 
 	spans := sr.Ended()
 	require.Len(t, spans, 1)
@@ -441,7 +444,7 @@ func TestBatchTargetsMixedOmitted(t *testing.T) {
 	assert.Equal(t, "", tbl)
 
 	obs, sr, _ := newTestObserver(t, config{})
-	obs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, obs.server, time.Now(), time.Now(), nil, obs.batchAttrs(batch, ns, tbl))
+	obs.record(context.Background(), spanName("BATCH", tbl), batchTarget(ns, tbl), obs.server, time.Now(), time.Now(), nil, obs.batchAttrs(batch, batchTarget(ns, tbl)))
 
 	spans := sr.Ended()
 	require.Len(t, spans, 1)
@@ -476,14 +479,14 @@ func TestBatchQueryTextOptIn(t *testing.T) {
 	offObs, offSR, _ := newTestObserver(t, config{})
 	b := build()
 	ns, tbl := batchTargets(b)
-	offObs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, offObs.server, time.Now(), time.Now(), nil, offObs.batchAttrs(b, ns, tbl))
+	offObs.record(context.Background(), spanName("BATCH", tbl), batchTarget(ns, tbl), offObs.server, time.Now(), time.Now(), nil, offObs.batchAttrs(b, batchTarget(ns, tbl)))
 	require.Len(t, offSR.Ended(), 1)
 	assert.False(t, spanHasKey(offSR.Ended()[0], semconv.DBQueryTextKey), "query text off by default")
 
 	onObs, onSR, _ := newTestObserver(t, config{queryTextEnabled: true})
 	b = build()
 	ns, tbl = batchTargets(b)
-	onObs.record(context.Background(), spanName("BATCH", tbl), "BATCH", ns, onObs.server, time.Now(), time.Now(), nil, onObs.batchAttrs(b, ns, tbl))
+	onObs.record(context.Background(), spanName("BATCH", tbl), batchTarget(ns, tbl), onObs.server, time.Now(), time.Now(), nil, onObs.batchAttrs(b, batchTarget(ns, tbl)))
 	require.Len(t, onSR.Ended(), 1)
 	assert.Contains(t, onSR.Ended()[0].Attributes(),
 		semconv.DBQueryText("INSERT INTO chat.rooms (id) VALUES (?); UPDATE chat.rooms SET name = ? WHERE id = ?"))
@@ -599,6 +602,133 @@ func TestPoolNameSynthesisAndOverride(t *testing.T) {
 	assert.Equal(t, "cassandra/chat", poolName("", serverAddr{}, "chat"))
 	// WithPoolName overrides the synthesized value entirely.
 	assert.Equal(t, "chat-cluster", poolName("chat-cluster", serverAddr{host: "10.0.0.1", port: 9042}, "chat"))
+}
+
+// durationAttrs runs one query observation and returns the resulting
+// db.client.operation.duration label set, which is what the collection-label
+// tests below assert against.
+func durationAttrs(t *testing.T, cfg config, keyspace, statement string) attribute.Set {
+	t.Helper()
+	obs, _, reader := newTestObserver(t, cfg)
+	start := time.Now()
+	obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+		Keyspace:  keyspace,
+		Statement: statement,
+		Start:     start,
+		End:       start.Add(time.Millisecond),
+		Host:      testHost(t),
+	})
+	dur := metricByName(collectMetrics(t, reader), "db.client.operation.duration")
+	require.NotNil(t, dur)
+	hist, ok := dur.Data.(metricdata.Histogram[float64])
+	require.True(t, ok)
+	require.Len(t, hist.DataPoints, 1)
+	return hist.DataPoints[0].Attributes
+}
+
+// The collection metric label is on by default (semconv marks db.collection.name
+// Conditionally Required on db.client.operation.duration and both conditions
+// hold for CQL), and WithCollectionMetricLabel(false) is the opt-out.
+func TestCollectionMetricLabelDefaultsOn(t *testing.T) {
+	assert.True(t, newConfig(nil).collectionMetricLabel(),
+		"db.collection.name must be a metric label unless explicitly disabled")
+	assert.True(t, config{}.collectionMetricLabel(),
+		"the zero-value config must match the shipped default, or tests diverge from NewSession")
+	assert.False(t, newConfig([]Option{WithCollectionMetricLabel(false)}).collectionMetricLabel())
+	assert.True(t, newConfig([]Option{
+		WithCollectionMetricLabel(false),
+		WithCollectionMetricLabel(true),
+	}).collectionMetricLabel(), "last option wins")
+}
+
+func TestCollectionMetricLabelOptOut(t *testing.T) {
+	stmt := "SELECT id FROM messages_by_room WHERE room_id = ?"
+
+	on := durationAttrs(t, config{}, "chat", stmt)
+	assertHasAttr(t, on, semconv.DBCollectionName("messages_by_room"))
+
+	off := durationAttrs(t, config{collectionMetricLabelDisabled: true}, "chat", stmt)
+	assertMissingKey(t, off, semconv.DBCollectionNameKey)
+	// Opting out of the metric label must not touch the rest of the label set.
+	assertHasAttr(t, off, semconv.DBNamespace("chat"))
+	assertHasAttr(t, off, semconv.DBOperationName("SELECT"))
+}
+
+// Turning the metric label off must not strip db.collection.name from spans —
+// the option governs the metric label set only.
+func TestCollectionMetricLabelOptOutKeepsSpanAttribute(t *testing.T) {
+	obs, sr, _ := newTestObserver(t, config{collectionMetricLabelDisabled: true})
+	start := time.Now()
+	obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+		Keyspace:  "chat",
+		Statement: "SELECT id FROM messages_by_room WHERE room_id = ?",
+		Start:     start,
+		End:       start.Add(time.Millisecond),
+	})
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	assert.Contains(t, spans[0].Attributes(), semconv.DBCollectionName("messages_by_room"))
+}
+
+// When no single table can be resolved the label is omitted rather than guessed:
+// that is semconv's "performed on a single collection" condition failing, and it
+// is also what keeps an unparseable statement from inventing a label value.
+func TestCollectionMetricLabelOmittedWhenTableUnresolved(t *testing.T) {
+	for _, tc := range []struct{ name, statement string }{
+		{"unparseable verb", "USE chat"},
+		{"no table token", "SELECT"},
+		{"truncated statement", "SELECT id FROM"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			attrs := durationAttrs(t, config{}, "chat", tc.statement)
+			assertMissingKey(t, attrs, semconv.DBCollectionNameKey)
+		})
+	}
+}
+
+// The attempts counter carries the same label, which is what makes per-table
+// client-side round-trip volume answerable from metrics rather than from sampled
+// traces. (The counter measures round trips, not retries: one attempt is
+// recorded per observer callback alongside one duration sample.)
+func TestCollectionMetricLabelOnAttemptsCounter(t *testing.T) {
+	obs, _, reader := newTestObserver(t, config{})
+	start := time.Now()
+	obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+		Keyspace:  "chat",
+		Statement: "SELECT id FROM messages_by_room WHERE room_id = ?",
+		Start:     start,
+		End:       start.Add(time.Millisecond),
+		Host:      testHost(t),
+	})
+
+	cnt := metricByName(collectMetrics(t, reader), "cassandra.query.attempts")
+	require.NotNil(t, cnt)
+	sum, ok := cnt.Data.(metricdata.Sum[int64])
+	require.True(t, ok)
+	require.Len(t, sum.DataPoints, 1)
+	assertHasAttr(t, sum.DataPoints[0].Attributes, semconv.DBCollectionName("messages_by_room"))
+}
+
+// A batch spanning several tables cannot report a single collection, so the
+// label is omitted on the metric exactly as it already is on the span.
+func TestCollectionMetricLabelOmittedForMultiTableBatch(t *testing.T) {
+	obs, _, reader := newTestObserver(t, config{})
+	batch := gocql.NewBatch(gocql.LoggedBatch) //nolint:staticcheck // see TestBatchAttrsMirrorQueryPath
+	batch.Query("INSERT INTO chat.messages_by_room (room_id, id) VALUES (?, ?)", "r1", "m1")
+	batch.Query("INSERT INTO chat.rooms (id) VALUES (?)", "r1")
+
+	tgt := batchTarget(batchTargets(batch))
+	require.Empty(t, tgt.table, "a two-table batch must not resolve a single table")
+
+	start := time.Now()
+	obs.record(context.Background(), spanName(tgt.operation, tgt.table), tgt, obs.server,
+		start, start.Add(time.Millisecond), nil, obs.batchAttrs(batch, tgt))
+
+	dur := metricByName(collectMetrics(t, reader), "db.client.operation.duration")
+	require.NotNil(t, dur)
+	hist := dur.Data.(metricdata.Histogram[float64])
+	require.Len(t, hist.DataPoints, 1)
+	assertMissingKey(t, hist.DataPoints[0].Attributes, semconv.DBCollectionNameKey)
 }
 
 func assertHasAttr(t *testing.T, set attribute.Set, want attribute.KeyValue) {

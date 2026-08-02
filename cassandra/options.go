@@ -10,7 +10,15 @@ type config struct {
 	hostAttributesEnabled bool
 	attrs                 []attribute.KeyValue
 	poolName              string
+	// collectionMetricLabelDisabled is stored negated because the label is on by
+	// default: the zero-value config then means "shipped defaults", so a config
+	// literal built in a test cannot silently disagree with what NewSession does.
+	collectionMetricLabelDisabled bool
 }
+
+// collectionMetricLabel reports whether db.collection.name is recorded as a
+// metric label. See WithCollectionMetricLabel.
+func (c config) collectionMetricLabel() bool { return !c.collectionMetricLabelDisabled }
 
 // WithQueryText controls whether the CQL statement text is recorded as
 // db.query.text on spans.
@@ -22,6 +30,42 @@ type config struct {
 func WithQueryText(enabled bool) Option {
 	return func(cfg *config) {
 		cfg.queryTextEnabled = enabled
+	}
+}
+
+// WithCollectionMetricLabel controls whether db.collection.name (the addressed
+// table) is recorded as a label on db.client.operation.duration and
+// cassandra.query.attempts.
+//
+// The default is true (ADR 0019 §7, 2026-07-29 amendment). semconv v1.39.0 marks
+// db.collection.name Conditionally Required on db.client.operation.duration "if
+// readily available and if a database call is performed on a single collection",
+// and both conditions hold for Cassandra: the table is already parsed for the
+// span, and CQL has no joins. Per-table breakdown is also the only way the
+// client-side signals join to the server-side cassandra-exporter, whose
+// table-level metrics carry keyspace/table labels, and it gives
+// cassandra.query.attempts a per-table view of client-side round trips —
+// something spans answer unreliably, because traces are sampled and metrics are
+// not. (That counter counts round trips, not retries: one attempt is recorded
+// per observer callback alongside one duration sample, so the two advance
+// together.)
+//
+// The label is omitted per-observation when no single table can be resolved (an
+// unparsed statement, one whose quoted identifier the tokenizer could not read
+// whole, or a batch spanning several tables), which is the semconv condition
+// failing rather than a cardinality guard.
+//
+// Pass false to keep the metric label set as it was before that amendment.
+//
+// Bounding: MetricViews' allow-keys filter governs which keys reach the series,
+// and o11y.WithMaxUniqueCollections collapses table values beyond its cap to
+// "other". The cap lives in the SDK's export pipeline, so it applies only to a
+// MeterProvider built by o11y.Init. A caller passing their own MeterProvider to
+// NewSession gets the view (it travels with MetricViews) but not the cap, and
+// should register an equivalent cap or a cardinality limit on that provider.
+func WithCollectionMetricLabel(enabled bool) Option {
+	return func(cfg *config) {
+		cfg.collectionMetricLabelDisabled = !enabled
 	}
 }
 

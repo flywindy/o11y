@@ -769,6 +769,57 @@ datacenter (`cassandra.coordinator.id` / `.dc`, plus `network.peer.*`) are
 additional and off by default; enable them with
 `o11ycassandra.WithHostAttributes(true)`.
 
+`db.collection.name` (the addressed table) is recorded **both on spans and as a
+metric label** on `db.client.operation.duration` and `cassandra.query.attempts`.
+The metric label matters because metrics are not sampled: per-table latency and
+error rate stay exact where the same breakdown derived from traces would be
+skewed by sampling (tail sampling especially, since it preferentially keeps
+errors and slow requests). It is also the dimension that joins these series to
+the server-side `cassandra-exporter`, whose table-level metrics are labeled by
+`keyspace`/`table`:
+
+```promql
+# Which table has the worst read latency, client-side?
+histogram_quantile(0.99, sum by (db_collection_name, le) (
+  rate(db_client_operation_duration_seconds_bucket{db_operation_name="SELECT"}[5m])))
+
+# Which table has the worst client-side error rate?
+sum by (db_collection_name) (rate(db_client_operation_duration_seconds_count{error_type!=""}[5m]))
+  / sum by (db_collection_name) (rate(db_client_operation_duration_seconds_count[5m]))
+
+# Per-table round-trip rate, including retries, speculative executions and
+# paging. Compare against a table's expected request rate: an excess is
+# client-side amplification the server-side exporter cannot show you.
+topk(5, sum by (db_collection_name) (rate(cassandra_query_attempts_total[5m])))
+```
+
+> **`cassandra.query.attempts` counts round trips, not retries.** gocql fires its
+> query observer once per attempt *and* once per page, and the SDK records one
+> `db.client.operation.duration` sample and one attempt on every such callback.
+> The two therefore advance together, so
+> `rate(cassandra_query_attempts_total) / rate(db_client_operation_duration_seconds_count)`
+> is identically `1` for query traffic and is **not** a retry ratio. A true
+> per-table retry *rate* needs a counter restricted to non-zero attempt indexes,
+> which the current instrument set does not provide; until then the attempt index
+> is available per span as `cassandra.query.attempt`, and the absolute
+> per-table attempt rate above is the metric-side signal.
+
+The label is omitted when no single table can be resolved — an unparsed
+statement, or a batch spanning several tables — which matches the semantic
+convention's "performed on a single collection" condition. Pass
+`o11ycassandra.WithCollectionMetricLabel(false)` to keep the table off metric
+labels (spans are unaffected). Distinct table values are capped at
+`o11y.DefaultMaxUniqueCollections` (200) and collapse to `"other"` past that;
+since a Cassandra schema is DDL-fixed, an `"other"` bucket means a statement
+shape confused the SDK's CQL tokenizer and is worth reporting rather than
+raising the cap with `o11y.WithMaxUniqueCollections(n)`.
+
+The overflow bucket is the literal label value `"other"`, which is also a legal
+table name. A table actually named `other` consumes a cap slot like any other
+table (so the cap's guarantee holds), but once the cap is reached its samples
+merge into the overflow bucket and the two become indistinguishable. If you have
+such a table and need it broken out, keep the cap above your table count.
+
 ## Messaging
 
 Spans and propagation in this group follow the OTel

@@ -46,7 +46,7 @@ func contactPoint(hosts []string, defaultPort int) serverAddr {
 // explicitly qualifies the table; callers use it only as a fallback for
 // db.namespace when the driver reports no session keyspace.
 func parseStatement(statement string) (operation, keyspace, table string) {
-	fields := strings.Fields(trimLeadingComments(statement))
+	fields := strings.Fields(stripComments(statement))
 	if len(fields) == 0 {
 		return "", "", ""
 	}
@@ -54,30 +54,65 @@ func parseStatement(statement string) (operation, keyspace, table string) {
 	return strings.ToUpper(fields[0]), keyspace, table
 }
 
-// trimLeadingComments strips leading whitespace and CQL comments so the
-// operation verb and table parse correctly when a statement is prefixed with a
-// query name, routing tag, or ORM annotation. CQL supports line comments (--)
-// and block comments (/* */); the C-style // is not CQL and is left untouched.
-func trimLeadingComments(stmt string) string {
-	for {
-		stmt = strings.TrimSpace(stmt)
+// stripComments removes CQL comments from a statement so the operation verb and
+// table parse correctly around a query name, routing tag, or ORM annotation.
+//
+// CQL has three comment forms and all three are handled: the two single-line
+// forms -- and //, and the block form /* */. (An earlier version of this file
+// asserted that // "is not CQL"; that was wrong. The Cassandra grammar defines a
+// comment as "a line beginning by either double dashes (--) or double slash
+// (//)", with block comments enclosed in /* */.)
+//
+// Comments are stripped wherever they appear, not only at the front. A comment
+// sitting between the target keyword and the identifier —
+// `SELECT * FROM /* routing tag */ rooms` — otherwise leaves `/*` as the token
+// after FROM, and the table resolves to `/*` rather than `rooms`. That is the
+// same failure mode as a split quoted identifier: a confident, wrong value, now
+// carried on a metric label where a varying comment could also consume the
+// collection cap (ADR 0019 §7, 2026-07-29 amendment).
+//
+// Quoted runs are copied verbatim so a comment marker inside a string literal or
+// a quoted identifier (`WHERE name = 'a/*b'`) is not mistaken for a comment. CQL
+// escapes a quote by doubling it, which falls out of this loop naturally: the
+// closing quote ends one run and the next character immediately opens another.
+// An unterminated comment ends the statement, since nothing after it is parseable.
+func stripComments(stmt string) string {
+	var b strings.Builder
+	b.Grow(len(stmt))
+	for i := 0; i < len(stmt); {
 		switch {
-		case strings.HasPrefix(stmt, "--"):
-			nl := strings.IndexByte(stmt, '\n')
+		case stmt[i] == '\'' || stmt[i] == '"' || stmt[i] == '`':
+			quote := stmt[i]
+			b.WriteByte(stmt[i])
+			for i++; i < len(stmt); i++ {
+				b.WriteByte(stmt[i])
+				if stmt[i] == quote {
+					i++
+					break
+				}
+			}
+		case strings.HasPrefix(stmt[i:], "--"), strings.HasPrefix(stmt[i:], "//"):
+			nl := strings.IndexByte(stmt[i:], '\n')
 			if nl < 0 {
-				return ""
+				return b.String()
 			}
-			stmt = stmt[nl+1:]
-		case strings.HasPrefix(stmt, "/*"):
-			end := strings.Index(stmt, "*/")
+			// Leave a space behind so the tokens either side do not merge into
+			// one when the comment had no surrounding whitespace.
+			b.WriteByte(' ')
+			i += nl + 1
+		case strings.HasPrefix(stmt[i:], "/*"):
+			end := strings.Index(stmt[i:], "*/")
 			if end < 0 {
-				return ""
+				return b.String()
 			}
-			stmt = stmt[end+2:]
+			b.WriteByte(' ')
+			i += end + 2
 		default:
-			return stmt
+			b.WriteByte(stmt[i])
+			i++
 		}
 	}
+	return b.String()
 }
 
 // parseTableFields is the shared table-parsing core operating on a pre-split
@@ -156,20 +191,53 @@ func objectToken(fields []string, start int) (keyspace, table string) {
 
 // normalizeTable strips trailing punctuation/clauses from a parsed table token
 // and splits an explicit keyspace qualifier, returning the keyspace (or "" when
-// unqualified) and the bare table name.
+// unqualified) and the bare table name. Either half is "" when that half is not
+// a complete identifier (see unquoteIdentifier).
 func normalizeTable(token string) (keyspace, table string) {
 	// Cut at the first character that cannot be part of an identifier so a
 	// "table(col,...)" or "table;" token reduces to the table name.
 	if idx := strings.IndexAny(token, "(;,"); idx >= 0 {
 		token = token[:idx]
 	}
-	token = strings.Trim(token, "\"`")
-	// Split a keyspace qualifier: keyspace.table -> keyspace, table.
+	// Split a keyspace qualifier (keyspace.table) before validating, so a
+	// well-formed keyspace still resolves when the table half is unusable.
+	rest := token
 	if idx := strings.LastIndex(token, "."); idx >= 0 {
-		keyspace = strings.Trim(token[:idx], "\"`")
-		token = token[idx+1:]
+		keyspace = unquoteIdentifier(token[:idx])
+		rest = token[idx+1:]
 	}
-	return keyspace, strings.Trim(token, "\"`")
+	return keyspace, unquoteIdentifier(rest)
+}
+
+// unquoteIdentifier returns the bare identifier for a single whitespace-delimited
+// token, or "" when the token does not contain a complete one.
+//
+// CQL allows quoted identifiers containing whitespace (`SELECT * FROM "message
+// archive"`). parseStatement tokenizes on whitespace, so such an identifier
+// arrives here already split — the first token is `"message`, whose stray
+// opening quote is the evidence that the rest was cut off. Trimming quotes
+// blindly would yield `message`: a confident, wrong table name for a table that
+// does not exist. An odd quote count therefore yields "" so the caller omits
+// db.collection.name rather than mislabeling the operation, which matters more
+// now that the value is a metric label and not only a span attribute
+// (ADR 0019 §7, 2026-07-29 amendment).
+//
+// A balanced token has exactly its outer quote pair removed and CQL's
+// doubled-quote escape decoded: `"room""archive"` names the table `room"archive`.
+// Trimming every outer quote instead (strings.Trim) would leave the escape
+// undecoded and report `room""archive` — again a table that does not exist.
+func unquoteIdentifier(token string) string {
+	for _, quote := range []string{`"`, "`"} {
+		if strings.Count(token, quote)%2 != 0 {
+			return ""
+		}
+	}
+	for _, quote := range []string{`"`, "`"} {
+		if len(token) >= 2 && strings.HasPrefix(token, quote) && strings.HasSuffix(token, quote) {
+			return strings.ReplaceAll(token[1:len(token)-1], quote+quote, quote)
+		}
+	}
+	return token
 }
 
 // spanName builds the cross-package span name (ADR 0023):

@@ -72,6 +72,13 @@ type Config struct {
 	ExtraViews          []sdkmetric.View
 	MaxUniqueRoutes     int
 
+	// MaxUniqueCollections caps distinct db.collection.name values on the
+	// Cassandra client metrics at the export boundary, collapsing the overflow to
+	// "other". A Cassandra schema is DDL-fixed and small, so this guards against
+	// the SDK's CQL tokenizer mis-reading a statement shape rather than against
+	// normal schema growth.
+	MaxUniqueCollections int
+
 	// ExtraHTTPServerAttrKeys augments the SDK-managed attribute allow-list
 	// for the http.server.request.duration view. Promoting caller-controlled
 	// keys onto the exported series (rather than letting them fall through to
@@ -100,7 +107,103 @@ type Closer func(context.Context) error
 const (
 	sdkCardinalityMethodBudget = 16
 	sdkCardinalityStatusBudget = 64
+
+	// sdkCardinalityCollectionBudget is the per-table envelope for the Cassandra
+	// query metrics: db.operation.name × server.address/port × error.type, the
+	// other bounded dimensions a db.collection.name series is multiplied by.
+	sdkCardinalityCollectionBudget = 128
 )
+
+// cassandraScope is the instrumentation scope the cassandra package records
+// under. The collection cap is restricted to it because instrument names are not
+// unique across scopes: db.client.operation.duration is the standard semconv name
+// and is also emitted by the Redis and MongoDB integrations and by any
+// caller-defined database instrumentation. A name-only rule would rewrite those
+// streams too and make unrelated collections share the Cassandra budget, even in
+// processes that never use Cassandra (the cap is installed by default).
+const cassandraScope = "github.com/flywindy/o11y/cassandra"
+
+// cassandraCollectionBudget makes the two Cassandra instruments share one
+// distinct-value budget. With separate budgets they can disagree about which
+// tables overflowed — a batch records a duration sample but no attempts sample,
+// so the buckets fill differently — and the same table could export as its own
+// name on one instrument and as "other" on the other, which breaks any query
+// that joins them per table.
+const cassandraCollectionBudget = "cassandra/db.collection.name"
+
+// cassandraCollectionInstruments are the Cassandra client metrics that carry
+// db.collection.name, paired with the Prometheus family name each is exposed as.
+var cassandraCollectionInstruments = []struct {
+	instrument string
+	family     string
+}{
+	{instrument: "db.client.operation.duration", family: "db_client_operation_duration_seconds"},
+	{instrument: "cassandra.query.attempts", family: "cassandra_query_attempts_total"},
+}
+
+// otlpCapRules builds the export-boundary attribute caps for the OTLP push path.
+func otlpCapRules(cfg Config) []metricscap.Rule {
+	var rules []metricscap.Rule
+	if cfg.MaxUniqueRoutes > 0 {
+		rules = append(rules,
+			metricscap.Rule{
+				InstrumentName: "http.server.request.duration",
+				Key:            semconv.HTTPRouteKey,
+				Max:            cfg.MaxUniqueRoutes,
+			},
+			metricscap.Rule{
+				InstrumentName: "http.client.request.duration",
+				Key:            semconv.HTTPRouteKey,
+				Max:            cfg.MaxUniqueRoutes,
+			},
+		)
+	}
+	if cfg.MaxUniqueCollections > 0 {
+		for _, inst := range cassandraCollectionInstruments {
+			rules = append(rules, metricscap.Rule{
+				InstrumentName: inst.instrument,
+				ScopeName:      cassandraScope,
+				Key:            semconv.DBCollectionNameKey,
+				Max:            cfg.MaxUniqueCollections,
+				BudgetKey:      cassandraCollectionBudget,
+			})
+		}
+	}
+	return rules
+}
+
+// prometheusCapRules mirrors otlpCapRules for the Prometheus pull path, which
+// caps by rendered metric-family and label name rather than instrument name and
+// attribute key.
+func prometheusCapRules(cfg Config) []metricscap.PrometheusRule {
+	var rules []metricscap.PrometheusRule
+	if cfg.MaxUniqueRoutes > 0 {
+		rules = append(rules,
+			metricscap.PrometheusRule{
+				MetricName: "http_server_request_duration_seconds",
+				LabelName:  "http_route",
+				Max:        cfg.MaxUniqueRoutes,
+			},
+			metricscap.PrometheusRule{
+				MetricName: "http_client_request_duration_seconds",
+				LabelName:  "http_route",
+				Max:        cfg.MaxUniqueRoutes,
+			},
+		)
+	}
+	if cfg.MaxUniqueCollections > 0 {
+		for _, inst := range cassandraCollectionInstruments {
+			rules = append(rules, metricscap.PrometheusRule{
+				MetricName: inst.family,
+				ScopeName:  cassandraScope,
+				LabelName:  "db_collection_name",
+				Max:        cfg.MaxUniqueCollections,
+				BudgetKey:  cassandraCollectionBudget,
+			})
+		}
+	}
+	return rules
+}
 
 // InitMeter initializes an OTel MeterProvider and returns it together with a
 // Closer that must be called during SDK shutdown.
@@ -208,7 +311,7 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 	}()
 
 	provider = sdkmetric.NewMeterProvider(
-		meterProviderOptions(exporter, res, views, cfg.MaxUniqueRoutes)...,
+		meterProviderOptions(exporter, res, views, cfg.MaxUniqueRoutes, cfg.MaxUniqueCollections)...,
 	)
 
 	if cfg.RuntimeMetrics {
@@ -223,19 +326,8 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 	}
 
 	gatherer := prometheus.Gatherer(reg)
-	if cfg.MaxUniqueRoutes > 0 {
-		gatherer = metricscap.NewGatherer(reg,
-			metricscap.PrometheusRule{
-				MetricName: "http_server_request_duration_seconds",
-				LabelName:  "http_route",
-				Max:        cfg.MaxUniqueRoutes,
-			},
-			metricscap.PrometheusRule{
-				MetricName: "http_client_request_duration_seconds",
-				LabelName:  "http_route",
-				Max:        cfg.MaxUniqueRoutes,
-			},
-		)
+	if rules := prometheusCapRules(cfg); len(rules) > 0 {
+		gatherer = metricscap.NewGatherer(reg, rules...)
 	}
 
 	mux := http.NewServeMux()
@@ -274,19 +366,8 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []s
 		return nil, nil, fmt.Errorf("metrics: create OTLP exporter: %w", err)
 	}
 	cappedExporter := sdkmetric.Exporter(exporter)
-	if cfg.MaxUniqueRoutes > 0 {
-		cappedExporter = metricscap.NewExporter(exporter,
-			metricscap.Rule{
-				InstrumentName: "http.server.request.duration",
-				Key:            semconv.HTTPRouteKey,
-				Max:            cfg.MaxUniqueRoutes,
-			},
-			metricscap.Rule{
-				InstrumentName: "http.client.request.duration",
-				Key:            semconv.HTTPRouteKey,
-				Max:            cfg.MaxUniqueRoutes,
-			},
-		)
+	if rules := otlpCapRules(cfg); len(rules) > 0 {
+		cappedExporter = metricscap.NewExporter(exporter, rules...)
 	}
 
 	var initSucceeded bool
@@ -297,7 +378,7 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []s
 	}()
 
 	provider := sdkmetric.NewMeterProvider(
-		meterProviderOptions(sdkmetric.NewPeriodicReader(cappedExporter), res, views, cfg.MaxUniqueRoutes)...,
+		meterProviderOptions(sdkmetric.NewPeriodicReader(cappedExporter), res, views, cfg.MaxUniqueRoutes, cfg.MaxUniqueCollections)...,
 	)
 
 	if cfg.RuntimeMetrics {
@@ -314,25 +395,43 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []s
 	return provider, func(_ context.Context) error { return nil }, nil
 }
 
-func meterProviderOptions(reader sdkmetric.Reader, res *resource.Resource, views []sdkmetric.View, maxUniqueRoutes int) []sdkmetric.Option {
+func meterProviderOptions(reader sdkmetric.Reader, res *resource.Resource, views []sdkmetric.View, maxUniqueRoutes, maxUniqueCollections int) []sdkmetric.Option {
 	opts := []sdkmetric.Option{
 		sdkmetric.WithReader(reader),
 		sdkmetric.WithResource(res),
 		sdkmetric.WithView(views...),
 	}
-	if maxUniqueRoutes > 0 {
-		opts = append(opts, sdkmetric.WithCardinalityLimit(cardinalityLimitBudget(maxUniqueRoutes)))
+	if limit := cardinalityLimitBudget(maxUniqueRoutes, maxUniqueCollections); limit > 0 {
+		opts = append(opts, sdkmetric.WithCardinalityLimit(limit))
 	}
 	return opts
 }
 
-func cardinalityLimitBudget(maxUniqueRoutes int) int {
+// cardinalityLimitBudget derives the in-process SDK cardinality limit, which is
+// a single global per-stream guard rather than a per-instrument one. It must
+// therefore accommodate every capped dimension the SDK exports, not just routes:
+// deriving it from MaxUniqueRoutes alone means a caller who lowers that option
+// (say to 1, giving 1024) can push the Cassandra streams over the limit, and the
+// OTel SDK then collapses the excess into otel.metric.overflow — dropping
+// db.collection.name entirely for data that was well inside MaxUniqueCollections.
+// The limit is the larger of the two budgets so neither dimension can starve the
+// other; at the default settings the route budget dominates and this is a no-op.
+func cardinalityLimitBudget(maxUniqueRoutes, maxUniqueCollections int) int {
+	routes := scaleBudget(maxUniqueRoutes, sdkCardinalityMethodBudget*sdkCardinalityStatusBudget)
+	collections := scaleBudget(maxUniqueCollections, sdkCardinalityCollectionBudget)
+	return max(routes, collections)
+}
+
+// scaleBudget returns n*per, saturating rather than overflowing.
+func scaleBudget(n, per int) int {
 	const maxInt = int(^uint(0) >> 1)
-	perRouteBudget := sdkCardinalityMethodBudget * sdkCardinalityStatusBudget
-	if maxUniqueRoutes > maxInt/perRouteBudget {
+	if n <= 0 {
+		return 0
+	}
+	if n > maxInt/per {
 		return maxInt
 	}
-	return maxUniqueRoutes * perRouteBudget
+	return n * per
 }
 
 // resolveResource returns the Resource to attach to the MeterProvider.

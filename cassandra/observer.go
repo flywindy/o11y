@@ -65,6 +65,17 @@ func filterReservedAttrs(attrs []attribute.KeyValue) []attribute.KeyValue {
 	return attrs
 }
 
+// target identifies the database object an observation addressed: the parsed
+// statement verb, the keyspace (db.namespace), and the single table
+// (db.collection.name) when one can be resolved. The three travel together
+// through span-attribute, metric-label, and span-name construction, so they are
+// grouped rather than threaded positionally.
+type target struct {
+	operation string
+	keyspace  string
+	table     string
+}
+
 // observer implements gocql's QueryObserver and ConnectObserver interfaces. It
 // is created once per session and shared across all queries; gocql sets it on
 // the *gocql.ClusterConfig before the session exists, so there is no
@@ -94,25 +105,26 @@ func (o *observer) ObserveQuery(ctx context.Context, q gocql.ObservedQuery) {
 	if namespace == "" {
 		namespace = q.Keyspace
 	}
+	tgt := target{operation: operation, keyspace: namespace, table: table}
 
 	// server.* is the node that actually ran this attempt (token-aware routing),
 	// falling back to the contact point when the driver supplies no host.
 	srv := o.queryServer(q.Host)
 
-	attrs := o.baseAttrs(operation, namespace, table, srv, q.Host)
+	attrs := o.baseAttrs(tgt, srv, q.Host)
 	attrs = append(attrs, semconv.DBResponseReturnedRows(q.Rows))
 	attrs = append(attrs, attemptKey.Int(q.Attempt))
 	if o.cfg.queryTextEnabled && q.Statement != "" {
 		attrs = append(attrs, semconv.DBQueryText(q.Statement))
 	}
 
-	spanCtx := o.record(ctx, spanName(operation, table), operation, namespace, srv, q.Start, q.End, q.Err, attrs)
+	spanCtx := o.record(ctx, spanName(operation, table), tgt, srv, q.Start, q.End, q.Err, attrs)
 
 	// Increment by a fixed 1 per callback: each callback is exactly one attempt
 	// (ADR 0019 §7.B). Never add q.Metrics.Attempts — it is a cumulative
 	// per-host snapshot and would over-count retried/paged queries. Use the
 	// span's context so this counter's exemplar references the query span too.
-	o.inst.attempts.Add(spanCtx, 1, metric.WithAttributes(o.metricAttrs(operation, namespace, srv, q.Err)...))
+	o.inst.attempts.Add(spanCtx, 1, metric.WithAttributes(o.metricAttrs(tgt, srv, q.Err)...))
 }
 
 // ObserveConnect records connect-observer signals (ADR 0019 §7.C): a connection
@@ -162,7 +174,8 @@ func (o *observer) connectPeer(host *gocql.HostInfo) (string, int) {
 // operation's span (e.g. the per-attempt counter).
 func (o *observer) record(
 	ctx context.Context,
-	name, operation, keyspace string,
+	name string,
+	tgt target,
 	srv serverAddr,
 	start, end time.Time,
 	obsErr error,
@@ -197,7 +210,7 @@ func (o *observer) record(
 	// caller's parent span. The span has ended, but its SpanContext is still the
 	// correct trace/span id to correlate the data point to.
 	o.inst.operationDuration.Record(spanCtx, end.Sub(start).Seconds(),
-		metric.WithAttributes(o.metricAttrs(operation, keyspace, srv, obsErr)...))
+		metric.WithAttributes(o.metricAttrs(tgt, srv, obsErr)...))
 
 	return spanCtx
 }
@@ -206,16 +219,16 @@ func (o *observer) record(
 // and batches. srv is the server attributed to this observation (the actual
 // coordinator for queries, the contact point for batches); host is the actual
 // coordinator for the Opt-In topology attributes (may be nil).
-func (o *observer) baseAttrs(operation, keyspace, table string, srv serverAddr, host *gocql.HostInfo) []attribute.KeyValue {
+func (o *observer) baseAttrs(tgt target, srv serverAddr, host *gocql.HostInfo) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{semconv.DBSystemNameCassandra}
-	if operation != "" {
-		attrs = append(attrs, semconv.DBOperationName(operation))
+	if tgt.operation != "" {
+		attrs = append(attrs, semconv.DBOperationName(tgt.operation))
 	}
-	if keyspace != "" {
-		attrs = append(attrs, semconv.DBNamespace(keyspace))
+	if tgt.keyspace != "" {
+		attrs = append(attrs, semconv.DBNamespace(tgt.keyspace))
 	}
-	if table != "" {
-		attrs = append(attrs, semconv.DBCollectionName(table))
+	if tgt.table != "" {
+		attrs = append(attrs, semconv.DBCollectionName(tgt.table))
 	}
 	attrs = appendServerAttrs(attrs, srv)
 	// network.peer.* and cassandra.coordinator.* describe the actual contacted
@@ -243,13 +256,27 @@ func (o *observer) baseAttrs(operation, keyspace, table string, srv serverAddr, 
 // actual coordinator for queries; cardinality stays bounded because it is one of
 // the cluster's nodes — a fixed set — ADR 0019 §7). The MetricViews allow-keys
 // filter is the backstop.
-func (o *observer) metricAttrs(operation, keyspace string, srv serverAddr, obsErr error) []attribute.KeyValue {
+//
+// db.collection.name is included by default (ADR 0019 §7 amendment): semconv
+// marks it Conditionally Required on db.client.operation.duration "if readily
+// available and if a database call is performed on a single collection", and
+// both hold here — the table is already parsed for the span, and CQL has no
+// joins, so a query addresses one table. It is omitted when the table could not
+// be resolved (unparsed statement, or a batch spanning several tables), which is
+// exactly the "single collection" condition failing. WithCollectionMetricLabel(false)
+// drops it for callers who would rather not pay the per-table series, and
+// o11y.WithMaxUniqueCollections caps distinct values at the export boundary so a
+// statement shape the parser mis-reads cannot grow the label without bound.
+func (o *observer) metricAttrs(tgt target, srv serverAddr, obsErr error) []attribute.KeyValue {
 	attrs := []attribute.KeyValue{semconv.DBSystemNameCassandra}
-	if operation != "" {
-		attrs = append(attrs, semconv.DBOperationName(operation))
+	if tgt.operation != "" {
+		attrs = append(attrs, semconv.DBOperationName(tgt.operation))
 	}
-	if keyspace != "" {
-		attrs = append(attrs, semconv.DBNamespace(keyspace))
+	if tgt.keyspace != "" {
+		attrs = append(attrs, semconv.DBNamespace(tgt.keyspace))
+	}
+	if tgt.table != "" && o.cfg.collectionMetricLabel() {
+		attrs = append(attrs, semconv.DBCollectionName(tgt.table))
 	}
 	attrs = appendServerAttrs(attrs, srv)
 	if obsErr != nil {

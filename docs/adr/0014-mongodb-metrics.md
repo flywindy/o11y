@@ -377,3 +377,61 @@ implementing PRs:
    after the final metrics flush. Pool counters are updated from concurrent
    driver goroutines, so per-address state must tolerate duplicate, missing, or
    reordered connection lifecycle events without emitting negative counts.
+
+---
+
+## Amendment (2026-07-29) — schema-level metric labels: upstream-blocked
+
+**Status**: Open (no code change)
+
+ADR 0019's 2026-07-29 amendment adds `db.collection.name` to the Cassandra query
+metrics on the semconv *Conditionally Required* argument. The same argument
+applies to MongoDB, so this records why parity is **not** shipped here and what
+would unblock it.
+
+**The instrument is not ours.** `mongo/views.go` scopes the
+`db.client.operation.duration` view to `otelmongo.ScopeName` — the histogram is
+recorded by the upstream contrib instrumentation, and the SDK owns only a view.
+`sdkmetric.Stream.AttributeFilter` is a predicate over attributes: it can drop
+keys, never add them. So unlike Cassandra (where the SDK records the instrument
+and adding a label is a local change), MongoDB parity cannot be implemented on
+our side of the seam at all.
+
+**What upstream emits** (source read of the pinned
+`otelmongo@v0.0.0-20260622212340-49857026d46e`, `mongo.go`):
+
+| | `db.namespace` | `db.collection.name` |
+|---|---|---|
+| `Started` (span) | yes | yes, via `extractCollection` |
+| `Succeeded` (metric) | yes | **no** |
+| `Failed` (metric) | **no** | **no** |
+
+`dbconv.ClientOperationDuration.RecordSet` passes the attribute set through
+unchanged, so the table above is what is exported.
+
+**Two upstream defects, one fix site.** The collection name is already extracted
+and simply never reaches the metric; and `db.namespace` is asymmetric between the
+success and failure paths, though `evt.DatabaseName` is available on both
+(`CommandFinishedEvent` is shared).
+
+**Why the SDK allowlist is not widened in the meantime.** The current allowlist
+omits `db.namespace` on both paths, which is accidentally *symmetric*. Adding
+`DBNamespaceKey` alone would expose the upstream asymmetry: successes would carry
+the label and failures would not, so `sum by (db_namespace)` would bucket every
+error under an empty namespace and break error-rate grouping. That is a
+regression relative to today's consistent omission. The allowlist should be
+widened for `db.namespace` and `db.collection.name` **together, after** an
+upstream fix lands and the dependency is bumped.
+
+**Rejected alternative.** The SDK could record its own duration histogram from
+the composed `CommandMonitor` (`commandCollection` and
+`composeCommandMonitors` already exist, and `CommandSucceededEvent.Duration` is
+available) and drop the upstream stream via `AggregationDrop{}`. This is
+technically viable but converts Phase 1 from T2 back to T3, contradicting this
+ADR's own finding that hand-rolling this instrument is an unjustified T3 under
+ADR 0008 §2. Not worth one label.
+
+**Next step**: file the upstream issue/PR against contrib `otelmongo` covering
+both defects; the existing `network.peer.*`-vs-`server.*` "Shared wart" noted in
+the Decision analysis is the same class of upstream divergence and can be raised
+alongside it.

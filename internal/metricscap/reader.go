@@ -23,6 +23,20 @@ type Rule struct {
 	InstrumentName string
 	Key            attribute.Key
 	Max            int
+
+	// ScopeName restricts the rule to one instrumentation scope. Empty matches
+	// any scope. Instrument names are not unique across scopes —
+	// db.client.operation.duration is emitted by several integrations and by
+	// caller-defined instruments — so an integration-specific cap must name its
+	// scope, or it would silently rewrite unrelated streams and make them share
+	// its budget.
+	ScopeName string
+
+	// BudgetKey shares one distinct-value budget across every rule carrying the
+	// same non-empty value. Empty gives the rule its own budget. Use it when two
+	// instruments must agree on which values overflow, so a value is never
+	// capped on one and preserved on the other.
+	BudgetKey string
 }
 
 // PrometheusRule caps one label for one Prometheus metric family.
@@ -30,7 +44,18 @@ type PrometheusRule struct {
 	MetricName string
 	LabelName  string
 	Max        int
+
+	// ScopeName is matched against the otel_scope_name label, which otelprom
+	// attaches to every series. Empty matches any scope. See Rule.ScopeName.
+	ScopeName string
+
+	// BudgetKey shares a budget across rules. See Rule.BudgetKey.
+	BudgetKey string
 }
+
+// scopeNameLabel is the label otelprom renders the instrumentation scope name
+// into; it is the Prometheus-side equivalent of ScopeMetrics.Scope.Name.
+const scopeNameLabel = "otel_scope_name"
 
 // Limiter rewrites capped attributes in metricdata.ResourceMetrics before
 // they are exported.
@@ -57,27 +82,35 @@ func (l *Limiter) Rewrite(rm *metricdata.ResourceMetrics) {
 		return
 	}
 	for si := range rm.ScopeMetrics {
+		scope := rm.ScopeMetrics[si].Scope.Name
 		for mi := range rm.ScopeMetrics[si].Metrics {
 			m := &rm.ScopeMetrics[si].Metrics[mi]
-			for _, rule := range l.rulesFor(m.Name) {
+			for _, rule := range l.rulesFor(scope, m.Name) {
 				rewriteMetric(m, l.bucket(rule), rule.Key)
 			}
 		}
 	}
 }
 
-func (l *Limiter) rulesFor(name string) []Rule {
+func (l *Limiter) rulesFor(scope, name string) []Rule {
 	out := make([]Rule, 0, len(l.rules))
 	for _, rule := range l.rules {
-		if rule.InstrumentName == name {
-			out = append(out, rule)
+		if rule.InstrumentName != name {
+			continue
 		}
+		if rule.ScopeName != "" && rule.ScopeName != scope {
+			continue
+		}
+		out = append(out, rule)
 	}
 	return out
 }
 
 func (l *Limiter) bucket(rule Rule) *bucket {
-	key := rule.InstrumentName + "\x00" + string(rule.Key)
+	key := rule.BudgetKey
+	if key == "" {
+		key = rule.ScopeName + "\x00" + rule.InstrumentName + "\x00" + string(rule.Key)
+	}
 	actual, _ := l.buckets.LoadOrStore(key, &bucket{
 		key:  rule.Key,
 		max:  rule.Max,
@@ -93,10 +126,33 @@ type bucket struct {
 	seen map[string]struct{}
 }
 
+// observe returns the label value to export for value, admitting it while the
+// budget has room and collapsing it to OverflowValue afterwards.
+//
+// The contract: at most Max distinct *real* values are exported, plus the single
+// shared OverflowValue bucket everything beyond the cap collapses into. Max+1
+// exported series is therefore normal and always has been — the extra one is the
+// overflow bucket, not a leak.
+//
+// A value equal to OverflowValue is deliberately *not* special-cased. A real
+// label value can legitimately be the literal "other" — a Cassandra table or an
+// HTTP route may be named that — and short-circuiting it used to let it skip the
+// budget entirely. That broke the contract above: with Max=1, a real "other"
+// followed by "/rooms" admitted *both*, exporting two real values while the
+// budget was never even exhausted. Running it through the normal path costs it a
+// slot and restores the guarantee.
+//
+// The overflow label's spelling does not move — "other" is returned whether a
+// value was admitted or collapsed — so queries grouping on that literal keep
+// matching. Which real values survive the cap does change, and that is the fix
+// working: in the example above "/rooms" now overflows instead of taking a slot
+// the sentinel failed to consume.
+//
+// What this does not fix: a real "other" is still indistinguishable from the
+// overflow bucket once the cap is reached, and their samples merge. That is
+// inherent to an in-band sentinel and needs an out-of-band representation to
+// resolve, which would change an exported label value. Tracked separately.
 func (b *bucket) observe(value string) string {
-	if value == OverflowValue {
-		return OverflowValue
-	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if _, ok := b.seen[value]; ok {
@@ -173,6 +229,11 @@ func (l *prometheusLimiter) rewrite(families []*dto.MetricFamily) {
 			}
 			bucket := l.bucket(rule)
 			for _, metric := range family.Metric {
+				// Scope is matched per series, not per family: one family can
+				// carry series from several instrumentation scopes.
+				if rule.ScopeName != "" && prometheusLabel(metric, scopeNameLabel) != rule.ScopeName {
+					continue
+				}
 				rewritePrometheusLabels(metric, rule.LabelName, bucket)
 			}
 			family.Metric = mergePrometheusMetrics(family.Metric)
@@ -180,8 +241,21 @@ func (l *prometheusLimiter) rewrite(families []*dto.MetricFamily) {
 	}
 }
 
+// prometheusLabel returns the value of one label on a series, or "" when absent.
+func prometheusLabel(metric *dto.Metric, name string) string {
+	for _, label := range metric.Label {
+		if label.GetName() == name {
+			return label.GetValue()
+		}
+	}
+	return ""
+}
+
 func (l *prometheusLimiter) bucket(rule PrometheusRule) *bucket {
-	key := rule.MetricName + "\x00" + rule.LabelName
+	key := rule.BudgetKey
+	if key == "" {
+		key = rule.ScopeName + "\x00" + rule.MetricName + "\x00" + rule.LabelName
+	}
 	actual, _ := l.buckets.LoadOrStore(key, &bucket{
 		key:  attribute.Key(rule.LabelName),
 		max:  rule.Max,

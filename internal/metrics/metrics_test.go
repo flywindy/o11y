@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -588,5 +589,223 @@ func TestInitMeter_OTLPHeadersAttached(t *testing.T) {
 		assert.Equal(t, "Bearer xyz", r.Header.Get("Authorization"),
 			"Authorization header must propagate to every OTLP metrics request (request[%d] %s %s)",
 			i, r.Method, r.Path)
+	}
+}
+
+// TestInitMeter_MaxUniqueCollectionsCapsCassandraTables pins the export-boundary
+// cap for db.collection.name on the Cassandra client metrics. The label is on by
+// default (ADR 0019 §7, 2026-07-29 amendment) and a Cassandra schema is
+// DDL-fixed, so this cap exists for the case where the SDK's CQL tokenizer
+// mis-reads a statement shape and starts minting table values.
+//
+// It also pins the rendered Prometheus family names the cap rules are keyed on:
+// those names are derived by otelprom from the instrument name and unit, so a
+// naming change upstream would silently disable the cap rather than fail loudly.
+func TestInitMeter_MaxUniqueCollectionsCapsCassandraTables(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.MaxUniqueCollections = 1
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	meter := mp.Meter("github.com/flywindy/o11y/cassandra")
+	hist, err := meter.Float64Histogram("db.client.operation.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	counter, err := meter.Int64Counter("cassandra.query.attempts", metric.WithUnit("{attempt}"))
+	require.NoError(t, err)
+	for _, table := range []string{"keep_table", "overflow_a", "overflow_b"} {
+		attrs := metric.WithAttributes(
+			semconv.DBSystemNameCassandra,
+			semconv.DBOperationName("SELECT"),
+			semconv.DBNamespace("chat"),
+			semconv.DBCollectionName(table),
+		)
+		hist.Record(context.Background(), 0.01, attrs)
+		counter.Add(context.Background(), 1, attrs)
+	}
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+
+	// The family names the cap rules key on must be the ones actually exposed.
+	require.Contains(t, body, "db_client_operation_duration_seconds")
+	require.Contains(t, body, "cassandra_query_attempts_total")
+
+	assert.Contains(t, body, `db_collection_name="keep_table"`)
+	assert.Contains(t, body, `db_collection_name="other"`)
+	assert.NotContains(t, body, `db_collection_name="overflow_a"`)
+	assert.NotContains(t, body, `db_collection_name="overflow_b"`)
+
+	// Both overflow tables merge into a single "other" series per instrument.
+	var histOther, counterOther bool
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.Contains(line, `db_collection_name="other"`) {
+			continue
+		}
+		if strings.HasPrefix(line, "db_client_operation_duration_seconds_count{") && strings.HasSuffix(line, "} 2") {
+			histOther = true
+		}
+		if strings.HasPrefix(line, "cassandra_query_attempts_total{") && strings.HasSuffix(line, "} 2") {
+			counterOther = true
+		}
+	}
+	assert.True(t, histOther, "overflow tables should merge to one duration series with count 2")
+	assert.True(t, counterOther, "overflow tables should merge to one attempts series with value 2")
+}
+
+// A zero MaxUniqueCollections installs no rule, leaving table values untouched.
+func TestInitMeter_MaxUniqueCollectionsDisabledKeepsAllTables(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.MaxUniqueCollections = 0
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	hist, err := mp.Meter("github.com/flywindy/o11y/cassandra").
+		Float64Histogram("db.client.operation.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	for _, table := range []string{"rooms", "messages_by_room"} {
+		hist.Record(context.Background(), 0.01, metric.WithAttributes(
+			semconv.DBSystemNameCassandra,
+			semconv.DBCollectionName(table),
+		))
+	}
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	assert.Contains(t, body, `db_collection_name="rooms"`)
+	assert.Contains(t, body, `db_collection_name="messages_by_room"`)
+	assert.NotContains(t, body, `db_collection_name="other"`)
+}
+
+// The collection cap must not reach instruments from other scopes. The
+// db.client.operation.duration name is the standard semconv one and is also
+// emitted by the Redis/MongoDB integrations and by caller-defined database
+// instrumentation; since the cap ships on by default, a name-only rule would
+// silently rewrite those streams and make them share the Cassandra budget even
+// in a process that never touches Cassandra.
+func TestInitMeter_MaxUniqueCollectionsIgnoresOtherScopes(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.MaxUniqueCollections = 1
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	// Same instrument name, a different instrumentation scope.
+	hist, err := mp.Meter("github.com/example/my-own-db-instrumentation").
+		Float64Histogram("db.client.operation.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	for _, collection := range []string{"users", "orders", "invoices"} {
+		hist.Record(context.Background(), 0.01, metric.WithAttributes(
+			semconv.DBCollectionName(collection),
+		))
+	}
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	assert.Contains(t, body, `db_collection_name="users"`)
+	assert.Contains(t, body, `db_collection_name="orders"`)
+	assert.Contains(t, body, `db_collection_name="invoices"`)
+	assert.NotContains(t, body, `db_collection_name="other"`,
+		"a foreign scope must not be capped by the Cassandra collection budget")
+}
+
+// The two Cassandra instruments share one distinct-value budget, so the cap
+// bounds how many tables are exported across both, not per instrument. With
+// separate budgets a batch (which records a duration sample but no attempts
+// sample) fills them unevenly: each instrument admits a different table, twice
+// as many distinct tables escape as the cap allows, and a table can export under
+// its own name on one instrument while showing as "other" on the other, breaking
+// any query that joins the two per table.
+func TestInitMeter_MaxUniqueCollectionsSharesBudgetAcrossInstruments(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.MaxUniqueCollections = 1
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	meter := mp.Meter("github.com/flywindy/o11y/cassandra")
+	hist, err := meter.Float64Histogram("db.client.operation.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	counter, err := meter.Int64Counter("cassandra.query.attempts", metric.WithUnit("{attempt}"))
+	require.NoError(t, err)
+
+	// A batch on table_a: duration only, no attempts sample. This asymmetry is
+	// what makes two independent budgets diverge.
+	hist.Record(context.Background(), 0.01, metric.WithAttributes(semconv.DBCollectionName("table_a")))
+	// A query on table_b touches both instruments.
+	attrs := metric.WithAttributes(semconv.DBCollectionName("table_b"))
+	hist.Record(context.Background(), 0.01, attrs)
+	counter.Add(context.Background(), 1, attrs)
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+
+	// Which table wins depends on scrape-time family ordering, so assert the
+	// invariant rather than a specific winner: across both Cassandra instruments
+	// no more than MaxUniqueCollections distinct real tables are exported, and
+	// every table that is not collapsed reads the same on both.
+	perFamily := map[string]map[string]bool{}
+	for _, line := range strings.Split(body, "\n") {
+		m := regexp.MustCompile(`^(cassandra_query_attempts_total|db_client_operation_duration_seconds)[a-z_]*\{.*db_collection_name="([^"]+)"`).FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		if perFamily[m[1]] == nil {
+			perFamily[m[1]] = map[string]bool{}
+		}
+		perFamily[m[1]][m[2]] = true
+	}
+	require.Len(t, perFamily, 2, "both Cassandra instruments should be exported")
+
+	distinctReal := map[string]bool{}
+	for _, values := range perFamily {
+		for v := range values {
+			if v != "other" {
+				distinctReal[v] = true
+			}
+		}
+	}
+	assert.LessOrEqual(t, len(distinctReal), cfg.MaxUniqueCollections,
+		"a shared budget must bound distinct tables across both instruments, got %v", distinctReal)
+
+	// The surviving table must not be collapsed on one instrument and kept on
+	// the other, for any instrument that observed it.
+	for family, values := range perFamily {
+		for real := range distinctReal {
+			if values[real] {
+				continue
+			}
+			assert.True(t, values["other"],
+				"%s neither reports %q nor an \"other\" bucket, so the two instruments disagree", family, real)
+		}
 	}
 }

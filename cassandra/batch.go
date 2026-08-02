@@ -133,11 +133,19 @@ func instrumentBatch(
 	err := exec(batch)
 	end := time.Now()
 
-	namespace, table := batchTargets(batch)
+	tgt := batchTarget(batchTargets(batch))
 	// The batch seam has no per-statement host (gocql's ExecuteBatch* take no
 	// observer host here), so server.* is the configured contact point.
-	obs.record(ctx, spanName("BATCH", table), "BATCH", namespace, obs.server, start, end, err, obs.batchAttrs(batch, namespace, table))
+	obs.record(ctx, spanName(tgt.operation, tgt.table), tgt, obs.server, start, end, err, obs.batchAttrs(batch, tgt))
 	return err
+}
+
+// batchTarget builds the target for one logical batch from the namespace/table
+// batchTargets resolved. The operation is always "BATCH": gocql executes the
+// statements as a single server-side operation, so the per-statement verbs are
+// not what the span and metric describe.
+func batchTarget(namespace, table string) target {
+	return target{operation: "BATCH", keyspace: namespace, table: table}
 }
 
 // batchTargets resolves db.namespace and db.collection.name for a batch in a
@@ -203,8 +211,8 @@ func batchTargets(batch *gocql.Batch) (namespace, table string) {
 // db.operation.batch.size from the statement count (ADR 0019 §4). db.query.text
 // is appended only under WithQueryText, mirroring the query path; the batch's
 // statements are joined since a batch has no single statement.
-func (o *observer) batchAttrs(batch *gocql.Batch, namespace, table string) []attribute.KeyValue {
-	attrs := o.baseAttrs("BATCH", namespace, table, o.server, nil)
+func (o *observer) batchAttrs(batch *gocql.Batch, tgt target) []attribute.KeyValue {
+	attrs := o.baseAttrs(tgt, o.server, nil)
 	if size := batch.Size(); size > 0 {
 		attrs = append(attrs, semconv.DBOperationBatchSize(size))
 	}

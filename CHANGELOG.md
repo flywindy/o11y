@@ -13,6 +13,77 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+### Added
+
+- `cassandra`: **`db.collection.name` (the addressed table) is now a metric label**
+  on `db.client.operation.duration` and `cassandra.query.attempts`, on by
+  default. semconv v1.39.0 marks it *Conditionally Required* on the duration
+  histogram — *"if readily available and if a database call is performed on a
+  single collection"* — and both conditions hold for CQL, so its previous
+  absence was a conformance gap. This makes per-table latency and error rate
+  answerable from metrics rather than from sampled traces, gives
+  `cassandra.query.attempts` a per-table view of client-side round trips
+  (retries, speculative executions, paging), and lets the client-side series
+  join the server-side `cassandra-exporter`, whose table-level metrics are
+  labeled by `keyspace`/`table`. Note that `cassandra.query.attempts` counts
+  round trips rather than retries — one attempt is recorded per observer
+  callback alongside one duration sample, so their ratio is identically `1`.
+  See ADR 0019's 2026-07-29 amendment.
+- `cassandra`: `WithCollectionMetricLabel(bool)` opts a session out of the new
+  metric label (spans keep `db.collection.name` either way).
+- `o11y`: `WithMaxUniqueCollections(n)` / `DefaultMaxUniqueCollections` (200)
+  cap distinct `db.collection.name` values on the Cassandra metrics at the
+  export boundary, collapsing overflow to `"other"` — the same mechanism
+  `WithMaxUniqueRoutes` applies to `http.route`. Because a Cassandra schema is
+  DDL-fixed, an `"other"` bucket here signals that the SDK's CQL tokenizer
+  mis-read a statement shape rather than that the schema grew.
+
+### Changed
+
+- **Series-count impact**: services using the `cassandra` integration will see
+  `db.client.operation.duration` and `cassandra.query.attempts` gain a per-table
+  dimension (roughly ×5 on a ten-table keyspace, since verbs and tables are
+  strongly correlated rather than a full cross-product). Pass
+  `cassandra.WithCollectionMetricLabel(false)` to `NewSession` to keep the
+  previous label set.
+
+### Fixed
+
+- `internal/metricscap`: a real label value equal to the overflow sentinel
+  (`"other"`) no longer bypasses the cardinality budget. The cap's contract is
+  *at most N distinct real values, plus the single shared overflow bucket*, but
+  the sentinel short-circuited before the budget check: with a cap of 1, a real
+  `other` followed by `/rooms` admitted **both**, exporting two real values while
+  the budget was never exhausted. Reproducible on `db.collection.name` (a
+  Cassandra table may be named `other`) and on `http.route`. It now consumes a
+  slot like any other value.
+
+  The overflow label's **spelling** is unchanged — `"other"` is returned whether
+  a value was admitted or collapsed — so queries and alerts that group on that
+  literal keep matching. **Which real series survive the cap can change**,
+  though, and that is the point of the fix: in the example above the exported
+  set goes from `other` + `/rooms` down to `other` alone, because `/rooms` now
+  correctly overflows instead of slipping in on a slot the sentinel failed to
+  take. Only a deployment that has a value literally named `other` *and* is at
+  its cap is affected.
+
+  A real `other` arriving *after* the budget is full still collapses into the
+  overflow bucket and becomes indistinguishable from it — that half needs an
+  out-of-band sentinel and is tracked in
+  [#83](https://github.com/flywindy/o11y/issues/83).
+
+### Notes
+
+- ADR 0002 §7 gained a 2026-07-29 addendum defining when a *schema-level* label
+  (table, collection, bucket, topic) is admissible as a metric label, so this is
+  a cross-integration rule rather than a Cassandra one-off.
+- MongoDB parity is **upstream-blocked** and deliberately not shipped: its
+  `db.client.operation.duration` is emitted by contrib `otelmongo`, and views
+  can filter attributes but never add them. Upstream also omits `db.namespace`
+  on the failure path while emitting it on success, so widening the SDK
+  allowlist alone would break error-rate grouping. See ADR 0014's 2026-07-29
+  amendment.
+
 ---
 
 ## [0.9.1] - 2026-07-29
