@@ -437,6 +437,19 @@ that would shadow its own identity or correlation fields. Two groups:
   emits anywhere in its own catalog is refused on the generic path.** Type-aware
   materialization is the alternative and is rejected — it would put a type
   system into a mechanism whose entire premise is that keys are opaque.
+
+  **Residual risk, stated rather than papered over.** This rule covers keys the
+  SDK emits *today*. A semconv key it does not emit — `http.response.body.size`
+  is an integer in `semconv/v1.39.0` and absent from `docs/semconv.md` — passes
+  the check and would materialize as a string. Rejecting *every* recognized
+  semconv key would close that, but the SDK cannot enumerate them: Go offers no
+  runtime reflection over a package's constants, so it would need a generated
+  list regenerated on every semconv pin bump (ADR 0006), and the list would then
+  reject keys an application had legitimately adopted before the bump. The
+  enforceable rule is therefore the catalog; the protection against the rest is
+  the namespacing guidance below, and it is guidance for this reason rather than
+  laziness. An application that puts its keys under its own namespace cannot hit
+  this at all.
 - **Resource-level service identity**: `service.version`, `service.namespace`,
   `deployment.environment.name` (`docs/semconv.md`, Resource Attributes). These
   do not collide on the log side, but as *span* attributes they shadow the
@@ -642,16 +655,45 @@ return c.Conn.Subscribe(subject, func(m otelnats.Msg) {
 })
 ```
 
-`restoreBaggage` extracts with a **`propagation.Baggage{}`-only** propagator, not
-the SDK composite. That is the whole trick: extracting with the composite would
-also apply `TraceContext`, overwriting the consumer span context that
-`otel-nats` just established and breaking the span topology ADR 0022 documents.
-Baggage-only adds the members and touches nothing else. The propagator itself is
-reachable through `otelnats.Conn.TraceContext()`.
+`restoreBaggage` must **honor the connection's configured propagation policy**,
+not hard-code a baggage extraction. Extract with the connection's own propagator
+into a throwaway context, then graft *only* the baggage onto the handler
+context:
 
-The same wrap applies to `QueueSubscribe` (`nats/conn.go:157-159`) and the
-JetStream paths (`nats/jetstream.go:365` `Consume`, `:542` the fetched-message
-channel).
+```go
+extracted := prop.Extract(context.Background(), &otelnats.HeaderCarrier{H: hdr})
+bag := baggage.FromContext(extracted)
+if bag.Len() == 0 {
+	return ctx
+}
+return baggage.ContextWithBaggage(ctx, bag)
+```
+
+Two properties fall out of that shape, and both are required:
+
+- **Grafting only the baggage** leaves the consumer span context alone. Applying
+  the composite propagator directly to `ctx` would reapply `TraceContext` and
+  overwrite the span context `otel-nats` just established, breaking the topology
+  ADR 0022 documents.
+- **Using the connection's propagator** — reachable via
+  `otelnats.Conn.TraceContext()` — means a connection given
+  `propagation.TraceContext{}` for public NATS ingress (Q6) extracts no baggage
+  and restores nothing. Hard-coding `propagation.Baggage{}` here would silently
+  defeat that sanitization from inside the SDK.
+
+**The restore must also be skipped entirely on the native path.**
+`WithTracingEnabled(false)` still routes through the facade's wrapper —
+`conn_direct.go:57-61` calls it with `Msg{Msg: msg, Ctx: context.Background()}`
+and an intact `msg.Header` — so an unconditional restore would extract baggage
+in the one mode Decision §9 says does not participate. Gate on the same
+`tracingEnabled` the facade already tracks.
+
+The same wrap applies to `QueueSubscribe` (`nats/conn.go:157-159`) and to
+**every** JetStream delivery path: `Consume` (`nats/jetstream.go:365`), the
+fetched-message channel (`:542`), and the `Messages(ctx)` pull iterator
+(`:374`), whose upstream `tracedMessagesContext.Next` is the third discarding
+site named in §12. Missing one leaves services on that path silently
+baggage-free, which is the same failure this decision exists to remove.
 
 Three things this deliberately does **not** claim:
 
@@ -862,8 +904,9 @@ an empty key list neither the SpanProcessor nor the log handler is installed,
 exactly as today.
 
 "The existing ADR 0016 tests still pass unmodified" is evidence of no
-regression, not evidence of no behavior change. A dedicated compatibility test
-must pin the one change: a >256-byte username accepted before, rejected after.
+regression, not evidence of no behavior change. Dedicated compatibility tests
+must pin **all three** rows above — the overlong username, the 64-member
+context, and the 8192-byte budget — each accepted today and rejected after.
 
 ---
 
@@ -1031,10 +1074,13 @@ setter for a NATS router) silently does nothing.
   the SDK, and the next product needs no SDK change at all.
 - Log-side materialization is sampling-independent, so identifier-based lookup
   keeps full coverage on services that sample their traces (ADR 0015).
-- Driver spans (Cassandra, Redis, MongoDB, NATS) and third-party-created spans
-  (`otel-nats` consumer spans) are enriched without touching, forking, or
-  waiting on any of those integrations — the SpanProcessor sits below all of
-  them. This is the capability ADR 0022 §4 could not offer.
+- Driver spans (Cassandra, Redis, MongoDB, NATS producer spans) are enriched
+  without touching, forking, or waiting on any of those integrations — the
+  SpanProcessor sits below all of them. This is the capability ADR 0022 §4 could
+  not offer. **The `otel-nats` consumer span is the exception**: restoration
+  happens after its `OnStart` (Decision §10), so it needs the explicit
+  `SetAttributes` ADR 0022 §4 already prescribes, exactly like the HTTP entry
+  span. Everything started *within* the handler is covered.
 - The core logic is unchanged: the iteration and de-duplication in
   `SpanAttributesFromContext`, `LogAttrsFromContext`, and `OnStart` already
   ignore the identity of the keys.
@@ -1074,7 +1120,7 @@ setter for a NATS router) silently does nothing.
 
 | | **SDK (chosen)** | Application |
 |---|---|---|
-| baggage → span | needs a SpanProcessor at provider construction | impossible: no `WithSpanProcessor`, provider returned as interface and wrapped by pyroscope, ADR 0003 forbids the global-state route |
+| baggage → span | needs a SpanProcessor at provider construction | reachable but unsupported: a type assertion works only while profiling is not running (Dependency behavior §1), and ADR 0003 forbids the global-state route |
 | baggage → log | wraps the handler chain | **possible** via `obs.Logger.Handler()` (Dependency behavior §2) — but log-only, and the key list must then be kept in sync with the span side by hand |
 | key naming, value source, trust rules | must not know | the only party that can know |
 
@@ -1233,7 +1279,7 @@ all-or-nothing on baggage.
    `user.name` is neither settable through the generic option nor evictable by
    `MaxBaggageAttributeKeys`. Add `WithBaggageAttributes` and
    `MaxBaggageAttributeKeys`; update `WithUserBaggage`'s doc comment. Drop-with-WARN
-   on empty, invalid, reserved, `user.name`, duplicate, and over-cap keys,
+   on empty, invalid, reserved, `user.name`, and over-cap keys,
    following `WithExtraHTTPServerAttributeKeys` (`options.go:417`).
 6. **`o11y.go`** — assemble the whitelist from both slots (`user.name` when
    `userBaggage`, plus `baggageKeys`) and gate all three sites
@@ -1251,10 +1297,14 @@ all-or-nothing on baggage.
    warning the SDK is not in a position to emit.
 7. **`nats/conn.go` and `nats/jetstream.go`** (Decision §10) — wrap the handler
    invocation at `conn.go:131-133`, `:157-159`, `jetstream.go:365`, and `:542`
-   so the handler context carries the message's baggage. Extract with a
-   `propagation.Baggage{}`-only propagator, never the composite: applying
-   `TraceContext` would overwrite the consumer span context `otel-nats` just
-   set. Re-audit these call sites on every `otel-nats` bump — if upstream starts
+   — and the `Messages(ctx)` iterator's `Next` (`jetstream.go:374`) — so the
+   handler context carries the message's baggage. Extract with the
+   **connection's own** propagator and graft only `baggage.FromContext` onto the
+   handler context; never apply the composite to that context directly, which
+   would overwrite the consumer span context `otel-nats` just set. Skip the
+   restore entirely when tracing is disabled for the connection (Decision §9;
+   `conn_direct.go:57-61` still invokes the facade wrapper with intact headers).
+   Re-audit these call sites on every `otel-nats` bump — if upstream starts
    preserving `msgCtx`, the restore becomes redundant rather than wrong, but the
    ADR's §12 evidence would need updating.
 8. **`attributes.go`** — add `ContextWithBaggageValue`,
