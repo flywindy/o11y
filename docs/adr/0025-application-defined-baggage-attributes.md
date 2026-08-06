@@ -81,16 +81,27 @@ Verified against the pinned dependencies at the time of writing
 `semconv/v1.39.0`) and the SDK tree on this branch. Items 8–11 are the
 substantive findings from review; they materially changed this ADR.
 
-1. **The application cannot register a SpanProcessor.** `Init` exposes no
-   `WithSpanProcessor`; `SDK.TracerProvider()` returns the
-   `oteltrace.TracerProvider` *interface* (`o11y.go:99`); the concrete
-   `tracerProviderInternal *sdktrace.TracerProvider` is unexported
-   (`o11y.go:86`); and when profiling is enabled the public provider is a
-   `otelpyroscope.NewTracerProvider(tpInternal)` wrapper (`o11y.go:387`), so a
-   type assertion back to `*sdktrace.TracerProvider` fails on exactly the
-   configuration most services run. Building a second TracerProvider to get the
-   hook means abandoning the SDK, and reaching the SDK's provider through
-   `otel.SetTracerProvider` is forbidden by ADR 0003.
+1. **Registering a SpanProcessor from the application works in some
+   configurations and silently stops working in others — it is not a contract.**
+   `Init` exposes no `WithSpanProcessor` and `tracerProviderInternal` is
+   unexported (`o11y.go:86`), but `SDK.TracerProvider()` returns an
+   `oteltrace.TracerProvider` *interface* (`o11y.go:99`) whose dynamic type is
+   the concrete `*sdktrace.TracerProvider` — and that type has an exported
+   `RegisterSpanProcessor` (`sdk/trace/provider.go:202`). So a type assertion
+   succeeds, and the hook is reachable, **whenever profiling is not running**.
+   That is the default: `O11Y_PROFILING_ENABLED` parses with a `false` default
+   (`o11y.go:581`), and the public provider is replaced by
+   `otelpyroscope.NewTracerProvider(tpInternal)` only after `profiling.Start`
+   succeeds (`o11y.go:387`).
+
+   The failure mode is what disqualifies it: the assertion returns `ok == false`
+   the moment a service turns profiling on, or when profiling is configured but
+   fails to start — so an application built on it loses all span materialization
+   from a change that has nothing to do with baggage, with no compile-time
+   signal. Building a second TracerProvider means abandoning the SDK, and
+   reaching its provider through `otel.SetTracerProvider` is forbidden by ADR
+   0003. **Not impossible; unsupported as a stable contract**, which is the
+   actual argument for putting the hook behind an SDK option.
 
 2. **The application can wrap the log chain, but only from the outside.** The
    chain is assembled and closed over inside `Init` (`o11y.go:262-320`), so
@@ -382,14 +393,23 @@ Precedence is defined, not left emergent:
   the BaggageHandler, wins over the baggage value; the baggage value fills in
   only where nothing else did. This preserves current behavior.
 
-  The collision check must **recurse into empty-key groups** to hold. `slog`
-  inlines them — *"If a group's key is empty, inline the group's Attrs"*
-  (`log/slog/handler.go:57`) — so an explicit `slog.Group("", slog.String(k, v))`
-  reaches the JSON output as a top-level `k`, while a check that looks only at
-  the outer attribute sees an empty key and misses it. The baggage value is then
-  added too, producing a duplicate field in which the *baggage* value — possibly
-  forged — is the later one. Both `recordHasAttr` and the `presetKeys`
-  accumulation in `WithAttrs` must flatten empty-key groups before comparing.
+  The collision check must **resolve, then recurse into empty-key groups** to
+  hold. `slog` inlines them — *"If a group's key is empty, inline the group's
+  Attrs"* (`log/slog/handler.go:57`) — so an explicit
+  `slog.Group("", slog.String(k, v))` reaches the JSON output as a top-level `k`,
+  while a check that looks only at the outer attribute sees an empty key and
+  misses it. The baggage value is then added too, producing a duplicate field in
+  which the *baggage* value — possibly forged — is the later one.
+
+  Resolution has to come first, because `slog.Any("", v)` for a `v` implementing
+  `LogValuer` presents as `KindLogValuer` until resolved and only then becomes
+  the group that gets inlined. `appendAttr` does `a.Value = a.Value.Resolve()`
+  as its first statement, ahead of every group and empty-key check
+  (`log/slog/handler.go:468`), so a check that tests `Kind()` without resolving
+  sees a different shape than the handler that ultimately writes the record.
+  Both `recordHasAttr` and the `presetKeys` accumulation in `WithAttrs` must
+  call `Value.Resolve()` before testing for an empty-key group, and flatten
+  recursively.
 
 **Known limitation — `slog` groups.** If an application calls `WithGroup` on the
 SDK logger, the BaggageHandler's `r.AddAttrs` is nested by the inner handler, so
@@ -398,6 +418,18 @@ queries keyed on the flat path stop matching. This cannot be fixed from the
 BaggageHandler's position in the chain — group nesting is applied by the
 handlers beneath it. It is documented as a limitation, and applications are
 directed not to open groups on the SDK logger.
+
+**`WithGroup` resets the preset-key set — do not "fix" this.** Today's
+`hasUserNameAttr` is deliberately dropped in `WithGroup`
+(`internal/log/handler.go:101-105`), and
+`TestBaggageHandlerWithGroupDoesNotInheritUserNameAttr`
+(`internal/log/handler_test.go:170-186`) pins the resulting output: an explicit
+`user.name` supplied before the group stays at top level *and* the baggage value
+still appears at `audit.user.name`. That is correct, not an oversight — the two
+land at different JSON paths, so there is no duplicate to suppress. Carrying
+`presetKeys` across `WithGroup` would suppress the grouped baggage value and
+change output that an existing test pins, so the generalized handler must keep
+the reset. Only same-level collisions are the preset set's business.
 
 ### 7. Ingress: remove, then set — overwrite is not enough
 
@@ -540,7 +572,8 @@ const MaxBaggageAttributeKeys = 8
 // string; keys that are not valid W3C baggage tokens (they would materialize
 // locally but never reach another service); keys that would shadow the SDK's own
 // identity or correlation fields (service.name, service.version,
-// service.namespace, environment, deployment.environment.name, traceId, spanId);
+// service.namespace, environment, deployment.environment.name, traceId, spanId)
+// or slog's own record fields (time, level, msg, source);
 // user.name, which is reserved for WithUserBaggage because it carries a PII
 // contract this option does not state; and keys beyond MaxBaggageAttributeKeys.
 // Never route a materialized key into a metric label.
@@ -562,6 +595,11 @@ func WithUserBaggage() Option
 // hard-coding the string; per docs/semconv.md the value is sourced from the
 // pinned semconv package, never written as a literal.
 const UserNameKey = baggageattrs.UserNameKey
+
+// MaxBaggageValueBytes is the per-value limit ContextWithBaggageValue and
+// ContextWithUser enforce. Exported from the root package so callers can
+// resolve the limit named in those doc comments without reaching into internal.
+const MaxBaggageValueBytes = baggageattrs.MaxBaggageValueBytes
 
 // ContextWithBaggageValue returns a child context carrying key=value as a W3C
 // baggage member. Services that enabled WithBaggageAttributes(key) then show it
@@ -985,10 +1023,13 @@ the SDK first gains a way to distinguish trusted from untrusted callers.
    `len(bag.String()) > 8192`.
 4. **`internal/log/handler.go`** — replace `hasUserNameAttr bool` with a
    `presetKeys map[string]struct{}` built clone-on-write in `WithAttrs` (never
-   mutate a map shared with a derived handler), carried through `WithGroup` as
-   well, and carry the `Whitelist` on the handler. Both `recordHasAttr` and the
-   `presetKeys` accumulation must recurse into empty-key groups, which `slog`
-   inlines into the output (`log/slog/handler.go:57`). `NewBaggageHandler` takes the
+   mutate a map shared with a derived handler) and **reset in `WithGroup`**,
+   matching today's `hasUserNameAttr` and the output pinned by
+   `TestBaggageHandlerWithGroupDoesNotInheritUserNameAttr` (Decision §6). Carry
+   the `Whitelist` on the handler. Both `recordHasAttr` and the
+   `presetKeys` accumulation must call `Value.Resolve()` and then recurse into
+   empty-key groups, which `slog` inlines into the output
+   (`log/slog/handler.go:57`, resolved first at `:468`). `NewBaggageHandler` takes the
    whitelist as a second parameter. Preserve the precedence in Decision §6.
 5. **`options.go`** — add `baggageKeys []string` to `Config` for application
    keys and **keep `userBaggage bool` as its own slot** (Decision §3), so
@@ -1004,8 +1045,10 @@ the SDK first gains a way to distinguish trusted from untrusted callers.
    combination and to log the effective key list at startup — the effective list
    is the first thing an operator needs when an expected attribute is missing.
 7. **`attributes.go`** — add `ContextWithBaggageValue`,
-   `ContextWithoutBaggageValues`, and the exported `UserNameKey` applications
-   need to name `user.name` in a sanitization set.
+   `ContextWithoutBaggageValues`, the exported `UserNameKey` applications need to
+   name `user.name` in a sanitization set, and a root-package
+   `MaxBaggageValueBytes` alias so the limit named in the public doc comments is
+   resolvable from package `o11y`.
 8. **Tests**
    - Whitelist: dedup, order, empty, over-cap, invalid token, reserved key;
      per-instance isolation (two whitelists, no cross-talk); mutating the slice
@@ -1018,7 +1061,12 @@ the SDK first gains a way to distinguish trusted from untrusted callers.
      `ContextWithBaggageValue(ctx, UserNameKey, ...)` returns an error while
      `ContextWithUser` still succeeds.
    - Empty-key groups: an explicit `slog.Group("", slog.String(k, v))` suppresses
-     the baggage value for `k`, in both the record and the `WithAttrs` paths.
+     the baggage value for `k`, in both the record and the `WithAttrs` paths;
+     and the same for `slog.Any("", v)` where `v` is a `LogValuer` resolving to
+     such a group, which only presents as a group after `Resolve()`.
+   - `WithGroup` resets the preset set:
+     `TestBaggageHandlerWithGroupDoesNotInheritUserNameAttr` passes unmodified,
+     with the explicit value at top level and the baggage value under the group.
    - Empty key rejected at both the option and the setter; empty value is a
      no-op returning no error.
    - **Round trip**: for each of the four keys in the Dependency behavior §8
