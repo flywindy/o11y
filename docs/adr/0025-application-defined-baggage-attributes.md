@@ -95,13 +95,17 @@ substantive findings from review; they materially changed this ADR.
    succeeds (`o11y.go:387`).
 
    The failure mode is what disqualifies it: the assertion returns `ok == false`
-   the moment a service turns profiling on, or when profiling is configured but
-   fails to start — so an application built on it loses all span materialization
-   from a change that has nothing to do with baggage, with no compile-time
-   signal. Building a second TracerProvider means abandoning the SDK, and
-   reaching its provider through `otel.SetTracerProvider` is forbidden by ADR
-   0003. **Not impossible; unsupported as a stable contract**, which is the
-   actual argument for putting the hook behind an SDK option.
+   the moment a service turns profiling on *and it starts successfully* — so an
+   application built on it loses all span materialization from a change that has
+   nothing to do with baggage, with no compile-time signal. (A configured
+   profiler that fails to start only warns and leaves the concrete provider in
+   place, `o11y.go:376-387`, so the assertion keeps working — which makes the
+   breakage depend on whether Pyroscope happened to be reachable at boot, an
+   even worse property than breaking outright.) Building a second
+   TracerProvider means abandoning the SDK, and reaching its provider through
+   `otel.SetTracerProvider` is forbidden by ADR 0003. **Not impossible;
+   unsupported as a stable contract**, which is the actual argument for putting
+   the hook behind an SDK option.
 
 2. **The application can wrap the log chain, but only from the outside.** The
    chain is assembled and closed over inside `Init` (`o11y.go:262-320`), so
@@ -482,20 +486,35 @@ actually sets, via the explicit entry-span write in Consumer guidance. For every
 other key, on every one of paths 1–3, **the forged value remains on the entry
 span** — the span an operator queries first.
 
-There are exactly two honest ways to close Plane 2, and both live above the SDK:
+Plane 2 is closed by keeping the baggage out of the context in the first place,
+and the SDK already has the seam for it — **give the public boundary its own
+propagator**:
 
-- **Strip the `baggage` header before OTel extraction.** Transport-level
-  middleware on the public listener, or an edge proxy, removes or filters the
-  header so the forged member never enters the context and `OnStart` never sees
-  it. This is the only complete fix, and it is available to any deployment that
-  controls its public ingress.
+```go
+// Public listener: extract trace context, never baggage. Nothing to forge,
+// nothing for OnStart to copy onto the entry span.
+gin.Middleware("edge", obs.TracerProvider(), obs.MeterProvider(),
+	propagation.TraceContext{})
+
+// Internal hops keep obs.Propagator, so ADR 0016's "identify once at the
+// source" is unaffected.
+nats.Connect(ctx, url, obs.TracerProvider(), obs.Propagator)
+```
+
+Every propagator entry point takes it per boundary (`http/server.go:21`,
+`http/transport.go:16`, `gin/middleware.go:21`, `nats/conn.go:71`), so trust can
+be expressed exactly where it actually differs. See Q6. Two fallbacks, for
+deployments that cannot do this:
+
+- **Strip the `baggage` header before OTel extraction** at an edge proxy — the
+  same effect, one layer out.
 - **Declare entry-span application attributes untrusted at public boundaries**
   and rely on the child spans, which are clean once Plane 1 is sanitized.
 
-The SDK cannot choose between these because it cannot tell a public listener
-from an internal one — the same reason propagator-level filtering is rejected
-(Q6). What it can do is say so plainly rather than let "remove first, then set"
-read as covering more than it does.
+What the SDK cannot do is *choose* for the application, because only the
+application knows which of its listeners is public. What this ADR can do is stop
+letting "clear, then set" read as covering more than it does, and point at the
+seam that covers the rest.
 
 ### 8. Bounds, split by what they actually protect
 
@@ -573,7 +592,8 @@ const MaxBaggageAttributeKeys = 8
 // locally but never reach another service); keys that would shadow the SDK's own
 // identity or correlation fields (service.name, service.version,
 // service.namespace, environment, deployment.environment.name, traceId, spanId)
-// or slog's own record fields (time, level, msg, source);
+// or slog's own record fields (time, level, msg, source); keys longer than
+// MaxBaggageKeyBytes;
 // user.name, which is reserved for WithUserBaggage because it carries a PII
 // contract this option does not state; and keys beyond MaxBaggageAttributeKeys.
 // Never route a materialized key into a metric label.
@@ -601,6 +621,11 @@ const UserNameKey = baggageattrs.UserNameKey
 // resolve the limit named in those doc comments without reaching into internal.
 const MaxBaggageValueBytes = baggageattrs.MaxBaggageValueBytes
 
+// MaxBaggageKeyBytes is the per-key limit ContextWithBaggageValue and
+// WithBaggageAttributes enforce. Exported for the same reason: a caller whose
+// syntactically valid W3C token is refused needs to be able to find out why.
+const MaxBaggageKeyBytes = baggageattrs.MaxBaggageKeyBytes
+
 // ContextWithBaggageValue returns a child context carrying key=value as a W3C
 // baggage member. Services that enabled WithBaggageAttributes(key) then show it
 // on their spans and log records with no per-call-site code.
@@ -616,7 +641,8 @@ const MaxBaggageValueBytes = baggageattrs.MaxBaggageValueBytes
 // materialization-side setting and the producer is usually a different process.
 //
 // Returns an error, leaving ctx unchanged, when the key is invalid or reserved,
-// when the value exceeds MaxBaggageValueBytes, or when adding the member would
+// when the key exceeds MaxBaggageKeyBytes or the value exceeds
+// MaxBaggageValueBytes, or when adding the member would
 // push the baggage past the W3C limits of 64 members / 8192 encoded bytes.
 // That last check matters: on the receiving side a header past 64 members is
 // truncated to the first 64 in header order, and one past 8192 bytes yields no
@@ -682,18 +708,30 @@ func ContextWithoutValues(ctx context.Context, keys ...string) context.Context
 
 ### Compatibility
 
-The change is additive with **one intentional behavior change**:
-`ContextWithUser` is reimplemented on `ContextWithValue` and therefore inherits
-the 256-byte value cap, which it does not have today. A username longer than
-256 bytes changes from accepted to rejected.
+The change is additive with **intentional behavior changes to
+`ContextWithUser`**, which is reimplemented on `ContextWithValue` and therefore
+inherits every guard that setter applies. Today it only calls `SetMember` and
+accepts whatever results. After this change it rejects, leaving ctx unchanged:
+
+| Input | Today | After |
+|---|---|---|
+| username > 256 bytes | accepted | rejected (`MaxBaggageValueBytes`) |
+| any username, when ctx already holds 64 unrelated members | accepted | rejected (member cap) |
+| any username, when the encoded baggage would pass 8192 bytes | accepted | rejected (byte cap) |
+
+The last two are not about the username at all — an ordinary short name is
+refused because of what other producers already put in the context. That is the
+point of the check (Dependency behavior §9: the alternative is the *downstream*
+service silently losing the whole baggage), but it is a behavior change to a
+shipped API and is documented as one rather than folded into "just a value cap".
 
 `user.name` is deliberately **not** exempted. Dependency behavior §9 shows that
 an unbounded value is what pushes a header past the byte limit, costing a
 downstream service its whole baggage for that request — `user.name` first among
 it. There is no argument for `user.name` being the one key allowed to do that.
 The affected input — a >256-byte username — is not a realistic legitimate value,
-but the change is real and is recorded as **Changed**, not **Added**, in the
-CHANGELOG.
+but the budget-driven rejections are reachable with entirely ordinary input.
+All three are recorded as **Changed**, not **Added**, in the CHANGELOG.
 
 Everything else is preserved: `SetUser`, `UserName`, `ContextWithUser`, and
 `WithUserBaggage` keep their signatures, their error messages, and their
@@ -971,30 +1009,54 @@ single `WithTraceSampler` slot. **Recorded as a legitimate interim bridge for an
 application that cannot wait for this ADR to ship, and as a non-goal for the
 SDK.**
 
-### Q6 — Why not filter untrusted baggage in the propagator?
+### Q6 — Should the SDK ship a baggage-filtering propagator?
 
-A filtered propagator that strips application keys during `Extract` would move
-ingress sanitization into the SDK, ahead of span creation, closing the
-entry-span window without application discipline. It is rejected:
+**No — because the application already has this seam, and using it is the
+recommended way to close Plane 2.**
 
-| | Filtered propagator | **Boundary-layer removal (chosen)** |
+An earlier revision of this ADR rejected propagator-level filtering on the
+grounds that "the propagator is configured once per SDK instance" and so cannot
+tell a public caller from an internal one. **That premise was wrong.** Every
+propagator entry point in this SDK takes the propagator as an explicit
+per-boundary argument:
+
+```go
+http.NewServerHandler(next, tp, mp, prop, ...)   // http/server.go:21
+http.NewTransport(base, tp, mp, prop, ...)       // http/transport.go:16
+gin.Middleware(service, tp, mp, prop, ...)       // gin/middleware.go:21
+nats.Connect(ctx, url, tp, prop, ...)            // nats/conn.go:71
+```
+
+Trust is a property of the caller, and the SDK already lets the application
+express exactly that — by wiring a different propagator per boundary:
+
+```go
+// Public listener: extract trace context, never baggage.
+publicMux := gin.Middleware("edge", obs.TracerProvider(), obs.MeterProvider(),
+	propagation.TraceContext{})
+
+// Internal hops: the SDK propagator, baggage included.
+conn, _ := nats.Connect(ctx, url, obs.TracerProvider(), obs.Propagator)
+```
+
+This is **strictly better than the removal primitive for public boundaries**,
+because it acts *before* `Extract` puts anything in the context and therefore
+before `OnStart` stamps the entry span — the one thing Decision §7 Plane 2
+identifies as unreachable from middleware. It composes exactly with §7's model:
+a public boundary is supposed to discard all inbound baggage and rebuild, and a
+TraceContext-only propagator is the cleanest expression of that.
+
+| | SDK-shipped filtering propagator | **Application-composed per boundary (chosen)** |
 |---|---|---|
-| Granularity | per process | per caller |
-| Effect on internal hops | strips trusted baggage too | preserves it |
-| Effect on ADR 0016 | breaks "identify once at the source" outright | none |
+| Granularity | per SDK instance | per boundary, which is where trust actually differs |
+| New SDK surface | a propagator type plus its configuration | none — `propagation.TraceContext{}` is upstream |
+| Closes Plane 2 | yes | yes |
+| Effect on internal hops | needs opting out per hop | untouched; they keep `obs.Propagator` |
 
-**Trust is a property of the caller, not of the process.** A service is
-routinely both a public edge and an internal hop: it must discard a forged
-`chat.room.id` from an external client while preserving the same key from a
-peer service. The propagator is configured once per SDK instance and cannot see
-that difference, so filtering there would strip internally-propagated baggage as
-well — destroying the capability ADR 0016 Phase 2 exists to provide.
-
-The correct layers are the ones that know who the caller is: an edge proxy, or
-transport middleware on the public listener. The SDK's contribution is the
-removal primitive (`ContextWithoutBaggageValues`, Decision §4), which those
-layers use. A propagator-level filter is not revisited by a future ADR unless
-the SDK first gains a way to distinguish trusted from untrusted callers.
+So the SDK adds nothing here. `ContextWithoutBaggageValues` (Decision §4)
+remains the tool for **internal** boundaries that want to drop specific keys
+while keeping others — a case the propagator swap cannot express, since it is
+all-or-nothing on baggage.
 
 ---
 
@@ -1047,8 +1109,8 @@ the SDK first gains a way to distinguish trusted from untrusted callers.
 7. **`attributes.go`** — add `ContextWithBaggageValue`,
    `ContextWithoutBaggageValues`, the exported `UserNameKey` applications need to
    name `user.name` in a sanitization set, and a root-package
-   `MaxBaggageValueBytes` alias so the limit named in the public doc comments is
-   resolvable from package `o11y`.
+   `MaxBaggageValueBytes` / `MaxBaggageKeyBytes` aliases so every limit named in
+   the public doc comments is resolvable from package `o11y`.
 8. **Tests**
    - Whitelist: dedup, order, empty, over-cap, invalid token, reserved key;
      per-instance isolation (two whitelists, no cross-talk); mutating the slice
@@ -1090,8 +1152,10 @@ the SDK first gains a way to distinguish trusted from untrusted callers.
      `WithGroup` combinations; a `-race` test exercising a handler derived
      concurrently.
    - Span precedence: `OnStart` value overwritten by a later `SetAttributes`.
-   - Compatibility: a >256-byte username accepted by today's `ContextWithUser`
-     and rejected after this change.
+   - Compatibility: all three `ContextWithUser` rejections that today's
+     implementation accepts — a >256-byte username, an ordinary username into a
+     context already holding 64 members, and one that would push the encoded
+     baggage past 8192 bytes — each leaving ctx unchanged.
    - Empty key list installs neither the processor nor the handler.
    - Existing ADR 0016 tests pass **unmodified**.
 9. **Docs** — `README.md`, which is the SDK's option reference and would
