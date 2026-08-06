@@ -451,6 +451,16 @@ that would shadow its own identity or correlation fields. Two groups:
   the namespacing guidance below, and it is guidance for this reason rather than
   laziness. An application that puts its keys under its own namespace cannot hit
   this at all.
+- **Wildcard-catalogued resource namespaces**: `host.` and `process.`. The
+  catalog lists these as `host.*` and `process.*` (`docs/semconv.md:51-52`)
+  because `resource.WithHost()` / `resource.WithProcess()` *detect* them at
+  runtime — the exact set is not knowable statically. A reserved list built
+  literally from the catalog would therefore contain the string `host.*`, which
+  matches no key, and let `process.pid` through to be materialized as a string
+  even though semconv defines it as `attribute.Int`
+  (`semconv/v1.39.0/attribute_group.go:13048-13050`) — wrong type *and*
+  shadowing the SDK's own resource value. **Wildcard rows must be enforced as
+  namespace-prefix rejections, not literal keys.**
 - **Resource-level service identity**: `service.version`, `service.namespace`,
   `deployment.environment.name` (`docs/semconv.md`, Resource Attributes). These
   do not collide on the log side, but as *span* attributes they shadow the
@@ -1389,7 +1399,8 @@ all-or-nothing on baggage.
      here silently returns the SDK to the §12 behavior, so this is the test that
      matters most for the stated use case.
    - SDK-catalogued keys such as `http.response.status_code` are refused at both
-     the option and the setter.
+     the option and the setter, and so is a wildcard-catalogued key such as
+     `process.pid`, which only a namespace-prefix check catches.
    - **Boundary contract** (integration-level, pinning what Decision §7 Plane 2
      and Q6 now recommend): a server wired with a `TraceContext`-only propagator
      records no application baggage attributes on its entry span even when the
