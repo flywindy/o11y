@@ -92,10 +92,19 @@ substantive findings from review; they materially changed this ADR.
    hook means abandoning the SDK, and reaching the SDK's provider through
    `otel.SetTracerProvider` is forbidden by ADR 0003.
 
-2. **The application cannot wrap the log handler chain.** The handler chain is
-   assembled and closed over inside `Init` (`o11y.go:262-320`); the application
-   receives the finished `*slog.Logger`. There is no seam to insert an enricher
-   into.
+2. **The application can wrap the log chain, but only from the outside.** The
+   chain is assembled and closed over inside `Init` (`o11y.go:262-320`), so
+   there is no seam *within* it. But `obs.Logger` is a `*slog.Logger`, and
+   `slog.Logger.Handler()` is exported, so an application can build
+   `slog.New(myEnricher{obs.Logger.Handler()})` and get log-only baggage
+   enrichment today — at the same position the SDK's own BaggageHandler occupies
+   (`o11y.go:309-311`, outermost). This is a supported path and this ADR does not
+   claim otherwise.
+
+   What it does not give is the span half (§1) or a single switch that keeps
+   spans and logs consistent. An application taking the log-only route must also
+   keep its enricher's key list in sync with whatever it does for spans, which
+   is the coupling `WithBaggageAttributes` removes.
 
 3. **Baggage transport already works, unconditionally.** The composite
    propagator (`propagation.TraceContext{}` + `propagation.Baggage{}`) is built
@@ -162,19 +171,30 @@ substantive findings from review; they materially changed this ADR.
    (`user.name=%E6%84%9B%E5%9B%A0%E6%96%AF%E5%9D%A6%20a%20b`). ADR 0016 chose
    `NewMemberRaw` precisely for that, and that choice must be preserved.
 
-9. **Exceeding the baggage budget silently destroys *all* baggage downstream.**
-   `Baggage.SetMember` (`baggage.go:636-660`) checks neither member count nor
-   total encoded size — it is only a map insert. The limits are enforced on the
-   *receiving* side: `Parse` rejects a header over 8192 bytes (`:517`), and
-   `propagation.Baggage.Extract` responds by reporting the error through the
-   global error handler **once per process** (`propagation/baggage.go:27-29,
-   62-77`, guarded by a `sync.Once`) and returning the parent context unchanged.
+9. **Exceeding the baggage budget silently drops members downstream — and the
+   two limits fail differently.** `Baggage.SetMember` (`baggage.go:636-660`)
+   checks neither member count nor total encoded size; it is only a map insert.
+   Both limits are enforced on the *receiving* side, with different blast
+   radii. Measured against v1.44.0:
 
-   So a producer that accumulates too many members does not lose only its own
-   new keys: every downstream service loses the entire baggage — including
-   `user.name` — for the remaining lifetime of that process, after at most one
-   diagnostic. This is the most severe failure mode in this design, and it is
-   reachable using only SDK setters.
+   | Inbound header | `Parse` result | What the downstream service sees |
+   |---|---|---|
+   | 70 members | error **plus a partial Baggage of 64** (`baggage.go:528`, `break` after `errMemberNumber`) | the first 64 members in header order; the rest vanish |
+   | > 8192 bytes | error, **empty** Baggage (`:517`) | no baggage at all for that request — `user.name` included |
+   | a normal header, after either of the above | no error, full Baggage | unaffected |
+
+   `propagation.Baggage.Extract` installs a non-empty partial result and falls
+   back to the parent context for an empty one, reporting the error through the
+   global error handler **once per process** (`propagation/baggage.go:27-29,
+   62-77`, `sync.Once`).
+
+   The `sync.Once` suppresses the *diagnostic*, not the baggage: each request is
+   parsed independently, so an oversized header costs that request's baggage and
+   does not poison later ones. The failure is therefore per-request rather than
+   process-wide, and at the member limit it is truncation rather than total
+   loss — but it is still silent after the first occurrence, still loses
+   `user.name` outright on the byte limit, and is still reachable using only SDK
+   setters. That is what the post-set check in Decision §8 exists to prevent.
 
 10. **Span attributes are last-write-wins.** `recordingSpan.SetAttributes`
     appends without de-duplicating (`sdk/trace/span.go:263-274`); duplicates are
@@ -301,9 +321,13 @@ that would shadow its own identity or correlation fields. Two groups:
 
 - **Emitted by handlers inside the BaggageHandler**: `service.name`,
   `environment` (`o11y.go:267`), `traceId`, `spanId`
-  (`internal/log/handler.go:30-33`). Per Dependency behavior §11 no
-  de-duplication at the BaggageHandler layer can see these, so only refusing the
-  key prevents a duplicate JSON field.
+  (`internal/log/handler.go:30-33`), and `slog.JSONHandler`'s own built-in
+  record fields `time`, `level`, `msg`, `source`. Per Dependency behavior §11 no
+  de-duplication at the BaggageHandler layer can see any of these, so only
+  refusing the key prevents a duplicate JSON field. The `slog` built-ins matter
+  as much as the SDK's own: a baggage member named `level` or `msg` lets an
+  untrusted caller forge a second severity or message field in every record the
+  service emits.
 - **Resource-level service identity**: `service.version`, `service.namespace`,
   `deployment.environment.name` (`docs/semconv.md`, Resource Attributes). These
   do not collide on the log side, but as *span* attributes they shadow the
@@ -401,8 +425,9 @@ does not (Dependency behavior §9). Three separate bounds:
 
 The post-set check is what actually prevents Dependency behavior §9. It costs a
 `Baggage.String()` per set; with at most 64 members that is accepted knowingly
-in exchange for not silently destroying every downstream service's baggage. Do
-not remove it for performance without replacing it with an equivalent bound.
+in exchange for not silently truncating or dropping baggage at every downstream
+hop. Do not remove it for performance without replacing it with an equivalent
+bound.
 
 ### What is explicitly NOT decided here
 
@@ -477,8 +502,9 @@ const UserNameKey = baggageattrs.UserNameKey
 // Returns an error, leaving ctx unchanged, when the key is invalid or reserved,
 // when the value exceeds MaxBaggageValueBytes, or when adding the member would
 // push the baggage past the W3C limits of 64 members / 8192 encoded bytes.
-// That last check matters: an oversized header makes every downstream Extract
-// discard the entire baggage, not just this member.
+// That last check matters: on the receiving side a header past 64 members is
+// truncated to the first 64 in header order, and one past 8192 bytes yields no
+// baggage at all for that request — user.name included.
 //
 // An empty key is an error like any other invalid token — the empty string is
 // not a valid W3C token, and accepting it silently would contradict the contract
@@ -543,8 +569,9 @@ the 256-byte value cap, which it does not have today. A username longer than
 256 bytes changes from accepted to rejected.
 
 `user.name` is deliberately **not** exempted. Dependency behavior §9 shows that
-an unbounded value is exactly what destroys every downstream service's baggage,
-and there is no argument for `user.name` being the one key allowed to do that.
+an unbounded value is what pushes a header past the byte limit, costing a
+downstream service its whole baggage for that request — `user.name` first among
+it. There is no argument for `user.name` being the one key allowed to do that.
 The affected input — a >256-byte username — is not a realistic legitimate value,
 but the change is real and is recorded as **Changed**, not **Added**, in the
 CHANGELOG.
@@ -688,8 +715,13 @@ setter for a NATS router) silently does nothing.
 
 ### Other boundaries
 
-- **Egress**: strip baggage (`baggage.ContextWithoutBaggage`) before calling
-  external third parties.
+- **Egress**: `baggage.ContextWithoutBaggage` alone is **not** sufficient.
+  `propagation.Baggage.Inject` calls `carrier.Set` only when the context holds
+  non-empty baggage (`propagation/baggage.go:40-45`), so with a cleared context
+  it writes nothing — and a `baggage` header already present on the carrier
+  (typically copied from the inbound request) survives untouched and reaches the
+  third party. Clear the context **and** either start from a fresh carrier or
+  delete the `baggage` header from the outbound one.
 - **Metrics**: never promote a materialized key to a metric label.
 - **`slog` groups**: do not call `WithGroup` on the SDK logger; see Decision §6.
 - **Partial rollout is safe**: baggage propagates through services that have not
@@ -750,11 +782,13 @@ setter for a NATS router) silently does nothing.
 | | **SDK (chosen)** | Application |
 |---|---|---|
 | baggage → span | needs a SpanProcessor at provider construction | impossible: no `WithSpanProcessor`, provider returned as interface and wrapped by pyroscope, ADR 0003 forbids the global-state route |
-| baggage → log | needs to wrap the handler chain | impossible: chain closed over inside `Init` |
+| baggage → log | wraps the handler chain | **possible** via `obs.Logger.Handler()` (Dependency behavior §2) — but log-only, and the key list must then be kept in sync with the span side by hand |
 | key naming, value source, trust rules | must not know | the only party that can know |
 
-- **Chosen: mechanism in the SDK, policy in the application.** The two halves
-  are not merely separable; each is *only* implementable on its own side.
+- **Chosen: mechanism in the SDK, policy in the application.** The span half is
+  only implementable in the SDK; the log half is implementable on either side,
+  but splitting them puts the burden of keeping one key list consistent across
+  two mechanisms on every adopter. Policy is only knowable by the application.
 
 ### Q2 — Generalize, or add a second hard-coded key?
 
@@ -894,8 +928,12 @@ the SDK first gains a way to distinguish trusted from untrusted callers.
      named — and drops it when it is.
    - Collision: baggage members named `service.name`, `service.version`,
      `service.namespace`, `environment`, `deployment.environment.name`,
-     `traceId`, `spanId` are refused at both the option and the setter; a test
-     asserts no duplicate JSON field is emitted.
+     `traceId`, `spanId`, `time`, `level`, `msg`, `source` are refused at both
+     the option and the setter; a test asserts no duplicate JSON field is
+     emitted.
+   - Budget: a header of 70 members extracts as 64 (truncation, not total loss)
+     and one over 8192 bytes extracts as empty — pinning the Dependency
+     behavior §9 semantics so a future OTel bump that changes them is caught.
    - Log handler: `WithAttrs` precedence for an arbitrary key; `WithAttrs` +
      `WithGroup` combinations; a `-race` test exercising a handler derived
      concurrently.
