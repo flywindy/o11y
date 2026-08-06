@@ -212,13 +212,21 @@ substantive findings from review; they materially changed this ADR.
    | Inbound header | `Parse` result | What the downstream service sees |
    |---|---|---|
    | 70 members | error **plus a partial Baggage of 64** (`baggage.go:528`, `break` after `errMemberNumber`) | the first 64 members in header order; the rest vanish |
-   | > 8192 bytes | error, **empty** Baggage (`:517`) | no baggage at all for that request — `user.name` included |
+   | > 8192 bytes | error, **empty** Baggage (`:517`) | the extraction contributes nothing — `user.name` included |
    | a normal header, after either of the above | no error, full Baggage | unaffected |
 
    `propagation.Baggage.Extract` installs a non-empty partial result and falls
-   back to the parent context for an empty one, reporting the error through the
-   global error handler **once per process** (`propagation/baggage.go:27-29,
+   back to the *parent context* for an empty one, reporting the error through
+   the global error handler **once per process** (`propagation/baggage.go:27-29,
    62-77`, `sync.Once`).
+
+   "Falls back to the parent" is why the byte-limit row says *contributes
+   nothing* rather than *clears everything*: the context keeps whatever baggage
+   it already carried. For a server extracting an inbound request that is
+   normally none — the handler's parent context is derived from the server's
+   base context — so the practical outcome there is no baggage at all. On a hop
+   whose parent context already carries baggage (an in-process consumer loop,
+   say), that inherited baggage survives and only the inbound members are lost.
 
    The `sync.Once` suppresses the *diagnostic*, not the baggage: each request is
    parsed independently, so an oversized header costs that request's baggage and
@@ -275,9 +283,13 @@ contract.
 ### 2. A new option: `WithBaggageAttributes(keys ...string)`
 
 Enables materialization of the named baggage members onto this service's spans
-and SDK log records. Keys are opaque to the SDK. Calls accumulate and
-de-duplicate. Rejected keys are dropped with a startup WARN rather than failing
-`Init`, matching `WithExtraHTTPServerAttributeKeys` (`options.go:417`).
+and SDK log records. Keys are opaque to the SDK. Calls accumulate, and a key
+already registered is **silently** ignored — registering the same key twice is
+harmless and idempotent, unlike the *collisions*
+`WithExtraHTTPServerAttributeKeys` warns about, which would merge two distinct
+values into one label. Keys that are actually *rejected* are dropped with a
+startup WARN rather than failing `Init`, matching that option
+(`options.go:417`).
 
 **`user.name` is rejected by this option**, with a WARN pointing at
 `WithUserBaggage()`. The generic path is defined as carrying no contract beyond
@@ -709,9 +721,11 @@ func ContextWithoutValues(ctx context.Context, keys ...string) context.Context
 ### Compatibility
 
 The change is additive with **intentional behavior changes to
-`ContextWithUser`**, which is reimplemented on `ContextWithValue` and therefore
-inherits every guard that setter applies. Today it only calls `SetMember` and
-accepts whatever results. After this change it rejects, leaving ctx unchanged:
+`ContextWithUser`**, which is reimplemented on the shared `ContextWithValue`
+logic and therefore inherits its syntax, length, and baggage-budget guards — but
+not the generic `user.name` reservation, which it reaches past through the
+unexported path (Decision §4). Today it only calls `SetMember` and accepts
+whatever results. After this change it rejects, leaving ctx unchanged:
 
 | Input | Today | After |
 |---|---|---|
@@ -838,14 +852,15 @@ func Ingress(log *slog.Logger) gin.HandlerFunc {
 		if account != "" {
 			next, err := o11y.ContextWithUser(ctx, account)
 			if err != nil {
-				// Do not swallow this: on error only the entry span gets
-				// user.name, and every downstream span and log silently
-				// loses it. Same non-load-bearing handling as tag().
+				// Do not swallow, and do not fall through to SetUser: the
+				// setter just refused this value, so writing it to the entry
+				// span anyway would bypass the same length and budget checks
+				// tag() is careful to run first.
 				log.WarnContext(ctx, "set user baggage failed", slog.Any("error", err))
 			} else {
 				ctx = next
+				o11y.SetUser(ctx, account)
 			}
-			o11y.SetUser(ctx, account)
 		}
 
 		// Authorize before tagging. ContextWithBaggageValue checks syntax and
@@ -1103,9 +1118,17 @@ all-or-nothing on baggage.
 6. **`o11y.go`** — assemble the whitelist from both slots (`user.name` when
    `userBaggage`, plus `baggageKeys`) and gate all three sites
    (`o11y.go:208`, `:310`, `:316`) on `whitelist.Len() > 0`. Generalize
-   `appendUserBaggageWarnings` (`o11y.go:496`) to warn on the trace-disabled
-   combination and to log the effective key list at startup — the effective list
-   is the first thing an operator needs when an expected attribute is missing.
+   `appendUserBaggageWarnings` (`o11y.go:496`) to log the effective key list at
+   startup — the first thing an operator needs when an expected attribute is
+   missing — and to warn on the trace-disabled combination.
+
+   Scope that warning precisely: with the **trace pillar** off the propagator is
+   still built (`o11y.go:203`), so baggage still propagates and still
+   materializes on log records; only spans are lost. It must not be worded as
+   though baggage stops. The native NATS case (Decision §9) *does* stop
+   propagation, but `Init` cannot detect it — the connection is created later,
+   by a separate call — so it stays documentation-only rather than a startup
+   warning the SDK is not in a position to emit.
 7. **`attributes.go`** — add `ContextWithBaggageValue`,
    `ContextWithoutBaggageValues`, the exported `UserNameKey` applications need to
    name `user.name` in a sanitization set, and a root-package
@@ -1157,6 +1180,14 @@ all-or-nothing on baggage.
      context already holding 64 members, and one that would push the encoded
      baggage past 8192 bytes — each leaving ctx unchanged.
    - Empty key list installs neither the processor nor the handler.
+   - **Boundary contract** (integration-level, pinning what Decision §7 Plane 2
+     and Q6 now recommend): a server wired with a `TraceContext`-only propagator
+     records no application baggage attributes on its entry span even when the
+     request carries a forged `baggage` header, while the same server wired with
+     `obs.Propagator` does; and a `nats.ConnectWithOptions(...,
+     WithTracingEnabled(false))` connection neither injects nor extracts
+     baggage, pinning the Decision §9 scope limit so a future upstream change
+     that quietly restores propagation is noticed rather than assumed.
    - Existing ADR 0016 tests pass **unmodified**.
 9. **Docs** — `README.md`, which is the SDK's option reference and would
    otherwise go stale the moment `WithBaggageAttributes` ships; an
