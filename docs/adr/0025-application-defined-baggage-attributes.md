@@ -106,12 +106,26 @@ substantive findings from review; they materially changed this ADR.
    keep its enricher's key list in sync with whatever it does for spans, which
    is the coupling `WithBaggageAttributes` removes.
 
-3. **Baggage transport already works, unconditionally.** The composite
-   propagator (`propagation.TraceContext{}` + `propagation.Baggage{}`) is built
-   in `internal/trace/trace.go` and mirrored on the trace-disabled path
-   (`o11y.go:203`), and the NATS facade injects with it. A baggage member
-   already rides every HTTP and NATS hop today. **Nothing about transport needs
-   to change.** The gap is materialization only.
+3. **Baggage transport already works wherever the propagator runs — with one
+   documented exception.** The composite propagator
+   (`propagation.TraceContext{}` + `propagation.Baggage{}`) is built in
+   `internal/trace/trace.go` and mirrored on the trace-disabled path
+   (`o11y.go:203`), so disabling the *trace pillar* still forwards baggage. On
+   the usual paths — HTTP via `otelhttp`/`otelgin`, NATS and JetStream via the
+   facade's Inject/Extract — a baggage member already rides every hop today, and
+   **nothing about transport needs to change.**
+
+   The exception is `nats.ConnectWithOptions(..., WithTracingEnabled(false))`,
+   whose own documentation states the contract: *"no spans, **no propagation
+   injection/extraction**, and JetStream wrappers backed by the upstream direct
+   implementation"* (`nats/options.go:23-29`). This is a supported, deliberate
+   native-cost mode, and `AGENTS.md:130-134` recommends driving it from
+   `obs.Toggles.Trace`. In it, **baggage stops at every NATS hop** — application
+   keys and `user.name` alike — so a downstream service materializes nothing,
+   and no SDK-side change to materialization can recover it. Recorded as a
+   scope limitation in Decision §9 rather than papered over: this feature
+   requires the traced NATS path, and a service that hard-disables it keeps
+   whatever per-service explicit tagging it already does.
 
 4. **The materialization logic is already key-agnostic.**
    `SpanAttributesFromContext` (`baggageattrs.go:59`),
@@ -141,7 +155,10 @@ substantive findings from review; they materially changed this ADR.
 7. **Sampling asymmetry (ADR 0015).** `span.SetAttributes` is a no-op on a
    non-recording span, and `SpanProcessor.OnStart` only fires for recording
    spans. So span-side materialization tracks the head sampling rate, while
-   **baggage propagation and log materialization are sampling-independent.** For
+   **baggage propagation and log materialization are sampling-independent** —
+   independent of the sampling *ratio*, that is, not of tracing being wired at
+   all: the native NATS mode in §3 removes the Inject/Extract that carries
+   baggage in the first place. For
    a "find everything about identifier X" workflow this makes the log side the
    more reliable of the two, which is the strongest argument for generalizing
    the mechanism rather than telling applications to stamp spans themselves.
@@ -254,6 +271,13 @@ option accepted it, a service could enable PII materialization without ever
 encountering that contract, which is precisely the boundary ADR 0016 exists to
 make deliberate.
 
+The same reservation applies to the **setter**, not just this option — see §4.
+Reserving one and not the other leaves the boundary open: rejecting
+`WithBaggageAttributes("user.name")` while allowing
+`ContextWithBaggageValue(ctx, UserNameKey, name)` still lets an application put
+PII on the wire through a call site that states no PII contract, which is the
+side that actually reaches the network.
+
 ### 3. `WithUserBaggage()` is retained, and tracked separately
 
 The option is kept rather than deprecated, and — following from §2 — it is not
@@ -287,6 +311,14 @@ The setter is the key-agnostic sibling of `ContextWithUser`. It deliberately
 service) and the materializing consumers are different processes with
 independent configuration, so a local check would force every producer to carry
 every consumer's whitelist. Whitelisting is a materialization-side concern.
+
+It **does** reject `user.name`, mirroring §2. This is the call that puts a value
+on the wire, so leaving it open would let an application propagate PII through
+an API that states no PII contract — the reservation would be decorative.
+`ContextWithUser` keeps working by taking an unexported path into the shared
+implementation: the public generic setter refuses the key, the PII-specific
+public API allows it. An implementation that routes `ContextWithUser` through
+the *public* setter cannot satisfy both halves and is wrong.
 
 The remover is new and is required by the ingress model (§7). OTel offers
 `baggage.ContextWithoutBaggage`, which clears *everything* — unusable at an edge
@@ -350,6 +382,15 @@ Precedence is defined, not left emergent:
   the BaggageHandler, wins over the baggage value; the baggage value fills in
   only where nothing else did. This preserves current behavior.
 
+  The collision check must **recurse into empty-key groups** to hold. `slog`
+  inlines them — *"If a group's key is empty, inline the group's Attrs"*
+  (`log/slog/handler.go:57`) — so an explicit `slog.Group("", slog.String(k, v))`
+  reaches the JSON output as a top-level `k`, while a check that looks only at
+  the outer attribute sees an empty key and misses it. The baggage value is then
+  added too, producing a duplicate field in which the *baggage* value — possibly
+  forged — is the later one. Both `recordHasAttr` and the `presetKeys`
+  accumulation in `WithAttrs` must flatten empty-key groups before comparing.
+
 **Known limitation — `slog` groups.** If an application calls `WithGroup` on the
 SDK logger, the BaggageHandler's `r.AddAttrs` is nested by the inner handler, so
 `user.name` is emitted at `<group>.user.name` instead of top level, and log
@@ -372,10 +413,23 @@ middleware can only reach one of them.
 
 **Plane 1 — the context (everything after the middleware).** Child spans, driver
 spans, log records, and all downstream services read the context as the
-middleware leaves it. Here the required posture is **remove first, then set**:
-clear every application-defined key *and* `user.name` unconditionally, then set
-the ones this request has authenticated and authorized. Overwrite-if-present is
-not sufficient, because three common paths perform no overwrite at all:
+middleware leaves it. Here the required posture is **clear, then set**.
+
+At a **public** boundary, clear *all* inbound baggage
+(`baggage.ContextWithoutBaggage`) and rebuild only the members this request has
+authenticated and authorized. Clearing only the edge's own key registry is not
+enough: the SDK propagator forwards members this service has never heard of, so
+during a rolling deployment an attacker can send a key the edge has not learned
+yet but a downstream service already materializes — and that service exports it
+as genuine. An allowlist of what to *keep* is sound; a denylist of what to
+remove is only as current as the slowest-deploying service.
+
+`ContextWithoutBaggageValues` (§4) is for **internal** boundaries, where the
+surviving members have an established trusted source and blanket clearing would
+destroy the `user.name` that ADR 0016 Phase 2 exists to carry.
+
+Either way, removal must be unconditional rather than overwrite-if-present,
+because three common paths perform no overwrite at all:
 
 1. **A route that never sets the key.** A forged `chat.room.id` on an endpoint
    with no room parameter is never overwritten.
@@ -385,12 +439,12 @@ not sufficient, because three common paths perform no overwrite at all:
    context on error — which ADR 0024 requires, since telemetry must not be
    load-bearing — also preserves whatever was already there.
 
-`ContextWithoutBaggageValues` fully closes this plane.
+Clearing fully closes this plane.
 
 **Plane 2 — the entry span, which middleware cannot fix.** `OnStart` has already
 copied the forged member onto the server or consumer span by the time any
-application code runs, and `ContextWithoutBaggageValues` returns a *child
-context* — it cannot retract an attribute already written to a running span.
+application code runs, and clearing baggage returns a *child context* — it
+cannot retract an attribute already written to a running span.
 Last-write-wins (Dependency behavior §10) rescues only the keys this request
 actually sets, via the explicit entry-span write in Consumer guidance. For every
 other key, on every one of paths 1–3, **the forged value remains on the entry
@@ -428,6 +482,26 @@ The post-set check is what actually prevents Dependency behavior §9. It costs a
 in exchange for not silently truncating or dropping baggage at every downstream
 hop. Do not remove it for performance without replacing it with an equivalent
 bound.
+
+### 9. Scope limitation: the traced NATS path is required
+
+This feature carries values over W3C Baggage, which needs the propagator's
+Inject/Extract to actually run on each hop. `nats.ConnectWithOptions(...,
+WithTracingEnabled(false))` deliberately removes exactly that
+(`nats/options.go:23-29`, Dependency behavior §3), so in that mode baggage —
+application keys and `user.name` alike — stops at every NATS and JetStream hop.
+
+This is **not fixable from the materialization side**, and this ADR does not
+attempt to fix it. Preserving baggage independently of span creation would mean
+re-adding header inject/extract to a mode whose entire purpose is the native
+NATS cost profile, which is a change to ADR 0004/0022 territory and needs its
+own decision.
+
+The rule is therefore stated rather than worked around: **a service that
+hard-disables NATS tracing does not participate in baggage materialization**,
+and keeps whatever explicit per-service tagging it already does. Services mixing
+the two modes get a partial picture, which is worse than a uniform one — so the
+mode should be chosen per mesh, not per service.
 
 ### What is explicitly NOT decided here
 
@@ -495,9 +569,13 @@ const UserNameKey = baggageattrs.UserNameKey
 //
 // The key must be a valid W3C baggage token; a key that is merely valid UTF-8
 // would materialize on this service's telemetry and then be silently dropped
-// during propagation, so it is rejected here instead. The key is NOT checked
-// against any whitelist — the whitelist is a materialization-side setting and
-// the producer is usually a different process.
+// during propagation, so it is rejected here instead. It must also not be
+// reserved — including user.name, which has its own PII-contract API in
+// ContextWithUser and is refused here so PII cannot reach the wire through a
+// call site that states no such contract.
+//
+// The key is NOT checked against any whitelist — the whitelist is a
+// materialization-side setting and the producer is usually a different process.
 //
 // Returns an error, leaving ctx unchanged, when the key is invalid or reserved,
 // when the value exceeds MaxBaggageValueBytes, or when adding the member would
@@ -521,12 +599,15 @@ func ContextWithBaggageValue(ctx context.Context, key, value string) (context.Co
 // ContextWithoutBaggageValues returns a child context with the named baggage
 // members removed, leaving every other member intact.
 //
-// This is the ingress primitive: at a public boundary, remove every
-// application-defined key — and user.name, which an unauthenticated caller can
-// forge just as easily — unconditionally, then set the ones this request has
-// authenticated and authorized. Overwriting only the keys you set is not
-// sufficient: a forged member on a route that never sets that key is never
-// overwritten.
+// This is the primitive for INTERNAL boundaries, where the members it leaves
+// behind have an established trusted source. At a PUBLIC boundary use
+// baggage.ContextWithoutBaggage instead and rebuild only authenticated members:
+// this function removes the keys you name, and the propagator forwards keys
+// this service has never heard of, so a denylist is only as current as the
+// slowest-deploying service in the mesh (Decision 7).
+//
+// Removal must be unconditional rather than overwrite-if-present: a forged
+// member on a route that never sets that key is never overwritten.
 //
 // This sanitizes the context, and therefore every later span, log record, and
 // downstream service. It cannot retract an attribute already written to the
@@ -638,8 +719,11 @@ span that the SDK just refused — a reserved key, or a value past the cap —
 letting the span silently bypass every guard this ADR defines:
 
 ```go
-// application helper
-func tag(ctx context.Context, key, value string) context.Context {
+// application helper — log through the SDK logger, not the slog default:
+// Init deliberately does not call slog.SetDefault (ADR 0003), so a bare
+// slog.WarnContext here would bypass the SDK's JSON/OTLP chain and lose the
+// traceId/spanId that make this diagnostic findable.
+func tag(ctx context.Context, log *slog.Logger, key, value string) context.Context {
 	if value == "" {
 		return ctx
 	}
@@ -647,7 +731,7 @@ func tag(ctx context.Context, key, value string) context.Context {
 	//     and members that would push the baggage past the W3C limits
 	next, err := o11y.ContextWithBaggageValue(ctx, key, value)
 	if err != nil {
-		slog.WarnContext(ctx, "tag baggage failed",
+		log.WarnContext(ctx, "tag baggage failed",
 			slog.String("key", key), slog.Any("error", err))
 		return ctx // telemetry must never be load-bearing (ADR 0024)
 	}
@@ -658,7 +742,7 @@ func tag(ctx context.Context, key, value string) context.Context {
 }
 ```
 
-### Public ingress: remove first, then set
+### Public ingress: clear everything, then rebuild
 
 The error and empty-value paths above both return the incoming context
 unchanged, so neither removes a forged member. At a public boundary, clear
@@ -666,18 +750,23 @@ before setting — and set only values this request has *authorized*, not values
 it merely supplied:
 
 ```go
-func Ingress() gin.HandlerFunc {
+func Ingress(log *slog.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Unconditional, and it must include user.name: an unauthenticated
-		// caller can forge that as easily as an application key. Covers routes
-		// that set none of these keys, plus the empty-value and error paths,
-		// none of which overwrite anything.
-		ctx := o11y.ContextWithoutBaggageValues(c.Request.Context(),
-			append(app.BaggageKeys(), o11y.UserNameKey)...)
+		// Clear ALL inbound baggage, not just the keys this service knows.
+		// The propagator forwards members we have never heard of, so a
+		// key a downstream service already materializes but this edge has
+		// not learned yet would sail through a per-key removal untouched.
+		ctx := baggage.ContextWithoutBaggage(c.Request.Context())
 
 		account := auth.AccountFrom(c) // authenticated
 		if account != "" {
-			if next, err := o11y.ContextWithUser(ctx, account); err == nil {
+			next, err := o11y.ContextWithUser(ctx, account)
+			if err != nil {
+				// Do not swallow this: on error only the entry span gets
+				// user.name, and every downstream span and log silently
+				// loses it. Same non-load-bearing handling as tag().
+				log.WarnContext(ctx, "set user baggage failed", slog.Any("error", err))
+			} else {
 				ctx = next
 			}
 			o11y.SetUser(ctx, account)
@@ -687,7 +776,7 @@ func Ingress() gin.HandlerFunc {
 		// size, never authorization: tagging a raw route parameter would let the
 		// caller choose what enters trusted telemetry and downstream baggage.
 		if room, ok := authz.ResolveRoom(c, account, c.Param("roomID")); ok {
-			ctx = tag(ctx, app.KeyRoomID, room.CanonicalID)
+			ctx = tag(ctx, log, app.KeyRoomID, room.CanonicalID)
 		}
 
 		c.Request = c.Request.WithContext(ctx) // without this, none of the above applies
@@ -695,6 +784,11 @@ func Ingress() gin.HandlerFunc {
 	}
 }
 ```
+
+An **internal** hop that trusts its callers uses
+`o11y.ContextWithoutBaggageValues(ctx, app.BaggageKeys()...)` instead, dropping
+application keys it intends to re-derive while keeping the `user.name` a peer
+service propagated.
 
 This sanitizes Plane 1 completely. It does **not** clean the entry span: by the
 time this middleware runs, `OnStart` has already copied any forged inbound
@@ -881,14 +975,20 @@ the SDK first gains a way to distinguish trusted from untrusted callers.
    token probe, plus the length and reserved-key checks. Member construction
    continues to use `NewMemberRaw(key, value)`. Do not hand-roll the RFC 7230
    token grammar, and do not switch value construction to `NewMember`. An empty
-   key is invalid; an empty **value** is the documented no-op.
+   key is invalid; an empty **value** is the documented no-op. The reserved set
+   includes `user.name`: the **public** setter refuses it, and `ContextWithUser`
+   reaches the shared implementation through an unexported path that allows it
+   (Decision §4). Routing `ContextWithUser` through the public setter breaks
+   ADR 0016 and is wrong.
 3. **Size enforcement** — `ContextWithValue` builds the candidate baggage, then
    rejects and returns the original context if the result exceeds 64 members or
    `len(bag.String()) > 8192`.
 4. **`internal/log/handler.go`** — replace `hasUserNameAttr bool` with a
    `presetKeys map[string]struct{}` built clone-on-write in `WithAttrs` (never
    mutate a map shared with a derived handler), carried through `WithGroup` as
-   well, and carry the `Whitelist` on the handler. `NewBaggageHandler` takes the
+   well, and carry the `Whitelist` on the handler. Both `recordHasAttr` and the
+   `presetKeys` accumulation must recurse into empty-key groups, which `slog`
+   inlines into the output (`log/slog/handler.go:57`). `NewBaggageHandler` takes the
    whitelist as a second parameter. Preserve the precedence in Decision §6.
 5. **`options.go`** — add `baggageKeys []string` to `Config` for application
    keys and **keep `userBaggage bool` as its own slot** (Decision §3), so
@@ -914,7 +1014,11 @@ the SDK first gains a way to distinguish trusted from untrusted callers.
    - Cap independence: eight application keys plus `WithUserBaggage` yields nine
      materialized keys, in either option order; a ninth application key is
      dropped with a warning and `user.name` is not.
-   - `WithBaggageAttributes("user.name")` is refused and warns.
+   - `WithBaggageAttributes("user.name")` is refused and warns; the public
+     `ContextWithBaggageValue(ctx, UserNameKey, ...)` returns an error while
+     `ContextWithUser` still succeeds.
+   - Empty-key groups: an explicit `slog.Group("", slog.String(k, v))` suppresses
+     the baggage value for `k`, in both the record and the `WithAttrs` paths.
    - Empty key rejected at both the option and the setter; empty value is a
      no-op returning no error.
    - **Round trip**: for each of the four keys in the Dependency behavior §8
