@@ -273,9 +273,10 @@ changed what it has to deliver.
     handler(Msg{Msg: msg, Ctx: ctx})
     ```
 
-    `oteljetstream/consumer_traced.go:151-169` (Consume) and `:183-208`
-    (`MessagesContext.Next`) are identical in this respect. `msgCtx` — the only
-    thing holding the extracted baggage — is discarded in all three.
+    `oteljetstream/consumer_traced.go:43-70` (`Consumer.Next`), `:151-169`
+    (`Consume`) and `:183-208` (`MessagesContext.Next`) are identical in this
+    respect. `msgCtx` — the only thing holding the extracted baggage — is
+    discarded in all four.
 
     The producer side is fine: `Inject(ctx, ...)` uses the caller's context
     (`otelnats/conn_traced.go:128,142`, `oteljetstream/jetstream_traced.go:44`),
@@ -689,21 +690,39 @@ in the one mode Decision §9 says does not participate. Gate on the same
 `tracingEnabled` the facade already tracks.
 
 The same wrap applies to `QueueSubscribe` (`nats/conn.go:157-159`) and to
-**every** JetStream delivery path: `Consume` (`nats/jetstream.go:365`), the
-fetched-message channel (`:542`), and the `Messages(ctx)` pull iterator
-(`:374`), whose upstream `tracedMessagesContext.Next` is the third discarding
-site named in §12. Missing one leaves services on that path silently
-baggage-free, which is the same failure this decision exists to remove.
+**every** JetStream delivery path — all four upstream discarding sites from
+§12: `Consume` (`nats/jetstream.go:365`), the fetched-message channel (`:542`),
+the `Messages(ctx)` pull iterator (`:374`), and single-shot `Consumer.Next`
+(`:592-603`), which today returns the upstream context unchanged. Missing one
+leaves services on that path silently baggage-free, which is the same failure
+this decision exists to remove.
 
 Three things this deliberately does **not** claim:
 
 1. **The consumer span itself stays clean of the restored values.** `OnStart`
    already ran, against a context with no baggage. The consumer span is the
-   NATS-side equivalent of the HTTP entry span (Decision §7, Plane 2), and the
-   remedy is the one ADR 0022 §4 already prescribes:
-   `trace.SpanFromContext(ctx).SetAttributes(...)` in the handler. Everything
-   *after* — child spans, driver spans, log records, and this handler's own
-   downstream publishes — gets the values.
+   NATS-side equivalent of the HTTP entry span (Decision §7, Plane 2).
+   Everything *after* — child spans, driver spans, log records, and this
+   handler's own downstream publishes — gets the values.
+
+   **The remedy differs by delivery path, and prescribing one for both is
+   wrong.**
+
+   - *Push paths* — Core `Subscribe`/`QueueSubscribe` and JetStream `Consume` —
+     hold the consumer span open for the duration of the handler, so
+     `trace.SpanFromContext(ctx).SetAttributes(...)` works. This is ADR 0022 §4
+     as written.
+   - *Pull paths* — `Consumer.Next`, `MessagesContext.Next`, and every `Fetch*`
+     batch — end the receive span **before** handing over the context, so
+     `SetAttributes` on it is a **deterministic silent no-op**. `nats/jetstream.go:103-115`
+     already documents this and names the correct pattern: start your own child
+     span with `tracer.Start(ctx, ...)` and enrich that, as
+     `examples/jetstream/fetch-worker` does.
+
+   The pull paths are in fact the *easier* case once restoration lands: a child
+   span started from the restored context is enriched automatically by
+   `OnStart`, with no explicit `SetAttributes` at all. The guidance must say so
+   rather than sending callers at an ended span.
 2. **It does not fix `otel-nats`.** Upstream still discards `msgCtx`; the facade
    compensates. If upstream later preserves it, the facade's restore becomes a
    no-op rather than a conflict, because `SetMember` on an equal key is
@@ -1078,9 +1097,10 @@ setter for a NATS router) silently does nothing.
   without touching, forking, or waiting on any of those integrations — the
   SpanProcessor sits below all of them. This is the capability ADR 0022 §4 could
   not offer. **The `otel-nats` consumer span is the exception**: restoration
-  happens after its `OnStart` (Decision §10), so it needs the explicit
-  `SetAttributes` ADR 0022 §4 already prescribes, exactly like the HTTP entry
-  span. Everything started *within* the handler is covered.
+  happens after its `OnStart` (Decision §10). On push paths it needs the
+  explicit `SetAttributes` ADR 0022 §4 prescribes, like the HTTP entry span; on
+  pull paths that span is already ended and the caller enriches its own child
+  span instead. Everything started *within* the handler is covered either way.
 - The core logic is unchanged: the iteration and de-duplication in
   `SpanAttributesFromContext`, `LogAttrsFromContext`, and `OnStart` already
   ignore the identity of the keys.
@@ -1359,9 +1379,13 @@ all-or-nothing on baggage.
      baggage past 8192 bytes — each leaving ctx unchanged.
    - Empty key list installs neither the processor nor the handler.
    - **NATS baggage restoration** (Decision §10): publish with baggage set,
-     receive through `Subscribe`, `QueueSubscribe`, JetStream `Consume`, and the
-     fetched-message channel; assert the handler context carries the members and
-     that the consumer span context is unchanged by the restore. A regression
+     receive through `Subscribe`, `QueueSubscribe`, JetStream `Consume`, the
+     fetched-message channel, the `Messages(ctx)` iterator, and single-shot
+     `Consumer.Next` — all four upstream discarding sites plus both facade
+     wrappers; assert the handler context carries the members and that the
+     consumer span context is unchanged by the restore. On the pull paths also
+     assert that a child span started from the restored context carries the
+     attributes, since the receive span itself is ended and cannot. A regression
      here silently returns the SDK to the §12 behavior, so this is the test that
      matters most for the stated use case.
    - SDK-catalogued keys such as `http.response.status_code` are refused at both
