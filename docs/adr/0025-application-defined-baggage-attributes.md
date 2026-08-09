@@ -416,8 +416,27 @@ table in Dependency behavior §8, including the three that never reach the wire.
 
 ### 6. Reserved keys, and precedence
 
-The SDK rejects — with a startup WARN, and at the setter with an error — keys
-that would shadow its own identity or correlation fields. Two groups:
+The SDK rejects keys that would shadow its own identity or correlation fields.
+**Where each reservation can be enforced differs, and the difference is
+structural, not a choice:**
+
+- The **static** reservations below — the SDK's log fields, `slog`'s record
+  fields, the generated semconv set, the namespace prefixes, `user.name` — are
+  enforced in *both* places: `WithBaggageAttributes` drops with a startup WARN,
+  and `ContextWithBaggageValue` returns an error. `ValidBaggageKey(key)` needs
+  nothing but the key.
+- The **dynamic** reservation — this process's actual Resource attributes,
+  including whatever `OTEL_RESOURCE_ATTRIBUTES` contributed — is enforced **only
+  at `Init`**. `ContextWithBaggageValue` is a package-level function with no SDK
+  instance and therefore no Resource to compare against; giving it one would
+  mean an ambient global, which ADR 0003 forbids. A service that sets such a key
+  through the *setter* rather than registering it will not be stopped — but it
+  also will not be materialized, because the option-side check kept it out of
+  the whitelist. The harm this reservation prevents is materialization, so
+  option-side enforcement is sufficient; the setter's silence on it is a
+  documented consequence, not a gap left open.
+
+The groups:
 
 - **Emitted by handlers inside the BaggageHandler**: `service.name`,
   `environment` (`o11y.go:267`), `traceId`, `spanId`
