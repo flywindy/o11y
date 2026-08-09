@@ -476,9 +476,16 @@ nothing.
 
 Precedence is defined, not left emergent:
 
-- **Spans**: `OnStart` writes the baggage value first; any later
-  `SetAttributes` for the same key wins (Dependency behavior §10). Application
-  code can therefore always correct a baggage-derived span attribute.
+- **Spans**: explicit attributes win at both ends. `OnStart` **skips** a key
+  already supplied at span creation via `trace.WithAttributes` — the current
+  processor checks `span.Attributes()` before writing, pinned by
+  `TestSpanProcessorDoesNotOverrideExplicitStartAttribute`
+  (`internal/baggageattrs/baggageattrs_test.go:103-121`) — and a *later*
+  `SetAttributes` for the same key overwrites the baggage value by last-write-wins
+  (Dependency behavior §10). Both halves must survive the generalization:
+  keeping only the second would let inbound baggage replace a trusted start-time
+  attribute. Application code can therefore always beat baggage, before or
+  after.
 - **Logs**: an attribute already on the record, or supplied via `WithAttrs` on
   the BaggageHandler, wins over the baggage value; the baggage value fills in
   only where nothing else did. This preserves current behavior.
@@ -783,7 +790,9 @@ const MaxBaggageAttributeKeys = 8
 // locally but never reach another service); keys that would shadow the SDK's own
 // identity or correlation fields (service.name, service.version,
 // service.namespace, environment, deployment.environment.name, traceId, spanId)
-// or slog's own record fields (time, level, msg, source); keys longer than
+// or slog's own record fields (time, level, msg, source); keys the SDK itself
+// emits per docs/semconv.md, including anything under the host. and process.
+// namespaces its resource detectors populate; keys longer than
 // MaxBaggageKeyBytes;
 // user.name, which is reserved for WithUserBaggage because it carries a PII
 // contract this option does not state; and keys beyond MaxBaggageAttributeKeys.
@@ -926,11 +935,22 @@ The affected input — a >256-byte username — is not a realistic legitimate va
 but the budget-driven rejections are reachable with entirely ordinary input.
 All three are recorded as **Changed**, not **Added**, in the CHANGELOG.
 
-Everything else is preserved: `SetUser`, `UserName`, `ContextWithUser`, and
-`WithUserBaggage` keep their signatures, their error messages, and their
-Unicode-value behavior. A service that adopts nothing new sees no change — with
-an empty key list neither the SpanProcessor nor the log handler is installed,
-exactly as today.
+Everything else about the *materialization* surface is preserved: `SetUser`,
+`UserName`, `ContextWithUser`, and `WithUserBaggage` keep their signatures,
+their error messages, and their Unicode-value behavior, and with an empty key
+list neither the SpanProcessor nor the log handler is installed.
+
+**But "adopts nothing new, sees no change" is not true for traced NATS
+services.** The Decision §10 restoration is deliberately *unconditional* — it is
+a bug fix for ADR 0016, not a feature of the whitelist — so a traced NATS
+service that upgrades without enabling either option still changes: handler
+contexts now carry the baggage that arrived on the wire, and anything that
+handler publishes downstream now forwards it, where today both are dropped.
+
+That is the intended repair, and for `user.name` it is what ADR 0016 promised
+all along. It is still a propagation-behavior change reaching services that
+opted into nothing, so it belongs in the CHANGELOG under **Fixed** with that
+scope stated plainly. Services on the native path (§9) are unaffected.
 
 "The existing ADR 0016 tests still pass unmodified" is evidence of no
 regression, not evidence of no behavior change. Dedicated compatibility tests
@@ -1327,8 +1347,10 @@ all-or-nothing on baggage.
    warning the SDK is not in a position to emit.
 7. **`nats/conn.go` and `nats/jetstream.go`** (Decision §10) — wrap the handler
    invocation at `conn.go:131-133`, `:157-159`, `jetstream.go:365`, and `:542`
-   — and the `Messages(ctx)` iterator's `Next` (`jetstream.go:374`) — so the
-   handler context carries the message's baggage. Extract with the
+   — plus the `Messages(ctx)` iterator's `Next` (`jetstream.go:374`) and
+   single-shot `Consumer.Next` (`jetstream.go:592-603`), which today returns the
+   upstream context unchanged — so the handler context carries the message's
+   baggage. Extract with the
    **connection's own** propagator and graft only `baggage.FromContext` onto the
    handler context; never apply the composite to that context directly, which
    would overwrite the consumer span context `otel-nats` just set. Skip the
