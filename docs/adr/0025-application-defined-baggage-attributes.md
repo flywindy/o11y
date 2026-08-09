@@ -937,8 +937,15 @@ All three are recorded as **Changed**, not **Added**, in the CHANGELOG.
 
 Everything else about the *materialization* surface is preserved: `SetUser`,
 `UserName`, `ContextWithUser`, and `WithUserBaggage` keep their signatures,
-their error messages, and their Unicode-value behavior, and with an empty key
-list neither the SpanProcessor nor the log handler is installed.
+their error messages, and their Unicode-value behavior, and when the
+**effective** whitelist is empty neither the SpanProcessor nor the log handler
+is installed.
+
+"Effective" matters because §3 gives `user.name` its own slot: the whitelist is
+the application key list **plus** `user.name` when `WithUserBaggage` is set. An
+implementation that gated installation on `len(baggageKeys) == 0` would disable
+`user.name` materialization for every service that has it today — a regression
+of shipped ADR 0016 behavior, caused by generalizing around it.
 
 **But "adopts nothing new, sees no change" is not true for traced NATS
 services.** The Decision §10 restoration is deliberately *unconditional* — it is
