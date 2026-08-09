@@ -373,7 +373,7 @@ func (c *consumer) Consume(ctx context.Context, handler JetStreamMsgHandler, opt
 		return nil, fmt.Errorf("nats jetstream consume: handler must not be nil")
 	}
 	cc, err := c.c.Consume(func(m oteljetstream.Msg) {
-		handler(c.policy.restoreBaggage(m.Context(), m.Msg.Headers()), m.Msg)
+		handler(c.policy.restoreBaggage(m.Context(), m.Headers()), m.Msg)
 	}, opts...)
 	if err != nil {
 		return nil, err
@@ -550,7 +550,7 @@ func wrapMessageBatch(mb oteljetstream.MessageBatch, bufSize int, cancel context
 					return
 				}
 				select {
-				case out <- FetchedMessage{Ctx: policy.restoreBaggage(m.Ctx, m.Msg.Headers()), Msg: m.Msg}:
+				case out <- FetchedMessage{Ctx: policy.restoreBaggage(m.Ctx, m.Headers()), Msg: m.Msg}:
 				case <-done:
 					return
 				}

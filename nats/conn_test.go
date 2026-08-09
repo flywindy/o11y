@@ -64,7 +64,7 @@ func newTestProviders() (oteltrace.TracerProvider, propagation.TextMapPropagator
 	return tp, prop, sr
 }
 
-func contextWithTestBaggage(t *testing.T, ctx context.Context, key, value string) context.Context {
+func contextWithTestBaggage(ctx context.Context, t *testing.T, key, value string) context.Context {
 	t.Helper()
 	member, err := baggage.NewMemberRaw(key, value)
 	require.NoError(t, err)
@@ -121,7 +121,7 @@ func TestConnectWithOptions_DisablesTracing(t *testing.T) {
 
 	tracer := tp.Tracer("test")
 	pubCtx, span := tracer.Start(context.Background(), "ambient")
-	pubCtx = contextWithTestBaggage(t, pubCtx, "app.order.id", "not-injected")
+	pubCtx = contextWithTestBaggage(pubCtx, t, "app.order.id", "not-injected")
 	err = pub.Publish(pubCtx, subject, []byte("hello"))
 	require.NoError(t, err)
 	span.End()
@@ -217,7 +217,7 @@ func TestSubscribe_ContextPropagation(t *testing.T) {
 	// propagate through the message headers.
 	tracer := tp.Tracer("test")
 	pubCtx, span := tracer.Start(context.Background(), "test-publish")
-	pubCtx = contextWithTestBaggage(t, pubCtx, "app.order.id", "order-42")
+	pubCtx = contextWithTestBaggage(pubCtx, t, "app.order.id", "order-42")
 	pubTraceID := span.SpanContext().TraceID()
 
 	err = pub.Publish(pubCtx, subject, []byte("hello"))
@@ -310,7 +310,7 @@ func TestQueueSubscribe(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, sub.NatsConn().FlushTimeout(2*time.Second))
 
-	pubCtx := contextWithTestBaggage(t, context.Background(), "app.order.id", "queue-order")
+	pubCtx := contextWithTestBaggage(context.Background(), t, "app.order.id", "queue-order")
 	err = pub.Publish(pubCtx, subject, []byte("ping"))
 	require.NoError(t, err)
 

@@ -62,7 +62,7 @@ func TestJetStream_TracingDisabledPublishConsumeUsesDirectPath(t *testing.T) {
 
 	tracer := tp.Tracer("test")
 	consumeCtx, consumeSpan := tracer.Start(context.Background(), "ambient-consume")
-	consumeCtx = contextWithTestBaggage(t, consumeCtx, "app.order.id", "not-injected")
+	consumeCtx = contextWithTestBaggage(consumeCtx, t, "app.order.id", "not-injected")
 	_, err = js.Publish(consumeCtx, consumeSubject, []byte("consume"))
 	require.NoError(t, err)
 	consumeSpan.End()
@@ -163,13 +163,13 @@ func TestJetStream_Consume_TracePropagation(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+	_, err = stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
 		Durable:       consumerName,
 		FilterSubject: subject,
 		AckPolicy:     jetstream.AckExplicitPolicy,
 	})
 	require.NoError(t, err)
-	cons, err = js.Consumer(context.Background(), streamName, consumerName)
+	cons, err := js.Consumer(context.Background(), streamName, consumerName)
 	require.NoError(t, err, "consumer reacquired through JetStream.Consumer must retain propagation policy")
 
 	ctxCh := make(chan context.Context, 1)
@@ -185,7 +185,7 @@ func TestJetStream_Consume_TracePropagation(t *testing.T) {
 
 	tracer := tp.Tracer("test")
 	pubCtx, span := tracer.Start(context.Background(), "publish-event")
-	pubCtx = contextWithTestBaggage(t, pubCtx, "app.order.id", "consume-order")
+	pubCtx = contextWithTestBaggage(pubCtx, t, "app.order.id", "consume-order")
 	pubTraceID := span.SpanContext().TraceID()
 	_, err = js.Publish(pubCtx, subject, []byte("hello"))
 	require.NoError(t, err)
@@ -392,25 +392,25 @@ func TestJetStream_Next_TracePropagation(t *testing.T) {
 	require.NoError(t, err)
 
 	const streamName, subject, consumerName = "EVENTS_NXT", "events.nxt.created", "next-trace-test"
-	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+	_, err = js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
 		Name:     streamName,
 		Subjects: []string{subject},
 	})
 	require.NoError(t, err)
-	stream, err = js.Stream(context.Background(), streamName)
+	stream, err := js.Stream(context.Background(), streamName)
 	require.NoError(t, err, "stream reacquired through JetStream.Stream must retain propagation policy")
-	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+	_, err = stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
 		Durable:       consumerName,
 		FilterSubject: subject,
 		AckPolicy:     jetstream.AckExplicitPolicy,
 	})
 	require.NoError(t, err)
-	cons, err = stream.Consumer(context.Background(), consumerName)
+	cons, err := stream.Consumer(context.Background(), consumerName)
 	require.NoError(t, err)
 
 	tracer := tp.Tracer("test")
 	pubCtx, span := tracer.Start(context.Background(), "publish-event")
-	pubCtx = contextWithTestBaggage(t, pubCtx, "app.order.id", "next-order")
+	pubCtx = contextWithTestBaggage(pubCtx, t, "app.order.id", "next-order")
 	pubTraceID := span.SpanContext().TraceID()
 	_, err = js.Publish(pubCtx, subject, []byte("hi"))
 	require.NoError(t, err)
@@ -470,18 +470,18 @@ func TestJetStream_Messages_TracePropagation(t *testing.T) {
 		Subjects: []string{subject},
 	})
 	require.NoError(t, err)
-	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+	_, err = stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
 		Durable:       consumerName,
 		FilterSubject: subject,
 		AckPolicy:     jetstream.AckExplicitPolicy,
 	})
 	require.NoError(t, err)
-	cons, err = stream.Consumer(context.Background(), consumerName)
+	cons, err := stream.Consumer(context.Background(), consumerName)
 	require.NoError(t, err, "consumer reacquired through Stream.Consumer must retain propagation policy")
 
 	tracer := tp.Tracer("test")
 	pubCtx, span := tracer.Start(context.Background(), "publish-event")
-	pubCtx = contextWithTestBaggage(t, pubCtx, "app.order.id", "messages-order")
+	pubCtx = contextWithTestBaggage(pubCtx, t, "app.order.id", "messages-order")
 	pubTraceID := span.SpanContext().TraceID()
 	_, err = js.Publish(pubCtx, subject, []byte("hi"))
 	require.NoError(t, err)
@@ -566,7 +566,7 @@ func TestJetStream_Fetch_TracePropagation(t *testing.T) {
 
 	tracer := tp.Tracer("test")
 	pubCtx, span := tracer.Start(context.Background(), "publish-event")
-	pubCtx = contextWithTestBaggage(t, pubCtx, "app.order.id", "fetch-order")
+	pubCtx = contextWithTestBaggage(pubCtx, t, "app.order.id", "fetch-order")
 	pubTraceID := span.SpanContext().TraceID()
 	_, err = js.Publish(pubCtx, subject, []byte("hi"))
 	require.NoError(t, err)
@@ -651,7 +651,7 @@ func TestJetStream_FetchBytes_Deliver(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	pubCtx := contextWithTestBaggage(t, context.Background(), "app.order.id", "fetch-bytes-order")
+	pubCtx := contextWithTestBaggage(context.Background(), t, "app.order.id", "fetch-bytes-order")
 	_, err = js.Publish(pubCtx, subject, []byte("a"))
 	require.NoError(t, err)
 
@@ -708,7 +708,7 @@ func TestJetStream_FetchNoWait_Deliver(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	pubCtx := contextWithTestBaggage(t, context.Background(), "app.order.id", "fetch-nowait-order")
+	pubCtx := contextWithTestBaggage(context.Background(), t, "app.order.id", "fetch-nowait-order")
 	_, err = js.Publish(pubCtx, subject, []byte("a"))
 	require.NoError(t, err)
 	require.NoError(t, conn.NatsConn().FlushTimeout(2*time.Second))
