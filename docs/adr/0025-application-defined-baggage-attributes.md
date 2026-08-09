@@ -1367,8 +1367,15 @@ all-or-nothing on baggage.
 2. **Key validation** — `ValidBaggageKey` uses `baggage.NewMember(key, "x")` as a
    token probe, plus the length and reserved-key checks. Member construction
    continues to use `NewMemberRaw(key, value)`. Do not hand-roll the RFC 7230
-   token grammar, and do not switch value construction to `NewMember`. An empty
-   key is invalid; an empty **value** is the documented no-op. The reserved set
+   token grammar, and do not switch value construction to `NewMember`.
+
+   **Order matters: validate the key — syntax, length, reserved — *before*
+   applying the empty-value no-op.** Otherwise the two rules collide silently on
+   the cases where both apply: `ContextWithBaggageValue(ctx, "", "")` and
+   `ContextWithBaggageValue(ctx, UserNameKey, "")` must both return an error, not
+   the quiet no-op an empty value would otherwise earn them. An empty key is
+   invalid; an empty **value** is the documented no-op, but only once the key has
+   passed. Both cases are required tests. The reserved set
    includes `user.name`: the **public** setter refuses it, and `ContextWithUser`
    reaches the shared implementation through an unexported path that allows it
    (Decision §4). Routing `ContextWithUser` through the public setter breaks
@@ -1415,10 +1422,18 @@ all-or-nothing on baggage.
    — plus the `Messages(ctx)` iterator's `Next` (`jetstream.go:374`) and
    single-shot `Consumer.Next` (`jetstream.go:592-603`), which today returns the
    upstream context unchanged — so the handler context carries the message's
-   baggage. Extract with the
-   **connection's own** propagator and graft only `baggage.FromContext` onto the
-   handler context; never apply the composite to that context directly, which
-   would overwrite the consumer span context `otel-nats` just set. Skip the
+   baggage. Extract with the **connection's own** propagator **into a throwaway
+   `context.Background()`** — never into the handler context — and graft only
+   `baggage.FromContext` of that result onto the handler context.
+
+   Both halves of that are load-bearing. Applying the propagator to the handler
+   context directly would overwrite the consumer span context `otel-nats` just
+   set. Passing the handler context as `Extract`'s *parent* is subtler: `Extract`
+   falls back to the parent when the message carries no `baggage` header
+   (Dependency behavior §9), so whatever baggage the handler context already held
+   would be read back out and re-grafted — laundering ambient or subscription-level
+   baggage into a message that carried none. A `context.Background()` parent makes
+   "no header" mean exactly "no baggage restored". Skip the
    restore entirely when tracing is disabled for the connection (Decision §9;
    `conn_direct.go:57-61` still invokes the facade wrapper with intact headers).
    **The JetStream wrapper graph cannot reach that policy today, and must be
@@ -1477,7 +1492,8 @@ all-or-nothing on baggage.
      `TestBaggageHandlerWithGroupDoesNotInheritUserNameAttr` passes unmodified,
      with the explicit value at top level and the baggage value under the group.
    - Empty key rejected at both the option and the setter; empty value is a
-     no-op returning no error.
+     no-op returning no error — **but** `("", "")` and `(UserNameKey, "")` both
+     return errors, pinning that key validation runs before the no-op.
    - **Round trip**: for each of the four keys in the Dependency behavior §8
      table, assert `Inject` → `Extract` actually carries (or refuses) the value.
      A constructor-only assertion is explicitly insufficient.
@@ -1521,7 +1537,10 @@ all-or-nothing on baggage.
      three shapes: one the SDK emits (`http.response.status_code`), one it does
      **not** emit but semconv defines as an int (`http.response.body.size`), and
      a wildcard-catalogued one that only a namespace-prefix check catches
-     (`process.pid`). An application-namespaced key is still accepted.
+     (`process.pid`), and one from a **parameterized family** with no per-member
+     constant at all (`http.request.header.authorization`) — the case that
+     passes an exact-key-only generator and is exactly why prefix rules exist.
+     An application-namespaced key is still accepted.
    - The generated semconv key set matches the pinned package — the CI gate's
      own regression test.
    - Materialization skips an inbound member whose value exceeds
