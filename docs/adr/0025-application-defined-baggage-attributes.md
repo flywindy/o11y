@@ -454,7 +454,17 @@ that would shadow its own identity or correlation fields. Two groups:
   discovering the set at run time. **The set is generated at build time from the
   pinned `semconv/v1.39.0/attribute_group.go` and checked in**, with a CI gate —
   alongside the existing `scripts/check_integrations.go` — asserting the
-  generated file matches the pin. ADR 0006 already makes a pin bump a single
+  generated file matches the pin.
+
+  Generation must emit **prefix rules for parameterized families, not only exact
+  keys.** Some conventions have no per-member constant at all: `HTTPRequestHeader`
+  builds `attribute.StringSlice("http.request.header."+key, val)`
+  (`attribute_group.go:8037-8038`), so no `attribute.Key` exists for
+  `http.request.header.authorization` and an exact-key set would let it through
+  — materialized as a `String` where semconv says `StringSlice`, and carrying an
+  auth header name into telemetry besides. The generator therefore recognizes
+  these `prefix+key` constructors and emits a namespace rule for each; at least
+  one such key belongs in the CI test. ADR 0006 already makes a pin bump a single
   atomic change with a defined checklist; regenerating this list joins it.
 
   The objection that a future semconv version might standardize a key an
@@ -980,8 +990,23 @@ all along. It is still a propagation-behavior change reaching services that
 opted into nothing, so it belongs in the CHANGELOG under **Fixed** with that
 scope stated plainly. Services on the native path (§9) are unaffected.
 
-"The existing ADR 0016 tests still pass unmodified" is evidence of no
-regression, not evidence of no behavior change. Dedicated compatibility tests
+"The existing ADR 0016 tests still pass unmodified" cannot be the criterion,
+and earlier revisions of this ADR were wrong to lean on it. Implementation §1
+turns `NewSpanProcessor()` into a `Whitelist` method and §4 gives
+`NewBaggageHandler` a second parameter, so eight existing call sites — two in
+`internal/baggageattrs/baggageattrs_test.go`, six in
+`internal/log/handler_test.go` — stop compiling. No compatibility shim is
+warranted: both are `internal/` packages with no external consumers, and adding
+one purely to avoid touching tests would preserve a signature nothing needs.
+
+**The criterion is therefore: those tests are updated at their call sites only,
+and every assertion in them is preserved byte for byte.** A diff that changes an
+`assert`/`require` line in either file is a red flag that needs justifying, not
+a mechanical port. That is the real non-regression proof; "unmodified" was never
+achievable.
+
+Separately, unmodified tests would in any case be evidence of no regression, not
+evidence of no behavior change. Dedicated compatibility tests
 must pin **all three** rows above — the overlong username, the 64-member
 context, and the 8192-byte budget — each accepted today and rejected after.
 
@@ -1411,12 +1436,15 @@ all-or-nothing on baggage.
      `*otelnats.Conn` or an immutable `{propagator, tracingEnabled}` policy
      value;
    - thread it through **every** constructor that mints one of those wrappers —
-     `JetStream()`, `Stream()`, `CreateOrUpdateConsumer()`, `Consumer()`,
-     `Messages()`, and the fetched-batch forwarder — not only the ones on the
-     delivery path being fixed at the time;
+     `JetStream()`, `CreateOrUpdateStream()` (`nats/jetstream.go:288-294`,
+     which returns its own fresh `&stream{s: s}`), `Stream()`,
+     `CreateOrUpdateConsumer()`, `Consumer()`, `Messages()`, and the
+     fetched-batch forwarder — not only the ones on the delivery path being
+     fixed at the time;
    - be tested per **constructor path**, not only per delivery method. A
      consumer obtained through `CreateOrUpdateConsumer` and one obtained through
-     `Consumer` must both restore.
+     `Consumer` must both restore, and so must one reached through a `Stream`
+     returned by `CreateOrUpdateStream` rather than `Stream()`.
 
    Without this the tempting shortcut is to hard-code a propagator in the
    JetStream paths — which is precisely the defect this decision already had to
@@ -1506,7 +1534,9 @@ all-or-nothing on baggage.
      WithTracingEnabled(false))` connection neither injects nor extracts
      baggage, pinning the Decision §9 scope limit so a future upstream change
      that quietly restores propagation is noticed rather than assumed.
-   - Existing ADR 0016 tests pass **unmodified**.
+   - Existing ADR 0016 tests are ported at their **call sites only** — the two
+     `NewSpanProcessor()` sites and the six `NewBaggageHandler(base)` sites —
+     with every assertion preserved verbatim (Compatibility).
 10. **Docs** — `README.md`, which is the SDK's option reference and would
    otherwise go stale the moment `WithBaggageAttributes` ships; an
    "Application-defined baggage attributes" section in `docs/semconv.md`
