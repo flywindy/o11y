@@ -489,10 +489,12 @@ that would shadow its own identity or correlation fields. Two groups:
   namespace, or environment. That is the same spoofing class as `service.name`
   and is refused for the same reason.
 
-Applications are additionally
-directed to use a product namespace, but namespacing is guidance, not an
-enforced rule — an unnamespaced `request_id` is harmless and refusing it buys
-nothing.
+Applications are additionally directed to use a product namespace. That is
+guidance rather than an enforced rule — an unnamespaced `request_id` is harmless
+and refusing it buys nothing — but it is now the *reliable* way to stay clear of
+the reservation, since the reserved set spans the whole pinned semconv package
+and grows with each pin bump. A key under an application-owned namespace can
+never collide with it.
 
 Precedence is defined, not left emergent:
 
@@ -821,9 +823,12 @@ const MaxBaggageAttributeKeys = 8
 // locally but never reach another service); keys that would shadow the SDK's own
 // identity or correlation fields (service.name, service.version,
 // service.namespace, environment, deployment.environment.name, traceId, spanId)
-// or slog's own record fields (time, level, msg, source); keys the SDK itself
-// emits per docs/semconv.md, including anything under the host. and process.
-// namespaces its resource detectors populate; keys longer than
+// or slog's own record fields (time, level, msg, source); ANY key defined by the
+// pinned semconv package -- not only the ones this SDK emits, since the
+// materializer writes every value as a string and semconv pins types (e.g.
+// http.response.body.size is an int) -- including parameterized families with no
+// per-key constant, such as anything under http.request.header., and the host.
+// and process. namespaces the resource detectors populate; keys longer than
 // MaxBaggageKeyBytes;
 // user.name, which is reserved for WithUserBaggage because it carries a PII
 // contract this option does not state; and keys beyond MaxBaggageAttributeKeys.
