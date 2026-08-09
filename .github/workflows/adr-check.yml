@@ -28,3 +28,8 @@ jobs:
 
       - name: check ADR integration policy
         run: go run ./scripts/check_integrations.go
+
+      - name: check generated semconv baggage reservations
+        run: |
+          go generate ./internal/baggageattrs
+          git diff --exit-code -- internal/baggageattrs/semconv_reserved_gen.go

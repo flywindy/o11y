@@ -12,13 +12,15 @@ import (
 
 	"github.com/akira-core/instrumentation-go/otel-nats/otelnats"
 	natsgo "github.com/nats-io/nats.go"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
 
 // MsgHandler is the callback signature for NATS subscriptions managed by this package.
-// ctx carries the trace context extracted from the inbound message headers,
-// enabling log correlation and child span creation within the handler body.
+// ctx carries the consumer span and W3C baggage extracted from the inbound
+// message headers, enabling log correlation, baggage materialization, and child
+// span creation within the handler body.
 //
 // Note: to reply to a message while preserving trace context, use
 // conn.Respond(ctx, msg, data) (or conn.Publish(ctx, msg.Reply, data))
@@ -33,6 +35,24 @@ type MsgHandler func(ctx context.Context, msg *natsgo.Msg)
 // simplified MsgHandler callback.
 type Conn struct {
 	*otelnats.Conn
+	policy propagationPolicy
+}
+
+type propagationPolicy struct {
+	propagator     propagation.TextMapPropagator
+	tracingEnabled bool
+}
+
+func (p propagationPolicy) restoreBaggage(ctx context.Context, headers natsgo.Header) context.Context {
+	if !p.tracingEnabled || p.propagator == nil || len(headers) == 0 {
+		return ctx
+	}
+	extracted := p.propagator.Extract(context.Background(), &otelnats.HeaderCarrier{H: headers})
+	bag := baggage.FromContext(extracted)
+	if bag.Len() == 0 {
+		return ctx
+	}
+	return baggage.ContextWithBaggage(ctx, bag)
 }
 
 // Connect establishes a traced NATS connection.
@@ -97,7 +117,14 @@ func connect(ctx context.Context, url string, tp trace.TracerProvider, prop prop
 	if err != nil {
 		return nil, fmt.Errorf("nats connect %s: %w", url, err)
 	}
-	return &Conn{Conn: nc}, nil
+	_, configuredPropagator := nc.TraceContext()
+	return &Conn{
+		Conn: nc,
+		policy: propagationPolicy{
+			propagator:     configuredPropagator,
+			tracingEnabled: tracingEnabled,
+		},
+	}, nil
 }
 
 // Subscribe subscribes to subject and invokes handler for each inbound message.
@@ -105,7 +132,9 @@ func connect(ctx context.Context, url string, tp trace.TracerProvider, prop prop
 // consumer span holds a span link to the publisher's trace, enabling correlation
 // across services in Grafana Tempo. Calls to slog.InfoContext(ctx, ...) will
 // include the consumer's traceId and spanId; calls to tracer.Start(ctx, ...)
-// produce child spans of the consumer span.
+// produce child spans of the consumer span. On the traced path the facade also
+// restores W3C baggage using this connection's configured propagator without
+// replacing that consumer span context.
 //
 // ctx is checked at registration time only. If ctx is already cancelled or
 // past its deadline, Subscribe returns ctx.Err() without registering the
@@ -129,7 +158,7 @@ func (c *Conn) Subscribe(ctx context.Context, subject string, handler MsgHandler
 		return nil, fmt.Errorf("nats subscribe %q: handler must not be nil", subject)
 	}
 	return c.Conn.Subscribe(subject, func(m otelnats.Msg) {
-		handler(m.Ctx, m.Msg)
+		handler(c.policy.restoreBaggage(m.Ctx, m.Msg.Header), m.Msg)
 	})
 }
 
@@ -155,7 +184,7 @@ func (c *Conn) QueueSubscribe(ctx context.Context, subject, queue string, handle
 		return nil, fmt.Errorf("nats queue-subscribe %q/%q: handler must not be nil", subject, queue)
 	}
 	return c.Conn.QueueSubscribe(subject, queue, func(m otelnats.Msg) {
-		handler(m.Ctx, m.Msg)
+		handler(c.policy.restoreBaggage(m.Ctx, m.Msg.Header), m.Msg)
 	})
 }
 

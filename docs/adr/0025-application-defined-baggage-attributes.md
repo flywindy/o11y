@@ -1,6 +1,6 @@
 # ADR 0025 — Application-Defined Baggage Attributes
 
-**Status**: Proposed
+**Status**: Accepted (implemented)
 **Date**: 2026-08-05
 **Relates to**: ADR 0016 (user identity — this ADR generalizes the fixed
 whitelist that ADR 0016 §Implementation specifics 3 deliberately left closed,

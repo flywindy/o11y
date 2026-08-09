@@ -11,10 +11,29 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/baggage"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
 	o11ynats "github.com/flywindy/o11y/nats"
 )
+
+func assertSpanHasStringAttribute(t *testing.T, sr *tracetest.SpanRecorder, spanName, key, value string) {
+	t.Helper()
+	assert.Eventually(t, func() bool {
+		for _, span := range sr.Ended() {
+			if span.Name() != spanName {
+				continue
+			}
+			for _, attr := range span.Attributes() {
+				if string(attr.Key) == key && attr.Value.AsString() == value {
+					return true
+				}
+			}
+		}
+		return false
+	}, 2*time.Second, 10*time.Millisecond)
+}
 
 func TestJetStream_TracingDisabledPublishConsumeUsesDirectPath(t *testing.T) {
 	_, url := startJetStreamServer(t)
@@ -43,6 +62,7 @@ func TestJetStream_TracingDisabledPublishConsumeUsesDirectPath(t *testing.T) {
 
 	tracer := tp.Tracer("test")
 	consumeCtx, consumeSpan := tracer.Start(context.Background(), "ambient-consume")
+	consumeCtx = contextWithTestBaggage(t, consumeCtx, "app.order.id", "not-injected")
 	_, err = js.Publish(consumeCtx, consumeSubject, []byte("consume"))
 	require.NoError(t, err)
 	consumeSpan.End()
@@ -75,8 +95,12 @@ func TestJetStream_TracingDisabledPublishConsumeUsesDirectPath(t *testing.T) {
 	require.NoError(t, consumed.ackErr)
 	assert.Empty(t, consumed.header.Get("traceparent"),
 		"disabled JetStream publish should not inject traceparent")
+	assert.Empty(t, consumed.header.Get("baggage"),
+		"disabled JetStream publish should not inject baggage")
 	assert.False(t, oteltrace.SpanFromContext(consumed.ctx).SpanContext().IsValid(),
 		"disabled JetStream Consume should deliver a background handler context")
+	assert.Empty(t, baggage.FromContext(consumed.ctx).Member("app.order.id").Key(),
+		"disabled JetStream Consume must not restore a raw baggage header")
 
 	fetchCons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
 		Durable:       "disabled-fetch-test",
@@ -86,7 +110,10 @@ func TestJetStream_TracingDisabledPublishConsumeUsesDirectPath(t *testing.T) {
 	require.NoError(t, err)
 
 	fetchCtx, fetchSpan := tracer.Start(context.Background(), "ambient-fetch")
-	_, err = js.Publish(fetchCtx, fetchSubject, []byte("fetch"))
+	fetchMsg := nats.NewMsg(fetchSubject)
+	fetchMsg.Data = []byte("fetch")
+	fetchMsg.Header.Set("baggage", "app.order.id=forged-fetch")
+	_, err = js.PublishMsg(fetchCtx, fetchMsg)
 	require.NoError(t, err)
 	fetchSpan.End()
 
@@ -107,6 +134,8 @@ func TestJetStream_TracingDisabledPublishConsumeUsesDirectPath(t *testing.T) {
 		"disabled JetStream publish should not inject traceparent")
 	assert.False(t, oteltrace.SpanFromContext(fetched.Ctx).SpanContext().IsValid(),
 		"disabled JetStream Fetch should deliver a background message context")
+	assert.Empty(t, baggage.FromContext(fetched.Ctx).Member("app.order.id").Key(),
+		"disabled JetStream Fetch must not restore a raw baggage header")
 
 	spans := sr.Ended()
 	require.Len(t, spans, 2, "only the explicit ambient spans should be recorded")
@@ -140,6 +169,8 @@ func TestJetStream_Consume_TracePropagation(t *testing.T) {
 		AckPolicy:     jetstream.AckExplicitPolicy,
 	})
 	require.NoError(t, err)
+	cons, err = js.Consumer(context.Background(), streamName, consumerName)
+	require.NoError(t, err, "consumer reacquired through JetStream.Consumer must retain propagation policy")
 
 	ctxCh := make(chan context.Context, 1)
 	cc, err := cons.Consume(context.Background(), func(msgCtx context.Context, m jetstream.Msg) {
@@ -154,6 +185,7 @@ func TestJetStream_Consume_TracePropagation(t *testing.T) {
 
 	tracer := tp.Tracer("test")
 	pubCtx, span := tracer.Start(context.Background(), "publish-event")
+	pubCtx = contextWithTestBaggage(t, pubCtx, "app.order.id", "consume-order")
 	pubTraceID := span.SpanContext().TraceID()
 	_, err = js.Publish(pubCtx, subject, []byte("hello"))
 	require.NoError(t, err)
@@ -168,6 +200,8 @@ func TestJetStream_Consume_TracePropagation(t *testing.T) {
 
 	gotTraceID := oteltrace.SpanFromContext(msgCtx).SpanContext().TraceID()
 	assert.True(t, gotTraceID.IsValid(), "handler ctx should carry a valid trace ID")
+	assert.NotEqual(t, pubTraceID, gotTraceID, "baggage restoration must not replace the consumer span context")
+	assert.Equal(t, "consume-order", baggage.FromContext(msgCtx).Member("app.order.id").Value())
 
 	// otelnats follows OTel messaging semantics: the consumer span starts a new
 	// trace and links back to the producer rather than parenting under it.
@@ -363,15 +397,20 @@ func TestJetStream_Next_TracePropagation(t *testing.T) {
 		Subjects: []string{subject},
 	})
 	require.NoError(t, err)
+	stream, err = js.Stream(context.Background(), streamName)
+	require.NoError(t, err, "stream reacquired through JetStream.Stream must retain propagation policy")
 	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
 		Durable:       consumerName,
 		FilterSubject: subject,
 		AckPolicy:     jetstream.AckExplicitPolicy,
 	})
 	require.NoError(t, err)
+	cons, err = stream.Consumer(context.Background(), consumerName)
+	require.NoError(t, err)
 
 	tracer := tp.Tracer("test")
 	pubCtx, span := tracer.Start(context.Background(), "publish-event")
+	pubCtx = contextWithTestBaggage(t, pubCtx, "app.order.id", "next-order")
 	pubTraceID := span.SpanContext().TraceID()
 	_, err = js.Publish(pubCtx, subject, []byte("hi"))
 	require.NoError(t, err)
@@ -391,6 +430,10 @@ func TestJetStream_Next_TracePropagation(t *testing.T) {
 	assert.True(t, gotTraceID.IsValid(), "Next ctx should carry a valid trace ID")
 	assert.NotEqual(t, pubTraceID, gotTraceID,
 		"the receive span starts a new trace and links to the producer, per OTel messaging semantics")
+	assert.Equal(t, "next-order", baggage.FromContext(msgCtx).Member("app.order.id").Value())
+	_, child := tp.Tracer("test").Start(msgCtx, "process-next")
+	child.End()
+	assertSpanHasStringAttribute(t, sr, "process-next", "app.order.id", "next-order")
 
 	// The single-shot receive span is ended immediately by upstream, so it is
 	// already in Ended() by the time Next returns; poll for robustness.
@@ -433,9 +476,12 @@ func TestJetStream_Messages_TracePropagation(t *testing.T) {
 		AckPolicy:     jetstream.AckExplicitPolicy,
 	})
 	require.NoError(t, err)
+	cons, err = stream.Consumer(context.Background(), consumerName)
+	require.NoError(t, err, "consumer reacquired through Stream.Consumer must retain propagation policy")
 
 	tracer := tp.Tracer("test")
 	pubCtx, span := tracer.Start(context.Background(), "publish-event")
+	pubCtx = contextWithTestBaggage(t, pubCtx, "app.order.id", "messages-order")
 	pubTraceID := span.SpanContext().TraceID()
 	_, err = js.Publish(pubCtx, subject, []byte("hi"))
 	require.NoError(t, err)
@@ -470,6 +516,11 @@ func TestJetStream_Messages_TracePropagation(t *testing.T) {
 
 	gotTraceID := oteltrace.SpanFromContext(res.ctx).SpanContext().TraceID()
 	assert.True(t, gotTraceID.IsValid(), "Next ctx should carry a valid trace ID")
+	assert.NotEqual(t, pubTraceID, gotTraceID, "baggage restoration must preserve the iterator receive span")
+	assert.Equal(t, "messages-order", baggage.FromContext(res.ctx).Member("app.order.id").Value())
+	_, child := tp.Tracer("test").Start(res.ctx, "process-messages")
+	child.End()
+	assertSpanHasStringAttribute(t, sr, "process-messages", "app.order.id", "messages-order")
 	// The pull-iterator receive span is ended on the *next* Next() call (it
 	// spans until the caller asks for the next message), so assert against
 	// Started() — the link is set at span start.
@@ -515,6 +566,7 @@ func TestJetStream_Fetch_TracePropagation(t *testing.T) {
 
 	tracer := tp.Tracer("test")
 	pubCtx, span := tracer.Start(context.Background(), "publish-event")
+	pubCtx = contextWithTestBaggage(t, pubCtx, "app.order.id", "fetch-order")
 	pubTraceID := span.SpanContext().TraceID()
 	_, err = js.Publish(pubCtx, subject, []byte("hi"))
 	require.NoError(t, err)
@@ -546,6 +598,11 @@ drain:
 
 	gotTraceID := oteltrace.SpanFromContext(fetched.Ctx).SpanContext().TraceID()
 	assert.True(t, gotTraceID.IsValid(), "fetched message ctx should carry a valid trace ID")
+	assert.NotEqual(t, pubTraceID, gotTraceID, "baggage restoration must preserve the fetched receive span")
+	assert.Equal(t, "fetch-order", baggage.FromContext(fetched.Ctx).Member("app.order.id").Value())
+	_, child := tp.Tracer("test").Start(fetched.Ctx, "process-fetch")
+	child.End()
+	assertSpanHasStringAttribute(t, sr, "process-fetch", "app.order.id", "fetch-order")
 	// Like the Messages() iterator, the batch's per-message receive span isn't
 	// ended until the next message arrives or the underlying pull request
 	// completes (which can take up to its expiry) — so assert against
@@ -594,13 +651,15 @@ func TestJetStream_FetchBytes_Deliver(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = js.Publish(context.Background(), subject, []byte("a"))
+	pubCtx := contextWithTestBaggage(t, context.Background(), "app.order.id", "fetch-bytes-order")
+	_, err = js.Publish(pubCtx, subject, []byte("a"))
 	require.NoError(t, err)
 
 	fbBatch, err := cons.FetchBytes(context.Background(), 1024, jetstream.FetchMaxWait(500*time.Millisecond))
 	require.NoError(t, err)
 
 	var got int
+	var gotOrderID string
 	timeout := time.After(3 * time.Second)
 drain:
 	for {
@@ -610,12 +669,14 @@ drain:
 				break drain
 			}
 			require.NoError(t, m.Msg.Ack())
+			gotOrderID = baggage.FromContext(m.Ctx).Member("app.order.id").Value()
 			got++
 		case <-timeout:
 			t.Fatal("FetchBytes did not close within timeout")
 		}
 	}
 	require.Equal(t, 1, got, "FetchBytes should deliver exactly the one published message")
+	assert.Equal(t, "fetch-bytes-order", gotOrderID)
 	require.NoError(t, fbBatch.Error())
 }
 
@@ -647,7 +708,8 @@ func TestJetStream_FetchNoWait_Deliver(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = js.Publish(context.Background(), subject, []byte("a"))
+	pubCtx := contextWithTestBaggage(t, context.Background(), "app.order.id", "fetch-nowait-order")
+	_, err = js.Publish(pubCtx, subject, []byte("a"))
 	require.NoError(t, err)
 	require.NoError(t, conn.NatsConn().FlushTimeout(2*time.Second))
 
@@ -660,6 +722,7 @@ func TestJetStream_FetchNoWait_Deliver(t *testing.T) {
 	case m, ok := <-batch.Messages():
 		require.True(t, ok, "FetchNoWait should deliver the already-published message")
 		require.NoError(t, m.Msg.Ack())
+		assert.Equal(t, "fetch-nowait-order", baggage.FromContext(m.Ctx).Member("app.order.id").Value())
 	case <-time.After(3 * time.Second):
 		t.Fatal("FetchNoWait did not deliver within timeout")
 	}

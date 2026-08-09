@@ -19,6 +19,7 @@ For project setup, the `Init` options reference, and feature toggles, see the
 - [The Four Pillars](#the-four-pillars)
   - [Tracing](#tracing)
     - [User Identity Attributes](#user-identity-attributes)
+    - [Application-Defined Baggage Attributes](#application-defined-baggage-attributes)
     - [Trace Sampling](#trace-sampling)
   - [Logging](#logging)
     - [Logging Guidelines](#logging-guidelines)
@@ -103,6 +104,62 @@ baggage onto that service's spans and SDK log records. Empty usernames leave the
 context unchanged. Enable it only after authenticating the user, ignore or
 overwrite untrusted inbound baggage at the edge, strip baggage before calls to
 external third parties, and never promote `user.name` into metric labels.
+
+### Application-Defined Baggage Attributes
+
+ADR 0025 generalizes the same mechanism for identifiers owned by an
+application. Define one shared key registry per product, use an application
+namespace, and configure the same list in every participating service:
+
+```go
+const KeyOrderID = "app.order.id"
+
+obs, err := o11y.Init(ctx,
+    // ...required options...
+    o11y.WithBaggageAttributes(KeyOrderID),
+)
+
+ctx, err = o11y.ContextWithBaggageValue(ctx, KeyOrderID, orderID)
+if err != nil {
+    obs.Logger.WarnContext(ctx, "set baggage attribute failed",
+        slog.String("key", KeyOrderID), slog.Any("error", err))
+    // Telemetry is not load-bearing: continue with the original context.
+}
+```
+
+The setter puts a trusted value on the wire; the option controls whether this
+service copies that key onto spans and SDK log records. Calls to the option
+accumulate and de-duplicate. At most eight application keys are materialized;
+`user.name` remains a separate PII opt-in and does not consume that budget.
+Values are strings, limited to 256 bytes, and never become metric labels.
+
+At a public boundary, do not trust inbound baggage. Prefer a TraceContext-only
+propagator so the framework's entry span is never stamped with forged baggage,
+or clear all baggage before rebuilding only authenticated values:
+
+```go
+ctx = baggage.ContextWithoutBaggage(ctx)
+ctx, err = o11y.ContextWithBaggageValue(ctx, KeyOrderID, authorizedOrderID)
+```
+
+`ContextWithoutBaggageValues` is for internal boundaries where other trusted
+members should survive. Removal must happen before setting because an empty or
+rejected value deliberately leaves the original context unchanged. For an
+entry span that started before the value was established, set the same trusted
+attribute explicitly after the baggage setter succeeds. Strip baggage before
+third-party egress, including deleting any pre-existing outbound `baggage`
+header.
+
+Explicit log attributes win over baggage at the same output path, including
+attributes inside an empty-key group (which `slog` inlines). A named group is a
+different path: after `logger.WithGroup("audit")`, a baggage key is emitted as
+`audit.<key>` and does not collide with the same key previously attached at the
+top level.
+
+HTTP integrations already preserve baggage through their configured
+propagator. The traced NATS facade restores it on Core and JetStream consumer
+contexts. `nats.WithTracingEnabled(false)` intentionally disables all NATS
+propagation, including baggage.
 
 ### Trace Sampling
 

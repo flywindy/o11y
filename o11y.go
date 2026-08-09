@@ -17,6 +17,8 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"sort"
+	"strings"
 	"sync"
 
 	o11ycassandra "github.com/flywindy/o11y/cassandra"
@@ -185,14 +187,17 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	if err := configureSampler(cfg); err != nil {
 		return nil, err
 	}
-	appendUserBaggageWarnings(cfg)
-
 	// 1. Build a shared Resource so TracerProvider, MeterProvider, and
 	//    LoggerProvider all carry identical service-identity attributes.
 	res, err := buildResource(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
+	whitelist, err := configureBaggageWhitelist(cfg, res)
+	if err != nil {
+		return nil, err
+	}
+	appendBaggageWarnings(cfg, whitelist)
 
 	// 2. Initialize TracerProvider (no global state).
 	//    When trace is disabled, a no-op provider is used and the W3C propagator
@@ -205,8 +210,8 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 
 	if cfg.traceEnabled {
 		var spanProcessors []sdktrace.SpanProcessor
-		if cfg.userBaggage {
-			spanProcessors = append(spanProcessors, baggageattrs.NewSpanProcessor())
+		if whitelist.Len() > 0 {
+			spanProcessors = append(spanProcessors, whitelist.NewSpanProcessor())
 		}
 		tp, p, initErr := trace.InitTracer(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, res, cfg.sampler, spanProcessors...)
 		if initErr != nil {
@@ -307,14 +312,14 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 			min:     cfg.logLevel,
 		}
 		logHandler := o11ylog.NewMultiHandler(otelHandler, stdoutHandler)
-		if cfg.userBaggage {
-			logHandler = o11ylog.NewBaggageHandler(logHandler)
+		if whitelist.Len() > 0 {
+			logHandler = o11ylog.NewBaggageHandler(logHandler, whitelist)
 		}
 		logger = slog.New(logHandler)
 	} else {
 		logHandler := stdoutHandler
-		if cfg.userBaggage {
-			logHandler = o11ylog.NewBaggageHandler(logHandler)
+		if whitelist.Len() > 0 {
+			logHandler = o11ylog.NewBaggageHandler(logHandler, whitelist)
 		}
 		logger = slog.New(logHandler)
 	}
@@ -323,6 +328,11 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	// initWarnings holds invalid O11Y_*_ENABLED values collected at config time.
 	for _, w := range cfg.initWarnings {
 		logger.WarnContext(ctx, w)
+	}
+	if whitelist.Len() > 0 {
+		logger.InfoContext(ctx, "baggage attribute materialization configured",
+			slog.Any("keys", whitelist.Keys()),
+		)
 	}
 	// Warn about disabled pillars so operators can confirm intent at startup.
 	if !cfg.traceEnabled {
@@ -493,12 +503,52 @@ func configureSampler(cfg *Config) error {
 	return nil
 }
 
-func appendUserBaggageWarnings(cfg *Config) {
-	if cfg.userBaggage && !cfg.traceEnabled {
+func appendBaggageWarnings(cfg *Config, whitelist baggageattrs.Whitelist) {
+	if whitelist.Len() > 0 && !cfg.traceEnabled {
 		cfg.initWarnings = append(cfg.initWarnings,
-			"WithUserBaggage enabled while trace pillar disabled; user.name baggage will materialize on logs only, not spans",
+			"baggage attribute materialization enabled while trace pillar disabled; baggage still propagates and materializes on logs, but not spans",
 		)
 	}
+}
+
+func configureBaggageWhitelist(cfg *Config, res *resource.Resource) (baggageattrs.Whitelist, error) {
+	effective := make([]string, 0, len(cfg.baggageKeys)+1)
+	if cfg.userBaggage {
+		effective = append(effective, baggageattrs.UserNameKey)
+	}
+	effective = append(effective, cfg.baggageKeys...)
+
+	resourceKeys := make(map[string]struct{})
+	for _, attr := range res.Attributes() {
+		resourceKeys[string(attr.Key)] = struct{}{}
+	}
+	collisions := make([]string, 0)
+	for _, key := range effective {
+		if _, ok := resourceKeys[key]; ok {
+			collisions = append(collisions, key)
+		}
+	}
+	if len(collisions) > 0 {
+		sort.Strings(collisions)
+		return baggageattrs.Whitelist{}, fmt.Errorf(
+			"baggage attribute keys collide with resource attributes: %s", strings.Join(collisions, ", "),
+		)
+	}
+
+	if len(cfg.baggageKeys) > MaxBaggageAttributeKeys {
+		dropped := append([]string(nil), cfg.baggageKeys[MaxBaggageAttributeKeys:]...)
+		cfg.initWarnings = append(cfg.initWarnings, fmt.Sprintf(
+			"WithBaggageAttributes: materializing only the first %d application keys; dropping %v",
+			MaxBaggageAttributeKeys, dropped,
+		))
+		cfg.baggageKeys = append([]string(nil), cfg.baggageKeys[:MaxBaggageAttributeKeys]...)
+	}
+	effective = effective[:0]
+	if cfg.userBaggage {
+		effective = append(effective, baggageattrs.UserNameKey)
+	}
+	effective = append(effective, cfg.baggageKeys...)
+	return baggageattrs.NewWhitelist(effective...), nil
 }
 
 // validateHistogramBuckets ensures the histogram boundaries are in a state

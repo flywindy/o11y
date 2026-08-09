@@ -11,12 +11,14 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
+	"github.com/flywindy/o11y/internal/baggageattrs"
 	o11ynats "github.com/flywindy/o11y/nats"
 )
 
@@ -49,16 +51,26 @@ func startJetStreamServer(t *testing.T) (*server.Server, string) {
 	return s, s.ClientURL()
 }
 
-// newTestProviders returns an in-memory TracerProvider, a TraceContext propagator,
-// and a SpanRecorder. No OTLP endpoint is required.
+// newTestProviders returns an in-memory TracerProvider, the SDK's
+// TraceContext+Baggage propagation shape, and a SpanRecorder.
 func newTestProviders() (oteltrace.TracerProvider, propagation.TextMapPropagator, *tracetest.SpanRecorder) {
 	sr := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithSpanProcessor(baggageattrs.NewWhitelist("app.order.id").NewSpanProcessor()),
 		sdktrace.WithSpanProcessor(sr),
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
 	)
-	prop := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{})
+	prop := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})
 	return tp, prop, sr
+}
+
+func contextWithTestBaggage(t *testing.T, ctx context.Context, key, value string) context.Context {
+	t.Helper()
+	member, err := baggage.NewMemberRaw(key, value)
+	require.NoError(t, err)
+	bag, err := baggage.FromContext(ctx).SetMember(member)
+	require.NoError(t, err)
+	return baggage.ContextWithBaggage(ctx, bag)
 }
 
 // Tracing in these tests is enabled by o11ynats.Connect itself (via
@@ -109,6 +121,7 @@ func TestConnectWithOptions_DisablesTracing(t *testing.T) {
 
 	tracer := tp.Tracer("test")
 	pubCtx, span := tracer.Start(context.Background(), "ambient")
+	pubCtx = contextWithTestBaggage(t, pubCtx, "app.order.id", "not-injected")
 	err = pub.Publish(pubCtx, subject, []byte("hello"))
 	require.NoError(t, err)
 	span.End()
@@ -124,6 +137,23 @@ func TestConnectWithOptions_DisablesTracing(t *testing.T) {
 		"disabled NATS tracing should deliver a background handler context")
 	assert.Empty(t, got.header.Get("traceparent"),
 		"disabled NATS tracing should delegate natively without injecting traceparent")
+	assert.Empty(t, got.header.Get("baggage"),
+		"disabled NATS tracing should delegate natively without injecting baggage")
+	assert.Empty(t, baggage.FromContext(got.ctx).Member("app.order.id").Key(),
+		"disabled NATS tracing should not deliver baggage from the publisher context")
+
+	raw := nats.NewMsg(subject)
+	raw.Data = []byte("raw")
+	raw.Header.Set("baggage", "app.order.id=forged")
+	require.NoError(t, pub.NatsConn().PublishMsg(raw))
+	select {
+	case got = <-received:
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscriber did not receive raw message within timeout")
+	}
+	assert.Equal(t, "app.order.id=forged", got.header.Get("baggage"))
+	assert.Empty(t, baggage.FromContext(got.ctx).Member("app.order.id").Key(),
+		"disabled NATS tracing must not restore a raw baggage header")
 
 	spans := sr.Ended()
 	require.Len(t, spans, 1, "only the explicit ambient span should be recorded")
@@ -171,12 +201,14 @@ func TestSubscribe_ContextPropagation(t *testing.T) {
 	var (
 		wg         sync.WaitGroup
 		gotTraceID oteltrace.TraceID
+		gotOrderID string
 	)
 	wg.Add(1)
 
 	_, err = sub.Subscribe(context.Background(), subject, func(ctx context.Context, _ *nats.Msg) {
 		defer wg.Done()
 		gotTraceID = oteltrace.SpanFromContext(ctx).SpanContext().TraceID()
+		gotOrderID = baggage.FromContext(ctx).Member("app.order.id").Value()
 	})
 	require.NoError(t, err)
 	require.NoError(t, sub.NatsConn().FlushTimeout(2*time.Second))
@@ -185,6 +217,7 @@ func TestSubscribe_ContextPropagation(t *testing.T) {
 	// propagate through the message headers.
 	tracer := tp.Tracer("test")
 	pubCtx, span := tracer.Start(context.Background(), "test-publish")
+	pubCtx = contextWithTestBaggage(t, pubCtx, "app.order.id", "order-42")
 	pubTraceID := span.SpanContext().TraceID()
 
 	err = pub.Publish(pubCtx, subject, []byte("hello"))
@@ -205,6 +238,8 @@ func TestSubscribe_ContextPropagation(t *testing.T) {
 	// Therefore gotTraceID will differ from pubTraceID, but must still be valid.
 	assert.True(t, gotTraceID.IsValid(), "subscriber ctx should carry a valid trace ID")
 	assert.NotEqual(t, oteltrace.TraceID{}, gotTraceID, "subscriber trace ID must not be zero")
+	assert.NotEqual(t, pubTraceID, gotTraceID, "baggage restoration must preserve the consumer span context")
+	assert.Equal(t, "order-42", gotOrderID, "subscriber ctx should retain propagated baggage")
 
 	// The consumer span is ended by a defer inside wrapHandler after our callback
 	// returns. Poll the SpanRecorder until that span appears, then verify it
@@ -222,6 +257,38 @@ func TestSubscribe_ContextPropagation(t *testing.T) {
 		"consumer span should have a span link back to the publisher's trace ID")
 }
 
+func TestSubscribe_UsesConfiguredPropagatorForBaggageRestoration(t *testing.T) {
+	_, url := startTestServer(t)
+	tp, _, _ := newTestProviders()
+	traceOnly := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{})
+
+	pub, err := o11ynats.Connect(context.Background(), url, tp, traceOnly)
+	require.NoError(t, err)
+	defer pub.Close()
+	sub, err := o11ynats.Connect(context.Background(), url, tp, traceOnly)
+	require.NoError(t, err)
+	defer sub.Close()
+
+	received := make(chan context.Context, 1)
+	_, err = sub.Subscribe(context.Background(), "test.trace-only", func(ctx context.Context, _ *nats.Msg) {
+		received <- ctx
+	})
+	require.NoError(t, err)
+	require.NoError(t, sub.NatsConn().FlushTimeout(2*time.Second))
+
+	msg := nats.NewMsg("test.trace-only")
+	msg.Header.Set("baggage", "app.order.id=forged")
+	require.NoError(t, pub.NatsConn().PublishMsg(msg))
+
+	select {
+	case ctx := <-received:
+		assert.Empty(t, baggage.FromContext(ctx).Member("app.order.id").Key(),
+			"a TraceContext-only policy must not be bypassed by the facade")
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscriber did not receive message within timeout")
+	}
+}
+
 func TestQueueSubscribe(t *testing.T) {
 	_, url := startTestServer(t)
 	tp, prop, _ := newTestProviders()
@@ -235,19 +302,21 @@ func TestQueueSubscribe(t *testing.T) {
 	defer sub.Close()
 
 	subject := "test.queue"
-	received := make(chan struct{}, 1)
+	received := make(chan string, 1)
 
-	_, err = sub.QueueSubscribe(context.Background(), subject, "workers", func(_ context.Context, _ *nats.Msg) {
-		received <- struct{}{}
+	_, err = sub.QueueSubscribe(context.Background(), subject, "workers", func(ctx context.Context, _ *nats.Msg) {
+		received <- baggage.FromContext(ctx).Member("app.order.id").Value()
 	})
 	require.NoError(t, err)
 	require.NoError(t, sub.NatsConn().FlushTimeout(2*time.Second))
 
-	err = pub.Publish(context.Background(), subject, []byte("ping"))
+	pubCtx := contextWithTestBaggage(t, context.Background(), "app.order.id", "queue-order")
+	err = pub.Publish(pubCtx, subject, []byte("ping"))
 	require.NoError(t, err)
 
 	select {
-	case <-received:
+	case got := <-received:
+		assert.Equal(t, "queue-order", got)
 	case <-time.After(2 * time.Second):
 		t.Fatal("queue subscriber did not receive message within timeout")
 	}

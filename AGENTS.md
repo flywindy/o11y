@@ -275,7 +275,7 @@ conn.Subscribe(ctx, "o11y.events", func(ctx context.Context, msg *nats.Msg) {
 ```
 
 To make the consumer span itself searchable on domain identifiers the SDK has
-no way to know (a room ID, a site ID, a request ID from the payload), set them
+no way to know (an order ID, a site ID, a request ID from the payload), set them
 on the span the handler was handed — `otel-nats` owns that span's name and
 base attributes and cannot be forked for this (ADR 0022), but its span
 accepts extra attributes like any other:
@@ -283,7 +283,7 @@ accepts extra attributes like any other:
 ```go
 conn.Subscribe(ctx, "o11y.events", func(ctx context.Context, msg *nats.Msg) {
     trace.SpanFromContext(ctx).SetAttributes(
-        attribute.String("app.room_id", roomID),
+        attribute.String("app.order.id", orderID),
     )
     // ...
 })

@@ -176,6 +176,16 @@ _Tracing:_
 | `WithSamplingRatio(ratio)` | unset → OTel default/env | Configure SDK-side head sampling as `ParentBased(TraceIDRatioBased(ratio))`; `ratio` must be in `[0.0, 1.0]` |
 | `WithTraceSampler(sampler)` | unset → OTel default/env | Escape hatch for a custom `sdktrace.Sampler`; a non-nil sampler overrides `OTEL_TRACES_SAMPLER` for this SDK instance |
 
+| `WithBaggageAttributes(keys ...string)` | `nil` | Materialize up to 8 application-defined W3C baggage keys onto spans and SDK log records. Keys must not collide with semconv, Resource, SDK, or slog fields |
+| `WithUserBaggage()` | off | Materialize the PII-bearing semconv `user.name` baggage member; use `ContextWithUser` to set it after authentication |
+
+Application baggage is a two-sided opt-in: call
+`ContextWithBaggageValue(ctx, key, value)` where a trusted value is known, and
+configure `WithBaggageAttributes(key)` in every service that should surface it.
+At public ingress, exclude baggage from extraction or clear all inbound baggage
+before rebuilding authenticated values. Never use these keys as metric labels.
+See [Application-Defined Baggage Attributes](docs/guide.md#application-defined-baggage-attributes).
+
 _Metrics:_
 
 | Option | Default | Description |
