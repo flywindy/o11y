@@ -481,6 +481,15 @@ that would shadow its own identity or correlation fields. Two groups:
   (`semconv/v1.39.0/attribute_group.go:13048-13050`) — wrong type *and*
   shadowing the SDK's own resource value. **Wildcard rows must be enforced as
   namespace-prefix rejections, not literal keys.**
+- **Whatever this process's Resource actually carries.** `buildResource` includes
+  `resource.WithFromEnv()` (`o11y.go:428`), so `OTEL_RESOURCE_ATTRIBUTES` can add
+  keys that appear in no generated set and no fixed list — and a baggage member
+  with that key would shadow the trusted resource value on every span, which is
+  the exact harm this section exists to prevent. The Resource is built at
+  `o11y.go:192`, before the whitelist is assembled, so `Init` **compares the
+  configured keys against `res.Attributes()`** and drops collisions with a WARN.
+  Without that check, "every SDK-emitted key is refused" is false for any
+  deployment that uses the environment variable.
 - **Resource-level service identity**: `service.version`, `service.namespace`,
   `deployment.environment.name` (`docs/semconv.md`, Resource Attributes). These
   do not collide on the log side, but as *span* attributes they shadow the
@@ -529,6 +538,16 @@ Precedence is defined, not left emergent:
   Both `recordHasAttr` and the `presetKeys` accumulation in `WithAttrs` must
   call `Value.Resolve()` before testing for an empty-key group, and flatten
   recursively.
+
+  **The scan and the delegated record must then see the same resolved values.**
+  `slog` resolves again downstream, and a `LogValuer` that is stateful or
+  otherwise non-idempotent can answer differently the second time — so the
+  suppression decision would no longer match the JSON actually written, either
+  emitting a duplicate field or suppressing a value that is no longer there.
+  When — and only when — the scan actually resolved a `LogValuer` into an
+  empty-key group, the handler rebuilds the record from the resolved attributes
+  before delegating, so both sides consume one resolution. Gating on that case
+  keeps the rebuild off the ordinary log path.
 
 **Known limitation — `slog` groups.** If an application calls `WithGroup` on the
 SDK logger, the BaggageHandler's `r.AddAttrs` is nested by the inner handler, so
@@ -608,8 +627,12 @@ propagator**:
 ```go
 // Public listener: extract trace context, never baggage. Nothing to forge,
 // nothing for OnStart to copy onto the entry span.
-gin.Middleware("edge", obs.TracerProvider(), obs.MeterProvider(),
-	propagation.TraceContext{})
+//
+// gin.Middleware returns a []gin.HandlerFunc to be SPREAD into Use
+// (gin/middleware.go:13-15) — calling it without installing the result
+// registers nothing and silently leaves the boundary unsanitized.
+r.Use(gin.Middleware("edge", obs.TracerProvider(), obs.MeterProvider(),
+	propagation.TraceContext{})...)
 
 // Internal hops keep obs.Propagator, so ADR 0016's "identify once at the
 // source" is unaffected.
@@ -956,8 +979,16 @@ whatever results. After this change it rejects, leaving ctx unchanged:
 | username > 256 bytes | accepted | rejected (`MaxBaggageValueBytes`) |
 | any username, when ctx already holds 64 unrelated members | accepted | rejected (member cap) |
 | any username, when the encoded baggage would pass 8192 bytes | accepted | rejected (byte cap) |
+| an **inbound** `user.name` over 256 bytes, from an older SDK, another language, or a raw baggage producer | materialized | skipped at materialization (Decision §8) |
 
-The last two are not about the username at all — an ordinary short name is
+The fourth row is not a source-side rejection at all: it is the materialization
+cap, and it means an upgraded service stops showing an over-cap `user.name` that
+today's `WithUserBaggage` displays — visible during a rolling upgrade as the
+value appearing on old pods and not new ones. It needs its own `user.name`
+regression test, and belongs in the CHANGELOG **Changed** entry alongside the
+other three.
+
+Rows two and three are not about the username either — an ordinary short name is
 refused because of what other producers already put in the context. That is the
 point of the check (Dependency behavior §9: the alternative is the *downstream*
 service silently losing the whole baggage), but it is a behavior change to a
@@ -1317,9 +1348,10 @@ Trust is a property of the caller, and the SDK already lets the application
 express exactly that — by wiring a different propagator per boundary:
 
 ```go
-// Public listener: extract trace context, never baggage.
-publicMux := gin.Middleware("edge", obs.TracerProvider(), obs.MeterProvider(),
-	propagation.TraceContext{})
+// Public listener: extract trace context, never baggage. The slice must be
+// spread into Use — see gin/middleware.go:13-15.
+r.Use(gin.Middleware("edge", obs.TracerProvider(), obs.MeterProvider(),
+	propagation.TraceContext{})...)
 
 // Internal hops: the SDK propagator, baggage included.
 conn, _ := nats.Connect(ctx, url, obs.TracerProvider(), obs.Propagator)
@@ -1409,7 +1441,10 @@ all-or-nothing on baggage.
    on empty, invalid, reserved, `user.name`, and over-cap keys,
    following `WithExtraHTTPServerAttributeKeys` (`options.go:417`).
 6. **`o11y.go`** — assemble the whitelist from both slots (`user.name` when
-   `userBaggage`, plus `baggageKeys`) and gate all three sites
+   `userBaggage`, plus `baggageKeys`), dropping with a WARN any key that
+   collides with the built Resource's own attributes (`res.Attributes()`,
+   available from `o11y.go:192`) — the `OTEL_RESOURCE_ATTRIBUTES` case in
+   Decision §6 that no static list can cover and gate all three sites
    (`o11y.go:208`, `:310`, `:316`) on `whitelist.Len() > 0`. Generalize
    `appendUserBaggageWarnings` (`o11y.go:496`) to log the effective key list at
    startup — the first thing an operator needs when an expected attribute is
@@ -1520,8 +1555,9 @@ all-or-nothing on baggage.
      `WithGroup` combinations; a `-race` test exercising a handler derived
      concurrently.
    - Span precedence: `OnStart` value overwritten by a later `SetAttributes`.
-   - Compatibility: all three `ContextWithUser` rejections that today's
-     implementation accepts — a >256-byte username, an ordinary username into a
+   - Compatibility: an **inbound** `user.name` over `MaxBaggageValueBytes` is
+     materialized today and skipped after, plus all three `ContextWithUser`
+     rejections that today's implementation accepts — a >256-byte username, an ordinary username into a
      context already holding 64 members, and one that would push the encoded
      baggage past 8192 bytes — each leaving ctx unchanged.
    - Empty key list installs neither the processor nor the handler.
@@ -1548,6 +1584,10 @@ all-or-nothing on baggage.
      An application-namespaced key is still accepted.
    - The generated semconv key set matches the pinned package — the CI gate's
      own regression test.
+   - A key supplied through `OTEL_RESOURCE_ATTRIBUTES` is dropped with a WARN
+     when also configured for baggage, and does not shadow the resource value.
+   - A non-idempotent `LogValuer` resolving to an empty-key group produces
+     exactly one field: the scan's decision and the emitted JSON agree.
    - Materialization skips an inbound member whose value exceeds
      `MaxBaggageValueBytes`, built from a legal W3C header the setter never saw.
    - **Boundary contract** (integration-level, pinning what Decision §7 Plane 2
