@@ -545,9 +545,13 @@ Precedence is defined, not left emergent:
   suppression decision would no longer match the JSON actually written, either
   emitting a duplicate field or suppressing a value that is no longer there.
   When — and only when — the scan actually resolved a `LogValuer` into an
-  empty-key group, the handler rebuilds the record from the resolved attributes
-  before delegating, so both sides consume one resolution. Gating on that case
-  keeps the rebuild off the ordinary log path.
+  empty-key group, the handler passes the **resolved** form downstream instead
+  of the original, so both sides consume one resolution. That applies to *both*
+  paths, not just records: `Handle` rebuilds the record from the resolved
+  attributes, and `WithAttrs` delegates a resolved copy of the slice rather than
+  the caller's. Fixing only `Handle` leaves the identical divergence for a
+  `LogValuer` supplied through `Logger.With`. Gating on the resolved-group case
+  keeps both rebuilds off the ordinary path.
 
 **Known limitation — `slog` groups.** If an application calls `WithGroup` on the
 SDK logger, the BaggageHandler's `r.AddAttrs` is nested by the inner handler, so
@@ -853,8 +857,13 @@ const MaxBaggageAttributeKeys = 8
 // per-key constant, such as anything under http.request.header., and the host.
 // and process. namespaces the resource detectors populate; keys longer than
 // MaxBaggageKeyBytes;
-// user.name, which is reserved for WithUserBaggage because it carries a PII
-// contract this option does not state; and keys beyond MaxBaggageAttributeKeys.
+// and user.name, which is reserved for WithUserBaggage because it carries a PII
+// contract this option does not state.
+//
+// MaxBaggageAttributeKeys is applied at Init, after keys colliding with this
+// process's Resource attributes are removed, so a key destined to be discarded
+// never costs another key its slot. Overflow is reported by the same startup
+// WARN.
 // Never route a materialized key into a metric label.
 func WithBaggageAttributes(keys ...string) Option
 
@@ -1444,7 +1453,16 @@ all-or-nothing on baggage.
    `userBaggage`, plus `baggageKeys`), dropping with a WARN any key that
    collides with the built Resource's own attributes (`res.Attributes()`,
    available from `o11y.go:192`) — the `OTEL_RESOURCE_ATTRIBUTES` case in
-   Decision §6 that no static list can cover and gate all three sites
+   Decision §6 that no static list can cover.
+
+   **`MaxBaggageAttributeKeys` is enforced here, after that filtering, not in
+   the option.** The Resource does not exist at option-evaluation time, so a
+   cap applied there would let a key that `Init` is about to discard consume a
+   slot — dropping a later valid key with a WARN and leaving seven effective
+   keys while the contract advertises eight. The option therefore validates
+   what it can statically (syntax, length, static reserved set, `user.name`,
+   duplicates) and accumulates without truncating; `Init` filters resource
+   collisions and *then* truncates, warning on whatever actually overflows and gate all three sites
    (`o11y.go:208`, `:310`, `:316`) on `whitelist.Len() > 0`. Generalize
    `appendUserBaggageWarnings` (`o11y.go:496`) to log the effective key list at
    startup — the first thing an operator needs when an expected attribute is
@@ -1586,6 +1604,11 @@ all-or-nothing on baggage.
      own regression test.
    - A key supplied through `OTEL_RESOURCE_ATTRIBUTES` is dropped with a WARN
      when also configured for baggage, and does not shadow the resource value.
+   - Cap ordering: nine application keys where one collides with a Resource
+     attribute yield **eight** materialized keys, not seven — the collision must
+     not consume a slot.
+   - A non-idempotent `LogValuer` supplied through `Logger.With` (the `WithAttrs`
+     path) suppresses correctly, not only one supplied on the record.
    - A non-idempotent `LogValuer` resolving to an empty-key group produces
      exactly one field: the scan's decision and the emitted JSON agree.
    - Materialization skips an inbound member whose value exceeds
