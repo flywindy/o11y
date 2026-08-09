@@ -431,14 +431,15 @@ structural, not a choice:**
   including whatever `OTEL_RESOURCE_ATTRIBUTES` contributed — is enforced **only
   at `Init`**. `ContextWithBaggageValue` is a package-level function with no SDK
   instance and therefore no Resource to compare against; giving it one would
-  mean ambient global state, which ADR 0003 forbids. If any configured
-  application key collides, `Init` returns an error instead of silently removing
-  the key. Failing initialization is deliberate here: the documented `tag`
-  helper explicitly writes every registered key onto the already-started entry
-  span, so dropping a collision from the materialization whitelist would still
-  let that write shadow the trusted Resource value. Rejecting the configuration
-  is the only enforcement point shared by the whitelist and that writer without
-  introducing global state.
+  mean ambient global state, which ADR 0003 forbids. If any key in the effective
+  whitelist collides — application keys, plus `user.name` when
+  `WithUserBaggage()` is enabled — `Init` returns an error instead of silently
+  removing the key. Failing initialization is deliberate here: the documented
+  `tag` helper and `SetUser` explicitly write those keys onto the already-started
+  entry span, so dropping a collision from the materialization whitelist would
+  still let that write shadow the trusted Resource value. Rejecting the
+  configuration is the only enforcement point shared by the whitelist and those
+  writers without introducing global state.
 
   The generic setter remains intentionally unaware of dynamic Resource keys.
   Applications must use `tag` only with keys registered through
@@ -515,9 +516,10 @@ The groups:
   with that key would shadow the trusted resource value on every span, which is
   the exact harm this section exists to prevent. The Resource is built at
   `o11y.go:192`, before the whitelist is assembled, so `Init` **compares the
-  configured keys against `res.Attributes()`** and returns an error naming every
-  collision. A WARN-and-drop policy is insufficient: the entry-span `tag`
-  helper writes registered keys explicitly after initialization and would still
+  effective whitelist — including `user.name` when enabled — against
+  `res.Attributes()`** and returns an error naming every collision. A
+  WARN-and-drop policy is insufficient: the entry-span `tag` helper and
+  `SetUser` write their keys explicitly after initialization and would still
   shadow the Resource value. Without this check, "every SDK-emitted key is
   refused" is false for any deployment that uses the environment variable.
 - **Resource-level service identity**: `service.version`, `service.namespace`,
@@ -530,10 +532,11 @@ The groups:
 
 Applications are additionally directed to use a product namespace. That is
 guidance rather than an enforced rule — an unnamespaced `request_id` is harmless
-and refusing it buys nothing — but it is now the *reliable* way to stay clear of
-the reservation, since the reserved set spans the whole pinned semconv package
-and grows with each pin bump. A key under an application-owned namespace can
-never collide with it.
+and refusing it buys nothing — but it is the reliable way to stay clear of the
+**currently pinned** semconv reservation. It is not an absolute guarantee: a
+future semconv pin can claim a previously application-owned namespace, and
+`OTEL_RESOURCE_ATTRIBUTES` can introduce any key. The generated reservation and
+the `Init`-time Resource collision check remain authoritative.
 
 Precedence is defined, not left emergent:
 
@@ -811,7 +814,7 @@ the `Messages(ctx)` pull iterator (`:374`), and single-shot `Consumer.Next`
 leaves services on that path silently baggage-free, which is the same failure
 this decision exists to remove.
 
-Three things this deliberately does **not** claim:
+Four things this deliberately does **not** claim:
 
 1. **The consumer span itself stays clean of the restored values.** `OnStart`
    already ran, against a context with no baggage. The consumer span is the
@@ -843,6 +846,14 @@ Three things this deliberately does **not** claim:
    idempotent.
 3. **It does not apply to the native mode** (§9), where nothing was put on the
    wire to restore.
+4. **It does not add channel-subscription APIs.** Neither the upstream
+   `otelnats.Conn` nor this facade exposes `ChanSubscribe` or
+   `ChanQueueSubscribe`; those native APIs deliver raw `*nats.Msg` values with no
+   context-first handler seam on which the facade can restore baggage. Expanding
+   the facade with a second, context-less delivery model is outside this ADR.
+   Applications that need automatic restoration use `Subscribe` or
+   `QueueSubscribe`; callers that deliberately reach the raw native connection
+   own extraction themselves.
 
 This is scoped as part of this ADR because ADR 0025 is what makes the gap
 load-bearing, but it repairs an ADR 0016 Phase 2 promise that has been untrue
@@ -897,10 +908,12 @@ const MaxBaggageAttributeKeys = 8
 // and user.name, which is reserved for WithUserBaggage because it carries a PII
 // contract this option does not state.
 //
-// Init returns an error if a statically accepted key collides with an attribute
-// on this process's actual Resource, including a key supplied through
-// OTEL_RESOURCE_ATTRIBUTES. Dropping it is not safe because application code
-// also writes registered keys explicitly onto already-started entry spans.
+// Init returns an error if any key in the effective whitelist collides with an
+// attribute on this process's actual Resource, including a key supplied through
+// OTEL_RESOURCE_ATTRIBUTES. The effective whitelist includes user.name when
+// WithUserBaggage is enabled. Dropping a collision is not safe because
+// application code also writes these keys explicitly onto already-started entry
+// spans.
 // MaxBaggageAttributeKeys is applied at Init after that collision check;
 // overflow is reported by the same startup WARN.
 // Never route a materialized key into a metric label.
@@ -1028,7 +1041,7 @@ whatever results. After this change it rejects, leaving ctx unchanged:
 |---|---|---|
 | username > 256 bytes | accepted | rejected (`MaxBaggageValueBytes`) |
 | any username, when ctx already holds 64 unrelated wire-serializable members | accepted | rejected (member cap) |
-| any username, when the encoded baggage would pass 8192 bytes | accepted | rejected (byte cap) |
+| any username, when the encoded baggage would exceed 8192 bytes | accepted | rejected (byte cap) |
 | an **inbound** `user.name` over 256 bytes, from an older SDK, another language, or a raw baggage producer | materialized | skipped at materialization (Decision §8) |
 
 The fourth row is not a source-side rejection at all: it is the materialization
@@ -1211,9 +1224,10 @@ func Ingress(log *slog.Logger) gin.HandlerFunc {
 			}
 		}
 
-		// Authorize before tagging. ContextWithBaggageValue checks syntax and
-		// size, never authorization: tagging a raw route parameter would let the
-		// caller choose what enters trusted telemetry and downstream baggage.
+		// Authorize before tagging. ContextWithBaggageValue checks syntax,
+		// reservations, key/value limits, and total size, never authorization:
+		// tagging a raw route parameter would let the caller choose what enters
+		// trusted telemetry and downstream baggage.
 		if room, ok := authz.ResolveRoom(c, account, c.Param("roomID")); ok {
 			ctx = tag(ctx, log, app.KeyRoomID, room.CanonicalID)
 		}
@@ -1509,13 +1523,15 @@ all-or-nothing on baggage.
    `WithExtraHTTPServerAttributeKeys` (`options.go:417`). Accumulate valid unique
    keys without truncating; the cap is applied at `Init` after its Resource
    collision check.
-6. **`o11y.go`** — assemble the whitelist from both slots (`user.name` when
-   `userBaggage`, plus `baggageKeys`) only after comparing every application key
+6. **`o11y.go`** — form the effective whitelist from both slots (`user.name`
+   when `userBaggage`, plus `baggageKeys`) and compare **every effective key**
    with the built Resource's own attributes (`res.Attributes()`, available from
-   `o11y.go:192`) — the `OTEL_RESOURCE_ATTRIBUTES` case in Decision §6 that no
-   static list can cover. Collect all colliding keys and return one deterministic
-   `Init` error listing them; do not WARN-and-drop them, because the documented
-   entry-span writer would otherwise still shadow the Resource.
+   `o11y.go:192`) before constructing the `Whitelist` — the
+   `OTEL_RESOURCE_ATTRIBUTES` case in Decision §6 that no static list can cover.
+   This includes `user.name`: `WithUserBaggage` makes it materializable and
+   `SetUser` writes it explicitly, so treating it differently would preserve the
+   same shadowing gap under another option. Collect all colliding keys and return
+   one deterministic `Init` error listing them; do not WARN-and-drop them.
 
    **`MaxBaggageAttributeKeys` is enforced here, after that collision check, not
    in the option.** If a collision exists initialization has already failed, so
@@ -1640,7 +1656,9 @@ all-or-nothing on baggage.
      rejections that today's implementation accepts — a >256-byte username, an ordinary username into a
      context already holding 64 wire-serializable members, and one that would push the encoded
      baggage past 8192 bytes — each leaving ctx unchanged.
-   - Empty key list installs neither the processor nor the handler.
+   - An empty **effective whitelist** installs neither the processor nor the
+     handler. An empty application key list with `WithUserBaggage()` enabled is
+     not empty and still installs both integrations.
    - **NATS baggage restoration** (Decision §10): publish with baggage set,
      receive through `Subscribe`, `QueueSubscribe`, JetStream `Consume`, the
      fetched-message channel, the `Messages(ctx)` iterator, and single-shot
@@ -1653,7 +1671,11 @@ all-or-nothing on baggage.
      assert that a child span started from the restored context carries the
      attributes, since the receive span itself is ended and cannot. A regression
      here silently returns the SDK to the §12 behavior, so this is the test that
-     matters most for the stated use case.
+     matters most for the stated use case. `ChanSubscribe` and
+     `ChanQueueSubscribe` are intentionally excluded per Decision §10: neither
+     facade exposes those context-less native delivery APIs. The native-mode
+     no-inject/no-extract case is pinned separately by the Boundary contract
+     test below.
    - Semconv keys are refused at both the option and the setter, covering all
      three shapes: one the SDK emits (`http.response.status_code`), one it does
      **not** emit but semconv defines as an int (`http.response.body.size`), and
@@ -1665,9 +1687,11 @@ all-or-nothing on baggage.
    - The generated semconv key set matches the pinned package — the CI gate's
      own regression test.
    - A key supplied through `OTEL_RESOURCE_ATTRIBUTES` causes `Init` to fail when
-     also configured for baggage, with the colliding key in the error; no SDK,
-     whitelist, or entry-span writer is made available in that configuration.
-     Multiple collisions are reported together in deterministic order.
+     it also appears in the effective whitelist, with the colliding key in the
+     error; no SDK, whitelist, or entry-span writer is made available in that
+     configuration. Cover both an application key and `user.name` enabled via
+     `WithUserBaggage()`. Multiple collisions are reported together in
+     deterministic order.
    - Cap ordering remains deterministic after the Resource check: with no
      collisions, the first eight validated unique application keys materialize
      and the ninth is warned and dropped. A colliding key never consumes a slot
