@@ -439,18 +439,28 @@ that would shadow its own identity or correlation fields. Two groups:
   materialization is the alternative and is rejected — it would put a type
   system into a mechanism whose entire premise is that keys are opaque.
 
-  **Residual risk, stated rather than papered over.** This rule covers keys the
-  SDK emits *today*. A semconv key it does not emit — `http.response.body.size`
-  is an integer in `semconv/v1.39.0` and absent from `docs/semconv.md` — passes
-  the check and would materialize as a string. Rejecting *every* recognized
-  semconv key would close that, but the SDK cannot enumerate them: Go offers no
-  runtime reflection over a package's constants, so it would need a generated
-  list regenerated on every semconv pin bump (ADR 0006), and the list would then
-  reject keys an application had legitimately adopted before the bump. The
-  enforceable rule is therefore the catalog; the protection against the rest is
-  the namespacing guidance below, and it is guidance for this reason rather than
-  laziness. An application that puts its keys under its own namespace cannot hit
-  this at all.
+  **The reserved set is the whole pinned semconv package, not just the SDK's
+  own catalog.** An earlier revision limited it to keys the SDK emits today and
+  filed the rest as residual risk. That was wrong. `http.response.body.size` is
+  an integer in `semconv/v1.39.0` and absent from `docs/semconv.md`, so it would
+  pass a catalog-only check and be materialized as a string — the SDK knowingly
+  emitting non-conformant telemetry, which contradicts three things this ADR and
+  the repository already assert: that application keys have no semconv constant
+  (Context, above), that the generic option holds no semantic-convention opinion
+  (its own doc comment), and `AGENTS.md`'s requirement that every semconv
+  attribute key *and type* match the pinned version.
+
+  Go has no runtime reflection over package constants, but that only rules out
+  discovering the set at run time. **The set is generated at build time from the
+  pinned `semconv/v1.39.0/attribute_group.go` and checked in**, with a CI gate —
+  alongside the existing `scripts/check_integrations.go` — asserting the
+  generated file matches the pin. ADR 0006 already makes a pin bump a single
+  atomic change with a defined checklist; regenerating this list joins it.
+
+  The objection that a future semconv version might standardize a key an
+  application already uses is real, and it is **ADR 0006's** problem: a pin bump
+  that newly collides with a live application key is a migration to plan in that
+  upgrade, not a reason to emit the wrong type today.
 - **Wildcard-catalogued resource namespaces**: `host.` and `process.`. The
   catalog lists these as `host.*` and `process.*` (`docs/semconv.md:51-52`)
   because `resource.WithHost()` / `resource.WithProcess()` *detect* them at
@@ -620,6 +630,17 @@ does not (Dependency behavior §9). Three separate bounds:
 | Key length | 128 bytes | the shared header budget, at the setter. |
 | Value length (`MaxBaggageValueBytes`) | 256 bytes | the same, at the setter. |
 | Post-set baggage size | 64 members / 8192 bytes | the whole header. Checked **after** the member is added; on breach the setter returns an error and the **original** context. |
+| Materialized value length | `MaxBaggageValueBytes` | this service's own telemetry volume, at the **materialization** side. |
+
+The last row is not redundant with the setter cap: the setter only governs
+values this SDK produces. A member arriving on the wire — from an OTel producer
+in another language, a Go service using the raw `baggage` API, or any hand-built
+but perfectly legal W3C header — can carry a value approaching the full 8192
+bytes, and materialization would copy it onto **every span and every log record**
+the service emits. That is telemetry amplification from a single inbound header.
+The whitelist enricher therefore skips a member whose value exceeds
+`MaxBaggageValueBytes`, and the case — a valid header, an over-cap value — is a
+required test.
 
 The post-set check is what actually prevents Dependency behavior §9. It costs a
 `Baggage.String()` per set; with at most 64 members that is accepted knowingly
@@ -1116,9 +1137,18 @@ setter for a NATS router) silently does nothing.
   delete the `baggage` header from the outbound one.
 - **Metrics**: never promote a materialized key to a metric label.
 - **`slog` groups**: do not call `WithGroup` on the SDK logger; see Decision §6.
-- **Partial rollout is safe**: baggage propagates through services that have not
-  enabled the option; those services simply do not show the value on their own
-  telemetry.
+- **Rollout has a required order, and "partial rollout is safe" applies only
+  after step 2.** Because the NATS restoration is unconditional (Decision §10)
+  and today's consumers drop baggage (§12), a rolling deployment has new pods
+  restoring and forwarding while old pods still drop — the same message path
+  intermittently carries the identifier, which is worse to debug than not having
+  it. Order:
+  1. Deploy the SDK version containing the NATS restoration to **every** service
+     that consumes from the mesh, including intermediaries and all replicas.
+  2. Confirm no pre-restoration consumer remains on any hop.
+  3. *Then* enable application baggage keys, which can safely be done service by
+     service — a service without the option still forwards baggage and simply
+     does not show it on its own telemetry.
 
 ---
 
@@ -1320,7 +1350,10 @@ all-or-nothing on baggage.
    ADR 0016 and is wrong.
 3. **Size enforcement** — `ContextWithValue` builds the candidate baggage, then
    rejects and returns the original context if the result exceeds 64 members or
-   `len(bag.String()) > 8192`.
+   `len(bag.String()) > 8192`. Separately, the **materialization** side
+   (`SpanAttributesFromContext` / `LogAttrsFromContext`) skips any whitelisted
+   member whose value exceeds `MaxBaggageValueBytes`: the setter cap governs only
+   what this SDK produces, and an inbound member can be far larger (Decision §8).
 4. **`internal/log/handler.go`** — replace `hasUserNameAttr bool` with a
    `presetKeys map[string]struct{}` built clone-on-write in `WithAttrs` (never
    mutate a map shared with a derived handler) and **reset in `WithGroup`**,
@@ -1363,6 +1396,32 @@ all-or-nothing on baggage.
    would overwrite the consumer span context `otel-nats` just set. Skip the
    restore entirely when tracing is disabled for the connection (Decision §9;
    `conn_direct.go:57-61` still invokes the facade wrapper with intact headers).
+   **The JetStream wrapper graph cannot reach that policy today, and must be
+   changed to carry it.** `Conn` embeds `*otelnats.Conn` (`nats/conn.go:34-36`)
+   so Core NATS can reach `TraceContext()`, but the reference is dropped at the
+   very first JetStream hop: `JetStream()` returns `&jetStream{js: js}`
+   (`nats/jetstream.go:274`), and `stream` (`:328`), `consumer` (`:356`) and
+   `messagesContext` (`:610`) each hold only their upstream object. By the time
+   `Consume`, `Next`, `Messages().Next` or the fetched-message forwarder runs,
+   the connection's propagator and `tracingEnabled` are unreachable.
+
+   So the implementation must:
+
+   - give `jetStream`, `stream`, `consumer` and `messagesContext` either the
+     `*otelnats.Conn` or an immutable `{propagator, tracingEnabled}` policy
+     value;
+   - thread it through **every** constructor that mints one of those wrappers —
+     `JetStream()`, `Stream()`, `CreateOrUpdateConsumer()`, `Consumer()`,
+     `Messages()`, and the fetched-batch forwarder — not only the ones on the
+     delivery path being fixed at the time;
+   - be tested per **constructor path**, not only per delivery method. A
+     consumer obtained through `CreateOrUpdateConsumer` and one obtained through
+     `Consumer` must both restore.
+
+   Without this the tempting shortcut is to hard-code a propagator in the
+   JetStream paths — which is precisely the defect this decision already had to
+   correct once.
+
    Re-audit these call sites on every `otel-nats` bump — if upstream starts
    preserving `msgCtx`, the restore becomes redundant rather than wrong, but the
    ADR's §12 evidence would need updating.
@@ -1422,14 +1481,23 @@ all-or-nothing on baggage.
      fetched-message channel, the `Messages(ctx)` iterator, and single-shot
      `Consumer.Next` — all four upstream discarding sites plus both facade
      wrappers; assert the handler context carries the members and that the
-     consumer span context is unchanged by the restore. On the pull paths also
+     consumer span context is unchanged by the restore. Cover each **constructor
+     path** too, not just each delivery method: a consumer reached via
+     `CreateOrUpdateConsumer` and one via `Consumer` must both restore, which is
+     what catches a policy field threaded through only some of the wrappers. On the pull paths also
      assert that a child span started from the restored context carries the
      attributes, since the receive span itself is ended and cannot. A regression
      here silently returns the SDK to the §12 behavior, so this is the test that
      matters most for the stated use case.
-   - SDK-catalogued keys such as `http.response.status_code` are refused at both
-     the option and the setter, and so is a wildcard-catalogued key such as
-     `process.pid`, which only a namespace-prefix check catches.
+   - Semconv keys are refused at both the option and the setter, covering all
+     three shapes: one the SDK emits (`http.response.status_code`), one it does
+     **not** emit but semconv defines as an int (`http.response.body.size`), and
+     a wildcard-catalogued one that only a namespace-prefix check catches
+     (`process.pid`). An application-namespaced key is still accepted.
+   - The generated semconv key set matches the pinned package — the CI gate's
+     own regression test.
+   - Materialization skips an inbound member whose value exceeds
+     `MaxBaggageValueBytes`, built from a legal W3C header the setter never saw.
    - **Boundary contract** (integration-level, pinning what Decision §7 Plane 2
      and Q6 now recommend): a server wired with a `TraceContext`-only propagator
      records no application baggage attributes on its entry span even when the
