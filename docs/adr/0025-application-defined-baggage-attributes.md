@@ -328,9 +328,11 @@ and SDK log records. Keys are opaque to the SDK. Calls accumulate, and a key
 already registered is **silently** ignored — registering the same key twice is
 harmless and idempotent, unlike the *collisions*
 `WithExtraHTTPServerAttributeKeys` warns about, which would merge two distinct
-values into one label. Keys that are actually *rejected* are dropped with a
+values into one label. Keys rejected by static validation are dropped with a
 startup WARN rather than failing `Init`, matching that option
-(`options.go:417`).
+(`options.go:417`). The one stricter case is a collision with this process's
+actual Resource attributes: that is known only after the Resource is built and
+causes `Init` to fail, for the security reason in §6.
 
 **`user.name` is rejected by this option**, with a WARN pointing at
 `WithUserBaggage()`. The generic path is defined as carrying no contract beyond
@@ -429,12 +431,19 @@ structural, not a choice:**
   including whatever `OTEL_RESOURCE_ATTRIBUTES` contributed — is enforced **only
   at `Init`**. `ContextWithBaggageValue` is a package-level function with no SDK
   instance and therefore no Resource to compare against; giving it one would
-  mean an ambient global, which ADR 0003 forbids. A service that sets such a key
-  through the *setter* rather than registering it will not be stopped — but it
-  also will not be materialized, because the option-side check kept it out of
-  the whitelist. The harm this reservation prevents is materialization, so
-  option-side enforcement is sufficient; the setter's silence on it is a
-  documented consequence, not a gap left open.
+  mean ambient global state, which ADR 0003 forbids. If any configured
+  application key collides, `Init` returns an error instead of silently removing
+  the key. Failing initialization is deliberate here: the documented `tag`
+  helper explicitly writes every registered key onto the already-started entry
+  span, so dropping a collision from the materialization whitelist would still
+  let that write shadow the trusted Resource value. Rejecting the configuration
+  is the only enforcement point shared by the whitelist and that writer without
+  introducing global state.
+
+  The generic setter remains intentionally unaware of dynamic Resource keys.
+  Applications must use `tag` only with keys registered through
+  `WithBaggageAttributes`; arbitrary direct `Span.SetAttributes` calls are
+  outside this API's enforcement boundary and remain application responsibility.
 
 The groups:
 
@@ -506,9 +515,11 @@ The groups:
   with that key would shadow the trusted resource value on every span, which is
   the exact harm this section exists to prevent. The Resource is built at
   `o11y.go:192`, before the whitelist is assembled, so `Init` **compares the
-  configured keys against `res.Attributes()`** and drops collisions with a WARN.
-  Without that check, "every SDK-emitted key is refused" is false for any
-  deployment that uses the environment variable.
+  configured keys against `res.Attributes()`** and returns an error naming every
+  collision. A WARN-and-drop policy is insufficient: the entry-span `tag`
+  helper writes registered keys explicitly after initialization and would still
+  shadow the Resource value. Without this check, "every SDK-emitted key is
+  refused" is false for any deployment that uses the environment variable.
 - **Resource-level service identity**: `service.version`, `service.namespace`,
   `deployment.environment.name` (`docs/semconv.md`, Resource Attributes). These
   do not collide on the log side, but as *span* attributes they shadow the
@@ -563,14 +574,17 @@ Precedence is defined, not left emergent:
   otherwise non-idempotent can answer differently the second time — so the
   suppression decision would no longer match the JSON actually written, either
   emitting a duplicate field or suppressing a value that is no longer there.
-  When — and only when — the scan actually resolved a `LogValuer` into an
-  empty-key group, the handler passes the **resolved** form downstream instead
-  of the original, so both sides consume one resolution. That applies to *both*
-  paths, not just records: `Handle` rebuilds the record from the resolved
-  attributes, and `WithAttrs` delegates a resolved copy of the slice rather than
-  the caller's. Fixing only `Handle` leaves the identical divergence for a
-  `LogValuer` supplied through `Logger.With`. Gating on the resolved-group case
-  keeps both rebuilds off the ordinary path.
+  Whenever the scan resolves **any** `LogValuer`, the handler passes the resolved
+  form downstream instead of the original, regardless of whether that first
+  result is a scalar, a named group, or an empty-key group. Otherwise a
+  non-idempotent value can first resolve to a scalar (so baggage is added) and
+  then resolve inside `JSONHandler` to an inlined group containing the same key
+  (so a duplicate is emitted). This applies to *both* paths, not just records:
+  `Handle` rebuilds the record from resolved attributes, and `WithAttrs`
+  delegates a resolved copy of the slice rather than the caller's. Fixing only
+  `Handle` leaves the identical divergence for a `LogValuer` supplied through
+  `Logger.With`. Records and slices containing no `LogValuer` retain the ordinary
+  no-rebuild path.
 
 **Known limitation — `slog` groups.** If an application calls `WithGroup` on the
 SDK logger, the BaggageHandler's `r.AddAttrs` is nested by the inner handler, so
@@ -687,7 +701,7 @@ does not (Dependency behavior §9). Three separate bounds:
 | `MaxBaggageAttributeKeys` | 8 | the per-span and per-record enrichment loops. Applies to the **application key list only** — not to the wire, and not to `user.name`, which has its own slot (§3). |
 | Key length | 128 bytes | the shared header budget, at the setter. |
 | Value length (`MaxBaggageValueBytes`) | 256 bytes | the same, at the setter. |
-| Post-set baggage size | 64 members / 8192 bytes | the whole header. Checked **after** the member is added; on breach the setter returns an error and the **original** context. |
+| Post-set baggage size | 64 wire members / 8192 encoded bytes | the serialized header. Checked **after** the member is added; on breach the setter returns an error and the **original** context. Members that `Baggage.String()` omits do not consume the wire-member cap. |
 | Materialized value length | `MaxBaggageValueBytes` | this service's own telemetry volume, at the **materialization** side. |
 
 The last row is not redundant with the setter cap: the setter only governs
@@ -700,11 +714,15 @@ The whitelist enricher therefore skips a member whose value exceeds
 `MaxBaggageValueBytes`, and the case — a valid header, an over-cap value — is a
 required test.
 
-The post-set check is what actually prevents Dependency behavior §9. It costs a
-`Baggage.String()` per set; with at most 64 members that is accepted knowingly
-in exchange for not silently truncating or dropping baggage at every downstream
-hop. Do not remove it for performance without replacing it with an equivalent
-bound.
+The post-set check is what actually prevents Dependency behavior §9. It counts
+only members whose `Member.String()` is non-empty — the same condition
+`Baggage.String()` uses before placing a member on the wire — and checks the
+encoded header length. Using `Baggage.Len()` here would reject a valid one-member
+header merely because the local context also carries 64 `NewMemberRaw` members
+whose keys the W3C serializer omits. The serialization work per set is accepted
+knowingly in exchange for neither over-rejecting that case nor silently
+truncating or dropping baggage at every downstream hop. Do not remove it for
+performance without replacing it with equivalent wire-aware bounds.
 
 ### 9. Scope limitation: the traced NATS path is required
 
@@ -874,15 +892,17 @@ const MaxBaggageAttributeKeys = 8
 // materializer writes every value as a string and semconv pins types (e.g.
 // http.response.body.size is an int) -- including parameterized families with no
 // per-key constant, such as anything under http.request.header., and the host.
-// and process. namespaces the resource detectors populate; keys longer than
+// and process. namespace prefixes populated by resource detectors; keys longer than
 // MaxBaggageKeyBytes;
 // and user.name, which is reserved for WithUserBaggage because it carries a PII
 // contract this option does not state.
 //
-// MaxBaggageAttributeKeys is applied at Init, after keys colliding with this
-// process's Resource attributes are removed, so a key destined to be discarded
-// never costs another key its slot. Overflow is reported by the same startup
-// WARN.
+// Init returns an error if a statically accepted key collides with an attribute
+// on this process's actual Resource, including a key supplied through
+// OTEL_RESOURCE_ATTRIBUTES. Dropping it is not safe because application code
+// also writes registered keys explicitly onto already-started entry spans.
+// MaxBaggageAttributeKeys is applied at Init after that collision check;
+// overflow is reported by the same startup WARN.
 // Never route a materialized key into a metric label.
 func WithBaggageAttributes(keys ...string) Option
 
@@ -930,7 +950,9 @@ const MaxBaggageKeyBytes = baggageattrs.MaxBaggageKeyBytes
 // Returns an error, leaving ctx unchanged, when the key is invalid or reserved,
 // when the key exceeds MaxBaggageKeyBytes or the value exceeds
 // MaxBaggageValueBytes, or when adding the member would
-// push the baggage past the W3C limits of 64 members / 8192 encoded bytes.
+// push the serialized baggage past the W3C limits of 64 wire members / 8192
+// encoded bytes. Locally held members that Baggage.String omits do not consume
+// the wire-member cap.
 // That last check matters: on the receiving side a header past 64 members is
 // truncated to the first 64 in header order, and one past 8192 bytes yields no
 // baggage at all for that request — user.name included.
@@ -1005,7 +1027,7 @@ whatever results. After this change it rejects, leaving ctx unchanged:
 | Input | Today | After |
 |---|---|---|
 | username > 256 bytes | accepted | rejected (`MaxBaggageValueBytes`) |
-| any username, when ctx already holds 64 unrelated members | accepted | rejected (member cap) |
+| any username, when ctx already holds 64 unrelated wire-serializable members | accepted | rejected (member cap) |
 | any username, when the encoded baggage would pass 8192 bytes | accepted | rejected (byte cap) |
 | an **inbound** `user.name` over 256 bytes, from an older SDK, another language, or a raw baggage producer | materialized | skipped at materialization (Decision §8) |
 
@@ -1119,6 +1141,14 @@ Applications should therefore do both at the point of identification. Because
 span attributes are last-write-wins, the explicit write also overwrites anything
 a forged inbound member put on the entry span *for this key*.
 
+The helper below accepts **only keys returned by the application's
+`BaggageKeys` registry** and passed to `WithBaggageAttributes` at startup. `Init`
+checks that complete registered set against the built Resource and fails on a
+collision before any request can reach the explicit span write. Passing an
+arbitrary or caller-controlled key to `tag` is outside this contract; the
+package-level setter cannot discover process Resource attributes without the
+global state ADR 0003 forbids.
+
 **Order matters: set the baggage first, and only write the span if that
 succeeded.** The reserved-key, key-length, value-length, and total-size checks
 all live in the setter. Writing the span first would put a value on the entry
@@ -1126,7 +1156,8 @@ span that the SDK just refused — a reserved key, or a value past the cap —
 letting the span silently bypass every guard this ADR defines:
 
 ```go
-// application helper — log through the SDK logger, not the slog default:
+// application helper for keys from app.BaggageKeys only — log through the SDK
+// logger, not the slog default:
 // Init deliberately does not call slog.SetDefault (ADR 0003), so a bare
 // slog.WarnContext here would bypass the SDK's JSON/OTLP chain and lose the
 // traceId/spanId that make this diagnostic findable.
@@ -1446,8 +1477,11 @@ all-or-nothing on baggage.
    (Decision §4). Routing `ContextWithUser` through the public setter breaks
    ADR 0016 and is wrong.
 3. **Size enforcement** — `ContextWithValue` builds the candidate baggage, then
-   rejects and returns the original context if the result exceeds 64 members or
-   `len(bag.String()) > 8192`. Separately, the **materialization** side
+   serializes it and rejects with the original context if more than 64 members
+   have a non-empty `Member.String()` or `len(bag.String()) > 8192`. Do not use
+   `bag.Len()` for the first check: it counts local `NewMemberRaw` entries whose
+   invalid W3C keys `Baggage.String()` omits, and those entries consume no header
+   budget. Separately, the **materialization** side
    (`SpanAttributesFromContext` / `LogAttrsFromContext`) skips any whitelisted
    member whose value exceeds `MaxBaggageValueBytes`: the setter cap governs only
    what this SDK produces, and an inbound member can be far larger (Decision §8).
@@ -1459,29 +1493,34 @@ all-or-nothing on baggage.
    the `Whitelist` on the handler. Both `recordHasAttr` and the
    `presetKeys` accumulation must call `Value.Resolve()` and then recurse into
    empty-key groups, which `slog` inlines into the output
-   (`log/slog/handler.go:57`, resolved first at `:468`). `NewBaggageHandler` takes the
-   whitelist as a second parameter. Preserve the precedence in Decision §6.
+   (`log/slog/handler.go:57`, resolved first at `:468`). If that scan encounters
+   any `LogValuer`, delegate its resolved form — for scalars and named groups as
+   well as empty-key groups — by rebuilding the record in `Handle` and passing a
+   resolved slice from `WithAttrs`. Otherwise a non-idempotent value is resolved
+   again by the inner handler and can change the collision decision. Keep the
+   no-rebuild path when no `LogValuer` was resolved. `NewBaggageHandler` takes
+   the whitelist as a second parameter. Preserve the precedence in Decision §6.
 5. **`options.go`** — add `baggageKeys []string` to `Config` for application
    keys and **keep `userBaggage bool` as its own slot** (Decision §3), so
    `user.name` is neither settable through the generic option nor evictable by
    `MaxBaggageAttributeKeys`. Add `WithBaggageAttributes` and
-   `MaxBaggageAttributeKeys`; update `WithUserBaggage`'s doc comment. Drop-with-WARN
-   on empty, invalid, reserved, `user.name`, and over-cap keys,
-   following `WithExtraHTTPServerAttributeKeys` (`options.go:417`).
+   `MaxBaggageAttributeKeys`; update `WithUserBaggage`'s doc comment. Drop with a
+   WARN on empty, invalid, statically reserved, and `user.name` keys, following
+   `WithExtraHTTPServerAttributeKeys` (`options.go:417`). Accumulate valid unique
+   keys without truncating; the cap is applied at `Init` after its Resource
+   collision check.
 6. **`o11y.go`** — assemble the whitelist from both slots (`user.name` when
-   `userBaggage`, plus `baggageKeys`), dropping with a WARN any key that
-   collides with the built Resource's own attributes (`res.Attributes()`,
-   available from `o11y.go:192`) — the `OTEL_RESOURCE_ATTRIBUTES` case in
-   Decision §6 that no static list can cover.
+   `userBaggage`, plus `baggageKeys`) only after comparing every application key
+   with the built Resource's own attributes (`res.Attributes()`, available from
+   `o11y.go:192`) — the `OTEL_RESOURCE_ATTRIBUTES` case in Decision §6 that no
+   static list can cover. Collect all colliding keys and return one deterministic
+   `Init` error listing them; do not WARN-and-drop them, because the documented
+   entry-span writer would otherwise still shadow the Resource.
 
-   **`MaxBaggageAttributeKeys` is enforced here, after that filtering, not in
-   the option.** The Resource does not exist at option-evaluation time, so a
-   cap applied there would let a key that `Init` is about to discard consume a
-   slot — dropping a later valid key with a WARN and leaving seven effective
-   keys while the contract advertises eight. The option therefore validates
-   what it can statically (syntax, length, static reserved set, `user.name`,
-   duplicates) and accumulates without truncating; `Init` filters resource
-   collisions and *then* truncates, warning on whatever actually overflows and gate all three sites
+   **`MaxBaggageAttributeKeys` is enforced here, after that collision check, not
+   in the option.** If a collision exists initialization has already failed, so
+   no colliding key can consume a slot in a partially configured SDK. Otherwise
+   truncate the validated unique list to the cap, warn on the overflow, and gate all three sites
    (`o11y.go:208`, `:310`, `:316`) on `whitelist.Len() > 0`. Generalize
    `appendUserBaggageWarnings` (`o11y.go:496`) to log the effective key list at
    startup — the first thing an operator needs when an expected attribute is
@@ -1575,8 +1614,12 @@ all-or-nothing on baggage.
      table, assert `Inject` → `Extract` actually carries (or refuses) the value.
      A constructor-only assertion is explicitly insufficient.
    - Unicode **value** survives the round trip (ADR 0016 regression guard).
-   - Size: setter rejects and preserves the original context at >64 members and
-     at >8192 encoded bytes; over-length key and value rejected.
+   - Size: setter rejects and preserves the original context at >64
+     **serializable** members and at >8192 encoded bytes; over-length key and
+     value rejected. A mixed context containing 64 locally created members whose
+     invalid W3C keys serialize to empty plus one ordinary valid member is
+     accepted and injects exactly that one member, proving `Baggage.Len()` is not
+     used as the wire cap.
    - Removal: `ContextWithoutBaggageValues` drops the named keys and preserves
      members it was not asked to remove, including `user.name` when it is not
      named — and drops it when it is.
@@ -1595,7 +1638,7 @@ all-or-nothing on baggage.
    - Compatibility: an **inbound** `user.name` over `MaxBaggageValueBytes` is
      materialized today and skipped after, plus all three `ContextWithUser`
      rejections that today's implementation accepts — a >256-byte username, an ordinary username into a
-     context already holding 64 members, and one that would push the encoded
+     context already holding 64 wire-serializable members, and one that would push the encoded
      baggage past 8192 bytes — each leaving ctx unchanged.
    - Empty key list installs neither the processor nor the handler.
    - **NATS baggage restoration** (Decision §10): publish with baggage set,
@@ -1621,15 +1664,23 @@ all-or-nothing on baggage.
      An application-namespaced key is still accepted.
    - The generated semconv key set matches the pinned package — the CI gate's
      own regression test.
-   - A key supplied through `OTEL_RESOURCE_ATTRIBUTES` is dropped with a WARN
-     when also configured for baggage, and does not shadow the resource value.
-   - Cap ordering: nine application keys where one collides with a Resource
-     attribute yield **eight** materialized keys, not seven — the collision must
-     not consume a slot.
+   - A key supplied through `OTEL_RESOURCE_ATTRIBUTES` causes `Init` to fail when
+     also configured for baggage, with the colliding key in the error; no SDK,
+     whitelist, or entry-span writer is made available in that configuration.
+     Multiple collisions are reported together in deterministic order.
+   - Cap ordering remains deterministic after the Resource check: with no
+     collisions, the first eight validated unique application keys materialize
+     and the ninth is warned and dropped. A colliding key never consumes a slot
+     because its configuration fails as a whole.
    - A non-idempotent `LogValuer` supplied through `Logger.With` (the `WithAttrs`
      path) suppresses correctly, not only one supplied on the record.
-   - A non-idempotent `LogValuer` resolving to an empty-key group produces
-     exactly one field: the scan's decision and the emitted JSON agree.
+   - A non-idempotent `LogValuer` resolving first to an empty-key group produces
+     exactly one field: the scan's decision and the emitted JSON agree. Also
+     cover the inverse-shape case from this review: first resolution is a scalar
+     or named group and the second would be an empty-key group containing a
+     whitelisted key; delegation must use the first resolved form, so the valuer
+     is called once and no duplicate field appears. Run both cases through
+     record attributes and `Logger.With`.
    - Materialization skips an inbound member whose value exceeds
      `MaxBaggageValueBytes`, built from a legal W3C header the setter never saw.
    - **Boundary contract** (integration-level, pinning what Decision §7 Plane 2
