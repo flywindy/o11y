@@ -219,13 +219,15 @@ func WithBaggageAttributes(keys ...string) Option {
 			if _, ok := seen[key]; ok {
 				continue
 			}
+			// Recorded before validation so a repeated invalid key is reported
+			// once rather than once per occurrence.
+			seen[key] = struct{}{}
 			if err := baggageattrs.ValidBaggageKey(key); err != nil {
 				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
 					"WithBaggageAttributes: dropping key %q: %v", key, err,
 				))
 				continue
 			}
-			seen[key] = struct{}{}
 			c.baggageKeys = append(c.baggageKeys, key)
 		}
 	}

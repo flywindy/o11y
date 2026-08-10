@@ -80,10 +80,6 @@ func ValidBaggageKey(key string) error {
 	if key == UserNameKey {
 		return errors.New("user.name is reserved; use ContextWithUser and WithUserBaggage")
 	}
-	return validBaggageKey(key)
-}
-
-func validBaggageKey(key string) error {
 	if key == "" {
 		return errors.New("baggage key must not be empty")
 	}
@@ -162,27 +158,43 @@ func contextWithValue(ctx context.Context, key, value string) (context.Context, 
 		return ctx, fmt.Errorf("set %s baggage member: %w", key, err)
 	}
 
-	wireMembers := 0
-	for _, candidateMember := range candidate.Members() {
-		if candidateMember.String() != "" {
-			wireMembers++
-		}
-	}
-	if wireMembers > maxWireMembers {
+	// One serialization answers both wire limits: members that cannot be
+	// encoded are absent from the header, so the encoded form is the faithful
+	// source for the member count as well as the byte count.
+	encoded := candidate.String()
+	if wireMembers(encoded) > maxWireMembers {
 		return ctx, fmt.Errorf("setting baggage member %q would exceed the W3C limit of %d wire members", key, maxWireMembers)
 	}
-	if encoded := candidate.String(); len(encoded) > maxWireBytes {
+	if len(encoded) > maxWireBytes {
 		return ctx, fmt.Errorf("setting baggage member %q would exceed the W3C limit of %d encoded bytes", key, maxWireBytes)
 	}
 	return baggage.ContextWithBaggage(ctx, candidate), nil
+}
+
+// wireMembers counts the members present in an encoded W3C baggage header.
+// Keys are tokens and values are percent-encoded, so a comma only ever appears
+// as the list separator.
+func wireMembers(encoded string) int {
+	if encoded == "" {
+		return 0
+	}
+	return strings.Count(encoded, ",") + 1
 }
 
 // ContextWithoutValues returns a child context with the named baggage members
 // removed while preserving all other members.
 func ContextWithoutValues(ctx context.Context, keys ...string) context.Context {
 	bag := baggage.FromContext(ctx)
+	changed := false
 	for _, key := range keys {
+		if bag.Member(key).Key() == "" {
+			continue
+		}
 		bag = bag.DeleteMember(key)
+		changed = true
+	}
+	if !changed {
+		return ctx
 	}
 	return baggage.ContextWithBaggage(ctx, bag)
 }
@@ -200,11 +212,17 @@ func (w Whitelist) SpanAttributesFromContext(ctx context.Context) []attribute.Ke
 	if bag.Len() == 0 {
 		return nil
 	}
-	attrs := make([]attribute.KeyValue, 0, len(w.attributes))
+	// Allocated on first match only: this runs for every started span, and a
+	// context carrying baggage that is entirely outside the whitelist is the
+	// common case for services downstream of an unrelated producer.
+	var attrs []attribute.KeyValue
 	for _, item := range w.attributes {
 		member := bag.Member(item.baggageKey)
 		if member.Key() == "" || member.Value() == "" || len(member.Value()) > MaxBaggageValueBytes {
 			continue
+		}
+		if attrs == nil {
+			attrs = make([]attribute.KeyValue, 0, len(w.attributes))
 		}
 		attrs = append(attrs, item.attributeKey.String(member.Value()))
 	}
@@ -217,11 +235,16 @@ func (w Whitelist) LogAttrsFromContext(ctx context.Context) []slog.Attr {
 	if bag.Len() == 0 {
 		return nil
 	}
-	attrs := make([]slog.Attr, 0, len(w.attributes))
+	// Allocated on first match only; see SpanAttributesFromContext. The
+	// returned slice is freshly built per call, so callers may modify it.
+	var attrs []slog.Attr
 	for _, item := range w.attributes {
 		member := bag.Member(item.baggageKey)
 		if member.Key() == "" || member.Value() == "" || len(member.Value()) > MaxBaggageValueBytes {
 			continue
+		}
+		if attrs == nil {
+			attrs = make([]slog.Attr, 0, len(w.attributes))
 		}
 		attrs = append(attrs, slog.String(item.baggageKey, member.Value()))
 	}

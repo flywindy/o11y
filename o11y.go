@@ -522,6 +522,14 @@ func configureBaggageWhitelist(cfg *Config, res *resource.Resource) (baggageattr
 	for _, attr := range res.Attributes() {
 		resourceKeys[string(attr.Key)] = struct{}{}
 	}
+	// The collision check deliberately runs against the untruncated key list so
+	// that its outcome does not depend on the order keys were registered in:
+	// checking after the cap would make the same key fail or merely warn
+	// depending on where it landed in the list. The cost is that a key beyond
+	// MaxBaggageAttributeKeys — which would never have been materialized, and
+	// so could never have shadowed the Resource attribute — still fails Init.
+	// The error says so, because otherwise it points an operator at a
+	// materialization path that was never live.
 	collisions := make([]string, 0)
 	for _, key := range effective {
 		if _, ok := resourceKeys[key]; ok {
@@ -530,9 +538,17 @@ func configureBaggageWhitelist(cfg *Config, res *resource.Resource) (baggageattr
 	}
 	if len(collisions) > 0 {
 		sort.Strings(collisions)
-		return baggageattrs.Whitelist{}, fmt.Errorf(
+		msg := fmt.Sprintf(
 			"baggage attribute keys collide with resource attributes: %s", strings.Join(collisions, ", "),
 		)
+		if overCap := collisionsBeyondCap(cfg.baggageKeys, collisions); len(overCap) > 0 {
+			msg += fmt.Sprintf(
+				" (%s exceed MaxBaggageAttributeKeys=%d and would not have been materialized;"+
+					" the collision check runs before the cap so its result does not depend on key order)",
+				strings.Join(overCap, ", "), MaxBaggageAttributeKeys,
+			)
+		}
+		return baggageattrs.Whitelist{}, errors.New(msg)
 	}
 
 	if len(cfg.baggageKeys) > MaxBaggageAttributeKeys {
@@ -549,6 +565,26 @@ func configureBaggageWhitelist(cfg *Config, res *resource.Resource) (baggageattr
 	}
 	effective = append(effective, cfg.baggageKeys...)
 	return baggageattrs.NewWhitelist(effective...), nil
+}
+
+// collisionsBeyondCap returns the colliding application keys that sit past
+// MaxBaggageAttributeKeys and would have been dropped with a warning had they
+// not collided. collisions must be sorted; the result preserves that order.
+func collisionsBeyondCap(appKeys, collisions []string) []string {
+	if len(appKeys) <= MaxBaggageAttributeKeys {
+		return nil
+	}
+	beyond := make(map[string]struct{}, len(appKeys)-MaxBaggageAttributeKeys)
+	for _, key := range appKeys[MaxBaggageAttributeKeys:] {
+		beyond[key] = struct{}{}
+	}
+	overCap := make([]string, 0, len(collisions))
+	for _, key := range collisions {
+		if _, ok := beyond[key]; ok {
+			overCap = append(overCap, key)
+		}
+	}
+	return overCap
 }
 
 // validateHistogramBuckets ensures the histogram boundaries are in a state

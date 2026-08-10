@@ -65,28 +65,40 @@ func NewBaggageHandler(base slog.Handler, whitelist baggageattrs.Whitelist) slog
 }
 
 // Handle implements slog.Handler.Handle and adds whitelisted baggage attrs.
+//
+// This runs on every emitted record, so the ordinary path — a record with no
+// LogValuer and no key that shadows a whitelisted one — allocates nothing
+// beyond the attribute slice the whitelist already returns. Shadowed entries
+// are struck out of that slice in place (it is freshly built per call and
+// owned here) instead of being tracked in a per-record key set.
 func (h *BaggageHandler) Handle(ctx context.Context, r slog.Record) error {
 	baggageAttrs := h.whitelist.LogAttrsFromContext(ctx)
 	if len(baggageAttrs) == 0 {
 		return h.Handler.Handle(ctx, r)
 	}
 
-	resolved := make([]slog.Attr, 0, r.NumAttrs())
-	present := cloneKeySet(h.presetKeys)
-	changed := false
+	// Attrs installed by WithAttrs at this group level win over baggage. The
+	// preset set is only read here, so it is consulted in place rather than
+	// copied per record.
+	for i, attr := range baggageAttrs {
+		if _, exists := h.presetKeys[attr.Key]; exists {
+			baggageAttrs[i] = slog.Attr{}
+		}
+	}
+
+	// Resolving rebuilds the record, so only records that actually carry a
+	// LogValuer pay for it. Detection walks values without resolving them,
+	// which keeps the resolve-exactly-once contract intact for LogValuers
+	// whose value changes between calls.
+	if recordHasLogValuer(r) {
+		r = resolveRecord(r)
+	}
 	r.Attrs(func(attr slog.Attr) bool {
-		resolvedAttr, attrChanged := resolveAttr(attr)
-		changed = changed || attrChanged
-		resolved = append(resolved, resolvedAttr)
-		collectSameLevelKeys(resolvedAttr, present)
+		suppressShadowed(attr, baggageAttrs)
 		return true
 	})
-	if changed {
-		r = slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
-		r.AddAttrs(resolved...)
-	}
 	for _, attr := range baggageAttrs {
-		if _, exists := present[attr.Key]; exists {
+		if attr.Equal(slog.Attr{}) {
 			continue
 		}
 		r.AddAttrs(attr)
@@ -142,6 +154,70 @@ func resolveAttr(attr slog.Attr) (slog.Attr, bool) {
 		attr.Value = slog.GroupValue(resolved...)
 	}
 	return attr, changed
+}
+
+// recordHasLogValuer reports whether any attr on r, at any depth, still needs
+// resolving. It inspects Kind only and never calls Resolve.
+func recordHasLogValuer(r slog.Record) bool {
+	found := false
+	r.Attrs(func(attr slog.Attr) bool {
+		if attrHasLogValuer(attr) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func attrHasLogValuer(attr slog.Attr) bool {
+	switch attr.Value.Kind() {
+	case slog.KindLogValuer:
+		return true
+	case slog.KindGroup:
+		for _, child := range attr.Value.Group() {
+			if attrHasLogValuer(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// resolveRecord returns a copy of r with every LogValuer resolved exactly once.
+func resolveRecord(r slog.Record) slog.Record {
+	resolved := make([]slog.Attr, 0, r.NumAttrs())
+	r.Attrs(func(attr slog.Attr) bool {
+		resolvedAttr, _ := resolveAttr(attr)
+		resolved = append(resolved, resolvedAttr)
+		return true
+	})
+	out := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
+	out.AddAttrs(resolved...)
+	return out
+}
+
+// suppressShadowed zeroes every baggage attr whose key is already occupied by
+// attr at the record's own group level. Only same-level keys shadow baggage,
+// so it recurses into empty-key groups (which slog inlines) but not into named
+// ones.
+func suppressShadowed(attr slog.Attr, baggageAttrs []slog.Attr) {
+	if attr.Equal(slog.Attr{}) {
+		return
+	}
+	if attr.Key != "" {
+		for i := range baggageAttrs {
+			if baggageAttrs[i].Key == attr.Key {
+				baggageAttrs[i] = slog.Attr{}
+			}
+		}
+		return
+	}
+	if attr.Value.Kind() == slog.KindGroup {
+		for _, child := range attr.Value.Group() {
+			suppressShadowed(child, baggageAttrs)
+		}
+	}
 }
 
 func collectSameLevelKeys(attr slog.Attr, keys map[string]struct{}) {

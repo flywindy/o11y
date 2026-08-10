@@ -319,6 +319,37 @@ func TestBaggageHandlerNonIdempotentLogValuerIsResolvedOnce(t *testing.T) {
 	}
 }
 
+// Handle runs for every emitted record, so the ordinary path — no LogValuer to
+// resolve and no attr shadowing a whitelisted key — must not pay for the
+// record rebuild or for a per-record key set.
+func TestBaggageHandlerOrdinaryPathDoesNotAllocatePerRecordBookkeeping(t *testing.T) {
+	whitelist := baggageattrs.NewWhitelist("app.order.id")
+	handler := o11ylog.NewBaggageHandler(discardHandler{}, whitelist).
+		WithAttrs([]slog.Attr{slog.String("preset", "value")})
+	ctx := baggageContext(t, baggageMember(t, "app.order.id", "order-42"))
+	record := slog.NewRecord(time.Now(), slog.LevelInfo, "ordinary", 0)
+	record.AddAttrs(slog.String("a", "1"), slog.Int("b", 2))
+
+	baseline := testing.AllocsPerRun(200, func() {
+		_ = handler.Handle(ctx, record.Clone())
+	})
+
+	// The whitelist's own attribute slice is the only permitted allocation on
+	// top of what cloning the record already costs.
+	clonesOnly := testing.AllocsPerRun(200, func() {
+		_ = record.Clone()
+	})
+	assert.LessOrEqual(t, baseline-clonesOnly, 2.0,
+		"ordinary path allocated %.0f objects beyond the record clone", baseline-clonesOnly)
+}
+
+type discardHandler struct{}
+
+func (discardHandler) Enabled(context.Context, slog.Level) bool  { return true }
+func (discardHandler) Handle(context.Context, slog.Record) error { return nil }
+func (h discardHandler) WithAttrs([]slog.Attr) slog.Handler      { return h }
+func (h discardHandler) WithGroup(string) slog.Handler           { return h }
+
 func TestBaggageHandlerDerivedHandlersAreConcurrentSafe(t *testing.T) {
 	base := slog.NewJSONHandler(io.Discard, nil)
 	logger := slog.New(o11ylog.NewBaggageHandler(base, baggageattrs.NewWhitelist("app.order.id")))

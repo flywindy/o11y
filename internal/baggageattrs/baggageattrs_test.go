@@ -311,6 +311,33 @@ func TestContextWithoutValuesRemovesOnlyNamedMembers(t *testing.T) {
 	assert.Empty(t, baggage.FromContext(got).Member(baggageattrs.UserNameKey).Key())
 }
 
+func TestContextWithoutValuesReturnsSameContextWhenNothingRemoved(t *testing.T) {
+	ctx := baggageContext(t, member(t, "app.order.id", "order-42"))
+
+	assert.Equal(t, ctx, baggageattrs.ContextWithoutValues(ctx, "missing", "also.missing"))
+	assert.Equal(t, ctx, baggageattrs.ContextWithoutValues(ctx))
+
+	bare := context.Background()
+	assert.Equal(t, bare, baggageattrs.ContextWithoutValues(bare, "app.order.id"))
+}
+
+// The wire-member limit is derived from the encoded header, so a value that
+// itself contains the list separator must not be counted as an extra member.
+func TestContextWithValueCountsCommaBearingValuesAsOneMember(t *testing.T) {
+	members := make([]baggage.Member, 0, 63)
+	for i := 0; i < 63; i++ {
+		members = append(members, member(t, fmt.Sprintf("app.k%d", i), "a,b,c"))
+	}
+	ctx := baggageContext(t, members...)
+
+	got, err := baggageattrs.ContextWithValue(ctx, "app.sixtyfourth", "v")
+	require.NoError(t, err, "64 members must fit even when every value contains commas")
+
+	_, err = baggageattrs.ContextWithValue(got, "app.overflow", "v")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "wire members")
+}
+
 func TestBaggageParseBudgetBehavior(t *testing.T) {
 	members := make([]string, 70)
 	for i := range members {

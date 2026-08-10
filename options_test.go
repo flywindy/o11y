@@ -3,6 +3,7 @@ package o11y
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -92,6 +93,17 @@ func TestWithBaggageAttributesRejectsEverySDKLogField(t *testing.T) {
 	}
 }
 
+func TestWithBaggageAttributesWarnsOncePerInvalidKey(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.initWarnings = nil
+
+	WithBaggageAttributes("msg", "msg", "app.order.id", "msg")(cfg)
+
+	assert.Equal(t, []string{"app.order.id"}, cfg.baggageKeys)
+	require.Len(t, cfg.initWarnings, 1, "a repeated invalid key must not warn once per occurrence")
+	assert.Contains(t, cfg.initWarnings[0], `dropping key "msg"`)
+}
+
 func TestConfigureBaggageWhitelistAppliesCapAfterCollisionCheck(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.initWarnings = nil
@@ -103,8 +115,22 @@ func TestConfigureBaggageWhitelistAppliesCapAfterCollisionCheck(t *testing.T) {
 	res := resource.NewSchemaless(attribute.String(keys[len(keys)-1], "resource-value"))
 
 	_, err := configureBaggageWhitelist(cfg, res)
-	require.EqualError(t, err, "baggage attribute keys collide with resource attributes: "+keys[len(keys)-1])
+	overCap := keys[len(keys)-1]
+	require.EqualError(t, err, "baggage attribute keys collide with resource attributes: "+overCap+
+		" ("+overCap+" exceed MaxBaggageAttributeKeys="+strconv.Itoa(MaxBaggageAttributeKeys)+
+		" and would not have been materialized; the collision check runs before the cap"+
+		" so its result does not depend on key order)")
 	assert.Empty(t, cfg.initWarnings, "collision must fail before the overflow warning/truncation")
+}
+
+func TestConfigureBaggageWhitelistCollisionWithinCapOmitsOverflowNote(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.initWarnings = nil
+	WithBaggageAttributes("app.order.id", "app.tenant.id")(cfg)
+	res := resource.NewSchemaless(attribute.String("app.order.id", "resource-value"))
+
+	_, err := configureBaggageWhitelist(cfg, res)
+	require.EqualError(t, err, "baggage attribute keys collide with resource attributes: app.order.id")
 }
 
 func TestConfigureBaggageWhitelistKeepsUserOutsideApplicationCap(t *testing.T) {
