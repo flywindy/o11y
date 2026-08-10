@@ -3,8 +3,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"go/ast"
+	"go/format"
 	"go/parser"
 	"go/token"
 	"os"
@@ -13,16 +15,35 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
+// lookupTimeout bounds the `go list` subprocess so a stalled module lookup
+// fails with a clear message instead of consuming the whole CI job budget.
+const lookupTimeout = 2 * time.Minute
+
 func main() {
-	dirBytes, err := exec.Command("go", "list", "-f", "{{.Dir}}", "go.opentelemetry.io/otel/semconv/v1.39.0").Output()
-	must(err)
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "gensemconv:", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
+	defer cancel()
+
+	dirBytes, err := exec.CommandContext(ctx, "go", "list", "-f", "{{.Dir}}", "go.opentelemetry.io/otel/semconv/v1.39.0").Output()
+	if err != nil {
+		return fmt.Errorf("locate the pinned semconv module: %w", err)
+	}
 	dir := strings.TrimSpace(string(dirBytes))
 	file := filepath.Join(dir, "attribute_group.go")
 	fset := token.NewFileSet()
 	parsed, err := parser.ParseFile(fset, file, nil, 0)
-	must(err)
+	if err != nil {
+		return fmt.Errorf("parse %s: %w", file, err)
+	}
 
 	keys := map[string]struct{}{}
 	prefixes := map[string]struct{}{"host.": {}, "process.": {}}
@@ -74,7 +95,18 @@ func main() {
 		fmt.Fprintf(&out, "\t%q,\n", prefix)
 	}
 	fmt.Fprintln(&out, "}")
-	must(os.WriteFile(filepath.Join("semconv_reserved_gen.go"), out.Bytes(), 0o644))
+
+	// Formatted here so that the committed file survives the `go fmt ./...`
+	// AGENTS.md requires before every commit: an unformatted generated file
+	// would otherwise reappear as an unrelated diff on someone else's branch.
+	formatted, err := format.Source(out.Bytes())
+	if err != nil {
+		return fmt.Errorf("format generated source: %w", err)
+	}
+	if err := os.WriteFile("semconv_reserved_gen.go", formatted, 0o644); err != nil {
+		return fmt.Errorf("write catalog: %w", err)
+	}
+	return nil
 }
 
 func stringLiteral(expr ast.Expr) (string, bool) {
@@ -93,10 +125,4 @@ func sorted(values map[string]struct{}) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-func must(err error) {
-	if err != nil {
-		panic(err)
-	}
 }

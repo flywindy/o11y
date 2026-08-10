@@ -327,7 +327,7 @@ for m := range batch.Messages() {
 }
 ```
 
-Not yet wrapped: single-message `Consumer.Next` (use `Messages(ctx, jetstream.PullMaxMessages(1))` instead — see ADR 0022 amendment), `PushConsumer`, and ordered consumers.
+Single-message `Consumer.Next` is wrapped and returns the receive-span context (see ADR 0022 amendment); it restores baggage on the same terms as `Messages` / `Fetch`. Not yet wrapped: `PushConsumer` and ordered consumers.
 
 ### Request-Reply note
 

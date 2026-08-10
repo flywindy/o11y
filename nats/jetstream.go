@@ -67,7 +67,8 @@ import (
 // JetStreamMsgHandler is the Consume callback signature. ctx carries the
 // consumer span and baggage extracted from the message headers, so
 // slog.InfoContext(ctx, ...) and tracer.Start(ctx, ...) inside the handler are
-// correlated with the producer's trace and retain application baggage. msg is
+// correlated through the consumer span, which links to (and is not parented
+// by) the producer's trace, and retain application baggage. msg is
 // the native jetstream.Msg, so
 // Ack / Nak / Term / InProgress / Metadata are available directly.
 type JetStreamMsgHandler func(ctx context.Context, msg jetstream.Msg)
