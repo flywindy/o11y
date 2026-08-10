@@ -40,11 +40,11 @@ type Conn struct {
 
 type propagationPolicy struct {
 	propagator     propagation.TextMapPropagator
-	tracingEnabled bool
+	tracingEnabled func() bool
 }
 
 func (p propagationPolicy) restoreBaggage(ctx context.Context, headers natsgo.Header) context.Context {
-	if !p.tracingEnabled || p.propagator == nil || len(headers) == 0 {
+	if p.tracingEnabled == nil || !p.tracingEnabled() || p.propagator == nil || len(headers) == 0 {
 		return ctx
 	}
 	extracted := p.propagator.Extract(context.Background(), &otelnats.HeaderCarrier{H: headers})
@@ -70,20 +70,21 @@ func (p propagationPolicy) restoreBaggage(ctx context.Context, headers natsgo.He
 // otel.GetTextMapPropagator), which is exactly the ambient global state ADR
 // 0003 keeps this SDK away from — so don't.
 //
-// Tracing is enabled explicitly via otelnats.WithTracingEnabled(true), so it
-// does NOT depend on the OTEL_INSTRUMENTATION_GO_TRACING_ENABLED /
-// OTEL_NATS_TRACING_ENABLED environment variables the upstream package gates
-// on by default. When the SDK's trace pillar is disabled, obs.TracerProvider()
-// is a no-op provider: the traced code path still runs, but every span is
-// non-recording and carries no span context. Because upstream starts each
-// publish/consume span from a fresh context, a no-op provider yields no active
-// trace to inject, so cross-service trace correlation is simply inactive while
-// the pillar is off (not broken) and resumes automatically once the trace
-// pillar is enabled.
+// Tracing defaults to enabled via otelnats.WithTracingEnabled(true). Since
+// otel-nats v0.8.0, OTEL_NATS_TRACING_ENABLED and a configured feature-flag
+// relay outrank that connection-local default and can change the effective
+// state. When the SDK's trace pillar is disabled but the effective NATS switch
+// is enabled, obs.TracerProvider() is a no-op provider: the traced code path
+// runs, but every span is non-recording and carries no span context. Because
+// upstream starts each publish/consume span from a fresh context, a no-op
+// provider yields no active trace to inject, so cross-service trace correlation
+// is simply inactive while the pillar is off (not broken) and resumes once the
+// trace pillar is enabled.
 //
-// If a service-level observability toggle requires the native NATS cost profile
-// while tracing is off, use ConnectWithOptions and WithTracingEnabled(false)
-// instead.
+// With no relay and no overriding upstream environment variable,
+// ConnectWithOptions plus WithTracingEnabled(false) selects the direct/native
+// path. A relay-capable process keeps both implementations and evaluates the
+// flags per operation even while the effective value is false.
 //
 // Typical usage with the o11y SDK:
 //
@@ -95,34 +96,33 @@ func Connect(ctx context.Context, url string, tp trace.TracerProvider, prop prop
 // ConnectWithOptions establishes a NATS connection with o11y-owned connection
 // options.
 //
-// It defaults to the same tracing behavior as Connect. Use
-// WithTracingEnabled(false) to deliberately select the upstream direct/native
-// path for services whose disabled-observability mode must avoid tracing
-// wrapper overhead. Use WithNATSOptions to pass ordinary nats.go connection
-// options such as nats.Name or nats.UserCredentials.
+// It defaults to the same tracing behavior as Connect. WithTracingEnabled is a
+// connection-local default: the upstream environment and relay can override it.
+// With no relay or override, false selects the direct/native path. Use
+// WithNATSOptions to pass ordinary nats.go connection options such as nats.Name
+// or nats.UserCredentials.
 func ConnectWithOptions(ctx context.Context, url string, tp trace.TracerProvider, prop propagation.TextMapPropagator, opts ...ConnectOption) (*Conn, error) {
 	cfg := newConnectConfig(opts)
-	return connect(ctx, url, tp, prop, cfg.tracingEnabled, cfg.natsOpts)
+	return connect(ctx, url, tp, prop, cfg.tracingDefault, cfg.natsOpts)
 }
 
-func connect(ctx context.Context, url string, tp trace.TracerProvider, prop propagation.TextMapPropagator, tracingEnabled bool, natsOpts []natsgo.Option) (*Conn, error) {
+func connect(ctx context.Context, url string, tp trace.TracerProvider, prop propagation.TextMapPropagator, tracingDefault bool, natsOpts []natsgo.Option) (*Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("nats connect: context already canceled: %w", err)
 	}
 	nc, err := otelnats.ConnectWithOptions(url, natsOpts,
 		otelnats.WithTracerProvider(tp),
 		otelnats.WithPropagators(prop),
-		otelnats.WithTracingEnabled(tracingEnabled),
+		otelnats.WithTracingEnabled(tracingDefault),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("nats connect %s: %w", url, err)
 	}
-	_, configuredPropagator := nc.TraceContext()
 	return &Conn{
 		Conn: nc,
 		policy: propagationPolicy{
-			propagator:     configuredPropagator,
-			tracingEnabled: tracingEnabled,
+			propagator:     prop,
+			tracingEnabled: nc.TracingEnabled,
 		},
 	}, nil
 }

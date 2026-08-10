@@ -6,12 +6,12 @@ import natsgo "github.com/nats-io/nats.go"
 type ConnectOption func(*connectConfig)
 
 type connectConfig struct {
-	tracingEnabled bool
+	tracingDefault bool
 	natsOpts       []natsgo.Option
 }
 
 func newConnectConfig(opts []ConnectOption) connectConfig {
-	cfg := connectConfig{tracingEnabled: true}
+	cfg := connectConfig{tracingDefault: true}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&cfg)
@@ -20,16 +20,18 @@ func newConnectConfig(opts []ConnectOption) connectConfig {
 	return cfg
 }
 
-// WithTracingEnabled controls whether the underlying otel-nats connection uses
-// the traced wrapper path.
+// WithTracingEnabled supplies the connection-local default for the underlying
+// otel-nats tracing switch.
 //
-// The default is true, matching Connect. Set false when a service-level
-// observability toggle must preserve the native NATS cost profile: no spans, no
-// propagation injection/extraction, and JetStream wrappers backed by the
-// upstream direct implementation.
+// The default is true, matching Connect. Since otel-nats v0.8.0 this option is
+// the third rung of relay > environment > option > module default. An
+// OTEL_NATS_TRACING_ENABLED value or a configured feature-flag relay can
+// therefore override it in either direction. When neither is configured,
+// false still selects the upstream direct implementation with no spans, no
+// propagation injection/extraction, and no per-operation flag evaluation.
 func WithTracingEnabled(enabled bool) ConnectOption {
 	return func(cfg *connectConfig) {
-		cfg.tracingEnabled = enabled
+		cfg.tracingDefault = enabled
 	}
 }
 

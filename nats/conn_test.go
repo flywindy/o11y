@@ -2,6 +2,7 @@ package nats_test
 
 import (
 	"context"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +22,23 @@ import (
 	"github.com/flywindy/o11y/internal/baggageattrs"
 	o11ynats "github.com/flywindy/o11y/nats"
 )
+
+func TestMain(m *testing.M) {
+	// otel-nats v0.8.0 gives its environment and relay configuration higher
+	// precedence than the per-connection option. Keep this package's baseline
+	// tests independent of the developer or CI process environment; individual
+	// tests set the variables they are exercising explicitly.
+	for _, key := range []string{
+		"OTEL_INSTRUMENTATION_GO_TRACING_ENABLED",
+		"OTEL_NATS_TRACING_ENABLED",
+		"OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT",
+		"OTEL_INSTRUMENTATION_GO_FLAGS_POLL_INTERVAL",
+		"OTEL_INSTRUMENTATION_GO_FLAGS_API_KEY",
+	} {
+		_ = os.Unsetenv(key)
+	}
+	os.Exit(m.Run())
+}
 
 // startTestServer starts an embedded NATS server and returns the server and its
 // client URL. The server is shut down automatically via t.Cleanup.
@@ -158,6 +176,141 @@ func TestConnectWithOptions_DisablesTracing(t *testing.T) {
 	spans := sr.Ended()
 	require.Len(t, spans, 1, "only the explicit ambient span should be recorded")
 	assert.Equal(t, "ambient", spans[0].Name())
+}
+
+func TestConnectWithOptions_EnvironmentOverridesTracingDefault(t *testing.T) {
+	_, url := startTestServer(t)
+	tp, prop, _ := newTestProviders()
+
+	tests := []struct {
+		name             string
+		moduleEnv        string
+		masterEnv        string
+		optionDefault    bool
+		wantTracingState bool
+	}{
+		{
+			name:             "module environment enables an option-disabled connection",
+			moduleEnv:        "true",
+			optionDefault:    false,
+			wantTracingState: true,
+		},
+		{
+			name:             "module environment disables an option-enabled connection",
+			moduleEnv:        "false",
+			optionDefault:    true,
+			wantTracingState: false,
+		},
+		{
+			name:             "master environment vetoes an enabled module",
+			moduleEnv:        "true",
+			masterEnv:        "false",
+			optionDefault:    true,
+			wantTracingState: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("OTEL_NATS_TRACING_ENABLED", tt.moduleEnv)
+			if tt.masterEnv != "" {
+				t.Setenv("OTEL_INSTRUMENTATION_GO_TRACING_ENABLED", tt.masterEnv)
+			}
+
+			conn, err := o11ynats.ConnectWithOptions(context.Background(), url, tp, prop,
+				o11ynats.WithTracingEnabled(tt.optionDefault),
+			)
+			require.NoError(t, err)
+			defer conn.Close()
+			assert.Equal(t, tt.wantTracingState, conn.TracingEnabled())
+		})
+	}
+}
+
+func TestConnectWithOptions_EnvironmentEnableRestoresBaggage(t *testing.T) {
+	_, url := startTestServer(t)
+	tp, prop, _ := newTestProviders()
+	t.Setenv("OTEL_NATS_TRACING_ENABLED", "true")
+
+	pub, err := o11ynats.ConnectWithOptions(context.Background(), url, tp, prop,
+		o11ynats.WithTracingEnabled(false),
+	)
+	require.NoError(t, err)
+	defer pub.Close()
+
+	sub, err := o11ynats.ConnectWithOptions(context.Background(), url, tp, prop,
+		o11ynats.WithTracingEnabled(false),
+	)
+	require.NoError(t, err)
+	defer sub.Close()
+
+	received := make(chan context.Context, 1)
+	_, err = sub.Subscribe(context.Background(), "test.env.enable.baggage", func(ctx context.Context, _ *nats.Msg) {
+		received <- ctx
+	})
+	require.NoError(t, err)
+	require.NoError(t, sub.NatsConn().FlushTimeout(2*time.Second))
+
+	ctx := contextWithTestBaggage(context.Background(), t, "app.order.id", "order-42")
+	require.NoError(t, pub.Publish(ctx, "test.env.enable.baggage", []byte("hello")))
+
+	select {
+	case got := <-received:
+		assert.Equal(t, "order-42", baggage.FromContext(got).Member("app.order.id").Value(),
+			"the effective traced path must restore baggage even when the option default is false")
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscriber did not receive message within timeout")
+	}
+}
+
+func TestConnectWithOptions_EnvironmentDisableSkipsBaggage(t *testing.T) {
+	_, url := startTestServer(t)
+	tp, prop, _ := newTestProviders()
+	t.Setenv("OTEL_NATS_TRACING_ENABLED", "false")
+
+	pub, err := o11ynats.ConnectWithOptions(context.Background(), url, tp, prop,
+		o11ynats.WithTracingEnabled(true),
+	)
+	require.NoError(t, err)
+	defer pub.Close()
+
+	sub, err := o11ynats.ConnectWithOptions(context.Background(), url, tp, prop,
+		o11ynats.WithTracingEnabled(true),
+	)
+	require.NoError(t, err)
+	defer sub.Close()
+
+	received := make(chan context.Context, 1)
+	_, err = sub.Subscribe(context.Background(), "test.env.disable.baggage", func(ctx context.Context, _ *nats.Msg) {
+		received <- ctx
+	})
+	require.NoError(t, err)
+	require.NoError(t, sub.NatsConn().FlushTimeout(2*time.Second))
+
+	raw := nats.NewMsg("test.env.disable.baggage")
+	raw.Header.Set("baggage", "app.order.id=forged")
+	require.NoError(t, pub.NatsConn().PublishMsg(raw))
+
+	select {
+	case got := <-received:
+		assert.Empty(t, baggage.FromContext(got).Member("app.order.id").Key(),
+			"the effective direct path must skip baggage even when the option default is true")
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscriber did not receive message within timeout")
+	}
+}
+
+func TestConnectWithOptions_InvalidUpstreamFlagFailsConstruction(t *testing.T) {
+	tp, prop, _ := newTestProviders()
+	t.Setenv("OTEL_NATS_TRACING_ENABLED", "enabled")
+
+	conn, err := o11ynats.ConnectWithOptions(context.Background(), "nats://127.0.0.1:1", tp, prop,
+		o11ynats.WithTracingEnabled(true),
+	)
+
+	assert.Nil(t, conn)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "OTEL_NATS_TRACING_ENABLED")
 }
 
 func TestConnectWithOptions_ForwardsNATSOptions(t *testing.T) {

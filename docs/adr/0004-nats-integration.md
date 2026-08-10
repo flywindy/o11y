@@ -340,3 +340,48 @@ global-state or provider-routing concerns.
   ctx+timeout shim (upstream `Request` is still ctx-less, tracked as R2/#72).
   Docs and test assertions updated for the corrected span kinds and
   span-lifecycle behavior.
+
+## Amendment (2026-08-10): otel-nats v0.8.0 dynamic feature flags
+
+The SDK now pins **v0.8.0** and accepts the upstream dynamic-control model.
+Existing Go call sites remain source-compatible, but `WithTracingEnabled` now
+supplies a connection-local default rather than a hard override. Effective
+NATS tracing resolves as `relay > OTEL_NATS_TRACING_ENABLED > option > false`,
+then the process-wide master switch is applied. The relay is authoritative in
+both directions and is re-evaluated for every operation.
+
+Consequences for the facade and adopting applications:
+
+- With no relay and no overriding upstream environment value,
+  `WithTracingEnabled(false)` still constructs only the direct implementation:
+  no spans, no trace propagation, and no per-operation feature-flag evaluation.
+- Once a relay can exist, the connection must retain both implementations so a
+  later remote enable can take effect. The disabled state therefore still pays
+  the relay evaluation cost; enabling a relay is a separate capacity-reviewed
+  rollout, not part of this dependency bump.
+- `OTEL_NATS_TRACING_ENABLED` now outranks the o11y option. Applications passing
+  `sdk.Toggles.Trace` are expressing a default, not an unbreakable native-cost
+  ceiling. A deployment requiring that ceiling must leave the relay unconfigured
+  and avoid an overriding upstream environment value.
+- Upstream flag values are strict. Only `1`/`true`/`yes`/`on` and
+  `0`/`false`/`no`/`off` are accepted; malformed values fail NATS wrapper
+  construction instead of being ignored.
+- A relay provider installed by the application must exist before any NATS
+  wrapper is constructed. The zero-code endpoint path may instead install a
+  named provider in the process-global OpenFeature registry and start a poller
+  for which o11y has no shutdown handle. o11y does not set the endpoint and
+  continues to pass its own OTel provider and propagator explicitly, so no OTel
+  global is read or mutated on the default path. Applications opting into the
+  relay own its lifecycle implications and the documented startup window in
+  which local values win until the first fetch.
+- The module now brings `otel-flags`, the OpenFeature SDK, and the GO Feature
+  Flag provider dependency graph into builds. The default no-relay hot path is
+  still upstream's zero-evaluation path, but binary/SBOM and supply-chain
+  review surfaces increase.
+
+The upgrade audit re-read the v0.8.0 constructors, gate resolution, direct and
+traced implementations, JetStream inheritance, module file, and upstream
+CHANGELOG. No new call to `otel.SetTracerProvider` or
+`otel.SetTextMapPropagator` is reachable when the facade supplies its explicit
+providers. Regression tests in `nats/conn_test.go` pin environment-over-option,
+master-veto, malformed-value, and no-relay direct-path behavior.

@@ -52,6 +52,20 @@ adopters can plan their upgrades.
   exceed the 8192-byte encoded header are rejected with the original context
   preserved. Inbound `user.name` values over 256 bytes are no longer
   materialized onto spans or logs.
+- `nats`: upgraded `github.com/akira-core/instrumentation-go/otel-nats` from
+  v0.7.0 to v0.8.0. `WithTracingEnabled` is now a connection-local default in
+  the upstream `relay > environment > option > default` ladder, rather than an
+  override. Existing callers remain source-compatible, and an option-disabled
+  connection still uses the zero-evaluation direct path when no relay or
+  overriding upstream environment value is configured.
+- `nats`: upstream NATS flags now accept only `1`/`true`/`yes`/`on` and
+  `0`/`false`/`no`/`off` (case-insensitive); any other explicitly set value,
+  including an empty string, fails connection construction. A configured relay
+  is evaluated per operation in both its enabled and disabled states and may
+  install a process-global named OpenFeature provider. This SDK does not
+  configure the relay; applications
+  that opt in must install/configure it before constructing NATS wrappers and
+  account for its lifecycle and hot-path cost.
 - **Series-count impact**: services using the `cassandra` integration will see
   `db.client.operation.duration` and `cassandra.query.attempts` gain a per-table
   dimension (roughly ×5 on a ten-table keyspace, since verbs and tables are
@@ -65,8 +79,10 @@ adopters can plan their upgrades.
   `otel-nats` extracted but dropped while constructing the consumer-span
   context. Restoration covers `Subscribe`, `QueueSubscribe`, `Consume`,
   `Messages`, `Fetch`, `FetchBytes`, `FetchNoWait`, and `Next`, uses the
-  connection's configured propagator, and remains disabled on the native
-  `WithTracingEnabled(false)` path.
+  connection's configured propagator, and remains disabled on the effective
+  native path. Since otel-nats v0.8.0, `WithTracingEnabled(false)` is only the
+  local default and a higher-precedence environment or relay value can enable
+  both tracing and baggage propagation.
 - `internal/metricscap`: a real label value equal to the overflow sentinel
   (`"other"`) no longer bypasses the cardinality budget. The cap's contract is
   *at most N distinct real values, plus the single shared overflow bucket*, but

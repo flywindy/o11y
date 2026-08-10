@@ -931,8 +931,9 @@ if err != nil {
 defer func() { _ = sub.Drain() }() // gracefully drain on shutdown
 ```
 
-For hard-disable modes that require native NATS cost while observability is
-off, use the option-based constructor and pass the SDK's resolved trace toggle:
+To use the native NATS path while observability is off, use the option-based
+constructor and pass the SDK's resolved trace toggle as the connection-local
+default:
 
 ```go
 natsOpts := []gonats.Option{gonats.Name("orders-worker")}
@@ -945,6 +946,13 @@ conn, err := o11ynats.ConnectWithOptions(
     o11ynats.WithNATSOptions(natsOpts...),
 )
 ```
+
+In `otel-nats` v0.8.0 the upstream precedence is **relay > environment >
+option > default**. Therefore the direct/native path is guaranteed by the
+option only when no relay is configured and `OTEL_NATS_TRACING_ENABLED` is
+unset. When a relay is available, flags are evaluated on every operation even
+while tracing is currently disabled; enabling that control plane is a separate
+deployment decision from this dependency upgrade.
 
 To make the *consumer* span itself searchable on domain identifiers the SDK
 has no way to know — a room ID, a site ID, a request ID pulled from the

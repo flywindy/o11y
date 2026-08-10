@@ -2,7 +2,7 @@
 
 **Upstream**: `github.com/akira-core/instrumentation-go` (`otel-nats` module;
 repo and module path renamed from `Marz32onE` in v0.6.0)
-**o11y pin**: v0.7.0 (see ADR 0004, 2026-07-16 amendment, for the audit)
+**o11y pin**: v0.8.0 (see ADR 0004, 2026-08-10 amendment, for the audit)
 **Contribution model**: `flywindy/instrumentation-go` is a PR workspace only —
 its `main` tracks upstream `main`, every change goes to upstream as a PR, and
 o11y always imports the upstream module. Hard-forking (module rename, own
@@ -14,9 +14,42 @@ why, and what each change unlocks in this SDK. Update it on every upstream
 release audit and whenever an item lands, and keep the linked o11y issues in
 sync.
 
-**Last surface audit**: 2026-07-16 against v0.7.0 — a full re-read of
-`otelnats` + `oteljetstream` after the upgrade landed, not just a delta check
-of the previous backlog. Findings are in "Open items" below.
+**Last surface audit**: 2026-08-10 against v0.8.0 — a full re-read of the
+constructors, flag resolution, direct/traced implementations,
+`oteljetstream` inheritance, module dependencies, and release notes.
+
+---
+
+## v0.8.0 adoption decision
+
+o11y adopts the upstream dynamic-control semantics without enabling a relay by
+default. The upgrade and the operational rollout are deliberately separate:
+
+- Existing `WithTracingEnabled` call sites compile unchanged, but the option is
+  now the third rung of `relay > env > option > default`; it is a local default,
+  not a hard override.
+- No relay plus an effective false local value still builds only the direct
+  implementation and performs no per-operation flag evaluation. This preserves
+  the previous hot-path cost for deployments that only upgrade the dependency.
+- A relay-capable process keeps the traced implementation available and makes
+  two flag evaluations per instrumented operation even while the NATS flag is
+  false. High-throughput services must capacity-test that mode before enabling
+  it fleet-wide.
+- Relay disable is not restart-durable until the first successful fetch; an
+  incident response that must survive restarts must also land the corresponding
+  environment value.
+- Invalid upstream flag values and invalid relay endpoint/poll interval values
+  now fail connection construction. Deployment configuration must be validated
+  before rollout.
+- The endpoint-driven zero-code path may install a process-global named
+  OpenFeature provider and poller without exposing an o11y shutdown handle.
+  o11y sets neither the endpoint nor any OpenFeature global; an adopting
+  application owns this opt-in lifecycle implication.
+
+The dependency adds `otel-flags`, OpenFeature, GO Feature Flag, and their
+transitive parsing/rule-evaluation modules. They expand build, SBOM, licence,
+and vulnerability-review surfaces even when the relay is unused; upstream
+documents that unreachable runtime code is linker-elided.
 
 ---
 

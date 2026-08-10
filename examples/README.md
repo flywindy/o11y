@@ -212,16 +212,17 @@ go run examples/nats-core/publisher/main.go
 
 Requires NATS — apply and port-forward it as shown in the NATS Core section above if not already running.
 
-`o11ynats.Connect` enables NATS tracing for you (it passes
-`otelnats.WithTracingEnabled(true)`), so no environment variables are needed —
-just run the two programs:
+`o11ynats.Connect` supplies an enabled connection-local NATS tracing default,
+so no environment variables are required — just run the two programs. An
+explicit upstream environment or relay value can still override that default:
 
-Applications with a hard disabled-observability/native-cost mode can opt out
-explicitly with `o11ynats.ConnectWithOptions(...,
+Applications can use the SDK trace toggle as the connection-local default with
+`o11ynats.ConnectWithOptions(...,
 o11ynats.WithTracingEnabled(obs.Toggles.Trace))`, where `obs` is the
 initialized SDK. This keeps NATS tracing aligned with the SDK's master switch,
-`O11Y_TRACE_ENABLED`, and explicit `WithTraceEnabled` options. The examples
-keep tracing on so the round trip is visible in Tempo.
+`O11Y_TRACE_ENABLED`, when no upstream env or relay overrides it. The direct
+path preserves native cost only when no relay is configured. The examples keep
+tracing on so the round trip is visible in Tempo.
 
 ```bash
 # Terminal 1 — start responder first
@@ -248,12 +249,14 @@ reply publish — so the handler → requester leg is no longer a dead end.
 
 Requires NATS — apply and port-forward it as shown in the NATS Core section above if not already running.
 
-As with the core examples, `o11ynats.Connect` enables tracing itself, so no
-environment variables are needed:
+As with the core examples, `o11ynats.Connect` supplies an enabled local default,
+so no environment variables are required unless a deployment wants to override
+it:
 
 Use `o11ynats.ConnectWithOptions(...,
-o11ynats.WithTracingEnabled(obs.Toggles.Trace))` for application modes that
-deliberately want the native NATS path when the SDK trace pillar is disabled.
+o11ynats.WithTracingEnabled(obs.Toggles.Trace))` to make the SDK trace toggle
+the local NATS default. With no upstream env or relay override, false selects
+the native NATS path; a configured relay keeps the dynamic wrapper available.
 
 ```bash
 # Terminal 1 — publisher creates the stream and publishes
