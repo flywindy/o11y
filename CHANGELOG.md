@@ -15,6 +15,13 @@ adopters can plan their upgrades.
 
 ### Added
 
+- `o11y`: ADR 0025 application-defined baggage attributes. Use
+  `WithBaggageAttributes(keys...)` to materialize up to eight application keys
+  on spans and SDK logs, `ContextWithBaggageValue` to set a validated value,
+  and `ContextWithoutBaggageValues` to remove selected members at internal
+  trust boundaries. Static semconv/SDK/slog reservations, runtime Resource
+  collision checks, and W3C member/header bounds prevent field impersonation
+  and silent downstream loss.
 - `cassandra`: **`db.collection.name` (the addressed table) is now a metric label**
   on `db.client.operation.duration` and `cassandra.query.attempts`, on by
   default. semconv v1.39.0 marks it *Conditionally Required* on the duration
@@ -40,6 +47,11 @@ adopters can plan their upgrades.
 
 ### Changed
 
+- `o11y.ContextWithUser` now shares ADR 0025's baggage safety bounds: usernames
+  over 256 bytes, additions beyond 64 wire members, and additions that would
+  exceed the 8192-byte encoded header are rejected with the original context
+  preserved. Inbound `user.name` values over 256 bytes are no longer
+  materialized onto spans or logs.
 - **Series-count impact**: services using the `cassandra` integration will see
   `db.client.operation.duration` and `cassandra.query.attempts` gain a per-table
   dimension (roughly ×5 on a ten-table keyspace, since verbs and tables are
@@ -49,6 +61,12 @@ adopters can plan their upgrades.
 
 ### Fixed
 
+- `nats`: traced Core and JetStream consumers now retain W3C baggage that
+  `otel-nats` extracted but dropped while constructing the consumer-span
+  context. Restoration covers `Subscribe`, `QueueSubscribe`, `Consume`,
+  `Messages`, `Fetch`, `FetchBytes`, `FetchNoWait`, and `Next`, uses the
+  connection's configured propagator, and remains disabled on the native
+  `WithTracingEnabled(false)` path.
 - `internal/metricscap`: a real label value equal to the overflow sentinel
   (`"other"`) no longer bypasses the cardinality budget. The cap's contract is
   *at most N distinct real values, plus the single shared overflow bucket*, but

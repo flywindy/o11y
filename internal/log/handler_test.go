@@ -5,7 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -125,7 +129,7 @@ func TestEnabled(t *testing.T) {
 func TestBaggageHandlerInjectsWhitelistedUserName(t *testing.T) {
 	var buf bytes.Buffer
 	base := slog.NewJSONHandler(&buf, nil)
-	logger := slog.New(o11ylog.NewBaggageHandler(base))
+	logger := slog.New(o11ylog.NewBaggageHandler(base, baggageattrs.NewWhitelist(baggageattrs.UserNameKey)))
 	ctx := baggageContext(t,
 		baggageMember(t, baggageattrs.UserNameKey, "a.einstein"),
 		baggageMember(t, "tenant.id", "physics"),
@@ -143,7 +147,7 @@ func TestBaggageHandlerInjectsWhitelistedUserName(t *testing.T) {
 func TestBaggageHandlerKeepsExplicitUserNameAttr(t *testing.T) {
 	var buf bytes.Buffer
 	base := slog.NewJSONHandler(&buf, nil)
-	logger := slog.New(o11ylog.NewBaggageHandler(base))
+	logger := slog.New(o11ylog.NewBaggageHandler(base, baggageattrs.NewWhitelist(baggageattrs.UserNameKey)))
 	ctx := baggageContext(t, baggageMember(t, baggageattrs.UserNameKey, "baggage-user"))
 
 	logger.InfoContext(ctx, "with explicit user", slog.String(baggageattrs.UserNameKey, "explicit-user"))
@@ -156,7 +160,7 @@ func TestBaggageHandlerKeepsExplicitUserNameAttr(t *testing.T) {
 func TestBaggageHandlerKeepsLoggerWithUserNameAttr(t *testing.T) {
 	var buf bytes.Buffer
 	base := slog.NewJSONHandler(&buf, nil)
-	logger := slog.New(o11ylog.NewBaggageHandler(base)).
+	logger := slog.New(o11ylog.NewBaggageHandler(base, baggageattrs.NewWhitelist(baggageattrs.UserNameKey))).
 		With(slog.String(baggageattrs.UserNameKey, "explicit-user"))
 	ctx := baggageContext(t, baggageMember(t, baggageattrs.UserNameKey, "baggage-user"))
 
@@ -170,7 +174,7 @@ func TestBaggageHandlerKeepsLoggerWithUserNameAttr(t *testing.T) {
 func TestBaggageHandlerWithGroupDoesNotInheritUserNameAttr(t *testing.T) {
 	var buf bytes.Buffer
 	base := slog.NewJSONHandler(&buf, nil)
-	logger := slog.New(o11ylog.NewBaggageHandler(base)).
+	logger := slog.New(o11ylog.NewBaggageHandler(base, baggageattrs.NewWhitelist(baggageattrs.UserNameKey))).
 		With(slog.String(baggageattrs.UserNameKey, "explicit-user")).
 		WithGroup("audit")
 	ctx := baggageContext(t, baggageMember(t, baggageattrs.UserNameKey, "baggage-user"))
@@ -188,7 +192,7 @@ func TestBaggageHandlerWithGroupDoesNotInheritUserNameAttr(t *testing.T) {
 func TestBaggageHandlerWithAttrsPreservesType(t *testing.T) {
 	var buf bytes.Buffer
 	base := slog.NewJSONHandler(&buf, nil)
-	h := o11ylog.NewBaggageHandler(base)
+	h := o11ylog.NewBaggageHandler(base, baggageattrs.NewWhitelist(baggageattrs.UserNameKey))
 	got := h.WithAttrs([]slog.Attr{slog.String("k", "v")})
 	_, ok := got.(*o11ylog.BaggageHandler)
 	assert.True(t, ok, "WithAttrs must return *BaggageHandler")
@@ -197,10 +201,192 @@ func TestBaggageHandlerWithAttrsPreservesType(t *testing.T) {
 func TestBaggageHandlerWithGroupPreservesType(t *testing.T) {
 	var buf bytes.Buffer
 	base := slog.NewJSONHandler(&buf, nil)
-	h := o11ylog.NewBaggageHandler(base)
+	h := o11ylog.NewBaggageHandler(base, baggageattrs.NewWhitelist(baggageattrs.UserNameKey))
 	got := h.WithGroup("grp")
 	_, ok := got.(*o11ylog.BaggageHandler)
 	assert.True(t, ok, "WithGroup must return *BaggageHandler")
+}
+
+func TestBaggageHandlerMaterializesApplicationKeys(t *testing.T) {
+	var buf bytes.Buffer
+	base := slog.NewJSONHandler(&buf, nil)
+	whitelist := baggageattrs.NewWhitelist("app.order.id", "app.site.id")
+	logger := slog.New(o11ylog.NewBaggageHandler(base, whitelist))
+	ctx := baggageContext(t,
+		baggageMember(t, "app.order.id", "order-42"),
+		baggageMember(t, "app.site.id", "site-7"),
+	)
+
+	logger.InfoContext(ctx, "with application baggage")
+
+	var record map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
+	assert.Equal(t, "order-42", record["app.order.id"])
+	assert.Equal(t, "site-7", record["app.site.id"])
+}
+
+func TestBaggageHandlerDetectsInlineGroupCollisionButNotNamedGroup(t *testing.T) {
+	var buf bytes.Buffer
+	base := slog.NewJSONHandler(&buf, nil)
+	whitelist := baggageattrs.NewWhitelist("app.order.id")
+	logger := slog.New(o11ylog.NewBaggageHandler(base, whitelist))
+	ctx := baggageContext(t, baggageMember(t, "app.order.id", "baggage"))
+
+	logger.InfoContext(ctx, "inline", slog.Group("", slog.String("app.order.id", "explicit")))
+	logger.InfoContext(ctx, "named", slog.Group("details", slog.String("app.order.id", "nested")))
+
+	decoder := json.NewDecoder(&buf)
+	var inline, named map[string]any
+	require.NoError(t, decoder.Decode(&inline))
+	require.NoError(t, decoder.Decode(&named))
+	assert.Equal(t, "explicit", inline["app.order.id"])
+	assert.Equal(t, "baggage", named["app.order.id"])
+	assert.Equal(t, "nested", named["details"].(map[string]any)["app.order.id"])
+}
+
+func TestBaggageHandlerResolvesLogValuerOnceAndReusesValue(t *testing.T) {
+	var buf bytes.Buffer
+	base := slog.NewJSONHandler(&buf, nil)
+	whitelist := baggageattrs.NewWhitelist("app.order.id")
+	logger := slog.New(o11ylog.NewBaggageHandler(base, whitelist))
+	ctx := baggageContext(t, baggageMember(t, "app.order.id", "baggage"))
+	count := 0
+	valuer := countingLogValuer{
+		count: &count,
+		value: slog.GroupValue(slog.String("app.order.id", "explicit")),
+	}
+
+	logger.InfoContext(ctx, "valuer", slog.Any("", valuer))
+
+	var record map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
+	assert.Equal(t, "explicit", record["app.order.id"])
+	assert.Equal(t, 1, count)
+}
+
+func TestBaggageHandlerWithAttrsApplicationKeyPrecedence(t *testing.T) {
+	var buf bytes.Buffer
+	base := slog.NewJSONHandler(&buf, nil)
+	whitelist := baggageattrs.NewWhitelist("app.order.id")
+	logger := slog.New(o11ylog.NewBaggageHandler(base, whitelist)).With(
+		slog.Group("", slog.String("app.order.id", "explicit")),
+	)
+	ctx := baggageContext(t, baggageMember(t, "app.order.id", "baggage"))
+
+	logger.InfoContext(ctx, "with attrs")
+
+	var record map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
+	assert.Equal(t, "explicit", record["app.order.id"])
+}
+
+func TestBaggageHandlerNonIdempotentLogValuerIsResolvedOnce(t *testing.T) {
+	for _, throughWith := range []bool{false, true} {
+		for _, first := range []slog.Value{
+			slog.GroupValue(slog.String("app.order.id", "explicit")),
+			slog.StringValue("scalar"),
+		} {
+			name := fmt.Sprintf("with=%v/first=%s", throughWith, first.Kind())
+			t.Run(name, func(t *testing.T) {
+				var buf bytes.Buffer
+				base := slog.NewJSONHandler(&buf, nil)
+				whitelist := baggageattrs.NewWhitelist("app.order.id")
+				logger := slog.New(o11ylog.NewBaggageHandler(base, whitelist))
+				ctx := baggageContext(t, baggageMember(t, "app.order.id", "baggage"))
+				valuer := &sequenceLogValuer{values: []slog.Value{
+					first,
+					slog.GroupValue(slog.String("app.order.id", "second-resolution")),
+				}}
+				attr := slog.Any("", valuer)
+				if throughWith {
+					logger.With(attr).InfoContext(ctx, "valuer")
+				} else {
+					logger.InfoContext(ctx, "valuer", attr)
+				}
+
+				assert.Equal(t, 1, valuer.calls)
+				assert.Equal(t, 1, strings.Count(buf.String(), `"app.order.id"`),
+					"the resolved record must contain exactly one field for the whitelisted key")
+				var record map[string]any
+				require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
+				if first.Kind() == slog.KindGroup {
+					assert.Equal(t, "explicit", record["app.order.id"])
+				} else {
+					assert.Equal(t, "baggage", record["app.order.id"])
+				}
+			})
+		}
+	}
+}
+
+// Handle runs for every emitted record, so the ordinary path — no LogValuer to
+// resolve and no attr shadowing a whitelisted key — must not pay for the
+// record rebuild or for a per-record key set.
+func TestBaggageHandlerOrdinaryPathDoesNotAllocatePerRecordBookkeeping(t *testing.T) {
+	whitelist := baggageattrs.NewWhitelist("app.order.id")
+	handler := o11ylog.NewBaggageHandler(discardHandler{}, whitelist).
+		WithAttrs([]slog.Attr{slog.String("preset", "value")})
+	ctx := baggageContext(t, baggageMember(t, "app.order.id", "order-42"))
+	record := slog.NewRecord(time.Now(), slog.LevelInfo, "ordinary", 0)
+	record.AddAttrs(slog.String("a", "1"), slog.Int("b", 2))
+
+	baseline := testing.AllocsPerRun(200, func() {
+		_ = handler.Handle(ctx, record.Clone())
+	})
+
+	// The whitelist's own attribute slice is the only permitted allocation on
+	// top of what cloning the record already costs.
+	clonesOnly := testing.AllocsPerRun(200, func() {
+		_ = record.Clone()
+	})
+	assert.LessOrEqual(t, baseline-clonesOnly, 2.0,
+		"ordinary path allocated %.0f objects beyond the record clone", baseline-clonesOnly)
+}
+
+type discardHandler struct{}
+
+func (discardHandler) Enabled(context.Context, slog.Level) bool  { return true }
+func (discardHandler) Handle(context.Context, slog.Record) error { return nil }
+func (h discardHandler) WithAttrs([]slog.Attr) slog.Handler      { return h }
+func (h discardHandler) WithGroup(string) slog.Handler           { return h }
+
+func TestBaggageHandlerDerivedHandlersAreConcurrentSafe(t *testing.T) {
+	base := slog.NewJSONHandler(io.Discard, nil)
+	logger := slog.New(o11ylog.NewBaggageHandler(base, baggageattrs.NewWhitelist("app.order.id")))
+	ctx := baggageContext(t, baggageMember(t, "app.order.id", "order-42"))
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			logger.With(slog.Int("worker", worker)).InfoContext(ctx, "concurrent")
+		}(i)
+	}
+	wg.Wait()
+}
+
+type countingLogValuer struct {
+	count *int
+	value slog.Value
+}
+
+func (v countingLogValuer) LogValue() slog.Value {
+	*v.count++
+	return v.value
+}
+
+type sequenceLogValuer struct {
+	calls  int
+	values []slog.Value
+}
+
+func (v *sequenceLogValuer) LogValue() slog.Value {
+	index := v.calls
+	v.calls++
+	if index >= len(v.values) {
+		index = len(v.values) - 1
+	}
+	return v.values[index]
 }
 
 func baggageContext(t *testing.T, members ...baggage.Member) context.Context {

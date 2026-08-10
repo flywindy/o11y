@@ -442,6 +442,25 @@ the whitelisted baggage value onto this service's spans and SDK log records.
 
 ---
 
+## Application-Defined Baggage Attributes
+
+ADR 0025 permits applications to register opaque W3C baggage keys through
+`WithBaggageAttributes`. Each accepted key is emitted as a string attribute of
+the same name on spans and SDK log records. These keys have no OpenTelemetry
+semantic-convention constant: their name, meaning, and value source belong to
+the application and should use an application-owned namespace such as
+`app.order.id`.
+
+Application baggage keys are never metric labels and their values never enter
+span names. The SDK rejects keys owned by
+the pinned semconv v1.39.0 catalog (including parameterized namespaces), keys
+that can collide with Resource or log fields, and `user.name`, whose PII
+contract remains under `WithUserBaggage`. See the
+[Developer Guide](guide.md#application-defined-baggage-attributes) for trust
+boundary, size-limit, and NATS propagation guidance.
+
+---
+
 ## Object Storage - MinIO / S3 (package `github.com/flywindy/o11y/minio`)
 
 Spans and metrics are emitted by the SDK-owned `minio` wrapper for

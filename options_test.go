@@ -1,11 +1,18 @@
 package o11y
 
 import (
+	"context"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/flywindy/o11y/internal/baggageattrs"
+	o11ylog "github.com/flywindy/o11y/internal/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk/resource"
 )
 
 func TestParseBoolEnv_Absent(t *testing.T) {
@@ -54,25 +61,183 @@ func TestWithUserBaggage_EnablesUserBaggageMaterialization(t *testing.T) {
 	assert.True(t, cfg.userBaggage, "WithUserBaggage must enable the opt-in flag")
 }
 
-func TestAppendUserBaggageWarnings_WhenTraceDisabled(t *testing.T) {
+func TestWithBaggageAttributesAccumulatesDeduplicatesAndWarns(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.initWarnings = nil
+
+	WithBaggageAttributes("app.order.id", "", "service.name", "user.name")(cfg)
+	WithBaggageAttributes("app.order.id", "app.site.id")(cfg)
+
+	assert.Equal(t, []string{"app.order.id", "app.site.id"}, cfg.baggageKeys)
+	require.Len(t, cfg.initWarnings, 3)
+	assert.Contains(t, strings.Join(cfg.initWarnings, "\n"), "must not be empty")
+	assert.Contains(t, strings.Join(cfg.initWarnings, "\n"), "service.name")
+	assert.Contains(t, strings.Join(cfg.initWarnings, "\n"), "WithUserBaggage")
+}
+
+func TestWithBaggageAttributesRejectsEverySDKLogField(t *testing.T) {
+	reserved := []string{
+		"service.name", "service.version", "service.namespace", "environment",
+		"deployment.environment.name", "traceId", "spanId", "time", "level",
+		"msg", "source", "http.response.status_code", "http.response.body.size",
+		"process.pid", "http.request.header.authorization",
+	}
+	cfg := defaultConfig()
+	cfg.initWarnings = nil
+	WithBaggageAttributes(append(reserved, "app.order.id")...)(cfg)
+
+	assert.Equal(t, []string{"app.order.id"}, cfg.baggageKeys)
+	require.Len(t, cfg.initWarnings, len(reserved))
+	for _, key := range reserved {
+		assert.Contains(t, strings.Join(cfg.initWarnings, "\n"), key)
+	}
+}
+
+func TestWithBaggageAttributesWarnsOncePerInvalidKey(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.initWarnings = nil
+
+	WithBaggageAttributes("msg", "msg", "app.order.id", "msg")(cfg)
+
+	assert.Equal(t, []string{"app.order.id"}, cfg.baggageKeys)
+	require.Len(t, cfg.initWarnings, 1, "a repeated invalid key must not warn once per occurrence")
+	assert.Contains(t, cfg.initWarnings[0], `dropping key "msg"`)
+}
+
+func TestConfigureBaggageWhitelistAppliesCapAfterCollisionCheck(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.initWarnings = nil
+	keys := make([]string, MaxBaggageAttributeKeys+1)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("app.key.%d", i)
+	}
+	WithBaggageAttributes(keys...)(cfg)
+	res := resource.NewSchemaless(attribute.String(keys[len(keys)-1], "resource-value"))
+
+	_, err := configureBaggageWhitelist(cfg, res)
+	overCap := keys[len(keys)-1]
+	require.EqualError(t, err, "baggage attribute keys collide with resource attributes: "+overCap+
+		" ("+overCap+" exceed MaxBaggageAttributeKeys="+strconv.Itoa(MaxBaggageAttributeKeys)+
+		" and would not have been materialized; the collision check runs before the cap"+
+		" so its result does not depend on key order)")
+	assert.Empty(t, cfg.initWarnings, "collision must fail before the overflow warning/truncation")
+}
+
+func TestConfigureBaggageWhitelistCollisionWithinCapOmitsOverflowNote(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.initWarnings = nil
+	WithBaggageAttributes("app.order.id", "app.tenant.id")(cfg)
+	res := resource.NewSchemaless(attribute.String("app.order.id", "resource-value"))
+
+	_, err := configureBaggageWhitelist(cfg, res)
+	require.EqualError(t, err, "baggage attribute keys collide with resource attributes: app.order.id")
+}
+
+func TestConfigureBaggageWhitelistKeepsUserOutsideApplicationCap(t *testing.T) {
+	for _, userFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("user-first=%v", userFirst), func(t *testing.T) {
+			cfg := defaultConfig()
+			cfg.initWarnings = nil
+			keys := make([]string, MaxBaggageAttributeKeys+1)
+			for i := range keys {
+				keys[i] = fmt.Sprintf("app.key.%d", i)
+			}
+			if userFirst {
+				WithUserBaggage()(cfg)
+			}
+			WithBaggageAttributes(keys...)(cfg)
+			if !userFirst {
+				WithUserBaggage()(cfg)
+			}
+
+			whitelist, err := configureBaggageWhitelist(cfg, resource.Empty())
+			require.NoError(t, err)
+			assert.Equal(t, MaxBaggageAttributeKeys+1, whitelist.Len())
+			assert.Equal(t, baggageattrs.UserNameKey, whitelist.Keys()[0])
+			require.Len(t, cfg.initWarnings, 1)
+			assert.Contains(t, cfg.initWarnings[0], "first 8")
+		})
+	}
+}
+
+func TestConfigureBaggageWhitelistReportsSortedResourceCollisions(t *testing.T) {
+	cfg := defaultConfig()
+	WithUserBaggage()(cfg)
+	WithBaggageAttributes("app.z", "app.a")(cfg)
+	res := resource.NewSchemaless(
+		attribute.String("app.z", "z"),
+		attribute.String(baggageattrs.UserNameKey, "user"),
+		attribute.String("app.a", "a"),
+	)
+
+	_, err := configureBaggageWhitelist(cfg, res)
+	require.EqualError(t, err, "baggage attribute keys collide with resource attributes: app.a, app.z, user.name")
+}
+
+func TestInitRejectsBaggageCollisionFromOTELResourceAttributes(t *testing.T) {
+	base := []Option{
+		WithServiceName("test"), WithServiceVersion("1.0.0"),
+		WithServiceNamespace("test"), WithEnvironment("testing"),
+		WithTraceEnabled(false), WithMetricsEnabled(false), WithLogEnabled(false),
+	}
+	for _, tt := range []struct {
+		name string
+		env  string
+		opt  Option
+		key  string
+	}{
+		{"application", "app.order.id=resource", WithBaggageAttributes("app.order.id"), "app.order.id"},
+		{"user", "user.name=resource", WithUserBaggage(), "user.name"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("OTEL_RESOURCE_ATTRIBUTES", tt.env)
+			obs, err := Init(context.Background(), append(base, tt.opt)...)
+			require.Error(t, err)
+			assert.Nil(t, obs)
+			assert.Contains(t, err.Error(), tt.key)
+		})
+	}
+}
+
+func TestInitInstallsBaggageHandlerOnlyForEffectiveWhitelist(t *testing.T) {
+	base := []Option{
+		WithServiceName("test"), WithServiceVersion("1.0.0"),
+		WithServiceNamespace("test"), WithEnvironment("testing"),
+		WithTraceEnabled(false), WithMetricsEnabled(false), WithLogEnabled(false),
+	}
+
+	without, err := Init(context.Background(), base...)
+	require.NoError(t, err)
+	defer func() { _ = without.Shutdown(context.Background()) }()
+	_, installed := without.Logger.Handler().(*o11ylog.BaggageHandler)
+	assert.False(t, installed)
+
+	withUser, err := Init(context.Background(), append(base, WithBaggageAttributes(), WithUserBaggage())...)
+	require.NoError(t, err)
+	defer func() { _ = withUser.Shutdown(context.Background()) }()
+	_, installed = withUser.Logger.Handler().(*o11ylog.BaggageHandler)
+	assert.True(t, installed, "user.name alone makes the effective whitelist non-empty")
+}
+
+func TestAppendBaggageWarnings_WhenTraceDisabled(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.initWarnings = nil
 	cfg.traceEnabled = false
 	WithUserBaggage()(cfg)
 
-	appendUserBaggageWarnings(cfg)
+	appendBaggageWarnings(cfg, baggageattrs.NewWhitelist(baggageattrs.UserNameKey))
 
 	require.Len(t, cfg.initWarnings, 1)
-	assert.Contains(t, cfg.initWarnings[0], "WithUserBaggage enabled while trace pillar disabled")
-	assert.Contains(t, cfg.initWarnings[0], "logs only, not spans")
+	assert.Contains(t, cfg.initWarnings[0], "trace pillar disabled")
+	assert.Contains(t, cfg.initWarnings[0], "not spans")
 }
 
-func TestAppendUserBaggageWarnings_WhenTraceEnabled(t *testing.T) {
+func TestAppendBaggageWarnings_WhenTraceEnabled(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.initWarnings = nil
 	WithUserBaggage()(cfg)
 
-	appendUserBaggageWarnings(cfg)
+	appendBaggageWarnings(cfg, baggageattrs.NewWhitelist(baggageattrs.UserNameKey))
 
 	assert.Empty(t, cfg.initWarnings)
 }

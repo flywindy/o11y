@@ -65,15 +65,17 @@ import (
 // demand later.
 
 // JetStreamMsgHandler is the Consume callback signature. ctx carries the
-// consumer span extracted from the message headers by the upstream layer, so
+// consumer span and baggage extracted from the message headers, so
 // slog.InfoContext(ctx, ...) and tracer.Start(ctx, ...) inside the handler are
-// correlated with the producer's trace. msg is the native jetstream.Msg, so
+// correlated through the consumer span, which links to (and is not parented
+// by) the producer's trace, and retain application baggage. msg is
+// the native jetstream.Msg, so
 // Ack / Nak / Term / InProgress / Metadata are available directly.
 type JetStreamMsgHandler func(ctx context.Context, msg jetstream.Msg)
 
 // FetchedMessage pairs a message delivered through Consumer.Fetch /
-// FetchBytes / FetchNoWait with the consumer-span ctx extracted from its
-// headers, mirroring the (ctx, msg) shape Consume and Messages already
+// FetchBytes / FetchNoWait with the consumer-span ctx and restored baggage from
+// its headers, mirroring the (ctx, msg) shape Consume and Messages already
 // deliver. An o11y-owned type is needed here (rather than re-exporting the
 // upstream oteljetstream.Msg) because the batch is delivered over a channel,
 // not a callback/iterator method — see ADR 0022 amendment (2026-07-01).
@@ -183,7 +185,7 @@ type Consumer interface {
 	// handler's ctx argument, extracted from the message headers.
 	Consume(ctx context.Context, handler JetStreamMsgHandler, opts ...jetstream.PullConsumeOpt) (ConsumeContext, error)
 	// Messages returns a pull iterator. Each Next yields a ctx carrying the
-	// consumer span plus the native jetstream.Msg. ctx is a registration-time
+	// consumer span and restored baggage plus the native jetstream.Msg. ctx is a registration-time
 	// guard only, with the same semantics as Consume's ctx.
 	Messages(ctx context.Context, opts ...jetstream.PullMessagesOpt) (MessagesContext, error)
 	// Fetch requests up to batch messages and returns immediately with a
@@ -270,12 +272,15 @@ func (c *Conn) JetStream() (JetStream, error) {
 	if err != nil {
 		return nil, fmt.Errorf("nats jetstream: %w", err)
 	}
-	return &jetStream{js: js}, nil
+	return &jetStream{js: js, policy: c.policy}, nil
 }
 
 // --- implementations: thin wrappers over the oteljetstream types ---
 
-type jetStream struct{ js oteljetstream.JetStream }
+type jetStream struct {
+	js     oteljetstream.JetStream
+	policy propagationPolicy
+}
 
 func (j *jetStream) Publish(ctx context.Context, subject string, data []byte, opts ...jetstream.PublishOpt) (*jetstream.PubAck, error) {
 	return j.js.Publish(ctx, subject, data, opts...)
@@ -290,7 +295,7 @@ func (j *jetStream) CreateOrUpdateStream(ctx context.Context, cfg jetstream.Stre
 	if err != nil {
 		return nil, err
 	}
-	return &stream{s: s}, nil
+	return &stream{s: s, policy: j.policy}, nil
 }
 
 func (j *jetStream) Stream(ctx context.Context, name string) (Stream, error) {
@@ -298,7 +303,7 @@ func (j *jetStream) Stream(ctx context.Context, name string) (Stream, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &stream{s: s}, nil
+	return &stream{s: s, policy: j.policy}, nil
 }
 
 func (j *jetStream) DeleteStream(ctx context.Context, name string) error {
@@ -310,7 +315,7 @@ func (j *jetStream) CreateOrUpdateConsumer(ctx context.Context, streamName strin
 	if err != nil {
 		return nil, err
 	}
-	return &consumer{c: c}, nil
+	return &consumer{c: c, policy: j.policy}, nil
 }
 
 func (j *jetStream) Consumer(ctx context.Context, streamName, name string) (Consumer, error) {
@@ -318,14 +323,17 @@ func (j *jetStream) Consumer(ctx context.Context, streamName, name string) (Cons
 	if err != nil {
 		return nil, err
 	}
-	return &consumer{c: c}, nil
+	return &consumer{c: c, policy: j.policy}, nil
 }
 
 func (j *jetStream) DeleteConsumer(ctx context.Context, streamName, name string) error {
 	return j.js.DeleteConsumer(ctx, streamName, name)
 }
 
-type stream struct{ s oteljetstream.Stream }
+type stream struct {
+	s      oteljetstream.Stream
+	policy propagationPolicy
+}
 
 func (s *stream) Info(ctx context.Context, opts ...jetstream.StreamInfoOpt) (*jetstream.StreamInfo, error) {
 	return s.s.Info(ctx, opts...)
@@ -338,7 +346,7 @@ func (s *stream) CreateOrUpdateConsumer(ctx context.Context, cfg jetstream.Consu
 	if err != nil {
 		return nil, err
 	}
-	return &consumer{c: c}, nil
+	return &consumer{c: c, policy: s.policy}, nil
 }
 
 func (s *stream) Consumer(ctx context.Context, name string) (Consumer, error) {
@@ -346,14 +354,17 @@ func (s *stream) Consumer(ctx context.Context, name string) (Consumer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &consumer{c: c}, nil
+	return &consumer{c: c, policy: s.policy}, nil
 }
 
 func (s *stream) DeleteConsumer(ctx context.Context, name string) error {
 	return s.s.DeleteConsumer(ctx, name)
 }
 
-type consumer struct{ c oteljetstream.Consumer }
+type consumer struct {
+	c      oteljetstream.Consumer
+	policy propagationPolicy
+}
 
 func (c *consumer) Consume(ctx context.Context, handler JetStreamMsgHandler, opts ...jetstream.PullConsumeOpt) (ConsumeContext, error) {
 	if err := ctx.Err(); err != nil {
@@ -363,7 +374,7 @@ func (c *consumer) Consume(ctx context.Context, handler JetStreamMsgHandler, opt
 		return nil, fmt.Errorf("nats jetstream consume: handler must not be nil")
 	}
 	cc, err := c.c.Consume(func(m oteljetstream.Msg) {
-		handler(m.Context(), m.Msg)
+		handler(c.policy.restoreBaggage(m.Context(), m.Headers()), m.Msg)
 	}, opts...)
 	if err != nil {
 		return nil, err
@@ -379,7 +390,7 @@ func (c *consumer) Messages(ctx context.Context, opts ...jetstream.PullMessagesO
 	if err != nil {
 		return nil, err
 	}
-	return &messagesContext{mc: mc}, nil
+	return &messagesContext{mc: mc, policy: c.policy}, nil
 }
 
 func (c *consumer) Fetch(ctx context.Context, batch int, opts ...jetstream.FetchOpt) (MessageBatch, error) {
@@ -401,7 +412,7 @@ func (c *consumer) Fetch(ctx context.Context, batch int, opts ...jetstream.Fetch
 	// guarantees the forwarding goroutine below can drain the entire batch
 	// without blocking, even if the caller never reads Messages() at all —
 	// see wrapMessageBatch.
-	return wrapMessageBatch(mb, batch, cancel), nil
+	return wrapMessageBatch(mb, batch, cancel, c.policy), nil
 }
 
 func (c *consumer) FetchBytes(ctx context.Context, maxBytes int, opts ...jetstream.FetchOpt) (MessageBatch, error) {
@@ -420,7 +431,7 @@ func (c *consumer) FetchBytes(ctx context.Context, maxBytes int, opts ...jetstre
 	// single small message could satisfy many times over), so unlike Fetch
 	// there is no buffer size that provably fits the whole batch — see the
 	// fetchBytesBatchBuf doc comment.
-	return wrapMessageBatch(mb, fetchBytesBatchBuf, cancel), nil
+	return wrapMessageBatch(mb, fetchBytesBatchBuf, cancel, c.policy), nil
 }
 
 // fetchWithCtxFallback calls call with jetstream.FetchContext(ctx) prepended
@@ -490,7 +501,7 @@ func (c *consumer) FetchNoWait(ctx context.Context, batch int) (MessageBatch, er
 	// and exits on its own without a pull to abort. A no-op cancel keeps the
 	// wrapMessageBatch contract uniform.
 	// Same reasoning as Fetch: batch is a hard cap here too.
-	return wrapMessageBatch(mb, batch, func() {}), nil
+	return wrapMessageBatch(mb, batch, func() {}, c.policy), nil
 }
 
 // fetchBytesBatchBuf is the best-effort forwarding buffer size for
@@ -504,7 +515,8 @@ const fetchBytesBatchBuf = 256
 
 // wrapMessageBatch adapts the upstream oteljetstream.MessageBatch (a channel
 // of oteljetstream.Msg) to the o11y MessageBatch (a channel of
-// FetchedMessage), forwarding each message's consumer-span ctx unchanged.
+// FetchedMessage), preserving each consumer span while restoring baggage with
+// the connection's configured propagation policy.
 //
 // out is buffered to bufSize so the forwarding goroutine can drain the
 // upstream channel into the buffer and exit cleanly on its own, rather than
@@ -522,7 +534,7 @@ const fetchBytesBatchBuf = 256
 // FetchMaxWait-collision path (where the fetch ctx was not wired) and for
 // FetchNoWait (which never blocks); Stop still releases this facade's
 // goroutine via done in those cases.
-func wrapMessageBatch(mb oteljetstream.MessageBatch, bufSize int, cancel context.CancelFunc) MessageBatch {
+func wrapMessageBatch(mb oteljetstream.MessageBatch, bufSize int, cancel context.CancelFunc, policy propagationPolicy) MessageBatch {
 	out := make(chan FetchedMessage, bufSize)
 	done := make(chan struct{})
 	go func() {
@@ -539,7 +551,7 @@ func wrapMessageBatch(mb oteljetstream.MessageBatch, bufSize int, cancel context
 					return
 				}
 				select {
-				case out <- FetchedMessage{Ctx: m.Ctx, Msg: m.Msg}:
+				case out <- FetchedMessage{Ctx: policy.restoreBaggage(m.Ctx, m.Headers()), Msg: m.Msg}:
 				case <-done:
 					return
 				}
@@ -600,17 +612,24 @@ func (c *consumer) Next(ctx context.Context, opts ...jetstream.FetchOpt) (contex
 	if err != nil {
 		return ctx, nil, err
 	}
-	return msgCtx, msg, nil
+	return c.policy.restoreBaggage(msgCtx, msg.Headers()), msg, nil
 }
 
 func (c *consumer) Info(ctx context.Context) (*jetstream.ConsumerInfo, error) { return c.c.Info(ctx) }
 
 func (c *consumer) CachedInfo() *jetstream.ConsumerInfo { return c.c.CachedInfo() }
 
-type messagesContext struct{ mc oteljetstream.MessagesContext }
+type messagesContext struct {
+	mc     oteljetstream.MessagesContext
+	policy propagationPolicy
+}
 
 func (m *messagesContext) Next(opts ...jetstream.NextOpt) (context.Context, jetstream.Msg, error) {
-	return m.mc.Next(opts...)
+	ctx, msg, err := m.mc.Next(opts...)
+	if err != nil {
+		return ctx, msg, err
+	}
+	return m.policy.restoreBaggage(ctx, msg.Headers()), msg, nil
 }
 
 func (m *messagesContext) Stop()  { m.mc.Stop() }

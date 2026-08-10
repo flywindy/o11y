@@ -54,22 +54,51 @@ func (h *OtelSlogHandler) WithGroup(name string) slog.Handler {
 // members as log record attributes.
 type BaggageHandler struct {
 	slog.Handler
-	hasUserNameAttr bool
+	whitelist  baggageattrs.Whitelist
+	presetKeys map[string]struct{}
 }
 
 // NewBaggageHandler returns a slog handler that copies whitelisted baggage
 // members onto every log record before delegating to base.
-func NewBaggageHandler(base slog.Handler) slog.Handler {
-	return &BaggageHandler{Handler: base}
+func NewBaggageHandler(base slog.Handler, whitelist baggageattrs.Whitelist) slog.Handler {
+	return &BaggageHandler{Handler: base, whitelist: whitelist}
 }
 
 // Handle implements slog.Handler.Handle and adds whitelisted baggage attrs.
+//
+// This runs on every emitted record, so the ordinary path — a record with no
+// LogValuer and no key that shadows a whitelisted one — allocates nothing
+// beyond the attribute slice the whitelist already returns. Shadowed entries
+// are struck out of that slice in place (it is freshly built per call and
+// owned here) instead of being tracked in a per-record key set.
 func (h *BaggageHandler) Handle(ctx context.Context, r slog.Record) error {
-	for _, attr := range baggageattrs.LogAttrsFromContext(ctx) {
-		if h.hasUserNameAttr && attr.Key == baggageattrs.UserNameKey {
-			continue
+	baggageAttrs := h.whitelist.LogAttrsFromContext(ctx)
+	if len(baggageAttrs) == 0 {
+		return h.Handler.Handle(ctx, r)
+	}
+
+	// Attrs installed by WithAttrs at this group level win over baggage. The
+	// preset set is only read here, so it is consulted in place rather than
+	// copied per record.
+	for i, attr := range baggageAttrs {
+		if _, exists := h.presetKeys[attr.Key]; exists {
+			baggageAttrs[i] = slog.Attr{}
 		}
-		if recordHasAttr(r, attr.Key) {
+	}
+
+	// Resolving rebuilds the record, so only records that actually carry a
+	// LogValuer pay for it. Detection walks values without resolving them,
+	// which keeps the resolve-exactly-once contract intact for LogValuers
+	// whose value changes between calls.
+	if recordHasLogValuer(r) {
+		r = resolveRecord(r)
+	}
+	r.Attrs(func(attr slog.Attr) bool {
+		suppressShadowed(attr, baggageAttrs)
+		return true
+	})
+	for _, attr := range baggageAttrs {
+		if attr.Equal(slog.Attr{}) {
 			continue
 		}
 		r.AddAttrs(attr)
@@ -84,34 +113,132 @@ func (h *BaggageHandler) Enabled(ctx context.Context, level slog.Level) bool {
 
 // WithAttrs implements slog.Handler.WithAttrs by delegating to the wrapped handler.
 func (h *BaggageHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	hasUserNameAttr := h.hasUserNameAttr
-	for _, attr := range attrs {
-		if attr.Key == baggageattrs.UserNameKey {
-			hasUserNameAttr = true
-			break
-		}
+	resolved := make([]slog.Attr, len(attrs))
+	presetKeys := cloneKeySet(h.presetKeys)
+	for i, attr := range attrs {
+		resolved[i], _ = resolveAttr(attr)
+		collectSameLevelKeys(resolved[i], presetKeys)
 	}
 	return &BaggageHandler{
-		Handler:         h.Handler.WithAttrs(attrs),
-		hasUserNameAttr: hasUserNameAttr,
+		Handler:    h.Handler.WithAttrs(resolved),
+		whitelist:  h.whitelist,
+		presetKeys: presetKeys,
 	}
 }
 
 // WithGroup implements slog.Handler.WithGroup by delegating to the wrapped handler.
 func (h *BaggageHandler) WithGroup(name string) slog.Handler {
 	return &BaggageHandler{
-		Handler: h.Handler.WithGroup(name),
+		Handler:   h.Handler.WithGroup(name),
+		whitelist: h.whitelist,
 	}
 }
 
-func recordHasAttr(r slog.Record, key string) bool {
-	var ok bool
+func resolveAttr(attr slog.Attr) (slog.Attr, bool) {
+	changed := false
+	if attr.Value.Kind() == slog.KindLogValuer {
+		attr.Value = attr.Value.Resolve()
+		changed = true
+	}
+	if attr.Value.Kind() != slog.KindGroup {
+		return attr, changed
+	}
+	children := attr.Value.Group()
+	resolved := make([]slog.Attr, len(children))
+	for i, child := range children {
+		var childChanged bool
+		resolved[i], childChanged = resolveAttr(child)
+		changed = changed || childChanged
+	}
+	if changed {
+		attr.Value = slog.GroupValue(resolved...)
+	}
+	return attr, changed
+}
+
+// recordHasLogValuer reports whether any attr on r, at any depth, still needs
+// resolving. It inspects Kind only and never calls Resolve.
+func recordHasLogValuer(r slog.Record) bool {
+	found := false
 	r.Attrs(func(attr slog.Attr) bool {
-		if attr.Key == key {
-			ok = true
+		if attrHasLogValuer(attr) {
+			found = true
 			return false
 		}
 		return true
 	})
-	return ok
+	return found
+}
+
+func attrHasLogValuer(attr slog.Attr) bool {
+	switch attr.Value.Kind() {
+	case slog.KindLogValuer:
+		return true
+	case slog.KindGroup:
+		for _, child := range attr.Value.Group() {
+			if attrHasLogValuer(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// resolveRecord returns a copy of r with every LogValuer resolved exactly once.
+func resolveRecord(r slog.Record) slog.Record {
+	resolved := make([]slog.Attr, 0, r.NumAttrs())
+	r.Attrs(func(attr slog.Attr) bool {
+		resolvedAttr, _ := resolveAttr(attr)
+		resolved = append(resolved, resolvedAttr)
+		return true
+	})
+	out := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
+	out.AddAttrs(resolved...)
+	return out
+}
+
+// suppressShadowed zeroes every baggage attr whose key is already occupied by
+// attr at the record's own group level. Only same-level keys shadow baggage,
+// so it recurses into empty-key groups (which slog inlines) but not into named
+// ones.
+func suppressShadowed(attr slog.Attr, baggageAttrs []slog.Attr) {
+	if attr.Equal(slog.Attr{}) {
+		return
+	}
+	if attr.Key != "" {
+		for i := range baggageAttrs {
+			if baggageAttrs[i].Key == attr.Key {
+				baggageAttrs[i] = slog.Attr{}
+			}
+		}
+		return
+	}
+	if attr.Value.Kind() == slog.KindGroup {
+		for _, child := range attr.Value.Group() {
+			suppressShadowed(child, baggageAttrs)
+		}
+	}
+}
+
+func collectSameLevelKeys(attr slog.Attr, keys map[string]struct{}) {
+	if attr.Equal(slog.Attr{}) {
+		return
+	}
+	if attr.Key != "" {
+		keys[attr.Key] = struct{}{}
+		return
+	}
+	if attr.Value.Kind() == slog.KindGroup {
+		for _, child := range attr.Value.Group() {
+			collectSameLevelKeys(child, keys)
+		}
+	}
+}
+
+func cloneKeySet(in map[string]struct{}) map[string]struct{} {
+	out := make(map[string]struct{}, len(in))
+	for key := range in {
+		out[key] = struct{}{}
+	}
+	return out
 }

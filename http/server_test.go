@@ -1,6 +1,7 @@
 package http_test
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -8,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -17,6 +19,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	o11yhttp "github.com/flywindy/o11y/http"
+	"github.com/flywindy/o11y/internal/baggageattrs"
 )
 
 func TestNewServerHandler_ThreadsProvidersAndPropagator(t *testing.T) {
@@ -117,6 +120,52 @@ func TestNewServerHandler_DefaultSpanNamePrefixesPatternWithoutMethod(t *testing
 	spans := spanRecorder.Ended()
 	require.Len(t, spans, 1)
 	assert.Equal(t, "PATCH /custom/{id}", spans[0].Name())
+}
+
+func TestNewServerHandler_BaggageTrustBoundaryControlsEntrySpan(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		prop     propagation.TextMapPropagator
+		wantAttr bool
+	}{
+		{"internal-composite", propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}), true},
+		{"public-trace-only", propagation.TraceContext{}, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			spanRecorder := tracetest.NewSpanRecorder()
+			tp := sdktrace.NewTracerProvider(
+				sdktrace.WithSpanProcessor(baggageattrs.NewWhitelist("app.order.id").NewSpanProcessor()),
+				sdktrace.WithSpanProcessor(spanRecorder),
+			)
+			t.Cleanup(func() { require.NoError(t, tp.Shutdown(context.Background())) })
+			mp := sdkmetric.NewMeterProvider()
+			var handlerValue string
+			handler := o11yhttp.NewServerHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				handlerValue = baggage.FromContext(r.Context()).Member("app.order.id").Value()
+				w.WriteHeader(http.StatusNoContent)
+			}), tp, mp, tt.prop)
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.Header.Set("baggage", "app.order.id=forged")
+
+			handler.ServeHTTP(httptest.NewRecorder(), req)
+
+			spans := spanRecorder.Ended()
+			require.Len(t, spans, 1)
+			hasAttr := false
+			for _, attr := range spans[0].Attributes() {
+				if string(attr.Key) == "app.order.id" {
+					hasAttr = true
+					assert.Equal(t, "forged", attr.Value.AsString())
+				}
+			}
+			assert.Equal(t, tt.wantAttr, hasAttr)
+			if tt.wantAttr {
+				assert.Equal(t, "forged", handlerValue)
+			} else {
+				assert.Empty(t, handlerValue)
+			}
+		})
+	}
 }
 
 func assertHTTPDurationLabels(t *testing.T, rm metricdata.ResourceMetrics) {

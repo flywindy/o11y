@@ -118,3 +118,16 @@ func TestContextWithUserReturnsErrorForInvalidBaggageValue(t *testing.T) {
 	require.Error(t, err)
 	assert.Equal(t, context.Background(), ctx)
 }
+
+func TestApplicationBaggagePublicAPI(t *testing.T) {
+	ctx, err := o11y.ContextWithBaggageValue(context.Background(), "app.order.id", "order-42")
+	require.NoError(t, err)
+	assert.Equal(t, "order-42", baggage.FromContext(ctx).Member("app.order.id").Value())
+
+	ctx = o11y.ContextWithoutBaggageValues(ctx, "app.order.id")
+	assert.Empty(t, baggage.FromContext(ctx).Member("app.order.id").Key())
+	assert.Equal(t, 128, o11y.MaxBaggageKeyBytes)
+	assert.Equal(t, 256, o11y.MaxBaggageValueBytes)
+	assert.Equal(t, 8, o11y.MaxBaggageAttributeKeys)
+	assert.Equal(t, string(semconv.UserNameKey), o11y.UserNameKey)
+}

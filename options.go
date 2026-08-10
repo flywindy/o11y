@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/flywindy/o11y/internal/baggageattrs"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
@@ -18,6 +19,10 @@ const DefaultMetricsAddr = ":2112"
 // http.route values. Additional SDK cardinality limits protect in-process
 // aggregation memory before export.
 const DefaultMaxUniqueRoutes = 1000
+
+// MaxBaggageAttributeKeys bounds the application-defined baggage keys one SDK
+// instance materializes. user.name has a separate opt-in and does not count.
+const MaxBaggageAttributeKeys = 8
 
 // DefaultMaxUniqueCollections is the default export-boundary cap for distinct
 // db.collection.name values on the Cassandra client metrics.
@@ -60,6 +65,7 @@ type Config struct {
 	samplingRatio    float64
 	samplingRatioSet bool
 	userBaggage      bool
+	baggageKeys      []string
 
 	// Profiling
 	profilingEndpoint    string
@@ -183,9 +189,47 @@ func WithTraceSampler(sampler sdktrace.Sampler) Option {
 // that whitelisted value onto spans at start time and onto slog records emitted
 // by this SDK's logger. The feature is off by default because user.name is PII
 // and propagated baggage can cross service boundaries.
+// user.name is tracked separately from application keys and does not consume
+// MaxBaggageAttributeKeys.
 func WithUserBaggage() Option {
 	return func(c *Config) {
 		c.userBaggage = true
+	}
+}
+
+// WithBaggageAttributes enables materialization of application-defined W3C
+// baggage members onto spans and SDK log records. This option does not create
+// baggage; use ContextWithBaggageValue after validating the source value.
+// Calls accumulate and de-duplicate, and the first MaxBaggageAttributeKeys
+// valid application keys are used.
+//
+// Empty, non-token, overlong, and reserved keys are dropped with a startup
+// warning. Reservations include SDK and slog fields, the complete pinned
+// semantic-convention catalog and parameterized namespaces, and user.name,
+// whose PII contract requires WithUserBaggage. Init fails if an otherwise valid
+// key collides with this process's effective Resource attributes, including
+// OTEL_RESOURCE_ATTRIBUTES. Never use a materialized key as a metric label.
+func WithBaggageAttributes(keys ...string) Option {
+	return func(c *Config) {
+		seen := make(map[string]struct{}, len(c.baggageKeys)+len(keys))
+		for _, key := range c.baggageKeys {
+			seen[key] = struct{}{}
+		}
+		for _, key := range keys {
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			// Recorded before validation so a repeated invalid key is reported
+			// once rather than once per occurrence.
+			seen[key] = struct{}{}
+			if err := baggageattrs.ValidBaggageKey(key); err != nil {
+				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
+					"WithBaggageAttributes: dropping key %q: %v", key, err,
+				))
+				continue
+			}
+			c.baggageKeys = append(c.baggageKeys, key)
+		}
 	}
 }
 
