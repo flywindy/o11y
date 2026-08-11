@@ -158,8 +158,14 @@ top level.
 
 HTTP integrations already preserve baggage through their configured
 propagator. The traced NATS facade restores it on Core and JetStream consumer
-contexts. `nats.WithTracingEnabled(false)` intentionally disables all NATS
-propagation, including baggage.
+contexts. `nats.WithTracingEnabled(false)` suppresses all NATS propagation
+including baggage — but only as a *connection-local default*. Since `otel-nats`
+v0.8.0 an enabled `OTEL_NATS_TRACING_ENABLED` or a feature-flag relay overrides
+that option and restores baggage along with tracing (see
+[NATS](#nats) for the full precedence). **Do not use the option as a
+baggage-sanitization boundary**: a deployment-side environment change is enough
+to turn propagation back on. Where baggage must not cross a boundary, strip it
+from the context explicitly as described above.
 
 ### Trace Sampling
 
