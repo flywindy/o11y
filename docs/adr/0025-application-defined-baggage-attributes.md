@@ -131,16 +131,16 @@ changed what it has to deliver.
    to change. NATS carries it **on the wire but drops it at the consumer**, for
    a separate reason — see §12, the finding that most affects this ADR's value.
 
-   The exception is `nats.ConnectWithOptions(..., WithTracingEnabled(false))`,
-   whose own documentation states the contract: *"no spans, **no propagation
-   injection/extraction**, and JetStream wrappers backed by the upstream direct
-   implementation"* (`nats/options.go:23-29`). This is a supported, deliberate
-   native-cost mode, and `AGENTS.md:130-134` recommends driving it from
-   `obs.Toggles.Trace`. In it baggage is not even put on the wire, so unlike
+   The exception is an effectively disabled NATS connection on the upstream
+   direct path: no spans, **no propagation injection/extraction**, and
+   JetStream wrappers backed by the direct implementation. Since otel-nats
+   v0.8.0, `WithTracingEnabled(false)` supplies only the local default; the
+   direct path is fixed only when no relay is available and no upstream env
+   overrides it. In that state baggage is not even put on the wire, so unlike
    §12 there is nothing for the facade to restore. Recorded as a scope
-   limitation in Decision §9: this feature requires the traced NATS path, and a
-   service that hard-disables it keeps whatever per-service explicit tagging it
-   already does.
+   limitation in Decision §9: this feature requires the effective traced NATS
+   path, and a service on the direct path keeps whatever per-service explicit
+   tagging it already does.
 
 4. **The materialization logic is already key-agnostic.**
    `SpanAttributesFromContext` (`baggageattrs.go:59`),
@@ -259,7 +259,7 @@ changed what it has to deliver.
     them.** This is the most consequential finding in this ADR, and it is a
     defect in **shipped ADR 0016 Phase 2**, not something this ADR introduces.
 
-    All three consumer wrappers in `otel-nats@v0.7.0` follow the same shape:
+    All three consumer wrappers in `otel-nats@v0.8.0` follow the same shape:
     extract the headers into a local `msgCtx`, take *only* the span context out
     of it, then start the consumer span from `context.Background()` and hand the
     handler that context.
@@ -730,10 +730,11 @@ performance without replacing it with equivalent wire-aware bounds.
 ### 9. Scope limitation: the traced NATS path is required
 
 This feature carries values over W3C Baggage, which needs the propagator's
-Inject/Extract to actually run on each hop. `nats.ConnectWithOptions(...,
-WithTracingEnabled(false))` deliberately removes exactly that
-(`nats/options.go:23-29`, Dependency behavior §3), so in that mode baggage —
-application keys and `user.name` alike — stops at every NATS and JetStream hop.
+Inject/Extract to actually run on each hop. An effectively disabled direct-path
+connection removes exactly that (`nats/options.go`, Dependency behavior §3),
+so in that mode baggage — application keys and `user.name` alike — stops at
+every NATS and JetStream hop. `WithTracingEnabled(false)` reaches that mode only
+when no higher-precedence upstream env or relay value enables tracing.
 
 This is **not fixable from the materialization side**, and this ADR does not
 attempt to fix it. Preserving baggage independently of span creation would mean
@@ -793,18 +794,26 @@ Two properties fall out of that shape, and both are required:
   the composite propagator directly to `ctx` would reapply `TraceContext` and
   overwrite the span context `otel-nats` just established, breaking the topology
   ADR 0022 documents.
-- **Using the connection's propagator** — reachable via
-  `otelnats.Conn.TraceContext()` — means a connection given
-  `propagation.TraceContext{}` for public NATS ingress (Q6) extracts no baggage
-  and restores nothing. Hard-coding `propagation.Baggage{}` here would silently
-  defeat that sanitization from inside the SDK.
+- **Using the explicitly supplied connection propagator** means a connection
+  given `propagation.TraceContext{}` for public NATS ingress (Q6) extracts no
+  baggage and restores nothing. The facade must retain the `prop` argument it
+  passed upstream; it must not capture `otelnats.Conn.TraceContext()` at
+  construction because v0.8.0 makes that method reflect the current dynamic
+  gate and it can return the direct implementation's no-op propagator before a
+  later relay enable. Hard-coding `propagation.Baggage{}` here would silently
+  defeat the caller's sanitization from inside the SDK.
 
-**The restore must also be skipped entirely on the native path.**
-`WithTracingEnabled(false)` still routes through the facade's wrapper —
-`conn_direct.go:57-61` calls it with `Msg{Msg: msg, Ctx: context.Background()}`
-and an intact `msg.Header` — so an unconditional restore would extract baggage
-in the one mode Decision §9 says does not participate. Gate on the same
-`tracingEnabled` the facade already tracks.
+**The restore must also be skipped entirely on the effective native path.**
+That path still routes through the facade's wrapper — `conn_direct.go` calls it
+with `Msg{Msg: msg, Ctx: context.Background()}` and an intact `msg.Header` — so
+an unconditional restore would extract baggage in the one mode Decision §9
+says does not participate. Since v0.8.0 the option value is only a default and
+cannot be cached as the answer. The facade must follow the connection's
+effective dynamic state (for example through `Conn.TracingEnabled`) so an env
+or relay override changes span and baggage propagation together. That query is
+another relay resolution on a consume path, so its capacity cost and the tiny
+between-evaluations transition window must be covered by the implementation
+review and load test.
 
 The same wrap applies to `QueueSubscribe` (`nats/conn.go:157-159`) and to
 **every** JetStream delivery path — all four upstream discarding sites from
@@ -1711,10 +1720,10 @@ all-or-nothing on baggage.
      and Q6 now recommend): a server wired with a `TraceContext`-only propagator
      records no application baggage attributes on its entry span even when the
      request carries a forged `baggage` header, while the same server wired with
-     `obs.Propagator` does; and a `nats.ConnectWithOptions(...,
-     WithTracingEnabled(false))` connection neither injects nor extracts
-     baggage, pinning the Decision §9 scope limit so a future upstream change
-     that quietly restores propagation is noticed rather than assumed.
+     `obs.Propagator` does; and an effectively disabled NATS connection with no
+     relay or upstream env override neither injects nor extracts baggage,
+     pinning the Decision §9 scope limit so a future upstream change that
+     quietly restores propagation is noticed rather than assumed.
    - Existing ADR 0016 tests are ported at their **call sites only** — the two
      `NewSpanProcessor()` sites and the six `NewBaggageHandler(base)` sites —
      with every assertion preserved verbatim (Compatibility).

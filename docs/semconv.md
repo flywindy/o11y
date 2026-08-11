@@ -123,7 +123,7 @@ package is the authoritative source and changes across contrib versions.
 ## Messaging - NATS (package `github.com/flywindy/o11y/nats`)
 
 Spans are emitted by
-`github.com/akira-core/instrumentation-go/otel-nats` v0.7.0 (Core Subscribe /
+`github.com/akira-core/instrumentation-go/otel-nats` v0.8.0 (Core Subscribe /
 Publish / Request — including the requester-side reply-receive span — and
 JetStream Consume / Messages / Next / Fetch / FetchBytes / FetchNoWait). The
 upstream package imports `go.opentelemetry.io/otel/semconv/v1.39.0`.

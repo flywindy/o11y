@@ -255,9 +255,8 @@ obs, err := o11y.Init(ctx,
 | **Profiling** | No Pyroscope profiler is started; the trace-to-profile `pyroscope.profile.id` span attribute is not added. Trace/log/metric pillars are untouched |
 
 `WithTraceEnabled(false)` returns a no-op `TracerProvider`; integration code
-that is already installed may still execute a no-op wrapper path. For NATS
-callers that require native NATS cost while observability is disabled, drive
-the NATS wrapper from the SDK's resolved toggle:
+that is already installed may still execute a no-op wrapper path. NATS callers
+can supply the SDK's resolved toggle as their connection-local tracing default:
 
 ```go
 conn, err := o11ynats.ConnectWithOptions(
@@ -269,6 +268,25 @@ conn, err := o11ynats.ConnectWithOptions(
     o11ynats.WithNATSOptions(natsOpts...),
 )
 ```
+
+Since `otel-nats` v0.8.0, the NATS-specific precedence is **relay > upstream
+environment > connection option > upstream default**. The option above selects
+the direct/native path only when no feature-flag relay and no overriding
+`OTEL_NATS_TRACING_ENABLED` value are present. A relay-capable process keeps the
+instrumented path available and evaluates flags per operation even while the
+effective flag is false. This SDK does not configure a relay; adopting one is a
+separate application/deployment decision.
+
+Above that whole ladder sits an upstream **master switch**,
+`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`, which is ANDed with the result. It
+defaults to enabled, so leaving it unset changes nothing — but setting it to a
+falsy value turns off NATS tracing (and with it header propagation and baggage
+restoration) no matter what the option, the module variable or the relay say.
+Both upstream variables are strict tri-state since v0.8.0: only `1`/`true`/`yes`/`on`
+and `0`/`false`/`no`/`off` are accepted, and **any other value — including the
+empty string an unexpanded `${VAR}` produces — fails the connection with an
+error rather than being ignored.** Audit deployment configuration for these two
+names before upgrading.
 
 **Environment-variable control** (useful for staged rollouts without deploys):
 
@@ -371,7 +389,7 @@ browser WebSocket; Object Storage: MinIO). See
 
 ## Acknowledgements
 
-- [`github.com/akira-core/instrumentation-go/otel-nats`](https://github.com/akira-core/instrumentation-go) — provides the underlying NATS Core + JetStream tracing semantics used by the `nats/` wrapper (module path renamed from `Marz32onE` to `akira-core` upstream in v0.6.0). Verified at v0.7.0 not to mutate global OTel providers/propagators and to import semconv v1.39.0; the implicit `OTEL_EXPORTER_OTLP_ENDPOINT`-gated deliver-span exporter was removed upstream in v0.7.0. See [ADR 0004](docs/adr/0004-nats-integration.md) for the integration decision and audit discipline.
+- [`github.com/akira-core/instrumentation-go/otel-nats`](https://github.com/akira-core/instrumentation-go) — provides the underlying NATS Core + JetStream tracing semantics used by the `nats/` wrapper (module path renamed from `Marz32onE` to `akira-core` upstream in v0.6.0). Verified at v0.8.0 not to mutate global OTel providers/propagators and to import semconv v1.39.0. When explicitly configured through `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT`, v0.8.0 may install a named OpenFeature provider; o11y does not set that variable. See [ADR 0004](docs/adr/0004-nats-integration.md) for the integration decision and audit discipline.
 - [`go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/v2/mongo/otelmongo`](https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/v2/mongo/otelmongo) provides MongoDB command spans and `db.client.operation.duration` metrics through the `mongo` facade; the SDK owns MongoDB connection-pool metrics. See [ADR 0014](docs/adr/0014-mongodb-metrics.md) and [ADR 0021](docs/adr/0021-mongodb-instrumentation-mechanism.md).
 - [`github.com/redis/go-redis/v9`](https://pkg.go.dev/github.com/redis/go-redis/v9) — is the Redis/Valkey client wrapped by the SDK-owned `redis/` instrumentation. The wrapper does not call `redisotel`; see [ADR 0013](docs/adr/0013-redis-valkey-integration.md).
 - [`github.com/elastic/go-elasticsearch/v8`](https://pkg.go.dev/github.com/elastic/go-elasticsearch/v8) — ships first-party OpenTelemetry tracing in its shared transport; the `elasticsearch/` facade wires the SDK `TracerProvider` into it (trace-only, search body opt-in) without touching OTel globals. See [ADR 0020](docs/adr/0020-elasticsearch-integration.md).

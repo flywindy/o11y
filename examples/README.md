@@ -212,16 +212,21 @@ go run examples/nats-core/publisher/main.go
 
 Requires NATS — apply and port-forward it as shown in the NATS Core section above if not already running.
 
-`o11ynats.Connect` enables NATS tracing for you (it passes
-`otelnats.WithTracingEnabled(true)`), so no environment variables are needed —
-just run the two programs:
+`o11ynats.Connect` supplies an enabled connection-local NATS tracing default,
+so no environment variables are required — just run the two programs. An
+explicit upstream environment or relay value can still override that default:
 
-Applications with a hard disabled-observability/native-cost mode can opt out
-explicitly with `o11ynats.ConnectWithOptions(...,
+Applications can use the SDK trace toggle as the connection-local default with
+`o11ynats.ConnectWithOptions(...,
 o11ynats.WithTracingEnabled(obs.Toggles.Trace))`, where `obs` is the
 initialized SDK. This keeps NATS tracing aligned with the SDK's master switch,
-`O11Y_TRACE_ENABLED`, and explicit `WithTraceEnabled` options. The examples
-keep tracing on so the round trip is visible in Tempo.
+`O11Y_TRACE_ENABLED`, when no upstream env or relay overrides it. A `false`
+connection default preserves the native path unless something *enables* tracing
+above it: a configured relay, or `OTEL_NATS_TRACING_ENABLED` set to a truthy
+value. The process-wide `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is not in that
+set — it is ANDed over the resolved value, so it can only force tracing off and
+never re-enables a disabled connection. The examples keep tracing on so the
+round trip is visible in Tempo.
 
 ```bash
 # Terminal 1 — start responder first
@@ -234,7 +239,7 @@ go run examples/nats-core/requester/main.go
 The responder replies with `conn.Respond`, which routes the reply through the
 traced publish path so the reply message carries the responder's trace context
 (unlike raw `msg.Respond`). The requester uses `conn.Request`; the upstream
-otel-nats v0.7.0 layer records a `receive {inbox}` span for the reply — named
+otel-nats layer records a `receive {inbox}` span for the reply — named
 for the reply inbox, parented under the responder's trace and linked back to
 its reply-send span (the reply-span recording moved from this SDK's facade to
 upstream in the v0.6.0 upgrade; see ADR 0022's amendments).
@@ -248,12 +253,14 @@ reply publish — so the handler → requester leg is no longer a dead end.
 
 Requires NATS — apply and port-forward it as shown in the NATS Core section above if not already running.
 
-As with the core examples, `o11ynats.Connect` enables tracing itself, so no
-environment variables are needed:
+As with the core examples, `o11ynats.Connect` supplies an enabled local default,
+so no environment variables are required unless a deployment wants to override
+it:
 
 Use `o11ynats.ConnectWithOptions(...,
-o11ynats.WithTracingEnabled(obs.Toggles.Trace))` for application modes that
-deliberately want the native NATS path when the SDK trace pillar is disabled.
+o11ynats.WithTracingEnabled(obs.Toggles.Trace))` to make the SDK trace toggle
+the local NATS default. With no upstream env or relay override, false selects
+the native NATS path; a configured relay keeps the dynamic wrapper available.
 
 ```bash
 # Terminal 1 — publisher creates the stream and publishes

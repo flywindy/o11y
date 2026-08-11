@@ -2,7 +2,7 @@
 
 **Upstream**: `github.com/akira-core/instrumentation-go` (`otel-nats` module;
 repo and module path renamed from `Marz32onE` in v0.6.0)
-**o11y pin**: v0.7.0 (see ADR 0004, 2026-07-16 amendment, for the audit)
+**o11y pin**: v0.8.0 (see ADR 0004, 2026-08-10 amendment, for the audit)
 **Contribution model**: `flywindy/instrumentation-go` is a PR workspace only —
 its `main` tracks upstream `main`, every change goes to upstream as a PR, and
 o11y always imports the upstream module. Hard-forking (module rename, own
@@ -14,9 +14,60 @@ why, and what each change unlocks in this SDK. Update it on every upstream
 release audit and whenever an item lands, and keep the linked o11y issues in
 sync.
 
-**Last surface audit**: 2026-07-16 against v0.7.0 — a full re-read of
-`otelnats` + `oteljetstream` after the upgrade landed, not just a delta check
-of the previous backlog. Findings are in "Open items" below.
+**Last surface audit**: 2026-08-10 against v0.8.0 — a full re-read of the
+constructors, flag resolution, direct/traced implementations,
+`oteljetstream` inheritance, module dependencies, and release notes.
+
+---
+
+## v0.8.0 adoption decision
+
+o11y adopts the upstream dynamic-control semantics without enabling a relay by
+default. The upgrade and the operational rollout are deliberately separate:
+
+- Existing `WithTracingEnabled` call sites compile unchanged, but the option is
+  now the third rung of `relay > env > option > default`; it is a local default,
+  not a hard override.
+- No relay plus an effective false local value still builds only the direct
+  implementation and performs no per-operation flag evaluation. This preserves
+  the previous hot-path cost for deployments that only upgrade the dependency.
+- A relay-capable process keeps the traced implementation available and makes
+  two flag evaluations per instrumented operation even while the NATS flag is
+  false. High-throughput services must capacity-test that mode before enabling
+  it fleet-wide.
+- Relay disable is not restart-durable until the first successful fetch; an
+  incident response that must survive restarts must also land the corresponding
+  environment value.
+- Invalid upstream flag values and invalid relay endpoint/poll interval values
+  now fail connection construction. Deployment configuration must be validated
+  before rollout.
+- The endpoint-driven zero-code path may install a process-global named
+  OpenFeature provider and poller without exposing an o11y shutdown handle.
+  o11y sets neither the endpoint nor any OpenFeature global; an adopting
+  application owns this opt-in lifecycle implication.
+
+The dependency adds `otel-flags`, OpenFeature, GO Feature Flag, and their
+transitive parsing/rule-evaluation modules. They expand build, SBOM, licence,
+and vulnerability-review surfaces even when the relay is unused.
+
+Upstream's CHANGELOG states the cost "lands on `go.sum`, vulnerability-scanning
+surface and licence review, not on runtime; the linker drops unreached code."
+The runtime half holds — a process with no relay configured measures 0
+allocations per operation — but **the linker half does not, and should not be
+relied on for image-size planning**. Measured here on a minimal `main` whose
+only SDK call is `o11ynats.Connect`, with no relay configured:
+
+| Build | Binary | `antlr`/`gofeatureflag`/`jsonlogic` symbols |
+|---|---|---|
+| o11y on otel-nats v0.7.0 | 9,382,454 B | 0 |
+| o11y on otel-nats v0.8.0 | 12,497,169 B | 1248 |
+
+That is **+3.11 MB (+33%)**, and `go tool nm` shows the rule-engine symbols are
+linked in rather than elided (1174 `antlr`, 69 `jsonlogic`, 5 `gofeatureflag`,
+plus 127 `openfeature`). The provider is reachable through the endpoint-driven
+auto-install path, so the linker cannot prove it dead — configuring no relay is
+a runtime decision, not a build-time one. Container images grow accordingly;
+budget for it before rolling the upgrade out fleet-wide.
 
 ---
 
@@ -272,6 +323,33 @@ engagement plan below sequences it accordingly.
   (public `Inject`/`Extract`) for the legacy `nats.JetStreamContext` API, which
   the wrapper deliberately does not cover.
 - **Friction**: low — thin, additive, no behavior change.
+
+#### R10. Carry the per-message dispatch decision on `otelnats.Msg`
+
+- **What**: since v0.8.0 the tracing switch is resolved per operation.
+  `Conn.msgHandler` evaluates `c.gate.tracing()` to choose the traced or direct
+  handler, but `otelnats.Msg` carries only `Msg` and `Ctx`, so a wrapper cannot
+  learn which path ran. Request: expose the decision on the message (a `Traced
+  bool` field, or an accessor), so a consumer reads the dispatch that actually
+  happened instead of recomputing it.
+- **Evidence**: v0.8.0 `otelnats/conn.go:27-33` (the `Msg` type) and `:84-98`
+  (`msgHandler`, which resolves the gate per message and hands off to one of two
+  pre-built handlers).
+- **o11y-side cost today**: `nats/conn.go`'s `restoreBaggage` must call
+  `nc.TracingEnabled()`, which routes through `Conn.impl()` and so re-resolves
+  the same gate. Two consequences: a relay-capable process pays **two extra
+  OpenFeature evaluations per delivered message** on top of upstream's own two;
+  and the two resolutions are independent, so a relay flip landing between them
+  makes them disagree — restoring wire baggage on a message upstream delivered
+  untraced, or dropping it on one upstream traced.
+- **Why the obvious workaround does not work**: the direct path hands back
+  `context.Background()` and the traced path a span context, so
+  `trace.SpanContextFromContext(m.Ctx).IsValid()` discriminates them — but only
+  while the `TracerProvider` is real. With the SDK's trace pillar off the
+  provider is a noop, the traced path's span context is invalid too, and the
+  signal collapses. A wrapper cannot distinguish "upstream went direct" from
+  "upstream traced into a noop provider" without help from upstream.
+- **Friction**: low — additive field or accessor, no behavior change.
 
 #### R9. KeyValue / ObjectStore wrapping (deferred)
 

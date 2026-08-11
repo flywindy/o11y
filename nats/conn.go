@@ -40,11 +40,36 @@ type Conn struct {
 
 type propagationPolicy struct {
 	propagator     propagation.TextMapPropagator
-	tracingEnabled bool
+	tracingEnabled func() bool
 }
 
+// restoreBaggage re-attaches W3C baggage from the inbound headers to ctx.
+// Upstream starts each handler span from a fresh context, so baggage extracted
+// during its own header read is not carried into the handler's ctx; this
+// restores it without disturbing the consumer span context already in ctx.
+//
+// Guard order is deliberate and load-bearing for cost. Since otel-nats v0.8.0
+// tracingEnabled resolves the dynamic switch, which in a relay-capable process
+// is two OpenFeature evaluations (measured upstream at roughly 12 us and 23
+// allocations each) on every call. The two guards above it are a nil check and
+// a map length, so a message that can never carry baggage — no headers at all,
+// the common case — is rejected for free instead of paying the relay. The
+// reordering is behaviour-identical: all three conditions short-circuit to the
+// same unchanged ctx.
+//
+// Known limitation (upstream dispatch is resolved separately): upstream picks
+// the traced or direct handler with its own evaluation of the same switch, and
+// this call re-resolves it microseconds later. A relay flip landing between the
+// two makes them disagree — restoring wire baggage on a message upstream
+// delivered untraced, or dropping it on one upstream traced. The window is
+// microseconds against a relay poll interval measured in tens of seconds. A
+// race-free fix needs the dispatch decision to travel with the message rather
+// than being recomputed; that is tracked as R10 in docs/upstream-otel-nats.md.
 func (p propagationPolicy) restoreBaggage(ctx context.Context, headers natsgo.Header) context.Context {
-	if !p.tracingEnabled || p.propagator == nil || len(headers) == 0 {
+	if p.propagator == nil || len(headers) == 0 {
+		return ctx
+	}
+	if p.tracingEnabled == nil || !p.tracingEnabled() {
 		return ctx
 	}
 	extracted := p.propagator.Extract(context.Background(), &otelnats.HeaderCarrier{H: headers})
@@ -70,20 +95,26 @@ func (p propagationPolicy) restoreBaggage(ctx context.Context, headers natsgo.He
 // otel.GetTextMapPropagator), which is exactly the ambient global state ADR
 // 0003 keeps this SDK away from — so don't.
 //
-// Tracing is enabled explicitly via otelnats.WithTracingEnabled(true), so it
-// does NOT depend on the OTEL_INSTRUMENTATION_GO_TRACING_ENABLED /
-// OTEL_NATS_TRACING_ENABLED environment variables the upstream package gates
-// on by default. When the SDK's trace pillar is disabled, obs.TracerProvider()
-// is a no-op provider: the traced code path still runs, but every span is
-// non-recording and carries no span context. Because upstream starts each
-// publish/consume span from a fresh context, a no-op provider yields no active
-// trace to inject, so cross-service trace correlation is simply inactive while
-// the pillar is off (not broken) and resumes automatically once the trace
-// pillar is enabled.
+// Tracing defaults to enabled via otelnats.WithTracingEnabled(true). Since
+// otel-nats v0.8.0, OTEL_NATS_TRACING_ENABLED and a configured feature-flag
+// relay outrank that connection-local default and can change the effective
+// state, and the process-wide master OTEL_INSTRUMENTATION_GO_TRACING_ENABLED is
+// ANDed above all of them — it defaults to enabled, but a falsy value disables
+// NATS tracing whatever the rest of the ladder says. Both variables are a
+// strict tri-state: an unparseable value (including the empty string) fails
+// this call rather than being ignored. When the SDK's trace pillar is disabled
+// but the effective NATS switch
+// is enabled, obs.TracerProvider() is a no-op provider: the traced code path
+// runs, but every span is non-recording and carries no span context. Because
+// upstream starts each publish/consume span from a fresh context, a no-op
+// provider yields no active trace to inject, so cross-service trace correlation
+// is simply inactive while the pillar is off (not broken) and resumes once the
+// trace pillar is enabled.
 //
-// If a service-level observability toggle requires the native NATS cost profile
-// while tracing is off, use ConnectWithOptions and WithTracingEnabled(false)
-// instead.
+// With no relay and no overriding upstream environment variable,
+// ConnectWithOptions plus WithTracingEnabled(false) selects the direct/native
+// path. A relay-capable process keeps both implementations and evaluates the
+// flags per operation even while the effective value is false.
 //
 // Typical usage with the o11y SDK:
 //
@@ -95,34 +126,50 @@ func Connect(ctx context.Context, url string, tp trace.TracerProvider, prop prop
 // ConnectWithOptions establishes a NATS connection with o11y-owned connection
 // options.
 //
-// It defaults to the same tracing behavior as Connect. Use
-// WithTracingEnabled(false) to deliberately select the upstream direct/native
-// path for services whose disabled-observability mode must avoid tracing
-// wrapper overhead. Use WithNATSOptions to pass ordinary nats.go connection
-// options such as nats.Name or nats.UserCredentials.
+// It defaults to the same tracing behavior as Connect. WithTracingEnabled is a
+// connection-local default: the upstream environment and relay can override it.
+// With no relay or override, false selects the direct/native path. Use
+// WithNATSOptions to pass ordinary nats.go connection options such as nats.Name
+// or nats.UserCredentials.
 func ConnectWithOptions(ctx context.Context, url string, tp trace.TracerProvider, prop propagation.TextMapPropagator, opts ...ConnectOption) (*Conn, error) {
 	cfg := newConnectConfig(opts)
-	return connect(ctx, url, tp, prop, cfg.tracingEnabled, cfg.natsOpts)
+	return connect(ctx, url, tp, prop, cfg.tracingDefault, cfg.natsOpts)
 }
 
-func connect(ctx context.Context, url string, tp trace.TracerProvider, prop propagation.TextMapPropagator, tracingEnabled bool, natsOpts []natsgo.Option) (*Conn, error) {
+func connect(ctx context.Context, url string, tp trace.TracerProvider, prop propagation.TextMapPropagator, tracingDefault bool, natsOpts []natsgo.Option) (*Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("nats connect: context already canceled: %w", err)
+	}
+	// The non-nil requirement is now enforced rather than only documented.
+	// Before otel-nats v0.8.0 a nil propagator was survivable here because the
+	// facade read its propagator back from nc.TraceContext(), which supplied a
+	// usable value on both paths. v0.8.0 made that accessor return a throwaway
+	// empty propagator on the direct path, so the facade holds the caller's
+	// value directly — and a nil one would silently disable baggage restoration
+	// for the life of the connection while upstream carried on propagating via
+	// the OTel globals. Failing the call keeps that divergence from shipping,
+	// and keeps ADR 0003's no-ambient-globals contract enforceable rather than
+	// advisory. SDK callers pass obs.TracerProvider() / obs.Propagator, which
+	// are never nil, so this cannot fire on the supported path.
+	if tp == nil {
+		return nil, fmt.Errorf("nats connect %s: tracer provider must not be nil (pass obs.TracerProvider())", url)
+	}
+	if prop == nil {
+		return nil, fmt.Errorf("nats connect %s: propagator must not be nil (pass obs.Propagator)", url)
 	}
 	nc, err := otelnats.ConnectWithOptions(url, natsOpts,
 		otelnats.WithTracerProvider(tp),
 		otelnats.WithPropagators(prop),
-		otelnats.WithTracingEnabled(tracingEnabled),
+		otelnats.WithTracingEnabled(tracingDefault),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("nats connect %s: %w", url, err)
 	}
-	_, configuredPropagator := nc.TraceContext()
 	return &Conn{
 		Conn: nc,
 		policy: propagationPolicy{
-			propagator:     configuredPropagator,
-			tracingEnabled: tracingEnabled,
+			propagator:     prop,
+			tracingEnabled: nc.TracingEnabled,
 		},
 	}, nil
 }
