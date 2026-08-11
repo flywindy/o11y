@@ -277,6 +277,17 @@ instrumented path available and evaluates flags per operation even while the
 effective flag is false. This SDK does not configure a relay; adopting one is a
 separate application/deployment decision.
 
+Above that whole ladder sits an upstream **master switch**,
+`OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`, which is ANDed with the result. It
+defaults to enabled, so leaving it unset changes nothing — but setting it to a
+falsy value turns off NATS tracing (and with it header propagation and baggage
+restoration) no matter what the option, the module variable or the relay say.
+Both upstream variables are strict tri-state since v0.8.0: only `1`/`true`/`yes`/`on`
+and `0`/`false`/`no`/`off` are accepted, and **any other value — including the
+empty string an unexpanded `${VAR}` produces — fails the connection with an
+error rather than being ignored.** Audit deployment configuration for these two
+names before upgrading.
+
 **Environment-variable control** (useful for staged rollouts without deploys):
 
 | Env var | Default |

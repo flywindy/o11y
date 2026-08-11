@@ -48,8 +48,26 @@ default. The upgrade and the operational rollout are deliberately separate:
 
 The dependency adds `otel-flags`, OpenFeature, GO Feature Flag, and their
 transitive parsing/rule-evaluation modules. They expand build, SBOM, licence,
-and vulnerability-review surfaces even when the relay is unused; upstream
-documents that unreachable runtime code is linker-elided.
+and vulnerability-review surfaces even when the relay is unused.
+
+Upstream's CHANGELOG states the cost "lands on `go.sum`, vulnerability-scanning
+surface and licence review, not on runtime; the linker drops unreached code."
+The runtime half holds — a process with no relay configured measures 0
+allocations per operation — but **the linker half does not, and should not be
+relied on for image-size planning**. Measured here on a minimal `main` whose
+only SDK call is `o11ynats.Connect`, with no relay configured:
+
+| Build | Binary | `antlr`/`gofeatureflag`/`jsonlogic` symbols |
+|---|---|---|
+| o11y on otel-nats v0.7.0 | 9,382,454 B | 0 |
+| o11y on otel-nats v0.8.0 | 12,497,169 B | 1248 |
+
+That is **+3.11 MB (+33%)**, and `go tool nm` shows the rule-engine symbols are
+linked in rather than elided (1174 `antlr`, 69 `jsonlogic`, 5 `gofeatureflag`,
+plus 127 `openfeature`). The provider is reachable through the endpoint-driven
+auto-install path, so the linker cannot prove it dead — configuring no relay is
+a runtime decision, not a build-time one. Container images grow accordingly;
+budget for it before rolling the upgrade out fleet-wide.
 
 ---
 
@@ -305,6 +323,33 @@ engagement plan below sequences it accordingly.
   (public `Inject`/`Extract`) for the legacy `nats.JetStreamContext` API, which
   the wrapper deliberately does not cover.
 - **Friction**: low — thin, additive, no behavior change.
+
+#### R10. Carry the per-message dispatch decision on `otelnats.Msg`
+
+- **What**: since v0.8.0 the tracing switch is resolved per operation.
+  `Conn.msgHandler` evaluates `c.gate.tracing()` to choose the traced or direct
+  handler, but `otelnats.Msg` carries only `Msg` and `Ctx`, so a wrapper cannot
+  learn which path ran. Request: expose the decision on the message (a `Traced
+  bool` field, or an accessor), so a consumer reads the dispatch that actually
+  happened instead of recomputing it.
+- **Evidence**: v0.8.0 `otelnats/conn.go:27-33` (the `Msg` type) and `:84-98`
+  (`msgHandler`, which resolves the gate per message and hands off to one of two
+  pre-built handlers).
+- **o11y-side cost today**: `nats/conn.go`'s `restoreBaggage` must call
+  `nc.TracingEnabled()`, which routes through `Conn.impl()` and so re-resolves
+  the same gate. Two consequences: a relay-capable process pays **two extra
+  OpenFeature evaluations per delivered message** on top of upstream's own two;
+  and the two resolutions are independent, so a relay flip landing between them
+  makes them disagree — restoring wire baggage on a message upstream delivered
+  untraced, or dropping it on one upstream traced.
+- **Why the obvious workaround does not work**: the direct path hands back
+  `context.Background()` and the traced path a span context, so
+  `trace.SpanContextFromContext(m.Ctx).IsValid()` discriminates them — but only
+  while the `TracerProvider` is real. With the SDK's trace pillar off the
+  provider is a noop, the traced path's span context is invalid too, and the
+  signal collapses. A wrapper cannot distinguish "upstream went direct" from
+  "upstream traced into a noop provider" without help from upstream.
+- **Friction**: low — additive field or accessor, no behavior change.
 
 #### R9. KeyValue / ObjectStore wrapping (deferred)
 

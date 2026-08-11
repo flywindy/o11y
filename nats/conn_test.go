@@ -327,6 +327,41 @@ func TestConnectWithOptions_ForwardsNATSOptions(t *testing.T) {
 	assert.Equal(t, "o11y-test-client", conn.NatsConn().Opts.Name)
 }
 
+// TestConnect_RejectsNilProviders pins the non-nil precondition the package
+// comment states. It is enforced rather than documented because otel-nats
+// v0.8.0 made a nil propagator silently harmful: the facade now holds the
+// caller's propagator directly (v0.8.0's directConn.TraceContext returns a
+// throwaway empty propagator, so reading it back is no longer viable), and a
+// nil one would disable baggage restoration for the connection's whole life
+// while upstream kept propagating through the OTel globals. The URL is never
+// dialed — validation happens before the connect attempt.
+func TestConnect_RejectsNilProviders(t *testing.T) {
+	tp, prop, _ := newTestProviders()
+
+	t.Run("nil tracer provider", func(t *testing.T) {
+		conn, err := o11ynats.Connect(context.Background(), "nats://127.0.0.1:1", nil, prop)
+		assert.Nil(t, conn)
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "tracer provider must not be nil")
+	})
+
+	t.Run("nil propagator", func(t *testing.T) {
+		conn, err := o11ynats.Connect(context.Background(), "nats://127.0.0.1:1", tp, nil)
+		assert.Nil(t, conn)
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "propagator must not be nil")
+	})
+
+	t.Run("ConnectWithOptions applies the same validation", func(t *testing.T) {
+		conn, err := o11ynats.ConnectWithOptions(context.Background(), "nats://127.0.0.1:1", tp, nil,
+			o11ynats.WithTracingEnabled(false),
+		)
+		assert.Nil(t, conn)
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "propagator must not be nil")
+	})
+}
+
 func TestConnect_InvalidURL(t *testing.T) {
 	tp, prop, _ := newTestProviders()
 

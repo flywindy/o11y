@@ -29,6 +29,17 @@ func newConnectConfig(opts []ConnectOption) connectConfig {
 // therefore override it in either direction. When neither is configured,
 // false still selects the upstream direct implementation with no spans, no
 // propagation injection/extraction, and no per-operation flag evaluation.
+//
+// One switch outranks that entire ladder: upstream ANDs the result with the
+// process-wide master OTEL_INSTRUMENTATION_GO_TRACING_ENABLED. It defaults to
+// enabled, so an unset value costs nothing, but a falsy one disables NATS
+// tracing regardless of this option, the module variable or the relay.
+//
+// Both upstream variables are a strict tri-state as of v0.8.0: 1/true/yes/on
+// and 0/false/no/off (trimmed, case-insensitive) are accepted, and every other
+// value — the empty string included, which is what an unexpanded ${VAR} in a
+// deployment manifest resolves to — fails connection construction with an
+// error wrapping otelflags.ErrInvalidFlagValue instead of being ignored.
 func WithTracingEnabled(enabled bool) ConnectOption {
 	return func(cfg *connectConfig) {
 		cfg.tracingDefault = enabled
