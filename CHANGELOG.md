@@ -13,6 +13,10 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+---
+
+## [0.10.0] - 2026-08-11
+
 ### Added
 
 - `o11y`: ADR 0025 application-defined baggage attributes. Use
