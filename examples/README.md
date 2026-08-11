@@ -235,7 +235,7 @@ go run examples/nats-core/requester/main.go
 The responder replies with `conn.Respond`, which routes the reply through the
 traced publish path so the reply message carries the responder's trace context
 (unlike raw `msg.Respond`). The requester uses `conn.Request`; the upstream
-otel-nats v0.7.0 layer records a `receive {inbox}` span for the reply — named
+otel-nats layer records a `receive {inbox}` span for the reply — named
 for the reply inbox, parented under the responder's trace and linked back to
 its reply-send span (the reply-span recording moved from this SDK's facade to
 upstream in the v0.6.0 upgrade; see ADR 0022's amendments).

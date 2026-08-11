@@ -888,18 +888,27 @@ producer's trace.
 
 Use `obs.Propagator` together with the `nats` sub-package to propagate trace context across NATS messages.
 
-> **Tracing is on by default.** `o11ynats.Connect` enables NATS tracing
-> explicitly (`otelnats.WithTracingEnabled(true)`), so it does not depend on the
-> `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` / `OTEL_NATS_TRACING_ENABLED`
-> environment variables the upstream package gates on by default. When the SDK's
-> trace pillar is disabled, `obs.TracerProvider()` is a no-op provider: NATS
+> **Tracing is on by default, but the default is no longer the last word.**
+> `o11ynats.Connect` supplies an enabled *connection-local default*
+> (`otelnats.WithTracingEnabled(true)`). Since `otel-nats` v0.8.0 that default
+> sits at the bottom of the precedence ladder described below, so
+> `OTEL_NATS_TRACING_ENABLED` and a feature-flag relay can both override it, and
+> the process-wide `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` master switch is
+> ANDed above the whole ladder — a falsy value there turns off NATS tracing,
+> header propagation and baggage restoration regardless of everything else.
+> Audit both variables in your deployment configuration before upgrading.
+>
+> When the SDK's trace pillar is disabled, `obs.TracerProvider()` is a no-op
+> provider: NATS
 > spans are non-recording and carry no span context, so no active trace is
 > propagated while the pillar is off — cross-service trace correlation is
 > inactive (not broken) and resumes as soon as the trace pillar is enabled.
 > If your service-level "observability off" mode must also avoid tracing
 > wrapper cost and use the native NATS path, call `ConnectWithOptions` with
 > `o11ynats.WithTracingEnabled(obs.Toggles.Trace)` so NATS follows the SDK's
-> resolved trace toggle. Do not re-parse env vars or infer state by inspecting
+> resolved trace toggle — subject to the same precedence: that option selects
+> the native path only when no relay is configured and `OTEL_NATS_TRACING_ENABLED`
+> is unset. Do not re-parse env vars or infer state by inspecting
 > the TracerProvider type.
 
 ```go
@@ -953,6 +962,18 @@ option only when no relay is configured and `OTEL_NATS_TRACING_ENABLED` is
 unset. When a relay is available, flags are evaluated on every operation even
 while tracing is currently disabled; enabling that control plane is a separate
 deployment decision from this dependency upgrade.
+
+The process-wide master switch `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED` is
+applied *after* that ladder and ANDed with its result. A falsy value disables
+NATS tracing, trace propagation and baggage restoration whatever the relay, the
+environment variable or the option resolved to. Both variables are a strict
+tri-state since v0.8.0: only `1`/`true`/`yes`/`on` and `0`/`false`/`no`/`off`
+are accepted, and any other value — including the empty string an unexpanded
+`${VAR}` produces — fails the connection with an error instead of being
+ignored. See
+[README's feature-toggle section](../README.md#feature-toggles-progressive-rollout)
+and [ADR 0004](adr/0004-nats-integration.md) for the same ladder stated
+alongside the option reference and the integration decision record.
 
 To make the *consumer* span itself searchable on domain identifiers the SDK
 has no way to know — a room ID, a site ID, a request ID pulled from the
