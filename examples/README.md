@@ -221,8 +221,11 @@ Applications can use the SDK trace toggle as the connection-local default with
 o11ynats.WithTracingEnabled(obs.Toggles.Trace))`, where `obs` is the
 initialized SDK. This keeps NATS tracing aligned with the SDK's master switch,
 `O11Y_TRACE_ENABLED`, when no upstream env or relay overrides it. The direct
-path preserves native cost only when no relay is configured. The examples keep
-tracing on so the round trip is visible in Tempo.
+path preserves native cost only when no relay is configured **and** no upstream
+environment variable overrides the default — `OTEL_NATS_TRACING_ENABLED` for
+this module, or the process-wide `OTEL_INSTRUMENTATION_GO_TRACING_ENABLED`
+master switch. The examples keep tracing on so the round trip is visible in
+Tempo.
 
 ```bash
 # Terminal 1 — start responder first
