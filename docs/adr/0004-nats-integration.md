@@ -96,7 +96,9 @@ canceled.
 ## Global-state verification
 
 ### Library: `github.com/akira-core/instrumentation-go/otel-nats`
+
 ### Version: `v0.9.1` (per `go.mod`)
+
 ### Result: ⚠️ conditional — never sets OTel globals; may write one **named OpenFeature** provider slot, but only on the endpoint-driven relay path o11y does not enable
 
 The OTel half of this verdict has held at every version audited (the module
@@ -142,8 +144,8 @@ it would only *read* globals, never set them.
 
 ## Semconv Alignment
 
-`otel-nats` v0.2.11 imports `go.opentelemetry.io/otel/semconv/v1.39.0`,
-matching the SDK pin after the semconv upgrade. The emitted messaging
+`otel-nats` imports `go.opentelemetry.io/otel/semconv/v1.39.0`, matching the SDK
+pin — re-verified at the currently pinned v0.9.1. The emitted messaging
 attributes use the v1.39 names documented in `docs/semconv.md`, including
 `messaging.operation.name` and `messaging.operation.type`.
 

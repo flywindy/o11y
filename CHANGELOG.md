@@ -67,7 +67,7 @@ adopters can plan their upgrades.
   | `receive {inbox}` (reply-receive) | `receive` |
   | `publish {inbox}` (manual reply via `conn.Publish(ctx, msg.Reply, …)`) | `publish` |
   | `process {inbox}` (handler subscribed on an inbox) | `process` |
-  | `receive`/`process {delivered subject}` for a wildcard-filter JetStream consumer | `receive`/`process {filter subject}` |
+  | `receive`/`process {delivered subject}` for a JetStream consumer with a **single-valued wildcard** filter | `receive`/`process {filter subject}` |
 
   Any span whose destination resolves to a request/reply inbox drops the
   destination from its name: an inbox is auto-generated and single-use, so it is
