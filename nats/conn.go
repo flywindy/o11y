@@ -269,9 +269,13 @@ func (c *Conn) Respond(ctx context.Context, msg *natsgo.Msg, data []byte) error 
 
 // Request sends subject/data and waits for a reply. ctx carries the trace
 // context and cancellation; timeout bounds the wait. The upstream otel-nats
-// layer (v0.6.0+) emits the producer "send" span, injects W3C headers, and
-// emits the requester-side CLIENT "receive" span for the reply (otel-nats
-// v0.7.0 corrected the kind from CONSUMER) — linked to
+// layer (v0.6.0+) emits the CLIENT "request {subject}" span (operation.type
+// "send"; named "{subject} request" before otel-nats v0.9.0), injects W3C
+// headers, and emits the requester-side CLIENT "receive" span for the reply
+// (otel-nats v0.7.0 corrected the kind from CONSUMER; v0.9.0 dropped the reply
+// inbox from that span's name, since an inbox is a temporary, anonymous
+// destination — it stays on messaging.destination.name and
+// messaging.message.conversation_id) — linked to
 // the responder's trace whenever the responder replied via Conn.Respond (or
 // any traced publish path). Earlier SDK versions created that reply span in
 // this facade; it is now delegated to upstream so the round trip is recorded
@@ -306,8 +310,8 @@ func (c *Conn) Request(ctx context.Context, subject string, data []byte, timeout
 // RequestMsg sends a pre-built request message — use it to set headers on the
 // request — and waits for a reply, with the same ctx-first tracing contract as
 // Request: ctx carries the trace context and cancellation, and timeout bounds
-// the wait. The producer "send" span parents to ctx; as with Request, the
-// upstream layer records the reply "receive" span under the responder's trace,
+// the wait. The "request {subject}" span parents to ctx; as with Request, the
+// upstream layer records the bare "receive" reply span under the responder's trace,
 // linked back to the request when the reply carries trace context and recorded
 // without a link when it does not.
 //

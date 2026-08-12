@@ -149,6 +149,12 @@ Whenever `otel-nats` is upgraded (any version change in `go.mod`):
 3. Update the "Global-state verification" section above with the new
    version number.
 4. Update the approved-integrations table in ADR 0003.
+5. Diff the emitted **span names** against the table in `docs/semconv.md` and
+   run `nats/conn_test.go`'s `TestSpanNames_*`. Names are entirely
+   upstream-owned here (no span-name formatter is exposed), so a rename is
+   both invisible to compilation and breaking for every dashboard keyed on
+   them; v0.9.0 renamed all of them and this step is what would have caught
+   it (added 2026-08-12).
 
 ---
 
@@ -385,3 +391,46 @@ CHANGELOG. No new call to `otel.SetTracerProvider` or
 `otel.SetTextMapPropagator` is reachable when the facade supplies its explicit
 providers. Regression tests in `nats/conn_test.go` pin environment-over-option,
 master-veto, malformed-value, and no-relay direct-path behavior.
+
+## Amendment (2026-08-12): otel-nats v0.9.1 span-name conformance
+
+The SDK now pins **v0.9.1**. This is a narrower bump than the one above: the
+dynamic-control model, the flag precedence, the dependency graph and every
+consequence listed in the 2026-08-10 amendment are unchanged — the upstream
+module's own `go.mod` is identical between v0.8.0 and v0.9.1, `oteljetstream`'s
+exported surface is byte-identical, and `otelnats` gains one additive method
+(`Conn.InboxPrefixes`). No facade code changed.
+
+What changed is span **names**, which this integration has always delegated
+entirely to upstream (otel-nats exposes no span-name formatter, and ADR 0023's
+naming convention is explicitly data-store-only). v0.9.0 moved them to the
+semconv v1.39.0 messaging shape `{messaging.operation.name} {destination}` and
+omits `{destination}` where no low-cardinality value exists — most visibly, a
+request/reply inbox is no longer in any span name. Three destination attributes
+were added (`messaging.destination.template`, `.temporary`, `.anonymous`) so the
+inbox stays queryable, and `messaging.message.conversation_id` now appears on
+every inbox-destination span, including JetStream ones whose subject is an inbox.
+
+Consequences for this integration:
+
+- **Dashboard-breaking, code-compatible.** Nothing in `nats/` needed a change;
+  four test assertions and every doc that quoted a span name did. The migration
+  table is in the CHANGELOG.
+- **The audit gap this exposed is now closed.** The integration had no written
+  span-name baseline anywhere — not in this ADR, not in `docs/semconv.md` — so an
+  upstream rename was undetectable by review. `docs/semconv.md` now carries a
+  span-name table and `nats/conn_test.go` pins the shapes, and "Audit discipline
+  for upstream bumps" above gains a step 5 requiring the diff — alongside the
+  existing global-state and semconv-version checks.
+- **Residual cardinality stays a deployment concern.** Subjects that embed
+  identifiers, on paths with no subscription or consumer filter to resolve
+  against, keep the concrete subject in the span name; upstream will not infer a
+  `messaging.destination.template` and neither will the SDK. This is the same
+  division of labour §5's cardinality guidance already assumes: the SDK
+  documents the risk, the deployment bounds it (collector `span` processor).
+
+Metrics scope is untouched by this release — the module is still trace-only, so
+the deferral in §5 and its revisit triggers stand. See
+`docs/upstream-otel-nats.md` for the v0.9.1 surface audit and the re-checked
+upstream backlog, and ADR 0022's 2026-08-12 amendment for the request/reply
+span-topology wording this rename affected.

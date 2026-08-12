@@ -13,6 +13,76 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+### Changed
+
+- `nats`: upgraded `github.com/akira-core/instrumentation-go/otel-nats` from
+  v0.8.0 to v0.9.1. The release is span-naming conformance work: no dependency
+  changes (the upstream module's own `go.mod` is unchanged), no API removals, and
+  one additive upstream method (`otelnats.Conn.InboxPrefixes`). Span names now
+  follow the semconv v1.39.0 messaging shape
+  `{messaging.operation.name} {destination}`, omitting `{destination}` when no
+  low-cardinality value exists — see Breaking Changes below for the migration.
+- `nats`: three destination attributes are now emitted by the upstream layer.
+  `messaging.destination.template` carries the bounded destination a span name
+  used when it differs from the concrete subject (a wildcard subscription
+  subject, or a single-valued wildcard JetStream consumer filter);
+  `messaging.destination.temporary` and `messaging.destination.anonymous` are
+  `true` on every span whose destination is a request/reply inbox.
+  `messaging.destination.name` continues to carry the concrete subject on every
+  span, whatever the name uses.
+- `nats`: `messaging.message.conversation_id` is now set on **every** span whose
+  destination is a reply inbox, not only the reply-receive span. JetStream spans
+  still omit it for ordinary subjects (a JetStream message's `Reply` is the
+  `$JS.ACK.…` acknowledgement subject, not a conversation ID), but a JetStream
+  message whose own subject is an inbox — a stream over `_INBOX.>`, how
+  request/reply-over-JetStream makes replies durable — now records it. This
+  narrows a blanket claim in `docs/semconv.md` that JetStream never emits the
+  attribute.
+- `docs`: `docs/semconv.md`'s NATS section gained the span-name table it never
+  had. NATS span names are entirely upstream-owned (otel-nats exposes no
+  span-name formatter, and ADR 0023's `{system.name}.{operation} {target}`
+  convention is explicitly data-store-only), so the table plus the new
+  `TestSpanNames_*` cases in `nats/conn_test.go` are the baseline each upstream
+  bump is diffed against. ADR 0022 carries a dated amendment for the same
+  reason. See `docs/upstream-otel-nats.md` for the v0.9.1 surface audit.
+
+### Breaking Changes (Migration Guide)
+
+- **NATS span names changed.** Update any dashboard, TraceQL/trace-search query,
+  alert, or `spanmetrics` connector rule keyed on the old names. There is no
+  compatibility shim.
+
+  | Old name (v0.8.0 and earlier) | New name |
+  |---|---|
+  | `send {subject}` (publish, core and JetStream) | `publish {subject}` |
+  | `{subject} request` | `request {subject}` |
+  | `receive {inbox}` (reply-receive) | `receive` |
+  | `publish {inbox}` (manual reply via `conn.Publish(ctx, msg.Reply, …)`) | `publish` |
+  | `process {inbox}` (handler subscribed on an inbox) | `process` |
+  | `receive`/`process {delivered subject}` for a wildcard-filter JetStream consumer | `receive`/`process {filter subject}` |
+
+  Any span whose destination resolves to a request/reply inbox drops the
+  destination from its name: an inbox is auto-generated and single-use, so it is
+  a temporary, anonymous destination, and semconv v1.39.0 directs omitting
+  `{destination}` rather than substituting it. Span names are a dimension in
+  trace backends (Jaeger's operation list, the `spanmetrics` connector), so the
+  old names were unbounded series, not just verbose labels. The inbox stays
+  queryable on `messaging.destination.name`,
+  `messaging.message.conversation_id`, `messaging.destination.temporary` and
+  `messaging.destination.anonymous` — **correlate replies by attribute, not by
+  span name**.
+
+  One exception: a subscription or consumer filter that is *only* an inbox
+  prefix plus wildcards (`_INBOX.>`) keeps its destination, because it is a
+  fixed low-cardinality string the subscriber declared.
+
+  Two sources of unbounded span names remain, both structurally invisible to the
+  instrumentation: subjects that embed identifiers (`orders.12345.created`) on
+  paths with no subscription or filter to resolve against, and a peer using a
+  custom inbox prefix this connection does not share. Bound them in the
+  collector with the `span` processor's `name.to_attributes` rules, where the
+  pattern is known; see "Known Cardinality Risks" in `docs/semconv.md`.
+
 ---
 
 ## [0.10.0] - 2026-08-11

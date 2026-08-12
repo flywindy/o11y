@@ -2,7 +2,8 @@
 
 **Upstream**: `github.com/akira-core/instrumentation-go` (`otel-nats` module;
 repo and module path renamed from `Marz32onE` in v0.6.0)
-**o11y pin**: v0.8.0 (see ADR 0004, 2026-08-10 amendment, for the audit)
+**o11y pin**: v0.9.1 (see ADR 0004, 2026-08-10 amendment, for the v0.8.0 audit;
+the v0.9.1 assessment is in this document)
 **Contribution model**: `flywindy/instrumentation-go` is a PR workspace only —
 its `main` tracks upstream `main`, every change goes to upstream as a PR, and
 o11y always imports the upstream module. Hard-forking (module rename, own
@@ -14,7 +15,7 @@ why, and what each change unlocks in this SDK. Update it on every upstream
 release audit and whenever an item lands, and keep the linked o11y issues in
 sync.
 
-**Last surface audit**: 2026-08-12 against **v0.9.1** (pin is still v0.8.0) — a
+**Last surface audit**: 2026-08-12 against **v0.9.1** (the current pin) — a
 full re-read of span naming and destination resolution across both packages,
 the exported surface and module dependencies of v0.9.0/v0.9.1 against v0.8.0,
 and a re-check of every open item below at v0.9.1 line numbers. The previous
@@ -76,9 +77,12 @@ budget for it before rolling the upgrade out fleet-wide.
 
 ---
 
-## v0.9.1 upgrade assessment (recommendation: take it)
+## v0.9.1 upgrade assessment (adopted 2026-08-12)
 
-**Verdict: adopt.** v0.9.0 + v0.9.1 are span-naming conformance work and
+**Verdict: adopt** — done; the pin is v0.9.1. The "work the upgrade requires"
+list below is retained as the record of what the bump touched.
+
+v0.9.0 + v0.9.1 are span-naming conformance work and
 nothing else. The expensive part of moving off v0.7.0 — the flag ladder, the
 `otel-flags` dependency and the +3.11 MB — was already paid by the v0.8.0
 upgrade; v0.9.1 adds none of it. The cost here is a **dashboard/query
@@ -128,8 +132,8 @@ reading of semconv v1.39.0:
 
 ### Verified locally against this tree
 
-Bumped in a throwaway working tree at `db308e5` (`go get
-…/otel-nats@v0.9.1`, reverted after measuring):
+First measured in a throwaway working tree at `db308e5`, before the pin moved
+(`go get …/otel-nats@v0.9.1`, reverted after measuring):
 
 - `go build ./...` — clean. The additive `InboxPrefixes` method needs no facade
   change; `nats/` compiles untouched.
@@ -199,12 +203,33 @@ subject-space cardinality: the SDK documents the risk, the deployment bounds
 it. Note this only rewrites the *name*; it does not reduce
 `messaging.destination.name`, which stays concrete by design.
 
-### Sequencing
+### What the bump actually landed
 
-Land this as its own change, separate from any documentation-only commit: the
-bump touches `go.mod`/`go.sum`, four test files' assertions and the span-name
-contract in `docs/semconv.md`, and reviewers should see those together and
-nothing else.
+The pin moved on 2026-08-12, in its own change, separate from the audit
+commit. Beyond `go.mod`/`go.sum` and the four assertions:
+
+- `nats/conn_test.go` gained `TestSpanNames_SemconvShape` (pins
+  `publish {subject}`, `request {subject}`, `process {subscription subject}`
+  with `destination.template`, and the bare `receive`) and
+  `TestSpanNames_InboxDestinationDropped` (the manual-reply `publish` and
+  inbox-subscription `process` shapes). Both are new coverage: the SDK had
+  **no** span-name assertions before, which is why the v0.9.0 rename was
+  invisible here. A shared `assertNoSpanNameCarriesInbox` helper asserts the
+  invariant across every recorded span rather than only the one under test.
+- `docs/semconv.md` gained the span-name table the NATS section never had, the
+  three new destination attributes, the narrowed JetStream `conversation_id`
+  claim, and a cardinality note covering names rather than only attributes.
+- ADR 0022 carries a dated amendment: its 2026-07-09 text named the span
+  `receive {inbox}`, and its §4 span-naming argument was illustrated with
+  `send events.created`. The §4 conclusion stands; the illustrations moved.
+- `nats/conn.go`'s `Request`/`RequestMsg` godoc now names the spans users will
+  actually search for, and drops a stale "producer span" description of what
+  has been a CLIENT span since v0.7.0.
+
+The collector-side `span` processor rules for the residual cases are **not**
+included: the rewrite patterns depend on a deployment's own subject spaces, and
+this repo's examples all use bounded subjects, so there is nothing here to
+rewrite. `docs/semconv.md` documents the mechanism for adopters who need it.
 
 ---
 
@@ -632,24 +657,24 @@ supply-chain concern for anyone still pinned below v0.6.0.
 
 Cleanups this SDK can do on its own, independent of the items above:
 
-- **Nothing in this repo documents the NATS span names.** ADR 0023 fixes the
-  name shape for the data-store integrations and explicitly scopes itself out of
-  messaging, and `docs/semconv.md` states a span-name shape only for
-  elasticsearch (`:552`) — the NATS section lists attributes and nothing else.
-  So the one integration whose names are entirely upstream-owned, and therefore
-  the one most likely to have them changed under it, is the one with no written
-  baseline: the v0.9.0 rename had to be reconstructed from upstream source
-  because there was nothing here to diff against. Add a span-name table when the
-  pin moves to v0.9.1 (listed as blocking work in the assessment above) and
-  treat it as the artefact each upstream bump is checked against.
-- **Extend the Known Cardinality Risks note from attributes to span names.**
-  That section currently warns only about `messaging.destination.name` per raw
-  subject. Span names carry the same subject and are worse, because trace
-  backends turn them into a dimension (Jaeger's operation list, the
-  `spanmetrics` connector) where an attribute would merely be stored. The
-  collector-side `span` processor rules for the residual cases belong in
-  `k8s/infrastructure/base/monitor/otel-collector.yaml`, referenced from that
-  section.
+- **Done (2026-08-12), kept as the reason it matters: nothing in this repo
+  documented the NATS span names.** ADR 0023 fixes the name shape for the
+  data-store integrations and explicitly scopes itself out of messaging, and
+  `docs/semconv.md` stated a span-name shape only for elasticsearch — the NATS
+  section listed attributes and nothing else. So the one integration whose names
+  are entirely upstream-owned, and therefore the one most likely to have them
+  changed under it, was the one with no written baseline: the v0.9.0 rename had
+  to be reconstructed from upstream source because there was nothing here to
+  diff against. The v0.9.1 bump added that table plus `TestSpanNames_*`; keep
+  both as the artefacts each upstream bump is checked against, and extend them
+  before assuming a future release left names alone.
+- **Consider collector-side `span` processor rules if a consuming service's
+  subject space is unbounded.** `docs/semconv.md`'s cardinality section now
+  covers span names and documents the `name.to_attributes` mechanism, but no
+  rules are configured in
+  `k8s/infrastructure/base/monitor/otel-collector.yaml`: the patterns depend on
+  the deployment's own subjects, and this repo's examples are all bounded.
+  Revisit when a service publishes to an identifier-bearing subject space.
 - **`nats/middleware.go`'s `headerCarrier` is now duplicative.** It was written
   because upstream's carrier was exact-case-only with no `Values`. v0.7.0's
   `otelnats.HeaderCarrier` implements `propagation.ValuesGetter` and falls back

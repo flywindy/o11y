@@ -1014,17 +1014,19 @@ _, err = conn.Subscribe(ctx, "orders.get", func(ctx context.Context, msg *gonats
 
 // Requester: conn.Request injects the active trace into the request headers.
 // Since otel-nats v0.6.0 the upstream layer also records the requester-side
-// reply-receive span itself: a "receive {inbox}" CLIENT span (v0.7.0 corrected
-// the kind from CONSUMER) that, when the reply carries a trace context (the
-// responder used conn.Respond), is parented under — and linked to — the
-// responder's reply-send context.
+// reply-receive span itself: a bare "receive" CLIENT span (v0.7.0 corrected the
+// kind from CONSUMER; v0.9.0 dropped the inbox from the name, since a reply
+// inbox is a temporary, anonymous destination — find it on
+// messaging.destination.name / conversation_id instead) that, when the reply
+// carries a trace context (the responder used conn.Respond), is parented
+// under — and linked to — the responder's reply-send context.
 _, err = conn.Request(ctx, "orders.get", []byte("42"), 2*time.Second)
 ```
 
 `Respond` guarantees the reply carries trace context, and upstream `Request`
 completes the requester-side half of the round trip: in Tempo you should see
 request publish, responder processing, responder reply publish, and a
-requester-side "receive {inbox}" span in the responder's trace, linked to the
+requester-side "receive" span in the responder's trace, linked to the
 reply publish. If the reply carries no trace context — an untraced responder,
 or one that used the raw `msg.Respond` instead of `conn.Respond` — the
 receive span is still recorded (in the requester's own trace) but carries no
