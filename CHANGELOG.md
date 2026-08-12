@@ -13,6 +13,10 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+---
+
+## [0.11.0] - 2026-08-12
+
 ### Changed
 
 - `nats`: upgraded `github.com/akira-core/instrumentation-go/otel-nats` from
