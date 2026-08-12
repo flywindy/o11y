@@ -1,7 +1,7 @@
 github.com/akira-core/instrumentation-go/otel-flags v0.2.0 h1:WlDn4nDVf/+bv3WKtzA9F6XZLmH8gCGGj43ryrg4HEw=
 github.com/akira-core/instrumentation-go/otel-flags v0.2.0/go.mod h1:Qv2ltxuODhboJiK8LduPzAi8h9/Qpf5pmIdHWPoF2os=
-github.com/akira-core/instrumentation-go/otel-nats v0.8.0 h1:Ls4qJNmcB77CjtlPWjz8S/QrYerchUNYy4dNUV9n7gU=
-github.com/akira-core/instrumentation-go/otel-nats v0.8.0/go.mod h1:KEsR9n4nRN53wQjjkHKY6uHbFNQNPDTh2qCpBplT7DI=
+github.com/akira-core/instrumentation-go/otel-nats v0.9.1 h1:liN1o1v0emOtV9x7kAmjt3A36NW2WetdO5j8YrYbpnw=
+github.com/akira-core/instrumentation-go/otel-nats v0.9.1/go.mod h1:KEsR9n4nRN53wQjjkHKY6uHbFNQNPDTh2qCpBplT7DI=
 github.com/antithesishq/antithesis-sdk-go v0.7.0-default-no-op h1:Z/MZK75wC/NSrkgqeNIa7jexam9uWzhLmFTSCPI/kn0=
 github.com/antithesishq/antithesis-sdk-go v0.7.0-default-no-op/go.mod h1:FQyySiasQQM8735Ddel3MRojmy4dA1IqCeyJ5jmPMbI=
 github.com/antlr4-go/antlr/v4 v4.13.0 h1:lxCg3LAv+EUK6t1i0y1V6/SLeUi0eKEKdhQAlS8TVTI=

@@ -792,3 +792,48 @@ Upstream v0.6.0 absorbs three decisions this ADR previously worked around:
 
 The 2026-07-03 canonical-header extraction limitation remains (upstream
 carrier still exact-case, verified in v0.6.0) and its documentation stands.
+
+---
+
+## Amendment (2026-08-12): otel-nats v0.9.1 — span names lose the subject where it is unbounded
+
+The 2026-07-09 amendment above records the reply-receive span as *"named
+`receive {inbox}`"*. That name is gone as of otel-nats v0.9.0, and the
+amendment's text stands only as the history of what v0.6.0 shipped. The span
+itself, its parenting and its link topology are unchanged; only the name is.
+
+Upstream v0.9.0 moved every span name to the semconv v1.39.0 messaging shape
+`{messaging.operation.name} {destination}` and, per the same spec text, omits
+`{destination}` whenever no low-cardinality value exists. For this ADR's
+request/reply decisions that means:
+
+- The reply-receive span is named **`receive`**, with the inbox on
+  `messaging.destination.name`, `messaging.message.conversation_id`,
+  `messaging.destination.temporary` and `messaging.destination.anonymous`.
+- The rule is not special-cased to that span. A reply published with
+  `conn.Publish(ctx, msg.Reply, data)` — the manual half of the exchange this
+  ADR's `Respond` decision exists to discourage — is named `publish`, and a
+  handler subscribed directly on an inbox is named `process`.
+- `Conn.Request`'s own span is `request {subject}` (was `{subject} request`),
+  and publish spans are `publish {subject}` (was `send {subject}`).
+- The 2026-07-01 amendment's §4 ("Span naming / attributes") argues from the
+  premise that *"every span this SDK or `otel-nats` emits is already
+  `{operation} {subject}`"*, illustrated with `send events.created` /
+  `process events.created` / `receive events.created`. The **conclusion of §4
+  stands unchanged** — high-cardinality app identifiers belong in attributes,
+  never in span names, and ADR 0023 stays data-store-only — but two of its
+  three illustrations have moved: the publish span is now
+  `publish events.created`, and a `receive` span for a reply carries no
+  subject at all. A `Subscribe` handler span still uses the **registered**
+  subject, so a wildcard subscription reads `process events.*`, with the
+  concrete subject on `messaging.destination.name` and the pattern on the new
+  `messaging.destination.template`. If anything v0.9.x strengthens §4: the
+  library now applies the very cardinality rule §4 invoked, to its own names.
+
+No facade decision in this ADR changes: `otel-nats` exposes no span-name
+formatter, the names were never SDK-owned, and nothing in `nats/` sets or
+rewrites them. The SDK-side consequences are documentation (the span-name table
+added to `docs/semconv.md`, which this ADR previously had no counterpart for)
+and test coverage — `nats/conn_test.go` now pins the name shapes so the next
+upstream rename is caught here rather than in a dashboard. See
+`docs/upstream-otel-nats.md` for the v0.9.1 audit and the migration list.

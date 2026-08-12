@@ -3,6 +3,7 @@ package nats_test
 import (
 	"context"
 	"os"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -589,10 +590,33 @@ func TestRespond_TracePropagation(t *testing.T) {
 		"a producer send span should be recorded for the reply publish, proving Respond uses the traced Publish path")
 }
 
+// replyReceiveSpanName is the name of the upstream reply-receive span. It is
+// the bare operation name with no destination segment: the reply inbox is
+// auto-generated and single-use, and semconv v1.39.0 directs omitting
+// {destination} when no low-cardinality value is available. otel-nats v0.9.0
+// implemented that (the span was `receive {inbox}` up to v0.8.0), so the inbox
+// now lives only in the span's attributes — see
+// TestRequest_ReplyReceive_DestinationIsInbox.
+const replyReceiveSpanName = "receive"
+
+// assertNoSpanNameCarriesInbox is the regression guard behind that rename: no
+// recorded span may put the inbox in its NAME, whichever path produced it.
+// Names are a dimension in trace backends (Jaeger's operation list, the
+// spanmetrics connector), so one leaked inbox is unbounded cardinality — a
+// weaker per-span assertion would not catch a new path that reintroduces it.
+func assertNoSpanNameCarriesInbox(t *testing.T, sr *tracetest.SpanRecorder, inbox string) {
+	t.Helper()
+	require.NotEmpty(t, inbox)
+	for _, s := range sr.Ended() {
+		assert.NotContains(t, s.Name(), inbox,
+			"span %q must not carry the reply inbox in its name", s.Name())
+	}
+}
+
 // TestRequest_ReplyLink verifies the requester-side half of the request/reply
 // round trip. Since otel-nats v0.6.0 the upstream layer records the reply
-// receive span itself (recordReply): a CONSUMER-kind span named after the
-// reply inbox, linked to — and parented under — the responder's reply-send
+// receive span itself (recordReply): a CLIENT-kind span, linked to — and
+// parented under — the responder's reply-send
 // span context whenever the reply carries one (which it does when the
 // responder replied via Conn.Respond). This replaces the reply-link span this
 // facade created in earlier SDK versions; the topology moved with it: the
@@ -630,7 +654,7 @@ func TestRequest_ReplyLink(t *testing.T) {
 
 	var found bool
 	for _, s := range sr.Ended() {
-		if s.Name() != "receive "+reply.Subject {
+		if s.Name() != replyReceiveSpanName {
 			continue
 		}
 		assert.Equal(t, oteltrace.SpanKindClient, s.SpanKind(),
@@ -644,7 +668,8 @@ func TestRequest_ReplyLink(t *testing.T) {
 			"upstream v0.6.0 parents the receive span under the responder's remote context, so span and link share the responder's trace")
 		found = true
 	}
-	assert.True(t, found, "a %q consumer span should be recorded", "receive "+reply.Subject)
+	assert.True(t, found, "a %q client span should be recorded", replyReceiveSpanName)
+	assertNoSpanNameCarriesInbox(t, sr, reply.Subject)
 }
 
 // TestRequest_ReplyLink_ServerAttrs verifies the upstream reply-receive span
@@ -680,7 +705,7 @@ func TestRequest_ReplyLink_ServerAttrs(t *testing.T) {
 
 	var found bool
 	for _, s := range sr.Ended() {
-		if s.Name() != "receive "+reply.Subject {
+		if s.Name() != replyReceiveSpanName {
 			continue
 		}
 		var hasServerAddress, hasServerPort bool
@@ -697,17 +722,19 @@ func TestRequest_ReplyLink_ServerAttrs(t *testing.T) {
 		assert.True(t, hasServerPort, "reply-receive span should carry server.port for a non-default port")
 		found = true
 	}
-	assert.True(t, found, "a %q consumer span should be recorded", "receive "+reply.Subject)
+	assert.True(t, found, "a %q client span should be recorded", replyReceiveSpanName)
 }
 
 // TestRequest_ReplyReceive_DestinationIsInbox verifies the upstream
-// reply-receive span can be correlated by inbox: its
-// messaging.destination.name is the reply's own Subject (the request/reply
-// inbox NATS generated for this call), the same value the requester's send
-// span emits as messaging.message.conversation_id via msg.Reply. (Earlier SDK
-// versions put the inbox on a conversation_id attribute of a facade-created
-// span; upstream v0.6.0's recordReply uses the destination attribute of its
-// receive span instead.)
+// reply-receive span can still be correlated by inbox now that its name no
+// longer carries one. The inbox lives on four attributes:
+// messaging.destination.name (the reply's own Subject, i.e. the inbox NATS
+// generated for this call), messaging.message.conversation_id (the same value,
+// also set late on the requester's send span), and the pair
+// messaging.destination.temporary / .anonymous, which are what classify the
+// destination as one whose name must be omitted. otel-nats v0.9.0 added the
+// last three; without them the rename would have made the inbox unqueryable
+// rather than merely unnamed.
 func TestRequest_ReplyReceive_DestinationIsInbox(t *testing.T) {
 	_, url := startTestServer(t)
 	tp, prop, sr := newTestProviders()
@@ -735,14 +762,21 @@ func TestRequest_ReplyReceive_DestinationIsInbox(t *testing.T) {
 
 	var found bool
 	for _, s := range sr.Ended() {
-		if s.Name() != "receive "+reply.Subject {
+		if s.Name() != replyReceiveSpanName {
 			continue
 		}
 		assert.Contains(t, s.Attributes(), semconv.MessagingDestinationNameKey.String(reply.Subject),
 			"reply-receive span should carry messaging.destination.name set to the reply's inbox subject")
+		assert.Contains(t, s.Attributes(), semconv.MessagingMessageConversationID(reply.Subject),
+			"reply-receive span should carry the inbox as messaging.message.conversation_id")
+		assert.Contains(t, s.Attributes(), semconv.MessagingDestinationTemporary(true),
+			"an inbox destination is temporary, which is why the span name omits it")
+		assert.Contains(t, s.Attributes(), semconv.MessagingDestinationAnonymous(true),
+			"an inbox destination is anonymous (auto-generated name)")
 		found = true
 	}
-	assert.True(t, found, "a %q consumer span should be recorded", "receive "+reply.Subject)
+	assert.True(t, found, "a %q client span should be recorded", replyReceiveSpanName)
+	assertNoSpanNameCarriesInbox(t, sr, reply.Subject)
 }
 
 // TestRequest_NoReplyHeader_NoLinkSpan verifies Request degrades cleanly when
@@ -779,7 +813,7 @@ func TestRequest_NoReplyHeader_NoLinkSpan(t *testing.T) {
 
 	var found bool
 	for _, s := range sr.Ended() {
-		if s.Name() != "receive "+reply.Subject {
+		if s.Name() != replyReceiveSpanName {
 			continue
 		}
 		assert.Empty(t, s.Links(),
@@ -787,6 +821,166 @@ func TestRequest_NoReplyHeader_NoLinkSpan(t *testing.T) {
 		found = true
 	}
 	assert.True(t, found, "upstream records the reply-receive span even for an untraced reply")
+}
+
+// spanNames returns the names of every recorded span, for the span-name shape
+// assertions below.
+func spanNames(sr *tracetest.SpanRecorder) []string {
+	spans := sr.Ended()
+	names := make([]string, 0, len(spans))
+	for _, s := range spans {
+		names = append(names, s.Name())
+	}
+	return names
+}
+
+// TestSpanNames_SemconvShape pins the span names the NATS integration emits, in
+// the semconv v1.39.0 messaging shape "{messaging.operation.name} {destination}"
+// — operation first, and the destination only when a low-cardinality one exists.
+// The names are entirely upstream-owned (otel-nats exposes no span-name
+// formatter), so this test is the SDK's baseline for detecting an upstream
+// rename: v0.9.0 changed all three of these (from "send {subject}",
+// "{subject} request", and a concrete-subject "process"), and nothing in this
+// repo caught it because nothing pinned them. docs/semconv.md's NATS span-name
+// table is the prose half of this assertion.
+//
+// The process span additionally proves the destination is the *registered*
+// subscription subject, not the concrete delivered one: a wildcard subscription
+// is what bounds this name, and the concrete subject stays available on
+// messaging.destination.name with the wildcard on messaging.destination.template.
+func TestSpanNames_SemconvShape(t *testing.T) {
+	_, url := startTestServer(t)
+	tp, prop, sr := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const (
+		filter    = "test.spannames.*"
+		published = "test.spannames.created"
+		rpc       = "test.spannames.rpc"
+	)
+
+	_, err = conn.Subscribe(context.Background(), filter, func(ctx context.Context, msg *nats.Msg) {
+		if msg.Reply != "" {
+			assert.NoError(t, conn.Respond(ctx, msg, []byte("pong")))
+		}
+	})
+	require.NoError(t, err)
+	require.NoError(t, conn.NatsConn().FlushTimeout(2*time.Second))
+
+	require.NoError(t, conn.Publish(context.Background(), published, []byte("event")))
+	reply, err := conn.Request(context.Background(), rpc, []byte("ping"), 2*time.Second)
+	require.NoError(t, err)
+	require.NotNil(t, reply)
+
+	assert.Eventually(t, func() bool {
+		names := spanNames(sr)
+		for _, want := range []string{
+			"publish " + published, // was "send {subject}" up to v0.8.0
+			"request " + rpc,       // was "{subject} request" up to v0.8.0
+			"process " + filter,    // the subscription subject, not the delivered one
+			replyReceiveSpanName,   // bare "receive": the inbox is not nameable
+		} {
+			if !slices.Contains(names, want) {
+				return false
+			}
+		}
+		return true
+	}, 2*time.Second, 10*time.Millisecond, "recorded span names: %v", spanNames(sr))
+
+	// The one wildcard subscription delivers both the published event and the
+	// request, so both deliveries share a span name while differing in
+	// destination.name. Wait for both rather than snapshotting: Request returns
+	// as soon as the reply arrives, and the handler sends that reply before it
+	// returns, so the RPC delivery's process span can still be open here while
+	// the earlier publish delivery has already satisfied the name assertion
+	// above.
+	var concrete []string
+	require.Eventually(t, func() bool {
+		concrete = nil
+		for _, s := range sr.Ended() {
+			if s.Name() != "process "+filter {
+				continue
+			}
+			for _, a := range s.Attributes() {
+				if a.Key == semconv.MessagingDestinationNameKey {
+					concrete = append(concrete, a.Value.AsString())
+				}
+			}
+		}
+		return len(concrete) == 2
+	}, 2*time.Second, 10*time.Millisecond, "recorded span names: %v", spanNames(sr))
+	assert.ElementsMatch(t, []string{published, rpc}, concrete,
+		"messaging.destination.name stays the concrete delivered subject on each process span")
+
+	// The bounded name and the concrete subject coexist on every such span, so
+	// assert the template over all of them rather than the first one recorded.
+	for _, s := range sr.Ended() {
+		if s.Name() != "process "+filter {
+			continue
+		}
+		assert.Contains(t, s.Attributes(), semconv.MessagingDestinationTemplate(filter),
+			"a wildcard subscription records its pattern as messaging.destination.template")
+	}
+}
+
+// TestSpanNames_InboxDestinationDropped covers the two manual request/reply
+// halves that otel-nats v0.9.0 brought under the same inbox rule as the
+// reply-receive span. Both are spans a wrapper could easily assume are named
+// after a subject:
+//
+//   - a reply published with conn.Publish(msg.Reply, …) rather than
+//     conn.Respond — the responder half of a hand-rolled exchange; and
+//   - a handler subscribed directly on an inbox — the requester half of the
+//     callback-style RPC where a peer advertises its own inbox.
+//
+// Up to v0.8.0 these were "publish {inbox}" and "process {inbox}", i.e. one
+// span name per request. Both are now bare, with the inbox on the attributes.
+func TestSpanNames_InboxDestinationDropped(t *testing.T) {
+	_, url := startTestServer(t)
+	tp, prop, sr := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// Half one: reply to a request with a plain traced Publish to msg.Reply.
+	const subject = "test.spannames.manualreply"
+	_, err = conn.Subscribe(context.Background(), subject, func(ctx context.Context, msg *nats.Msg) {
+		assert.NoError(t, conn.Publish(ctx, msg.Reply, []byte("pong")))
+	})
+	require.NoError(t, err)
+
+	// Half two: subscribe on an inbox of our own and publish to it.
+	inbox := nats.NewInbox()
+	delivered := make(chan struct{}, 1)
+	_, err = conn.Subscribe(context.Background(), inbox, func(_ context.Context, _ *nats.Msg) {
+		delivered <- struct{}{}
+	})
+	require.NoError(t, err)
+	require.NoError(t, conn.NatsConn().FlushTimeout(2*time.Second))
+
+	reply, err := conn.Request(context.Background(), subject, []byte("ping"), 2*time.Second)
+	require.NoError(t, err)
+	require.Equal(t, "pong", string(reply.Data))
+
+	require.NoError(t, conn.Publish(context.Background(), inbox, []byte("callback")))
+	select {
+	case <-delivered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("inbox subscription did not receive the message")
+	}
+
+	assert.Eventually(t, func() bool {
+		names := spanNames(sr)
+		return slices.Contains(names, "publish") && slices.Contains(names, "process")
+	}, 2*time.Second, 10*time.Millisecond,
+		"a bare publish and a bare process span should be recorded; got %v", spanNames(sr))
+
+	assertNoSpanNameCarriesInbox(t, sr, reply.Subject)
+	assertNoSpanNameCarriesInbox(t, sr, inbox)
 }
 
 // TestRequestMsg_CtxFirstTracing verifies the RequestMsg shim routes through

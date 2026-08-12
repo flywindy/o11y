@@ -123,7 +123,7 @@ package is the authoritative source and changes across contrib versions.
 ## Messaging - NATS (package `github.com/flywindy/o11y/nats`)
 
 Spans are emitted by
-`github.com/akira-core/instrumentation-go/otel-nats` v0.8.0 (Core Subscribe /
+`github.com/akira-core/instrumentation-go/otel-nats` v0.9.1 (Core Subscribe /
 Publish / Request — including the requester-side reply-receive span — and
 JetStream Consume / Messages / Next / Fetch / FetchBytes / FetchNoWait). The
 upstream package imports `go.opentelemetry.io/otel/semconv/v1.39.0`.
@@ -143,16 +143,56 @@ Dashboards that filtered the pull-receive / reply spans by `CONSUMER` kind must
 switch to `CLIENT`; filters for `Consume` (durable-consumer processing) spans
 stay on `CONSUMER`.
 
+### Span Names (upstream-owned; changed in otel-nats v0.9.0)
+
+Span names follow the semconv v1.39.0 messaging shape
+`{messaging.operation.name} {destination}` — operation first, and the
+destination **only when a low-cardinality one exists**. They are emitted
+entirely by the upstream layer: `otel-nats` exposes no span-name formatter, so
+unlike the data-store integrations (ADR 0023, which explicitly scopes itself out
+of messaging) the SDK neither sets nor rewrites them. This table is therefore
+the baseline an upstream bump is diffed against, and `TestSpanNames_*` in
+`nats/conn_test.go` pins it.
+
+| Path | Span name | Destination used |
+|---|---|---|
+| `Publish` / `PublishMsg` (core and JetStream) | `publish {subject}` | The caller's concrete subject. |
+| `Request` / `RequestMsg` (and their `WithContext` forms) | `request {subject}` | The caller's concrete subject. |
+| Subscribe / QueueSubscribe handler | `process {subscription subject}` | The **registered** subject, so a wildcard subscription (`orders.*`) is what the name carries — not the delivered subject, which stays on `messaging.destination.name`. |
+| JetStream `Consume` callback | `process {filter subject}` | The consumer's filter subject when single-valued; falls back to the concrete delivered subject when the consumer has no filter, several filters, or an unobservable filter configuration. |
+| JetStream pull-receive (`Next` / `Messages` / `Fetch` / `FetchBytes` / `FetchNoWait`) | `receive {filter subject}` | Same resolution as `Consume`. |
+| Reply-receive (`recordReply`) | `receive` | **None** — see below. |
+| Any span whose resolved destination is a **reply inbox** | `publish` / `process` / `receive` | **None** — the inbox is auto-generated and single-use, so semconv directs omitting `{destination}` rather than substituting it. Covers a reply published via `conn.Publish(msg.Reply, …)` and a handler subscribed on an inbox, not just the reply-receive span. |
+| NATS-server trace events (`Nats-Trace-Dest`) | `nats.{hop kind}.{hop type}` | Not a messaging span; carries no subject. |
+
+One exception to the inbox rule: a subscription or consumer filter that is
+*only* an inbox prefix plus wildcards (`_INBOX.>`) **keeps** its destination in
+the name. It is a fixed low-cardinality string the subscriber declared, so it
+qualifies as `messaging.destination.template` — semconv's first choice for
+`{destination}` — while the temporary/anonymous exclusion applies to the second
+choice (`messaging.destination.name`) only. A filter carrying a literal token
+(`_INBOX.<nuid>.>`) is unbounded and still drops the destination.
+
+**Migrating from otel-nats v0.8.0 and earlier**: publish spans were
+`send {subject}`, request spans `{subject} request`, and every inbox-destination
+span carried its inbox (`receive {inbox}`, `publish {inbox}`,
+`process {inbox}`); JetStream consumer spans used the concrete delivered subject
+rather than the filter. Update any dashboard, TraceQL query, alert or
+`spanmetrics` rule keyed on those names.
+
 ### Core and JetStream Attributes
 
 | Key | Type | Notes |
 |---|---|---|
 | `messaging.system` | string | Constant `"nats"`. |
-| `messaging.destination.name` | string | NATS subject (e.g. `events.created`). |
+| `messaging.destination.name` | string | NATS subject (e.g. `events.created`). Always the **concrete** subject, whatever the span name uses. |
+| `messaging.destination.template` | string | The bounded destination the span name used, emitted only when it differs from the concrete subject — i.e. a wildcard subscription subject or a single-valued wildcard JetStream consumer filter. Added in otel-nats v0.9.0. |
+| `messaging.destination.temporary` | boolean | `true` on every span whose destination is a request/reply inbox. This is the marker that explains an omitted destination in the span name, and the one to exclude on when building metric labels. Added in otel-nats v0.9.0. |
+| `messaging.destination.anonymous` | boolean | `true` on the same spans — an inbox subject is auto-generated. Added in otel-nats v0.9.0. |
 | `messaging.operation.type` | string | `send`, `receive`, or `process`. The JetStream pull-**receive** spans (`Next`/`Messages`/`Fetch`/`FetchBytes`/`FetchNoWait`) carry `receive` since otel-nats v0.7.0; the `Consume` callback span carries `process`. |
 | `messaging.operation.name` | string | `publish`, `request`, `receive`, or `process`. `request` is emitted (with operation.type `send`) on `Conn.Request`'s producer span since otel-nats v0.6.0; plain publishes stay `publish`. |
 | `messaging.message.body.size` | int | Emitted when payload is non-empty. |
-| `messaging.message.conversation_id` | string | Request/reply inbox. On the requester's "send" span it is set (late) once a reply arrives; see the Reply-Receive Span section. |
+| `messaging.message.conversation_id` | string | Request/reply inbox, on every span whose destination is an inbox (otel-nats v0.9.0 generalized it from the reply-receive span alone). On the requester's "send" span to an ordinary subject it is set (late) once a reply arrives; see the Reply-Receive Span section. |
 | `messaging.consumer.group.name` | string | Queue group, and the JetStream consumer/durable name (otel-nats v0.7.0 moved the consumer name onto this standard key). |
 | `server.address` | string | NATS endpoint host. |
 | `server.port` | int | NATS endpoint port, omitted for default port 4222. |
@@ -165,10 +205,13 @@ on the old `messaging.consumer.name` attribute must be updated.
 
 ### Reply-Receive Span (`Conn.Request`, upstream-owned since v0.6.0)
 
-On every successful `Request`, upstream `recordReply` emits a short
-`receive {inbox}` span (`SpanKind` **CLIENT** since v0.7.0; was CONSUMER in
-v0.6.0) named after the reply's inbox subject, with
-`messaging.destination.name` set to that inbox. When the reply carries a trace
+On every successful `Request`, upstream `recordReply` emits a short `receive`
+span (`SpanKind` **CLIENT** since v0.7.0; was CONSUMER in v0.6.0). Since
+otel-nats v0.9.0 the name is **bare** — the reply inbox is a temporary,
+anonymous destination, so it is omitted from the name and carried on
+`messaging.destination.name`, `messaging.message.conversation_id`,
+`messaging.destination.temporary` and `messaging.destination.anonymous`
+instead. Correlate by attribute, not by name. When the reply carries a trace
 context (the responder replied via `Conn.Respond` or any traced publish
 path), this span is **parented under the responder's remote reply-send context
 and carries a link to it**, so it lands in the responder's trace; when the
@@ -182,8 +225,19 @@ link. On the "send" span the inbox is set **late** — after a reply arrives, vi
 a `SetAttributes` call before `End()` — so a request that times out or errors
 never records `conversation_id`, and samplers (which only see span-start
 attributes) never observe it. This is spec-conformant (the key is Recommended,
-not Required). JetStream spans deliberately omit it: a JetStream message's
-`Reply` is the native `$JS.ACK.…` subject, not a conversation ID.
+not Required).
+
+JetStream spans omit `conversation_id` **for ordinary subjects**: a JetStream
+message's `Reply` is the native `$JS.ACK.…` acknowledgement subject, not a
+conversation ID. The exception, added in otel-nats v0.9.1, is a JetStream
+message whose own **subject** is an inbox — a stream over `_INBOX.>`, which is
+how request/reply-over-JetStream makes replies durable. Those spans are treated
+exactly like the core NATS inbox paths: destination dropped from the name,
+`conversation_id` / `temporary` / `anonymous` set. A request addressed *at* an
+inbox keeps the `conversation_id` it recorded at span start (v0.9.1 stopped
+`recordReply` overwriting it with the request's own reply inbox, which had left
+the attribute holding a value no sampler ever observed); the nested conversation
+stays on the reply-`receive` span, which is the span that reply belongs to.
 
 `messaging.message.body.size` on the "send" span reports the **request**
 payload size (v0.7.0 fixed a v0.6.0 bug where `recordReply` overwrote it with
@@ -211,6 +265,27 @@ payload.
 - `messaging.destination.name` per raw subject can explode if applications
   publish to unbounded subject spaces (e.g. `events.user.<userID>`). Use
   bounded subject templates or hash the dynamic portion before publishing.
+- **The same subject reaches the span name, where it costs more.** Trace
+  backends turn span names into a dimension (Jaeger's operation list, the
+  `spanmetrics` connector), so an unbounded name is an unbounded series, not
+  merely a stored value. otel-nats v0.9.x bounds every case it can see —
+  inbox destinations lose the segment, wildcard subscriptions and consumer
+  filters supply a bounded one — but two cases remain, both structurally
+  invisible to the library:
+  - **Subjects that embed identifiers** (`orders.12345.created`) on paths with
+    no subscription or filter to resolve against: every publish and request
+    span, plus JetStream consumers with no filter or several wildcard filters.
+    Upstream deliberately does not infer a template (semconv permits recording
+    a *known* `messaging.destination.template`, never inferring one) and neither
+    does the SDK.
+  - **A peer on a custom inbox prefix this connection does not share**, seen
+    only as a concrete subject — a manual `conn.Publish(peerInbox, …)` or a
+    handler subscribed on a foreign-prefix inbox.
+
+  Bound both in the collector, where the subject pattern is known, with the
+  `span` processor's `name.to_attributes` rules — e.g.
+  `^receive orders\.(?P<orderId>[^.]+)\.created$`. This rewrites the name only;
+  `messaging.destination.name` stays concrete by design.
 
 ---
 

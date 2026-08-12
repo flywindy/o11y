@@ -2,7 +2,8 @@
 
 **Upstream**: `github.com/akira-core/instrumentation-go` (`otel-nats` module;
 repo and module path renamed from `Marz32onE` in v0.6.0)
-**o11y pin**: v0.8.0 (see ADR 0004, 2026-08-10 amendment, for the audit)
+**o11y pin**: v0.9.1 (see ADR 0004, 2026-08-10 amendment, for the v0.8.0 audit;
+the v0.9.1 assessment is in this document)
 **Contribution model**: `flywindy/instrumentation-go` is a PR workspace only —
 its `main` tracks upstream `main`, every change goes to upstream as a PR, and
 o11y always imports the upstream module. Hard-forking (module rename, own
@@ -14,9 +15,14 @@ why, and what each change unlocks in this SDK. Update it on every upstream
 release audit and whenever an item lands, and keep the linked o11y issues in
 sync.
 
-**Last surface audit**: 2026-08-10 against v0.8.0 — a full re-read of the
-constructors, flag resolution, direct/traced implementations,
-`oteljetstream` inheritance, module dependencies, and release notes.
+**Last surface audit**: 2026-08-12 against **v0.9.1** (the current pin) — a
+full re-read of span naming and destination resolution across both packages,
+the exported surface and module dependencies of v0.9.0/v0.9.1 against v0.8.0,
+and a re-check of every open item below at v0.9.1 line numbers. The previous
+audit (2026-08-10, against v0.8.0) covered the constructors, flag resolution,
+direct/traced implementations, `oteljetstream` inheritance, module
+dependencies, and release notes; nothing in v0.9.x changes those, so that
+audit's findings stand unamended.
 
 ---
 
@@ -71,6 +77,189 @@ budget for it before rolling the upgrade out fleet-wide.
 
 ---
 
+## v0.9.1 upgrade assessment (adopted 2026-08-12)
+
+**Verdict: adopt** — done; the pin is v0.9.1. The "work the upgrade requires"
+list below is retained as the record of what the bump touched.
+
+v0.9.0 + v0.9.1 are span-naming conformance work and
+nothing else. The expensive part of moving off v0.7.0 — the flag ladder, the
+`otel-flags` dependency and the +3.11 MB — was already paid by the v0.8.0
+upgrade; v0.9.1 adds none of it. The cost here is a **dashboard/query
+migration** plus a documentation pass, not an engineering risk.
+
+### Surface delta, v0.8.0 → v0.9.1
+
+Measured, not read off the release notes:
+
+| Dimension | Delta |
+|---|---|
+| Module dependencies | **None.** The module's own `go.mod` is byte-identical between v0.8.0 and v0.9.1 (`otel-flags` stays v0.2.0), so `go.sum` gains only the two v0.9.1 hash lines and image size is unchanged |
+| `otelnats` exported surface | **One additive method**: `(*Conn).InboxPrefixes() []string`, which `oteljetstream` needs to apply the same inbox test. Nothing removed, nothing re-signatured |
+| `oteljetstream` exported surface | **Byte-identical** |
+| Flag / configuration semantics | Unchanged from v0.8.0 |
+| New internal package | `otel-nats/internal/spanname` — shared `Resolve` + `InboxAttrs`, used by both wrappers so the filter-then-concrete precedence and the inbox test cannot drift |
+
+### Span names change (the whole point of the release)
+
+| v0.8.0 name | v0.9.1 name |
+|---|---|
+| `send {subject}` (publish, core and JetStream) | `publish {subject}` |
+| `{subject} request` | `request {subject}` |
+| `receive {inbox}` (reply-receive) | `receive` — destination dropped |
+| `publish {inbox}` (manual reply via `conn.Publish(msg.Reply, …)`) | `publish` — destination dropped |
+| `process {inbox}` (handler subscribed on an inbox) | `process` — destination dropped |
+| `receive`/`process {concrete subject}` for a **wildcard-filter** JetStream consumer | `receive`/`process {filter subject}` (e.g. `receive orders.*`) |
+
+Four defects motivated this, all found in this repo's 2026-08-12 review of the
+v0.8.0 span-name behaviour and **all already fixed upstream before we filed
+anything** — see "Resolved by upstream v0.9.0 / v0.9.1" below for the mapping.
+
+Two behaviours are refinements rather than fixes, and both are the correct
+reading of semconv v1.39.0:
+
+- A filter that is *only* an inbox prefix plus wildcards (`_INBOX.>`) **keeps**
+  its destination in the span name. It is a fixed low-cardinality string the
+  subscriber declared, so semconv's first choice for `{destination}` (use
+  `messaging.destination.template` when available) applies; the
+  temporary/anonymous exclusion is written into the second choice
+  (`messaging.destination.name`) only. A filter carrying a literal token
+  (`_INBOX.<nuid>.>`) is still unbounded and still drops the destination.
+- The inbox verdict drives the **attributes** independently of the name, so an
+  inbox destination always records `messaging.destination.temporary=true`,
+  `messaging.destination.anonymous=true` and
+  `messaging.message.conversation_id` even when the name kept its destination.
+
+### Verified locally against this tree
+
+First measured in a throwaway working tree at `db308e5`, before the pin moved
+(`go get …/otel-nats@v0.9.1`, reverted after measuring):
+
+- `go build ./...` — clean. The additive `InboxPrefixes` method needs no facade
+  change; `nats/` compiles untouched.
+- `go test ./nats/...` — **4 failures, all the same assertion class**, every
+  other NATS test green:
+  - `TestRequest_ReplyLink` (`nats/conn_test.go:633`, asserted at `:647`)
+  - `TestRequest_ReplyLink_ServerAttrs` (`:683`, asserted at `:700`)
+  - `TestRequest_ReplyReceive_DestinationIsInbox` (`:738`, asserted at `:745`)
+  - `TestRequest_NoReplyHeader_NoLinkSpan` (`:782`, asserted at `:789`)
+
+  All four look for a span named `"receive "+reply.Subject`, which is exactly
+  the name v0.9.0 removed. The fix is to match the bare `receive` name and keep
+  the inbox assertion on `messaging.destination.name` /
+  `conversation_id`, where it now belongs. No other package in the repo asserts
+  a NATS span name.
+
+### o11y-side work the upgrade requires
+
+Ordered by whether it blocks the bump:
+
+1. **Blocking — tests** (4 sites above): assert `receive` and move the inbox
+   check onto the attributes. Worth adding a case for the manual-reply
+   (`conn.Publish(msg.Reply, …)` ⇒ `publish`) and inbox-subscription
+   (⇒ `process`) shapes, which are new behaviour with no coverage here.
+2. **Blocking — `docs/semconv.md`**: the Reply-Receive Span section
+   (`:169`) names the span `receive {inbox}`; and `:185` states flatly that
+   *"JetStream spans deliberately omit"* `conversation_id`, which v0.9.1
+   **invalidates** — a JetStream message whose subject is an inbox (a stream
+   over `_INBOX.>`, the durable-reply deployment) now carries
+   `conversation_id`, `destination.temporary` and `destination.anonymous` like
+   the core paths. The `$JS.ACK.…` reasoning still holds for ordinary
+   JetStream subjects; the sentence needs narrowing, not deleting.
+3. **Blocking — three new attributes to document** in the same file's
+   attribute table: `messaging.destination.template` (set whenever the resolved
+   span-name destination differs from the concrete subject),
+   `messaging.destination.temporary`, `messaging.destination.anonymous`.
+4. **Blocking — CHANGELOG**: a Breaking entry with the old→new name table
+   above. Dashboards, Tempo/TraceQL queries and any `spanmetrics` connector
+   keyed on the old names must be updated; this SDK ships no shim.
+5. **Non-blocking — prose that names spans**: `docs/guide.md:1017,1027`,
+   `AGENTS.md:336`, `examples/README.md:242,249`. ADR 0022 (`:602`, `:683`,
+   `:778`) describes the old names as decided history — amend with a dated
+   note rather than rewriting the record.
+6. **Non-blocking — collector rules for the residual cases** (below), which
+   belong in `k8s/infrastructure/base/monitor/otel-collector.yaml`.
+
+### Residual unbounded span names after the upgrade
+
+Upstream states two cases it cannot see, and both apply to this SDK:
+
+- **Subjects that embed identifiers** (`orders.12345.created`) on paths with no
+  subscription or filter to resolve against — i.e. every publish and request
+  span, plus JetStream consumers with no filter or several wildcard filters.
+  Upstream deliberately does not infer a template (semconv permits recording a
+  *known* `messaging.destination.template`, not inferring one), and this SDK
+  should not either.
+- **A peer on a custom inbox prefix this connection does not share**, seen only
+  as a concrete subject. Reply-receive is unaffected (that path knows
+  structurally that it holds an inbox); what remains is a manual
+  `conn.Publish(peerInbox, …)` or a handler subscribed on a foreign-prefix
+  inbox.
+
+Both are collector-side work, with the OTel Collector `span` processor's
+`name.to_attributes` rules — the pattern is known to the deployment, not to the
+library. This is the same division of labour ADR 0004 already uses for
+subject-space cardinality: the SDK documents the risk, the deployment bounds
+it. Note this only rewrites the *name*; it does not reduce
+`messaging.destination.name`, which stays concrete by design.
+
+### What the bump actually landed
+
+The pin moved on 2026-08-12, in its own change, separate from the audit
+commit. Beyond `go.mod`/`go.sum` and the four assertions:
+
+- `nats/conn_test.go` gained `TestSpanNames_SemconvShape` (pins
+  `publish {subject}`, `request {subject}`, `process {subscription subject}`
+  with `destination.template`, and the bare `receive`) and
+  `TestSpanNames_InboxDestinationDropped` (the manual-reply `publish` and
+  inbox-subscription `process` shapes). Both are new coverage: the SDK had
+  **no** span-name assertions before, which is why the v0.9.0 rename was
+  invisible here. A shared `assertNoSpanNameCarriesInbox` helper asserts the
+  invariant across every recorded span rather than only the one under test.
+- `docs/semconv.md` gained the span-name table the NATS section never had, the
+  three new destination attributes, the narrowed JetStream `conversation_id`
+  claim, and a cardinality note covering names rather than only attributes.
+- ADR 0022 carries a dated amendment: its 2026-07-09 text named the span
+  `receive {inbox}`, and its §4 span-naming argument was illustrated with
+  `send events.created`. The §4 conclusion stands; the illustrations moved.
+- `nats/conn.go`'s `Request`/`RequestMsg` godoc now names the spans users will
+  actually search for, and drops a stale "producer span" description of what
+  has been a CLIENT span since v0.7.0.
+
+The collector-side `span` processor rules for the residual cases are **not**
+included: the rewrite patterns depend on a deployment's own subject spaces, and
+this repo's examples all use bounded subjects, so there is nothing here to
+rewrite. `docs/semconv.md` documents the mechanism for adopters who need it.
+
+---
+
+## Resolved by upstream v0.9.0 / v0.9.1 (for the record)
+
+None of these were ever open items in this document. They were found here on
+2026-08-12, while answering whether putting the NATS subject in the span name is
+conformant at all, and upstream had already fixed every one of them — v0.9.0
+(2026-08-11) and its follow-up v0.9.1 (2026-08-12) landed before an item could be
+filed. Recorded so the analysis is not repeated. Every defect below was live in
+this SDK while the pin sat at v0.8.0; the v0.9.1 bump in the same change cleared
+all of them, so the table is pre-upgrade history rather than an open exposure.
+
+| Defect at v0.8.0 | Why it was wrong | Resolution |
+|---|---|---|
+| Reply-receive span named `receive {inbox}` | The reply inbox is auto-generated and single-use — precisely semconv's temporary/anonymous destination, for which the spec directs omitting `{destination}` rather than substituting it. Span names feed Jaeger's operation list and `spanmetrics`, so this was an unbounded dimension, not a cosmetic issue | v0.9.0: named bare `receive`, and the rule was generalised to **every** span whose resolved destination is an inbox — a manual reply via `conn.Publish(msg.Reply, …)` (⇒ `publish`) and a handler subscribed on an inbox (⇒ `process`). The inbox stays queryable via `messaging.destination.name`, `conversation_id`, `destination.temporary` and `destination.anonymous` (`otelnats/conn_traced.go:234`, `internal/spanname/attrs.go`) |
+| Publish spans named `send {subject}` while carrying `messaging.operation.name=publish` | semconv's format is `{messaging.operation.name} {destination}`; `send` is the `operation.type` value, so name and attribute disagreed | v0.9.0: `publish {subject}` on both core and JetStream (`otelnats/conn_traced.go:139`, `oteljetstream/jetstream_traced.go:61`). The attribute was already right; only the name moved |
+| Request spans named `{subject} request` — destination-first | RPC-style naming imported into a messaging span. The messaging conventions define no `request` operation and no noun-first form | v0.9.0: `request {subject}`, operation-first (`otelnats/conn_traced.go:164-170`). Upstream's design note records the choice explicitly: fix the name, do not relabel the attribute to fit the older shape |
+| JetStream receive/process spans named after the **concrete delivered** subject | Core Subscribe already used the registered subscription subject (naturally bounded); JetStream used the per-message subject, so a stream over an identifier-bearing subject space produced unbounded names | v0.9.0: a single-valued consumer filter containing a wildcard is used as the name and recorded as `messaging.destination.template` (`internal/spanname/spanname.go`, `oteljetstream/consumer.go:137`, filter resolution at `:148`). Exact filters, multi-filter and unobservable-filter consumers still fall back to the concrete subject — see the residual cases in the upgrade assessment |
+
+v0.9.1 closed two gaps v0.9.0's own review found, both of which would otherwise
+have reached this SDK: JetStream paths passed no inbox prefixes at all (so a
+stream over `_INBOX.>` — how request/reply-over-JetStream makes replies durable
+— still produced `receive _INBOX.<nuid>`), and a request addressed *at* an inbox
+had its span-start `conversation_id` overwritten by `recordReply`, so the
+attribute held two values during the span's life and exported the one no sampler
+had observed.
+
+---
+
 ## Resolved by upstream v0.7.0 (for the record)
 
 v0.7.0 cleared almost the entire backlog below. Each row links the item as it
@@ -121,7 +310,14 @@ additionally carry `messaging.operation.type=receive`. This is reflected in
 
 v0.7.0 cleared the original backlog down to three carried items (R2, R4, D2).
 A fresh surface audit against v0.7.0 (2026-07-16, after the upgrade landed)
-added seven more.
+added seven more, and the v0.8.0 audit (2026-08-10) added R10.
+
+**Every item below was re-checked against v0.9.1 on 2026-08-12 and none of them
+is fixed.** v0.9.x is span-naming work only, so each entry's evidence has been
+re-pointed at v0.9.1 line numbers and only R6 and R10 changed in substance —
+both because of what v0.9.x added rather than what it fixed (a reusable
+low-cardinality destination for R6's metric labels; a second per-message gate
+re-check for R10).
 
 The table below is ordered by (value ÷ expected review friction), with one
 deliberate exception: **R6 is listed first on value alone**, because it is the
@@ -132,15 +328,16 @@ engagement plan below sequences it accordingly.
 
 | Item | Kind | Value | Friction | Status |
 |---|---|---|---|---|
-| R6 — messaging metrics | Feature | High | High (design) | New |
-| R7 — `Fetch`/`FetchBytes` ctx parameter | Feature | High | Low | New |
-| F8 — CHANGELOG mis-describes the `Consume` span kind | Fix (docs) | Medium | Trivial | New |
-| F7 — unbuffered `MessageBatch` channel leaks on abandon | Fix | Medium | Low | New |
+| R6 — messaging metrics | Feature | High | High (design) | Open — friction **reduced** by v0.9.x |
+| R7 — `Fetch`/`FetchBytes` ctx parameter | Feature | High | Low | Open — unchanged at v0.9.1 |
+| F8 — CHANGELOG mis-describes the `Consume` span kind | Fix (docs) | Medium | Trivial | Open — unchanged at v0.9.1 |
+| F7 — unbuffered `MessageBatch` channel leaks on abandon | Fix | Medium | Low | Open — now **two** call sites |
+| R10 — per-message dispatch decision on `otelnats.Msg` | Feature | Medium | Low | Open — case **strengthened** by v0.9.x |
 | R2 — `RequestWithTimeout(ctx, …)` | Feature | Low (mitigated) | Low-med | Carried ([#72](https://github.com/flywindy/o11y/issues/72)) |
 | R4 — caller-attribute hook on reply-receive span | Feature | Medium | Medium | Carried |
-| R8 — exported message-level `Inject`/`Extract` | Feature | Low | Low | New |
-| F9 — `Consume`/`Messages` take no ctx | Fix | Low | Medium | New |
-| R9 — KeyValue / ObjectStore wrapping | Feature | Deferred | High | New |
+| R8 — exported message-level `Inject`/`Extract` | Feature | Low | Low | Open — unchanged at v0.9.1 |
+| F9 — `Consume`/`Messages` take no ctx | Fix | Low | Medium | Open — unchanged at v0.9.1 |
+| R9 — KeyValue / ObjectStore wrapping | Feature | Deferred | High | Open — unrequested |
 | D2 — old-namespace retention | Discussion | Medium | None (ask) | Carried |
 
 ### Feature requests
@@ -158,10 +355,10 @@ engagement plan below sequences it accordingly.
   Note the correct counter name is `messaging.client.sent.messages` —
   `messaging.client.published.messages` does **not** exist in v1.39.0 and has
   appeared in at least one internal proposal.
-- **Evidence**: v0.7.0 — `grep -rl "metric\|Meter" otelnats/ oteljetstream/`
-  returns nothing outside tests.
+- **Evidence**: v0.9.1 — `grep -rl "metric\|Meter" otelnats/ oteljetstream/`
+  still returns nothing outside tests. Unchanged since v0.7.0.
 - **Why metrics rather than reading it off spans**: this SDK samples
-  (`sdktrace.ParentBased(sdktrace.TraceIDRatioBased(ratio))`, `o11y.go:491`),
+  (`sdktrace.ParentBased(sdktrace.TraceIDRatioBased(ratio))`, `o11y.go:502`),
   so counts and rates **cannot** be derived from spans at all, and latency
   histograms only cover the sampled fraction. Unsampled per-operation counters
   and histograms are the one thing neither spans nor the server-side exporter
@@ -181,7 +378,7 @@ engagement plan below sequences it accordingly.
   | `messaging.client.consumed.messages` | Either | Both layers wrap the handler; the low-cardinality label is free at both. |
   | `messaging.client.operation.duration` (request/reply RTT) | **o11y is trivial** | The facade already owns the ctx-first `Request`/`RequestMsg` shims and brackets the round trip. |
   | JetStream `delivered` / `redelivered` | Either | Readable at delivery from `msg.Metadata().NumDelivered`, no API change. |
-  | JetStream `ack` / `nak` | **Neither, as things stand** | Both layers hand the caller the **native** `jetstream.Msg` (`nats/jetstream.go:366`, upstream `Msg{Msg: msg, Ctx: ctx}`), so `msg.Ack()` is invoked directly on the native type and is invisible to both. Counting these requires wrapping the message type — an upstream-only, breaking change that also conflicts with ADR 0022's "deliver native types" contract. Treat as out of scope unless separately proposed. |
+  | JetStream `ack` / `nak` | **Neither, as things stand** | Both layers hand the caller the **native** `jetstream.Msg` (`nats/jetstream.go:74` and `:84`, upstream `Msg{Msg: msg, Ctx: ctx}`), so `msg.Ack()` is invoked directly on the native type and is invisible to both. Counting these requires wrapping the message type — an upstream-only, breaking change that also conflicts with ADR 0022's "deliver native types" contract. Treat as out of scope unless separately proposed. |
 
 - **Cardinality is asymmetric — but the safe set is narrow.** A blanket "subject
   pattern" rule would over-engineer the consume side, while a publish-only rule
@@ -190,11 +387,11 @@ engagement plan below sequences it accordingly.
 
   | Path | Destination label source | Safe as a metric label? |
   |---|---|---|
-  | Core subscribe / queue-subscribe | The **subscription** subject — upstream names the span `"process " + subject` (`otelnats/conn_traced.go:193`), i.e. the pattern the developer registered (`orders.*`), not `msg.Subject` | ✅ naturally low-cardinality |
-  | JetStream consume / pull-receive | Durable consumer name, already emitted as `messaging.consumer.group.name` | ✅ naturally low-cardinality |
+  | Core subscribe / queue-subscribe | The **subscription** subject — upstream resolves the span name to it (`otelnats/conn_traced.go:268`, via `spanname.Resolve`), i.e. the pattern the developer registered (`orders.*`), not `msg.Subject` | ✅ naturally low-cardinality |
+  | JetStream consume / pull-receive | Durable consumer name, already emitted as `messaging.consumer.group.name`; since v0.9.0 a single-valued wildcard filter is also available as `messaging.destination.template` | ✅ naturally low-cardinality |
   | Core publish | Concrete caller-supplied subject | ⚠️ high — needs a pattern hook |
   | `Request` / `RequestMsg` | Concrete caller-supplied subject | ⚠️ high — same as publish |
-  | Reply-receive | The **reply inbox** — `recordReply` names the span `"receive " + reply.Subject` (`otelnats/conn_traced.go:181`) and sets it as `conversation_id` | 🔴 **unbounded** — a fresh inbox per request, so this is strictly worse than publish and must never be a metric label |
+  | Reply-receive | The **reply inbox** — since v0.9.0 the span is named bare `receive` and the inbox lives only in attributes (`messaging.destination.name`, `conversation_id`, `destination.temporary`, `destination.anonymous`; `otelnats/conn_traced.go:226-234`) | 🔴 **unbounded** — a fresh inbox per request. Upstream has already excluded it from the span *name*; the same exclusion must be written into the metric labels, and it now has a recognisable marker to key off (`destination.temporary=true`) |
 
   So the pattern-extraction / caller-supplied-label hook must cover **every path
   that labels a destination**, not just publish; and the reply-receive path
@@ -202,6 +399,19 @@ engagement plan below sequences it accordingly.
   span, where high cardinality is fine). This is also a repo rule, not just a
   preference — `AGENTS.md` forbids high-cardinality values as metric label
   values.
+- **v0.9.x materially lowers this item's friction, and the proposal should lean
+  on it.** The hardest part of R6 was never the instruments; it was agreeing
+  which value becomes the destination label without exploding cardinality. That
+  machinery now exists in the module: `internal/spanname.Resolve` already
+  computes a bounded destination (declared filter beats concrete subject) and
+  already classifies inbox destinations, and `messaging.destination.template`
+  already carries the bounded form as an attribute. A metrics proposal can now
+  say "label with the destination `spanname.Resolve` returned, and omit it when
+  the inbox verdict is true" instead of designing a cardinality policy from
+  scratch. The residual gap is the same one upstream documented for span names —
+  identifier-bearing subjects on paths with no filter — and the same answer
+  applies: the library must not infer a template, so those paths either omit the
+  label or take a caller-supplied one.
 - **Unlocks**: closes ADR 0004's "Metrics scope: deferred" amendment. NATS is
   one of only **two** trace-only integrations in this SDK — the other is
   Elasticsearch (ADR 0020 §6, which explicitly places ES "with NATS") — while
@@ -252,10 +462,11 @@ engagement plan below sequences it accordingly.
   parameter at all**. (The o11y facade's own `Fetch`/`FetchBytes` do take ctx
   and honor it — that is exactly the compensation described below.)
   Request: add ctx to both upstream methods, reusing the `Next` implementation.
-- **Evidence**: v0.7.0 `oteljetstream/consumer.go:81-83` — `Next(ctx context.Context, …)`
+- **Evidence**: v0.9.1 `oteljetstream/consumer.go:83-85` — `Next(ctx context.Context, …)`
   sits directly above `Fetch(batch int, …)` / `FetchBytes(maxBytes int, …)`.
   The logic to copy already exists at `oteljetstream/consumer_direct.go:77`
-  (`applyCtxToFetchOpts`).
+  (`applyCtxToFetchOpts`), called from both implementations
+  (`consumer_direct.go:41`, `consumer_traced.go:50`). Unchanged since v0.7.0.
 - **o11y-side cost today**: `nats/jetstream.go` carries
   `fetchWithCtxFallback` + `fetchOptsWithCtx` + `isFetchMaxWaitCollision` —
   14 lines of logic wrapped in ~50 lines with the rationale comments, plus
@@ -289,8 +500,9 @@ engagement plan below sequences it accordingly.
   takes a `timeout` but no ctx (its span parents to `context.Background()`),
   and `RequestWithContext` takes a ctx but no timeout. Add one additive method
   carrying both, as the recommended traced entry point.
-- **Evidence**: v0.7.0 `otelnats/conn_traced.go` — `Request(subject, data,
-  timeout)` vs `RequestWithContext(ctx, subject, data)`; no method takes both.
+- **Evidence**: v0.9.1 `otelnats/conn.go:365-383` (and the traced
+  implementations at `conn_traced.go:70-91`) — `Request(subject, data, timeout)`
+  vs `RequestWithContext(ctx, subject, data)`; no method takes both.
 - **Tracked in**: [#72](https://github.com/flywindy/o11y/issues/72).
 - **Unlocks**: `o11y/nats.Conn.Request` drops its `context.WithTimeout` shim.
   (Low urgency for o11y — the shim fully hides this from SDK users.)
@@ -306,19 +518,22 @@ engagement plan below sequences it accordingly.
   keeping the facade span would duplicate the upstream one. Propose an option
   or per-call hook (SDK-owned keys protected from collision, last-write-wins
   ordering documented).
-- **Evidence**: v0.7.0 `otelnats/conn_traced.go` `recordReply` — no caller
-  attribute path.
+- **Evidence**: v0.9.1 `otelnats/conn_traced.go:226-235` — `recordReply` builds
+  its attribute slice from `receiveAttrs` plus `inboxAttrs` and starts the span
+  immediately; there is no caller attribute path. v0.9.0 rewrote the span's
+  *name* and added the inbox markers without opening one.
 - **Unlocks**: restores the searchable-domain-identifier capability the facade
   had to drop (documented as a migration note in `nats/conn.go` and the guide).
 - **Friction**: medium — API-shape discussion.
 
 #### R8. Export message-level `Inject` / `Extract` helpers
 
-- **What**: v0.7.0 exports `HeaderCarrier` but no convenience pair for a raw
+- **What**: the module exports `HeaderCarrier` but no convenience pair for a raw
   `*nats.Msg` — every consumer that touches an un-instrumented NATS path has to
   hand-roll `prop.Inject(ctx, &otelnats.HeaderCarrier{H: msg.Header})` plus the
   nil-header guard. Request: `Inject(ctx, prop, msg)` / `Extract(ctx, prop, msg)`.
-- **Evidence**: v0.7.0 `otelnats/propagation.go` exports the carrier only.
+- **Evidence**: v0.9.1 `otelnats/propagation.go` still exports the carrier and
+  its four methods (`Get`/`Values`/`Set`/`Keys`) only. Unchanged since v0.7.0.
 - **o11y-side cost today**: `nats/middleware.go` implements exactly this pair
   (public `Inject`/`Extract`) for the legacy `nats.JetStreamContext` API, which
   the wrapper deliberately does not cover.
@@ -332,9 +547,16 @@ engagement plan below sequences it accordingly.
   learn which path ran. Request: expose the decision on the message (a `Traced
   bool` field, or an accessor), so a consumer reads the dispatch that actually
   happened instead of recomputing it.
-- **Evidence**: v0.8.0 `otelnats/conn.go:27-33` (the `Msg` type) and `:84-98`
-  (`msgHandler`, which resolves the gate per message and hands off to one of two
-  pre-built handlers).
+- **Evidence**: v0.9.1 `otelnats/conn.go:27-33` (the `Msg` type — still just
+  `Msg` + `Ctx`) and `:84-97` (`msgHandler`, which resolves the gate per message
+  and hands off to one of two pre-built handlers).
+- **v0.9.x strengthens the case.** The same per-message dispatch now also runs
+  inside JetStream batch delivery: `newDynamicMessageBatch` forwards through a
+  `receiveSpanner` that re-checks the connection's tracing gate for every
+  message rather than freezing the decision at construction
+  (`oteljetstream/consumer.go:237-250`). So the number of places a wrapper would
+  have to recompute a decision upstream already made has grown, in a package
+  that cannot even reach `Conn.gate`.
 - **o11y-side cost today**: `nats/conn.go`'s `restoreBaggage` must call
   `nc.TracingEnabled()`, which routes through `Conn.impl()` and so re-resolves
   the same gate. Two consequences: a relay-capable process pays **two extra
@@ -356,7 +578,7 @@ engagement plan below sequences it accordingly.
 - **What**: the wrapper explicitly does not re-expose JetStream's KeyValue and
   ObjectStore surfaces, so any consumer using them drops to the native client
   and loses trace propagation.
-- **Evidence**: v0.7.0 `oteljetstream/jetstream.go:96` documents the omission.
+- **Evidence**: v0.9.1 `oteljetstream/jetstream.go:97` documents the omission.
 - **Status**: **not requested yet** — no o11y consumer needs KV/ObjectStore
   today. Recorded so the gap is known if one does.
 - **Friction**: high — a large new surface.
@@ -365,14 +587,17 @@ engagement plan below sequences it accordingly.
 
 #### F7. `MessageBatch` channel is unbuffered — abandoning without `Stop` parks the goroutine
 
-- **What**: `newTracedMessageBatch` forwards onto `ch := make(chan Msg)` — an
+- **What**: the batch forwarder writes onto `ch := make(chan Msg)` — an
   **unbuffered** channel. v0.7.0 correctly fixed `Stop()` to be observed while
   the goroutine is parked on either side, but a caller that simply stops
   reading `Messages()` *without* calling `Stop` still leaves the forwarding
   goroutine blocked on the send forever, holding its NATS pull subscription.
   Request: size the buffer to the request's own message-count bound where one
   exists (`Fetch`/`FetchNoWait` both take an explicit `batch` cap).
-- **Evidence**: v0.7.0 `oteljetstream/consumer.go:197`.
+- **Evidence**: v0.9.1 `oteljetstream/consumer.go:225` (`newDirectMessageBatch`)
+  and `:237` (`newDynamicMessageBatch`). v0.8.0's per-message gate split the
+  single v0.7.0 constructor in two, so the same defect now has **two** call
+  sites; both take the `batch` bound the fix would use.
 - **o11y-side status**: worked around in `wrapMessageBatch`, which buffers to
   exactly that bound so the goroutine always drains and exits on its own. The
   upstream fix is still wanted so direct upstream users get the same guarantee.
@@ -386,12 +611,19 @@ engagement plan below sequences it accordingly.
   still starts its `process` span with `trace.SpanKindConsumer`, which is
   correct. Only the pull-*receive* paths (`Next`/`Messages`/`Fetch`/
   `FetchBytes`/`FetchNoWait`) and the reply-receive span moved to `CLIENT`.
-- **Evidence**: v0.7.0 `oteljetstream/consumer_traced.go:159`
-  (`SpanKindConsumer`, reached from `Consume` at :23-25) vs the CHANGELOG text.
+- **Evidence**: v0.9.1 still ships the same v0.7.0 entry verbatim
+  (`CHANGELOG.md:160`), while the code it describes still starts the `Consume`
+  span `SpanKindConsumer` (`oteljetstream/consumer_traced.go`, the
+  `tracedConsumeHandler` path).
 - **Impact**: this is a dashboard-breaking instruction. Anyone who follows it
   and moves their `Consume` filters from `CONSUMER` to `CLIENT` silently loses
   every durable-consumer processing span. It already propagated into this SDK's
   docs before an automated review caught it.
+- **Note after v0.9.x**: the v0.9.0 CHANGELOG is precise about which spans it
+  renamed (it names the pull-receive paths individually), so this is now an
+  isolated historical error rather than a pattern — but a reader migrating
+  straight from v0.7.0 still hits it, which is exactly the audience the entry
+  exists for.
 - **Friction**: trivial — a CHANGELOG wording fix, high leverage.
 
 #### F9. Upstream `Consume` / `Messages` accept no ctx
@@ -402,7 +634,7 @@ engagement plan below sequences it accordingly.
   per-message context comes only from the message headers. (The o11y facade's
   `Consume`/`Messages` do take ctx — see the status note below for what it
   does and does not do.)
-- **Evidence**: v0.7.0 `oteljetstream/consumer.go:79-80`.
+- **Evidence**: v0.9.1 `oteljetstream/consumer.go:81-82`.
 - **o11y-side status**: the facade accepts ctx and uses it as a
   registration-time guard only, documenting that it does not stop a running
   consume (`ConsumeContext.Stop`/`Drain` do).
@@ -426,6 +658,24 @@ supply-chain concern for anyone still pinned below v0.6.0.
 
 Cleanups this SDK can do on its own, independent of the items above:
 
+- **Done (2026-08-12), kept as the reason it matters: nothing in this repo
+  documented the NATS span names.** ADR 0023 fixes the name shape for the
+  data-store integrations and explicitly scopes itself out of messaging, and
+  `docs/semconv.md` stated a span-name shape only for elasticsearch — the NATS
+  section listed attributes and nothing else. So the one integration whose names
+  are entirely upstream-owned, and therefore the one most likely to have them
+  changed under it, was the one with no written baseline: the v0.9.0 rename had
+  to be reconstructed from upstream source because there was nothing here to
+  diff against. The v0.9.1 bump added that table plus `TestSpanNames_*`; keep
+  both as the artefacts each upstream bump is checked against, and extend them
+  before assuming a future release left names alone.
+- **Consider collector-side `span` processor rules if a consuming service's
+  subject space is unbounded.** `docs/semconv.md`'s cardinality section now
+  covers span names and documents the `name.to_attributes` mechanism, but no
+  rules are configured in
+  `k8s/infrastructure/base/monitor/otel-collector.yaml`: the patterns depend on
+  the deployment's own subjects, and this repo's examples are all bounded.
+  Revisit when a service publishes to an identifier-bearing subject space.
 - **`nats/middleware.go`'s `headerCarrier` is now duplicative.** It was written
   because upstream's carrier was exact-case-only with no `Values`. v0.7.0's
   `otelnats.HeaderCarrier` implements `propagation.ValuesGetter` and falls back
@@ -439,7 +689,16 @@ Cleanups this SDK can do on its own, independent of the items above:
 The consumer-path fixes (F1–F6), the configuration surface (R1), the deliver-
 span removal (R3), and the batch span lifecycle (R5) all landed in v0.7.0, so
 the original multi-bundle plan is complete. The post-upgrade audit reopened a
-new, smaller set:
+new, smaller set.
+
+**Span naming needs no bundle.** The four defects found here on 2026-08-12 were
+already fixed in v0.9.0/v0.9.1 before an item could be filed, so the obvious
+next PR is not ours to write. The o11y-side action is the pin bump, assessed
+above. Read this as evidence about the collaboration model rather than luck:
+upstream is auditing its own semconv conformance on a faster cycle than this
+repo's release-audit rhythm, so the highest-value contributions here are the
+ones upstream *cannot* see from inside the library — the wrapper-seam gaps
+(R10), the o11y-side workarounds (R7, F7), and the metric-label policy (R6).
 
 1. **Bundle D — quick wins** (F8, R7): F8 is a CHANGELOG wording fix that
    prevents downstream dashboard breakage; R7 is a near-mechanical port of the
@@ -449,8 +708,11 @@ new, smaller set:
    blocks an ADR-level decision here (ADR 0004's deferred metrics scope).
    Issue-first — it needs agreement on the instrument set, the
    `WithMeterProvider` option shape, and which attributes become labels.
-3. **Bundle F — leak + ergonomics** (F7, R8, F9): small, independent, can ride
-   whichever bundle lands first.
+3. **Bundle F — leak + ergonomics** (F7, R8, F9, R10): small, independent, can
+   ride whichever bundle lands first. R10 is the one with a live correctness
+   cost on this side (baggage restoration re-resolving a decision upstream
+   already made) and is additive, so it is the pick of the four if the bundle
+   has to be trimmed.
 4. **Bundle C — request/reply ergonomics** (R2, R4): issue-first; PR after ack.
    Both touch the request/reply API contract, so they ride the same discussion.
 5. **R9** (KeyValue/ObjectStore) stays unrequested until a consumer needs it.
@@ -467,6 +729,8 @@ new, smaller set:
 | [#72](https://github.com/flywindy/o11y/issues/72) | Upstream unfixed (→ R2); o11y facade shim shipped, SDK users unaffected | Open — mitigation status commented |
 | [#73](https://github.com/flywindy/o11y/issues/73) | Resolved — CHANGELOG + `VERSIONING.md` + release-tag CI guard in v0.7.0 | **Closed** |
 
-The seven items added by the 2026-07-16 post-upgrade audit (R6–R9, F7–F9) have
-no o11y issues yet; open them only if/when a bundle above is actually taken to
-upstream, to avoid a second stale tracking layer.
+The seven items added by the 2026-07-16 post-upgrade audit (R6–R9, F7–F9) and
+R10 from the v0.8.0 audit have no o11y issues yet; open them only if/when a
+bundle above is actually taken to upstream, to avoid a second stale tracking
+layer. The v0.9.1 pin bump is o11y-side work with no upstream dependency, so it
+needs no issue here either — the assessment section above is its specification.
