@@ -239,8 +239,9 @@ None of these were ever open items in this document. They were found here on
 2026-08-12, while answering whether putting the NATS subject in the span name is
 conformant at all, and upstream had already fixed every one of them — v0.9.0
 (2026-08-11) and its follow-up v0.9.1 (2026-08-12) landed before an item could be
-filed. Recorded so the analysis is not repeated, and because the o11y pin
-(v0.8.0) still carries all of it.
+filed. Recorded so the analysis is not repeated. Every defect below was live in
+this SDK while the pin sat at v0.8.0; the v0.9.1 bump in the same change cleared
+all of them, so the table is pre-upgrade history rather than an open exposure.
 
 | Defect at v0.8.0 | Why it was wrong | Resolution |
 |---|---|---|

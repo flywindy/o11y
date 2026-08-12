@@ -1040,12 +1040,15 @@ own ambient span instead.
 
 **Cross-trace topology (not a single trace):** under the v0.6.0 upstream
 path the two sides of a request/reply do **not** share one trace. The
-requester's "send" span parents to `ctx`; the reply "receive" span (and the
-responder's own processing) parent under the responder's trace, tied back to
-the request only by a **span link**. In Tempo you follow the link between the
-two traces — there is no single trace containing both sides. (The pre-v0.6.0
-facade parented the receive span in the requester's trace; that is what
-changed.)
+requester's "request" span parents to `ctx`; the reply "receive" span (and the
+responder's own processing) live in the responder's trace. The two traces are
+tied together by a **span link** — but not the one on the `receive` span, whose
+link points at the responder's own reply-send span and therefore stays inside
+the responder's trace. The link that crosses is on the responder's `process`
+span, which points back at the requester's request span. In Tempo, follow *that*
+link between the two traces; there is no single trace containing both sides.
+(The pre-v0.6.0 facade parented the receive span in the requester's trace; that
+is what changed.)
 
 What opening an ambient span at the call site *does* buy you: it gives the
 requester "send" span an application parent instead of a disconnected root
