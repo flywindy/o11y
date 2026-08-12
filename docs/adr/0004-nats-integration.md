@@ -95,9 +95,20 @@ canceled.
 
 ## Global-state verification
 
-### Library: `github.com/Marz32onE/instrumentation-go/otel-nats`
-### Version: `v0.2.11` (per `go.mod`)
-### Result: ✅ SAFE — does not set globals
+### Library: `github.com/akira-core/instrumentation-go/otel-nats`
+### Version: `v0.9.1` (per `go.mod`)
+### Result: ⚠️ conditional — never sets OTel globals; may write one **named OpenFeature** provider slot, but only on the endpoint-driven relay path o11y does not enable
+
+The OTel half of this verdict has held at every version audited (the module
+reads `otel.GetTracerProvider` / `otel.GetTextMapPropagator` as fallbacks and
+never sets them). The conditional qualifier arrived with v0.8.0's feature-flag
+relay: when `OTEL_INSTRUMENTATION_GO_FLAGS_ENDPOINT` is explicitly configured,
+upstream may install a provider in the `otel-instrumentation-go` **named** slot
+of the process-global OpenFeature registry and start a poller. o11y never sets
+that variable, so the default path writes no global state; an application
+opting into the relay owns that exception. See the 2026-08-10 amendment for the
+full analysis, and the 2026-08-12 amendment for the v0.9.1 re-verification
+(v0.9.x changed span naming only and introduced no new global-state surface).
 
 **Verification method.** Source inspection of
 `otel-nats/otelnats/conn.go`. Relevant pattern:
@@ -113,12 +124,13 @@ no option is supplied. It does not call `otel.SetTracerProvider` or
 `otel.SetTextMapPropagator`.
 
 **Why the current wrapper is already compliant with ADR 0003.**
-`nats.Connect` (`nats/conn.go:48`) always passes both options:
+`nats.Connect` (`nats/conn.go:160`) always passes both options:
 
 ```go
 nc, err := otelnats.ConnectWithOptions(url, natsOpts,
     otelnats.WithTracerProvider(tp),
     otelnats.WithPropagators(prop),
+    otelnats.WithTracingEnabled(tracingDefault),
 )
 ```
 

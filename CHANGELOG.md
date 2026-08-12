@@ -49,6 +49,10 @@ adopters can plan their upgrades.
   `TestSpanNames_*` cases in `nats/conn_test.go` are the baseline each upstream
   bump is diffed against. ADR 0022 carries a dated amendment for the same
   reason. See `docs/upstream-otel-nats.md` for the v0.9.1 surface audit.
+- `examples`: the NATS Core requester's comments describe the new span names,
+  and the hand-instrumented reply span in the WebSocket-browser backend is
+  renamed from `send {subject}` to `publish {subject}` so a manually traced
+  reply reads the same way as a wrapper-traced one.
 
 ### Breaking Changes (Migration Guide)
 

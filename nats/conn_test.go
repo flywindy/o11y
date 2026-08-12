@@ -892,24 +892,38 @@ func TestSpanNames_SemconvShape(t *testing.T) {
 
 	// The one wildcard subscription delivers both the published event and the
 	// request, so both deliveries share a span name while differing in
-	// destination.name. Assert over every such span rather than the first one
-	// recorded: the point is that the bounded name and the concrete subject
-	// coexist on all of them.
+	// destination.name. Wait for both rather than snapshotting: Request returns
+	// as soon as the reply arrives, and the handler sends that reply before it
+	// returns, so the RPC delivery's process span can still be open here while
+	// the earlier publish delivery has already satisfied the name assertion
+	// above.
 	var concrete []string
+	require.Eventually(t, func() bool {
+		concrete = nil
+		for _, s := range sr.Ended() {
+			if s.Name() != "process "+filter {
+				continue
+			}
+			for _, a := range s.Attributes() {
+				if a.Key == semconv.MessagingDestinationNameKey {
+					concrete = append(concrete, a.Value.AsString())
+				}
+			}
+		}
+		return len(concrete) == 2
+	}, 2*time.Second, 10*time.Millisecond, "recorded span names: %v", spanNames(sr))
+	assert.ElementsMatch(t, []string{published, rpc}, concrete,
+		"messaging.destination.name stays the concrete delivered subject on each process span")
+
+	// The bounded name and the concrete subject coexist on every such span, so
+	// assert the template over all of them rather than the first one recorded.
 	for _, s := range sr.Ended() {
 		if s.Name() != "process "+filter {
 			continue
 		}
 		assert.Contains(t, s.Attributes(), semconv.MessagingDestinationTemplate(filter),
 			"a wildcard subscription records its pattern as messaging.destination.template")
-		for _, a := range s.Attributes() {
-			if a.Key == semconv.MessagingDestinationNameKey {
-				concrete = append(concrete, a.Value.AsString())
-			}
-		}
 	}
-	assert.ElementsMatch(t, []string{published, rpc}, concrete,
-		"messaging.destination.name stays the concrete delivered subject on each process span")
 }
 
 // TestSpanNames_InboxDestinationDropped covers the two manual request/reply

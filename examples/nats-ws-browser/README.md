@@ -107,7 +107,7 @@ Search by service name `nats-ws-browser` or `nats-ws-browser-backend`. You shoul
 | --- | --- | --- |
 | `nats.publish` | `nats-ws-browser` | Root span created when clicking Publish and ended when the reply arrives |
 | `process-frontend-event` | `nats-ws-browser-backend` | Child span of the browser publish span |
-| `send demo.frontend.replies` | `nats-ws-browser-backend` | Reply publish span that explicitly injects backend context into NATS headers |
+| `publish demo.frontend.replies` | `nats-ws-browser-backend` | Reply publish span that explicitly injects backend context into NATS headers. Named in the semconv `{operation} {destination}` shape the SDK's own NATS spans use |
 | `nats.receive` | `nats-ws-browser` | Child span of the backend reply publish span |
 
 ## How trace propagation works
@@ -120,7 +120,7 @@ On publish:
 2. Each key is copied to the NATS `MsgHdrs` object and sent with the message.
 3. The Go backend extracts those headers with `obs.Propagator.Extract` and starts `process-frontend-event` as a child span.
 
-On reply, the backend starts `send demo.frontend.replies`, explicitly injects that span context into a NATS message header, and publishes through the raw NATS connection. The browser subscriber extracts that header and starts `nats.receive` as a child span, via the `receiveWithSpan` helper in `src/tracing.js`.
+On reply, the backend starts `publish demo.frontend.replies`, explicitly injects that span context into a NATS message header, and publishes through the raw NATS connection. The browser subscriber extracts that header and starts `nats.receive` as a child span, via the `receiveWithSpan` helper in `src/tracing.js`.
 
 Note: the normal `o11ynats.Subscribe` and `conn.Publish` wrapper methods intentionally follow `otel-nats` behavior, including env-gated NATS instrumentation and OTel messaging correlation through span links. This example uses raw NATS subscribe/publish plus explicit extraction/injection because its purpose is to show one parent-child trace tree in Tempo.
 

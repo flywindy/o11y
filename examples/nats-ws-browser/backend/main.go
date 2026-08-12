@@ -110,7 +110,11 @@ func main() {
 		// Reply with explicit header injection so this demo does not depend on
 		// otel-nats env flags such as OTEL_NATS_TRACING_ENABLED.
 		reply := "backend processed: " + payload
-		replyCtx, replySpan := tracer.Start(msgCtx, "send "+repSubject,
+		// Named "publish {destination}" to match the shape the SDK's own NATS
+		// spans use (semconv v1.39.0 "{messaging.operation.name} {destination}",
+		// which otel-nats v0.9.0 adopted), so a hand-instrumented reply and a
+		// wrapper-instrumented one read the same way in Tempo.
+		replyCtx, replySpan := tracer.Start(msgCtx, "publish "+repSubject,
 			trace.WithSpanKind(trace.SpanKindProducer),
 			trace.WithAttributes(
 				semconv.MessagingSystemKey.String("nats"),
