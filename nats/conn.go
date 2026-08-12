@@ -311,9 +311,9 @@ func (c *Conn) Request(ctx context.Context, subject string, data []byte, timeout
 // request — and waits for a reply, with the same ctx-first tracing contract as
 // Request: ctx carries the trace context and cancellation, and timeout bounds
 // the wait. The "request {subject}" span parents to ctx; as with Request, the
-// upstream layer records the bare "receive" reply span under the responder's trace,
-// linked back to the request when the reply carries trace context and recorded
-// without a link when it does not.
+// upstream layer records the bare "receive" reply span under the responder's
+// reply-send context, linked to that same span when the reply carries trace
+// context and recorded without a link when it does not.
 //
 // This shadows the embedded otelnats.Conn.RequestMsg(msg, timeout), whose
 // ctx-less signature parents its producer span to context.Background() and so
