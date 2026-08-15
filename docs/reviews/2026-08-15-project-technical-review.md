@@ -3,6 +3,10 @@
 > 審查範圍:核心 SDK(root、`internal/`)、九個整合套件、`k8s/` 基礎設施、CI/CD 與工具鏈。
 > 審查角度:資深後端工程師 / SRE / 架構師。
 > 審查方法:全量程式碼閱讀 + `go build`/`go vet`/`go test`(全數通過)+ `go list -deps` 相依驗證 + manifest 交叉比對。
+>
+> **2026-08-15 更新:本報告已完成逐項查證**(實測重現 + 上游原始碼比對),
+> 查證結果與修復計畫見 [`2026-08-15-verification-and-remediation-plan.md`](./2026-08-15-verification-and-remediation-plan.md)。
+> 其中 **D4(Loki exporter)與 C4(minio 無測試)兩項原始指控經查不成立或過度誇大,已於下方就地更正**。
 
 ---
 
@@ -96,7 +100,7 @@ mongo 與 cassandra 在相同 instrument 上都有釘 bucket 與 allow-keys,redi
 | C1 | `http/server.go:17-19`、`gin/middleware.go:17-19` | 文件承諾「絕不回退到全域 OTel state」,但 otelhttp/otelgin 的 option 對 nil 是忽略,`NewServerHandler(next, nil, nil, nil)` 會**靜默使用全域 provider** —— 正是文件排除的行為。且九個套件對 nil provider 有三種姿態(回錯誤 / 靜默 no-op / 靜默用全域),應統一(建議:一律回錯誤,與 redis/mongo/cassandra/nats/es 對齊)。 |
 | C2 | `cassandra/observer.go:104-108, 270-286` | `db.namespace` label 來自解析 statement 文字,**無 value cap**(`WithMaxUniqueCollections` 只管 `db.collection.name`)。keyspace-per-tenant 部署或 tokenizer 誤判時 cardinality 無界。 |
 | C3 | `mongo/pool_metrics.go:146-160, 214-219, 323-339` | (a) fallback pool 名含單調遞增序號,client 重建(重連/配置重載)時每次產生新 label value,舊 series 以 sync UpDownCounter 永久留存 → 緩慢無界成長;(b) `cleanup()` 在 `Disconnect` 之前執行(兩個 defer 的自然順序)會吞掉歸零事件,`db.client.connection.count` 凍結在非零值。 |
-| C4 | `minio/client.go:353-382` | `ListObjects` 消費者棄讀 channel 且 ctx 不可取消時,轉發 goroutine 永久阻塞 **且 wrapper 額外掛著一個未結束的 span**;ListObjects 完全無測試。 |
+| C4 | `minio/client.go:353-382` | 阻塞行為屬實(棄讀 channel + 不可取消 ctx → goroutine 與 span 永久懸置),但**嚴重度下修**:`client.go:350-352` 已明文記載這是繼承自 minio-go 的契約。且「完全無測試」的說法**不成立** —— `client_test.go:436-443` 有 ListObjects 測試,只是僅涵蓋完整排空的 happy path。 |
 | C5 | 低嚴重度批次 | ES 對 3xx 標 span Error(與 SDK 其他 HTTP 套件 ≥400 不一致);redis `commandText` 先組完整字串(10MB SET → 10MB 暫時配置)再截斷;mongo pool 事件單一 mutex 且 `Add` 在臨界區內;resty 錯誤路徑丟失 `server.address`;resty 無 `OnPanic` hook(panic 時 span 不 End);minio metric 樣本缺 system attribute。 |
 
 ### K8s 基礎設施(kind 開發環境定位,但需修)
@@ -106,7 +110,7 @@ mongo 與 cassandra 在相同 instrument 上都有釘 bucket 與 allow-keys,redi
 | D1 | `k8s/infrastructure/base/{cassandra,elasticsearch}.yaml` | **未被任何 kustomization 引用的重複 manifest,且已漂移**:頂層 elasticsearch.yaml:32 是 `runAsGroup: 0`(root group),components 版本是 `1000`。直接刪除兩個頂層檔案。 |
 | D2 | `components/nats/nats.yaml:10` | JetStream 已啟用但 StatefulSet **完全沒有儲存 volume**(連 emptyDir 都沒有),stream/KV 寫在 overlay fs,容器重啟即消失。至少加 volumeClaimTemplate 或明示 emptyDir。 |
 | D3 | `monitor/otel-collector.yaml:25-28, 92-102` | 全部遙測的單一入口沒有 `memory_limiter` processor、沒有 resource limits、沒有 probes(collector 有 `health_check` extension 可用)。遙測突發時被 OOMKill、in-flight 資料全丟。 |
-| D4 | `monitor/otel-collector.yaml:35-50, 67-70` | 使用**已被 collector-contrib 移除的 deprecated `loki` exporter**,image 一升版就起不來。改用 `otlphttp` exporter 打 Loki 原生 OTLP endpoint(`/otlp`),並連動調整 Grafana derived-field regex。 |
+| D4 | `monitor/otel-collector.yaml:35-50, 67-70` | ~~使用已被移除的 loki exporter,升版即掛~~ **← 查證後更正,見下方「更正記錄」**。實情:`loki` exporter 自 2024-07-09 起**標記棄用但仍持續發佈**(最新 v0.130.0 > 專案釘的 0.121.0),目前**沒有壞**,也非迫在眉睫。屬應排程處理的技術債:遷移到 `otlphttp` 打 Loki 原生 OTLP endpoint(`/otlp`),並連動調整 Grafana derived-field regex。 |
 | D5 | monitor 全部 + mongodb + nats | 整個 monitor stack(prometheus/loki/tempo/grafana/alloy)無 probes、無 resources、無 securityContext、全部 emptyDir(Grafana 連 volume 都沒有);與 minio/cassandra/es/pyroscope 的模範寫法(non-root、drop ALL、seccomp、PVC、明確的 production-override 註解)形成強烈反差 —— **最容易被複製到 production 的那一半反而最沒防護**。mongodb 無認證且以 root 執行,亦無 dev-only 註解。 |
 | D6 | `monitor/grafana.yaml:117-118` vs `monitor/tempo.yaml` | Grafana service map 指向 Prometheus,但 Tempo 沒開 `metrics_generator` → node graph 永遠空白的死功能。二擇一:補 metrics_generator 或移除設定。 |
 | D7 | `kind-config.yaml:5-11` | 未設 `listenAddress`,host 的 4318(無認證 OTLP)、4223(`no_tls` WebSocket NATS)、4040(Pyroscope ingest)綁 `0.0.0.0`,共享網路上任何人可注入。加 `listenAddress: "127.0.0.1"`。 |
