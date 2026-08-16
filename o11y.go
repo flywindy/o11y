@@ -67,7 +67,10 @@ type SDK struct {
 	//   • OTel Collector – OTLP/HTTP → Loki (full OTel Log Data Model; service
 	//                    identity comes from the shared Resource, not per-record attrs)
 	// When a span is active in the context, traceId and spanId are included
-	// automatically in both destinations.
+	// automatically in both destinations. They stay at the record's top level
+	// even on a logger derived with Logger.WithGroup, so log-to-trace queries
+	// keyed on the top-level field keep matching; the group still nests that
+	// logger's own attributes as usual.
 	// When WithLogEnabled(false) is set, only the stdout destination is active.
 	Logger *slog.Logger
 

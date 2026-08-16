@@ -126,6 +126,249 @@ func TestEnabled(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// OtelSlogHandler — group handling
+//
+// Log pipelines index traceId as a top-level field, so it must stay at the top
+// level no matter how many groups the logger has opened. The handler therefore
+// keeps groups to itself rather than delegating them, which makes "does the
+// rest of the grouping still behave exactly like slog's own" the property most
+// worth pinning.
+// ---------------------------------------------------------------------------
+
+// dropTime removes the timestamp so two handlers' output can be compared.
+func dropTime(groups []string, a slog.Attr) slog.Attr {
+	if len(groups) == 0 && a.Key == slog.TimeKey {
+		return slog.Attr{}
+	}
+	return a
+}
+
+// loggerShapes covers the WithGroup/WithAttrs combinations whose nesting the
+// handler has to reproduce itself.
+var loggerShapes = []struct {
+	name  string
+	apply func(*slog.Logger) *slog.Logger
+}{
+	{"no group", func(l *slog.Logger) *slog.Logger { return l }},
+	{"attrs only", func(l *slog.Logger) *slog.Logger { return l.With("top", "a") }},
+	{"group only", func(l *slog.Logger) *slog.Logger { return l.WithGroup("g") }},
+	{"attrs then group", func(l *slog.Logger) *slog.Logger { return l.With("top", "a").WithGroup("g") }},
+	{"group then attrs", func(l *slog.Logger) *slog.Logger { return l.WithGroup("g").With("in", "b") }},
+	{"nested groups", func(l *slog.Logger) *slog.Logger { return l.WithGroup("outer").WithGroup("inner") }},
+	{"attrs at every level", func(l *slog.Logger) *slog.Logger {
+		return l.With("top", "a").WithGroup("outer").With("mid", "b").WithGroup("inner").With("deep", "c")
+	}},
+	{"repeated attrs in one group", func(l *slog.Logger) *slog.Logger {
+		return l.WithGroup("g").With("one", 1).With("two", 2)
+	}},
+	{"empty group name is a no-op", func(l *slog.Logger) *slog.Logger { return l.WithGroup("") }},
+	{"empty group name between groups", func(l *slog.Logger) *slog.Logger {
+		return l.WithGroup("outer").WithGroup("").With("in", "b")
+	}},
+}
+
+// TestOTelHandler_GroupingMatchesStdlib is the equivalence check: with no span
+// in context the wrapped handler must produce byte-for-byte what a bare
+// slog.JSONHandler produces for the same logger shape. Anything else means the
+// handler's own group bookkeeping has diverged from slog's semantics.
+func TestOTelHandler_GroupingMatchesStdlib(t *testing.T) {
+	for _, shape := range loggerShapes {
+		t.Run(shape.name, func(t *testing.T) {
+			opts := &slog.HandlerOptions{ReplaceAttr: dropTime}
+			var plain, wrapped bytes.Buffer
+			plainLogger := shape.apply(slog.New(slog.NewJSONHandler(&plain, opts)))
+			wrappedLogger := shape.apply(slog.New(o11ylog.NewOTelHandler(slog.NewJSONHandler(&wrapped, opts))))
+
+			plainLogger.InfoContext(context.Background(), "msg", slog.String("rec", "r"))
+			wrappedLogger.InfoContext(context.Background(), "msg", slog.String("rec", "r"))
+
+			assert.JSONEq(t, plain.String(), wrapped.String(),
+				"grouping must match slog's own handler when no span is present")
+		})
+	}
+}
+
+// TestOTelHandler_TraceIDsStayTopLevelUnderGroups is the regression test for
+// the bug this handler exists to avoid: WithGroup used to bury traceId inside
+// the group, so {"req":{"traceId":…}} reached Loki and every query keyed on the
+// top-level field silently matched nothing.
+func TestOTelHandler_TraceIDsStayTopLevelUnderGroups(t *testing.T) {
+	sc := spanContext("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7")
+	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+
+	for _, shape := range loggerShapes {
+		t.Run(shape.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := shape.apply(slog.New(o11ylog.NewOTelHandler(
+				slog.NewJSONHandler(&buf, &slog.HandlerOptions{ReplaceAttr: dropTime}))))
+
+			logger.InfoContext(ctx, "msg", slog.String("rec", "r"))
+
+			var record map[string]any
+			require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
+			assert.Equal(t, sc.TraceID().String(), record[traceIDField],
+				"traceId must be a top-level field, got %s", buf.String())
+			assert.Equal(t, sc.SpanID().String(), record[spanIDField],
+				"spanId must be a top-level field, got %s", buf.String())
+		})
+	}
+}
+
+// TestOTelHandler_GroupedRecordKeepsItsOwnAttrsNested guards the other half:
+// hoisting the identifiers must not drag the record's attributes out of the
+// group with them.
+func TestOTelHandler_GroupedRecordKeepsItsOwnAttrsNested(t *testing.T) {
+	var buf bytes.Buffer
+	sc := spanContext("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7")
+	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+	logger := slog.New(o11ylog.NewOTelHandler(slog.NewJSONHandler(&buf, nil))).
+		With("top", "a").
+		WithGroup("outer").With("mid", "b").
+		WithGroup("inner")
+
+	logger.InfoContext(ctx, "msg", slog.String("rec", "r"))
+
+	var record map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
+	assert.Equal(t, sc.TraceID().String(), record[traceIDField])
+	assert.Equal(t, "a", record["top"], "attrs added before any group stay top-level")
+
+	outer, ok := record["outer"].(map[string]any)
+	require.True(t, ok, "outer group must be present: %s", buf.String())
+	assert.Equal(t, "b", outer["mid"])
+	inner, ok := outer["inner"].(map[string]any)
+	require.True(t, ok, "inner group must nest inside outer: %s", buf.String())
+	assert.Equal(t, "r", inner["rec"], "the record's own attrs belong to the innermost group")
+	assert.NotContains(t, inner, traceIDField, "traceId must not also appear inside the group")
+}
+
+// TestOTelHandler_DerivedHandlersAreIndependent pins that deriving two loggers
+// from one grouped parent cannot leak attributes between them — the group
+// frames are copied on write rather than shared.
+func TestOTelHandler_DerivedHandlersAreIndependent(t *testing.T) {
+	var left, right bytes.Buffer
+	opts := &slog.HandlerOptions{ReplaceAttr: dropTime}
+
+	newSide := func(buf *bytes.Buffer) *slog.Logger {
+		return slog.New(o11ylog.NewOTelHandler(slog.NewJSONHandler(buf, opts))).WithGroup("g")
+	}
+	// Same parent shape, two independent children.
+	parentLeft, parentRight := newSide(&left), newSide(&right)
+	parentLeft.With("only", "left").InfoContext(context.Background(), "msg")
+	parentRight.With("only", "right").InfoContext(context.Background(), "msg")
+
+	var recLeft, recRight map[string]any
+	require.NoError(t, json.Unmarshal(left.Bytes(), &recLeft))
+	require.NoError(t, json.Unmarshal(right.Bytes(), &recRight))
+	assert.Equal(t, map[string]any{"only": "left"}, recLeft["g"])
+	assert.Equal(t, map[string]any{"only": "right"}, recRight["g"])
+}
+
+func TestOTelHandler_DerivedHandlersAreConcurrentSafe(_ *testing.T) {
+	base := slog.NewJSONHandler(io.Discard, nil)
+	parent := slog.New(o11ylog.NewOTelHandler(base)).WithGroup("g").With("shared", "v")
+	ctx := trace.ContextWithSpanContext(context.Background(),
+		spanContext("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7"))
+
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			parent.With(slog.Int("worker", worker)).WithGroup("sub").InfoContext(ctx, "concurrent")
+		}(i)
+	}
+	wg.Wait()
+}
+
+// TestHandlers_DoNotWriteThroughSharedRecordArray covers the slog handler
+// contract: a handler must not AddAttrs to the record it was given, because the
+// caller may hand the same record to a sibling handler and the two share an
+// attribute array. Go's slog detects a write through a shared array and appends
+// a "!BUG" attr rather than corrupting data, so that sentinel appearing in the
+// sibling's output is the observable symptom.
+func TestHandlers_DoNotWriteThroughSharedRecordArray(t *testing.T) {
+	sc := spanContext("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7")
+	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+	whitelist := baggageattrs.NewWhitelist("app.order.id")
+	baggageCtx := baggageContext(t, baggageMember(t, "app.order.id", "order-42"))
+
+	handlers := map[string]struct {
+		build func(io.Writer) slog.Handler
+		ctx   context.Context
+	}{
+		"OtelSlogHandler": {
+			build: func(w io.Writer) slog.Handler {
+				return o11ylog.NewOTelHandler(slog.NewJSONHandler(w, nil))
+			},
+			ctx: ctx,
+		},
+		"BaggageHandler": {
+			build: func(w io.Writer) slog.Handler {
+				return o11ylog.NewBaggageHandler(slog.NewJSONHandler(w, nil), whitelist)
+			},
+			ctx: baggageCtx,
+		},
+	}
+
+	for name, tc := range handlers {
+		t.Run(name, func(t *testing.T) {
+			// Sweep attr counts across the boundary where slog.Record spills
+			// from its inline array into the heap-allocated one two copies can
+			// share. slog only reports the violation once a second copy also
+			// appends, which is why both sides here are attr-adding handlers —
+			// the shape of a caller fanning one record out to sdk.Logger's
+			// handler and another of their own.
+			for n := 1; n <= 18; n++ {
+				var firstOut, secondOut bytes.Buffer
+				first, second := tc.build(&firstOut), tc.build(&secondOut)
+
+				rec := slog.NewRecord(time.Now(), slog.LevelInfo, "msg", 0)
+				for i := 0; i < n; i++ {
+					rec.AddAttrs(slog.Int(fmt.Sprintf("a%d", i), i))
+				}
+
+				require.NoError(t, first.Handle(tc.ctx, rec))
+				require.NoError(t, second.Handle(tc.ctx, rec))
+
+				for side, out := range map[string]string{"first": firstOut.String(), "second": secondOut.String()} {
+					assert.NotContains(t, out, "!BUG",
+						"n=%d %s: the handler wrote through the caller's shared attr array", n, side)
+				}
+			}
+		})
+	}
+}
+
+// TestOTelHandler_UngroupedPathAllocations keeps the common (ungrouped) logger
+// on its original cost: cloning a record that still fits its inline attr array
+// is free, so injection must not add heap traffic to every log line.
+func TestOTelHandler_UngroupedPathAllocations(t *testing.T) {
+	handler := o11ylog.NewOTelHandler(discardHandler{})
+	sc := spanContext("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7")
+	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+	record := slog.NewRecord(time.Now(), slog.LevelInfo, "ordinary", 0)
+	record.AddAttrs(slog.String("a", "1"), slog.Int("b", 2))
+
+	handled := testing.AllocsPerRun(200, func() {
+		_ = handler.Handle(ctx, record)
+	})
+
+	// Rendering the two IDs as hex is the irreducible cost of injecting them.
+	// Cloning the record to leave the caller's copy alone must not add to it:
+	// a record whose attrs still fit slog's inline array clones for free.
+	var sink string
+	idFormatting := testing.AllocsPerRun(200, func() {
+		sink = sc.TraceID().String()
+		sink = sc.SpanID().String()
+	})
+	_ = sink
+
+	assert.LessOrEqual(t, handled-idFormatting, 0.0,
+		"ungrouped injection allocated %.0f objects beyond rendering the IDs", handled-idFormatting)
+}
+
 func TestBaggageHandlerInjectsWhitelistedUserName(t *testing.T) {
 	var buf bytes.Buffer
 	base := slog.NewJSONHandler(&buf, nil)
@@ -534,3 +777,9 @@ func TestMultiHandler_Handle_ClonesRecord(t *testing.T) {
 	assert.Equal(t, []string{"clone-test"}, h1.msgs)
 	assert.Equal(t, []string{"clone-test"}, h2.msgs)
 }
+
+// Field names asserted throughout; they are part of the SDK's log contract.
+const (
+	traceIDField = "traceId"
+	spanIDField  = "spanId"
+)

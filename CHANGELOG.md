@@ -13,6 +13,37 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+### Fixed
+
+- `log`: `traceId` and `spanId` are now always written at the log record's top
+  level, including on loggers derived with `Logger.WithGroup`. Previously the
+  handler forwarded the group to the JSON handler beneath it, and because a
+  handler's record attributes are qualified into whatever groups are open, the
+  identifiers were emitted inside the group — `{"req":{"traceId":…}}` instead of
+  a top-level `traceId`. Any Loki/Fluentd query, Grafana derived field, or
+  log-to-trace correlation keyed on the top-level field silently matched nothing
+  for those loggers. The group continues to nest that logger's own attributes;
+  only the two trace identifiers are hoisted. Grouping behaviour is otherwise
+  unchanged and is now pinned against `slog`'s own handler by an equivalence
+  test covering ten `WithGroup`/`WithAttrs` shapes.
+- `log`: `OtelSlogHandler` and `BaggageHandler` no longer add attributes to the
+  `slog.Record` they were handed without cloning it first. The record belongs to
+  the caller and may share its attribute array with a sibling handler, so
+  writing through it violates the `slog.Handler` contract; a caller fanning
+  `sdk.Logger.Handler()` out alongside another attribute-adding handler could
+  see slog's `!BUG` marker appear in the sibling's output. The SDK's own handler
+  chain was unaffected because `MultiHandler` already clones per delivery.
+- `log`: `WithGroup("")` is now the no-op the `slog.Handler` contract requires
+  on `OtelSlogHandler`, `BaggageHandler`, and `MultiHandler`. `BaggageHandler`
+  additionally kept its preset-key set instead of discarding it for a group that
+  was never opened.
+
+### Migration
+
+- No API change. Services that adopted the previous (incorrect) nesting — for
+  example a Loki query or Grafana derived field reading `req.traceId` rather
+  than `traceId` — should move those back to the top-level field.
+
 ---
 
 ## [0.11.0] - 2026-08-12

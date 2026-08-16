@@ -237,6 +237,15 @@ Use `obs.Logger` instead of the global `slog` package. Every log record is writt
 - **stdout (JSON)**: Human-readable output for local development. Includes `service.name`, `environment`, `traceId`, and `spanId` as flat JSON fields.
 - When `WithLogEnabled(false)` is set, only the stdout destination is active.
 
+`traceId` and `spanId` stay top-level fields on a logger derived with
+`WithGroup`, so a query keyed on `traceId` keeps matching whatever grouping a
+service adopts. The group still nests that logger's own attributes:
+
+```go
+obs.Logger.WithGroup("req").InfoContext(ctx, "handled", slog.String("method", "GET"))
+// stdout: {..., "traceId":"4bf92f...", "spanId":"00f067...", "req":{"method":"GET"}}
+```
+
 ```go
 // Without a span — no trace fields in either destination
 obs.Logger.Info("service started")
