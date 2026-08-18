@@ -83,13 +83,18 @@ func Start(ctx context.Context, cfg Config) (func(context.Context) error, error)
 	profilerStarted = true
 
 	return func(context.Context) error {
-		err := profiler.Stop()
-		if err == nil {
+		// Release the process-wide pprof slot whatever Stop reports. The flag
+		// tracks "this process holds the profiler", not "shutdown was clean":
+		// the profiler is no longer running either way, and SDK.Shutdown runs
+		// each closer at most once, so a flag left set on a Stop error could
+		// never be cleared and every later Start would fail with
+		// ErrAlreadyStarted for the life of the process.
+		defer func() {
 			profilerMu.Lock()
 			profilerStarted = false
 			profilerMu.Unlock()
-		}
-		return err
+		}()
+		return profiler.Stop()
 	}, nil
 }
 

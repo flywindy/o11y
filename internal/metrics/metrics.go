@@ -274,6 +274,11 @@ func defaultViews(cfg Config) []sdkmetric.View {
 }
 
 // initPrometheus sets up the Prometheus pull path.
+// runtimeStart is a seam over runtime.Start so tests can exercise the
+// init-failure branches, which otherwise only trigger on instrument-creation
+// errors. It mirrors internal/profiling's pyroscopeStart.
+var runtimeStart = runtime.Start
+
 func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, views []sdkmetric.View) (*sdkmetric.MeterProvider, Closer, error) {
 	reg := prometheus.NewRegistry()
 
@@ -315,7 +320,7 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 	)
 
 	if cfg.RuntimeMetrics {
-		if err := runtime.Start(runtime.WithMeterProvider(provider)); err != nil {
+		if err := runtimeStart(runtime.WithMeterProvider(provider)); err != nil {
 			return nil, nil, fmt.Errorf("metrics: start runtime metrics: %w", err)
 		}
 	}
@@ -371,18 +376,29 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []s
 	}
 
 	var initSucceeded bool
+	var provider *sdkmetric.MeterProvider
 	defer func() {
-		if !initSucceeded {
-			_ = exporter.Shutdown(ctx)
+		if initSucceeded {
+			return
 		}
+		// Shut the provider down, not just the exporter: NewPeriodicReader
+		// starts its export goroutine at construction, and only the provider's
+		// Shutdown drains it (it in turn shuts the exporter down). Releasing
+		// the exporter alone would leave that goroutine exporting against a
+		// closed exporter once per interval for the life of the process.
+		if provider != nil {
+			_ = provider.Shutdown(ctx)
+			return
+		}
+		_ = exporter.Shutdown(ctx)
 	}()
 
-	provider := sdkmetric.NewMeterProvider(
+	provider = sdkmetric.NewMeterProvider(
 		meterProviderOptions(sdkmetric.NewPeriodicReader(cappedExporter), res, views, cfg.MaxUniqueRoutes, cfg.MaxUniqueCollections)...,
 	)
 
 	if cfg.RuntimeMetrics {
-		if err := runtime.Start(runtime.WithMeterProvider(provider)); err != nil {
+		if err := runtimeStart(runtime.WithMeterProvider(provider)); err != nil {
 			return nil, nil, fmt.Errorf("metrics: start runtime metrics: %w", err)
 		}
 	}

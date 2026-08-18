@@ -67,6 +67,25 @@ adopters can plan their upgrades.
 - `resty`: a panicking middleware or transport no longer leaves the attempt
   span open; resty unwinds through its panic hooks only, and `OnPanic` is now
   registered.
+- `metrics`: a failure to register runtime metrics on the OTLP push path no
+  longer leaks the MeterProvider. `sdkmetric.NewPeriodicReader` starts its
+  export goroutine at construction and only the provider's `Shutdown` drains
+  it, but the failure path released just the exporter — so the goroutine
+  outlived the failed `Init` and exported against a closed exporter once per
+  interval for the life of the process. The Prometheus path already handled
+  this; both are now covered by tests.
+- `profiling`: a Pyroscope `Stop` that returns an error no longer strands the
+  process-wide pprof slot. The flag tracks whether this process holds the
+  profiler, not whether shutdown was clean, and `SDK.Shutdown` runs each closer
+  at most once — so a single `Stop` failure previously made every later
+  `Init` with profiling enabled fail with `ErrAlreadyStarted`, with no way to
+  recover short of a restart.
+- `profiling`: the Pyroscope endpoint is redacted before it is logged. An
+  endpoint of the form `scheme://user:password@host` is a working
+  authentication mechanism — Go's `http.Client` turns userinfo into a Basic
+  `Authorization` header — and the two warning paths that name the endpoint
+  write to stdout *and* the OTLP log pipeline, carrying the credential out of
+  the process. Such endpoints keep working; only the logged form changes.
 
 ### Migration
 

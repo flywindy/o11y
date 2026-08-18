@@ -160,3 +160,35 @@ func TestPyroscopeSlogAdapter_InfofUsesInfoLevel(t *testing.T) {
 	assert.Contains(t, output, `"level":"INFO"`)
 	assert.Contains(t, output, `"msg":"upload started"`)
 }
+
+// TestCloser_ReleasesSlotEvenWhenStopFails pins that a failed Stop does not
+// strand the process-wide pprof slot. The closer used to clear profilerStarted
+// only on a nil error, and SDK.Shutdown runs each closer at most once, so a
+// single Stop failure made every later Start in the process return
+// ErrAlreadyStarted with no way to recover.
+func TestCloser_ReleasesSlotEvenWhenStopFails(t *testing.T) {
+	stopErr := errors.New("pyroscope: flush failed")
+	failing := &fakeProfiler{stopErr: stopErr}
+	healthy := &fakeProfiler{}
+	// The first Start gets a profiler whose Stop fails; a later one gets a
+	// working profiler, so the only thing that can block it is a stranded slot.
+	starts := 0
+	withFakePyroscopeStart(t, func(pyroscope.Config) (profilerHandle, error) {
+		starts++
+		if starts == 1 {
+			return failing, nil
+		}
+		return healthy, nil
+	})
+
+	closer, err := Start(context.Background(), Config{ServiceName: "profiled-svc", Endpoint: "http://alloy:4040"})
+	require.NoError(t, err)
+
+	// The error still reaches the caller — the slot is released regardless.
+	require.ErrorIs(t, closer(context.Background()), stopErr)
+	assert.True(t, failing.stopped)
+
+	second, err := Start(context.Background(), Config{ServiceName: "profiled-svc", Endpoint: "http://alloy:4040"})
+	require.NoError(t, err, "a failed Stop must not permanently poison profiling for the process")
+	require.NoError(t, second(context.Background()))
+}
