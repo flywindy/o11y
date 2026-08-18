@@ -502,3 +502,52 @@ users are not forced to migrate.
   a future use case calls dynamic hosts (URL shorteners, multi-tenant
   egress), we may need per-host cap config in the metric.View. Lean:
   defer until a concrete case appears.
+
+---
+
+## Amendment (2026-08-15) — the retry hook, not `OnAfterResponse`, ends a retried span
+
+§1's hook table gives `OnAfterResponse` the job of ending the span when "the
+response would have triggered a retry". Implementing that meant asking the
+client for its retry conditions and re-evaluating them. That re-derivation was
+wrong: resty evaluates `append(r.retryConditions, r.client.RetryConditions...)`
+(`request.go:1071` in v2.17.2), and `Request.AddRetryCondition` writes to the
+unexported `r.retryConditions`. A wrapper cannot read the request-level half.
+
+The consequence was silent telemetry loss. A caller who registered the
+condition on the request rather than the client got a wrapper that judged the
+response non-retryable, so `OnAfterResponse` left the attempt span open and
+never recorded its `http.client.request.duration` sample. resty then retried
+anyway. Every attempt but the last vanished — spans that were started, never
+ended, and never exported — so client error rates and P99s were understated
+exactly on the requests that were struggling.
+
+**Decision.** The retry decision belongs to resty, so the wrapper consumes it
+instead of reproducing it. `AddRetryHook` fires on every retry decision,
+including the one taken on the final attempt (`retry.go:147-155`), and *the
+hook firing is itself the signal that the attempt was retryable*. The wrapper
+therefore:
+
+- ends a retried attempt's span in the retry hook, for both response-based
+  retries (where resty passes a nil error) and error-based ones;
+- passes `retryable` into the response-finishing path as a parameter rather
+  than recomputing it, which is what keeps `resty.retry.exhausted` correct on
+  the request-level path;
+- no longer registers `OnAfterResponse` at all, and the `retryableResponse`
+  helper is deleted. `OnSuccess` and `OnError` continue to end spans for
+  requests resty did not retry; reaching them means no retry decision was made,
+  because any decision fires the retry hook first.
+
+Two supporting changes fall out of the same lifecycle review:
+
+- The hook now holds a reference to the client it was installed on. resty's
+  retry-hook signature is `func(*Response, error)` and `Request` keeps its
+  client unexported, so without it the retry path resolved targets with a nil
+  client and dropped `server.address`/`server.port` for relative URLs — the
+  dimension most wanted when a host is failing.
+- `OnPanic` is now registered. resty unwinds a panic through its panic hooks
+  only (`request.go:1018-1027`), so a panicking middleware or transport
+  previously left the attempt span open.
+
+§1's table and diagram should be read with `OnAfterResponse` replaced by the
+retry hook for the retried case; the rest of the lifecycle is unchanged.

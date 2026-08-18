@@ -30,6 +30,11 @@ type hook struct {
 	duration metric.Float64Histogram
 	prop     propagation.TextMapPropagator
 	cfg      config
+	// client is the wrapped client this hook was installed on. resty's retry
+	// hook signature passes only (*Response, error) and Request keeps its
+	// client unexported, so the reference is held here to keep target
+	// resolution accurate on the retry path.
+	client *restyclient.Client
 }
 
 type requestState struct {
@@ -52,6 +57,7 @@ type targetAttrs struct {
 }
 
 func newHook(
+	client *restyclient.Client,
 	tp trace.TracerProvider,
 	duration metric.Float64Histogram,
 	prop propagation.TextMapPropagator,
@@ -65,6 +71,7 @@ func newHook(
 		duration: duration,
 		prop:     prop,
 		cfg:      cfg,
+		client:   client,
 	}
 }
 
@@ -111,20 +118,6 @@ func (h *hook) beforeRequest(c *restyclient.Client, req *restyclient.Request) er
 	return nil
 }
 
-func (h *hook) afterResponse(c *restyclient.Client, resp *restyclient.Response) error {
-	if resp == nil || resp.Request == nil {
-		return nil
-	}
-	state := stateFromContext(resp.Request.Context())
-	if state == nil || state.finished {
-		return nil
-	}
-	if h.retryableResponse(c, resp) {
-		h.finishResponse(c, resp, state)
-	}
-	return nil
-}
-
 func (h *hook) success(c *restyclient.Client, resp *restyclient.Response) {
 	if resp == nil || resp.Request == nil {
 		return
@@ -133,10 +126,21 @@ func (h *hook) success(c *restyclient.Client, resp *restyclient.Response) {
 	if state == nil || state.finished {
 		return
 	}
-	h.finishResponse(c, resp, state)
+	// Reaching the success hook means resty made no retry decision for this
+	// attempt: any decision fires the retry hook first, which ends the span.
+	h.finishResponse(c, resp, state, false)
 }
 
-func (h *hook) finishResponse(c *restyclient.Client, resp *restyclient.Response, state *requestState) {
+// finishResponse ends the attempt span for a request that produced a response.
+// retryable reports whether resty decided this attempt warranted a retry; it is
+// passed in rather than re-derived because the wrapper cannot see the full
+// condition set (see hook.retry).
+func (h *hook) finishResponse(
+	c *restyclient.Client,
+	resp *restyclient.Response,
+	state *requestState,
+	retryable bool,
+) {
 	state.target = requestTarget(c, resp.Request)
 	statusCode := resp.StatusCode()
 	attrs := append(targetAttributes(state.target), semconv.HTTPResponseStatusCode(statusCode))
@@ -148,7 +152,7 @@ func (h *hook) finishResponse(c *restyclient.Client, resp *restyclient.Response,
 		errType = strconv.Itoa(statusCode)
 		attrs = append(attrs, semconv.ErrorTypeKey.String(errType))
 	}
-	if isLastAttempt(state) && h.retryableResponse(c, resp) {
+	if isLastAttempt(state) && retryable {
 		attrs = append(attrs, restyRetryExhaustedKey.Bool(true))
 		addRetryExhaustedEvent(state.parentCtx)
 	}
@@ -174,15 +178,47 @@ func isErrorStatusCode(code int) bool {
 	return code >= 400 && code < 600
 }
 
+// retry runs on every retry decision resty makes, including the one taken on
+// the final attempt. Reaching this hook is itself the signal that the attempt
+// was retryable: resty evaluates the merged condition set — the request's own
+// conditions appended to the client's (Request.AddRetryCondition writes to an
+// unexported field) — so the wrapper cannot reproduce that decision. It used to
+// try, via the client-level conditions alone, and a request that retried on a
+// condition registered with req.AddRetryCondition therefore left every attempt
+// span but the last unended and its duration sample unrecorded.
 func (h *hook) retry(resp *restyclient.Response, err error) {
-	if resp == nil || resp.Request == nil || err == nil {
+	if resp == nil || resp.Request == nil {
 		return
 	}
 	state := stateFromContext(resp.Request.Context())
 	if state == nil || state.finished {
 		return
 	}
+	if err == nil {
+		// resty hands the retry hook the raw operation error, which is nil when
+		// the decision came from inspecting the response rather than a
+		// transport failure.
+		h.finishResponse(h.client, resp, state, true)
+		return
+	}
 	h.finishError(resp.Request, state, err, isLastAttempt(state))
+}
+
+// panicked ends the attempt span when a middleware or transport panics. resty
+// unwinds through its panic hooks only, so without this the span started in
+// beforeRequest would never be ended.
+func (h *hook) panicked(req *restyclient.Request, err error) {
+	if req == nil {
+		return
+	}
+	state := stateFromContext(req.Context())
+	if state == nil || state.finished {
+		return
+	}
+	if err == nil {
+		err = errors.New("resty: panic during request")
+	}
+	h.finishError(req, state, err, false)
 }
 
 func (h *hook) error(req *restyclient.Request, err error) {
@@ -287,18 +323,6 @@ func (h *hook) spanName(req *restyclient.Request, method, route string) string {
 		return method + " " + route
 	}
 	return method
-}
-
-func (h *hook) retryableResponse(c *restyclient.Client, resp *restyclient.Response) bool {
-	if c == nil || resp == nil || len(c.RetryConditions) == 0 {
-		return false
-	}
-	for _, condition := range c.RetryConditions {
-		if condition != nil && condition(resp, nil) {
-			return true
-		}
-	}
-	return false
 }
 
 func stateFromContext(ctx context.Context) *requestState {

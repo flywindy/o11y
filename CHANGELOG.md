@@ -46,6 +46,27 @@ adopters can plan their upgrades.
   already pinned the same instrument. `db.client.connection.count`,
   `.idle.max`, `.idle.min`, `.max`, and `.timeouts` gained the allow-keys
   backstop those wrappers also carry, so a stray attribute cannot widen them.
+- `resty`: every attempt span is now ended, and its
+  `http.client.request.duration` sample recorded, when a request retries on a
+  condition registered with `req.AddRetryCondition`. The wrapper re-derived
+  resty's retry decision from the client-level conditions alone, but resty
+  evaluates the request's own conditions appended to the client's and
+  `Request.AddRetryCondition` writes to an unexported field, so the wrapper
+  judged such responses non-retryable and left every attempt but the last
+  unended and unrecorded — understating client error rates and P99s exactly on
+  the requests that were struggling. The retry hook, which resty fires on every
+  retry decision, is now authoritative; `OnAfterResponse` and the
+  `retryableResponse` helper are gone. See the 2026-08-15 amendment to
+  [ADR 0011](docs/adr/0011-resty-integration.md).
+- `resty`: `resty.retry.exhausted` is now set on the final attempt of a
+  request-level retry too, for the same reason — the marker is taken from
+  resty's decision rather than recomputed.
+- `resty`: the retry path keeps `server.address` and `server.port` on spans and
+  metric samples for relative URLs. resty's retry-hook signature carries no
+  client, so the target was previously resolved without the base URL.
+- `resty`: a panicking middleware or transport no longer leaves the attempt
+  span open; resty unwinds through its panic hooks only, and `OnPanic` is now
+  registered.
 
 ### Migration
 
@@ -57,6 +78,13 @@ adopters can plan their upgrades.
   set. Any PromQL written against the old boundaries needs updating — though in
   practice the old histogram carried no usable signal, since every sample sat
   in the first bucket.
+- **Resty telemetry volume increases** for services that retry via
+  `req.AddRetryCondition`: spans and `http_client_request_duration` samples that
+  were previously dropped now appear, one per retried attempt. Dashboards and
+  alerts reading client request rate or error rate will show a step change on
+  rollout. This is the missing data arriving, not a traffic change — but it is
+  worth announcing before the release so an on-call reading the graph does not
+  chase a phantom incident.
 
 ---
 
