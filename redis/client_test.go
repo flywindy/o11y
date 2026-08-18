@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/sdk/instrumentation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -616,6 +617,125 @@ func TestPoolMetricsOmitIdleMaxWhenUnbounded(t *testing.T) {
 	assert.NotNil(t, metricByName(rm, "db.client.connection.max"),
 		"db.client.connection.max stays present when MaxActiveConns is bounded")
 	assert.NotNil(t, metricByName(rm, "db.client.connection.idle.min"))
+}
+
+// sdkTestBuckets mirrors o11y.DefaultLatencyBuckets: second-scale boundaries,
+// which is what makes the OTel default (millisecond-scale) wrong for the
+// second-valued histograms this package records.
+var sdkTestBuckets = []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10}
+
+// TestMetricViewsCoverEveryEmittedInstrument walks what the package actually
+// exports and requires a view to match each one. db.client.connection.create_time
+// shipped without one: it records seconds but kept OTel's default boundaries
+// ([0, 5, 10, … 10000]), so every Redis dial landed in the first bucket and the
+// histogram was useless for the pool sizing it exists to support. The mongo and
+// cassandra wrappers pin the same instrument; redis was the odd one out.
+//
+// Driving the list from collected output rather than a hand-kept list is the
+// point: a pool instrument added later shows up here without anyone
+// remembering to extend the test.
+func TestMetricViewsCoverEveryEmittedInstrument(t *testing.T) {
+	tp, _, mp, reader := newRedisTestProviders()
+	client := goredis.NewClient(&goredis.Options{
+		Addr:           "127.0.0.1:6379",
+		MaxActiveConns: 13,
+		MaxIdleConns:   7,
+		MinIdleConns:   1,
+	})
+	defer client.Close()
+	_, err := Wrap(client, tp, mp, WithPoolName("view-coverage"))
+	require.NoError(t, err)
+
+	rm := collectRedisMetrics(t, reader)
+	views := MetricViews(sdkTestBuckets)
+	scope := instrumentation.Scope{Name: instrumentationName}
+
+	emitted := make([]string, 0)
+	for i := range rm.ScopeMetrics {
+		if rm.ScopeMetrics[i].Scope.Name != instrumentationName {
+			continue
+		}
+		for j := range rm.ScopeMetrics[i].Metrics {
+			emitted = append(emitted, rm.ScopeMetrics[i].Metrics[j].Name)
+		}
+	}
+	require.NotEmpty(t, emitted, "the wrapper exported no metrics; the walk below would vacuously pass")
+
+	// create_time only records on a successful dial, which this test does not
+	// perform, so it is asserted explicitly alongside the observed set.
+	emitted = append(emitted, "db.client.connection.create_time")
+
+	for _, name := range emitted {
+		t.Run(name, func(t *testing.T) {
+			matched := false
+			for _, v := range views {
+				if _, ok := v(sdkmetric.Instrument{Name: name, Scope: scope}); ok {
+					matched = true
+					break
+				}
+			}
+			assert.True(t, matched,
+				"%s is exported by this package but no view matches it, so it keeps OTel's defaults", name)
+		})
+	}
+}
+
+// TestMetricViewsPinConnectionCreateTimeBuckets is the behavioural half: the
+// view must actually put the SDK's second-scale boundaries on the histogram.
+func TestMetricViewsPinConnectionCreateTimeBuckets(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithView(MetricViews(sdkTestBuckets)...),
+	)
+	// Same instrument name, unit, and scope the wrapper registers.
+	hist, err := mp.Meter(instrumentationName).Float64Histogram(
+		"db.client.connection.create_time", metric.WithUnit("s"))
+	require.NoError(t, err)
+	// A dial faster than OTel's first default boundary (5) — indistinguishable
+	// from every other dial before this view existed.
+	hist.Record(context.Background(), 0.0004, metric.WithAttributes(
+		semconv.DBSystemNameRedis,
+		attribute.String("db.client.connection.pool.name", "bucket-check"),
+	))
+
+	rm := collectRedisMetrics(t, reader)
+	createTime := metricByName(rm, "db.client.connection.create_time")
+	require.NotNil(t, createTime, "create_time must be exported")
+	hd, ok := createTime.Data.(metricdata.Histogram[float64])
+	require.True(t, ok, "create_time must aggregate as a float64 histogram")
+	require.Len(t, hd.DataPoints, 1)
+	assert.Equal(t, sdkTestBuckets, hd.DataPoints[0].Bounds,
+		"create_time must use the SDK's second-scale boundaries, not OTel's millisecond defaults")
+}
+
+// TestMetricViewsBoundPoolInstrumentLabels pins the allow-keys backstop: an
+// attribute outside the bounded set must not reach the exported series.
+func TestMetricViewsBoundPoolInstrumentLabels(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithView(MetricViews(sdkTestBuckets)...),
+	)
+	hist, err := mp.Meter(instrumentationName).Float64Histogram(
+		"db.client.connection.create_time", metric.WithUnit("s"))
+	require.NoError(t, err)
+	hist.Record(context.Background(), 0.001, metric.WithAttributes(
+		semconv.DBSystemNameRedis,
+		attribute.String("db.client.connection.pool.name", "bounded"),
+		attribute.String("redis.command.argument", "unbounded-user-value"),
+	))
+
+	rm := collectRedisMetrics(t, reader)
+	createTime := metricByName(rm, "db.client.connection.create_time")
+	require.NotNil(t, createTime)
+	hd := createTime.Data.(metricdata.Histogram[float64])
+	require.Len(t, hd.DataPoints, 1)
+	_, present := hd.DataPoints[0].Attributes.Value("redis.command.argument")
+	assert.False(t, present, "an attribute outside the allow-list must be filtered off the series")
+	poolName, present := hd.DataPoints[0].Attributes.Value("db.client.connection.pool.name")
+	assert.True(t, present, "the bounded pool label must survive")
+	assert.Equal(t, "bounded", poolName.AsString())
 }
 
 func TestMetricViewsDropRedisotelLegacyInstruments(t *testing.T) {

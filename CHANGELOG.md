@@ -37,12 +37,26 @@ adopters can plan their upgrades.
   on `OtelSlogHandler`, `BaggageHandler`, and `MultiHandler`. `BaggageHandler`
   additionally kept its preset-key set instead of discarding it for a group that
   was never opened.
+- `redis`: the pool instruments this package emits itself are now covered by
+  metric views. `db.client.connection.create_time` records seconds but matched
+  no view, so it kept OTel's default millisecond-scale boundaries
+  (`[0, 5, 10, … 10000]`) and every Redis dial fell into the first bucket,
+  making the histogram useless for the pool sizing it exists to support. It now
+  follows `WithHistogramBuckets` like the MongoDB and Cassandra wrappers, which
+  already pinned the same instrument. `db.client.connection.count`,
+  `.idle.max`, `.idle.min`, `.max`, and `.timeouts` gained the allow-keys
+  backstop those wrappers also carry, so a stray attribute cannot widen them.
 
 ### Migration
 
 - No API change. Services that adopted the previous (incorrect) nesting — for
   example a Loki query or Grafana derived field reading `req.traceId` rather
   than `traceId` — should move those back to the top-level field.
+- `db_client_connection_create_time_bucket` changes shape for Redis: its `le`
+  boundaries move from OTel's millisecond defaults to the SDK's second-scale
+  set. Any PromQL written against the old boundaries needs updating — though in
+  practice the old histogram carried no usable signal, since every sample sat
+  in the first bucket.
 
 ---
 
