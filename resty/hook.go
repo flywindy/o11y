@@ -242,7 +242,11 @@ func (h *hook) finishError(req *restyclient.Request, state *requestState, err er
 			req = responseErr.Response.Request
 		}
 	}
-	state.target = requestTarget(nil, req)
+	// Resolve against the wrapped client: on an early failure (a panicking or
+	// erroring before-request hook) RawRequest is not built yet, so a relative
+	// URL needs the client's base URL to yield server.address and server.port —
+	// the dimensions most wanted when a host is misbehaving.
+	state.target = requestTarget(h.client, req)
 
 	attrs := append(targetAttributes(state.target),
 		semconv.ErrorTypeKey.String(errType),

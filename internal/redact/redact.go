@@ -56,3 +56,18 @@ func URL(raw string) string {
 	// parser has attributed, and which userinfo cannot occupy.
 	return raw
 }
+
+// EndpointInText returns text with every occurrence of endpoint replaced by its
+// redacted form.
+//
+// Redacting the endpoint attribute alone is not enough: net/url renders a parse
+// failure as `parse "<raw>": …`, so an error logged beside a redacted endpoint
+// hands back the very credential the redaction removed. Pyroscope's client
+// parses the address and returns that error verbatim, which puts the leak on
+// the same warning that reports the failure.
+func EndpointInText(text, endpoint string) string {
+	if endpoint == "" || !strings.Contains(text, endpoint) {
+		return text
+	}
+	return strings.ReplaceAll(text, endpoint, URL(endpoint))
+}

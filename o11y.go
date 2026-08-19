@@ -389,11 +389,14 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 				return nil, startErr
 			}
 			logger.WarnContext(ctx, "profiling disabled after Pyroscope start failure",
-				// Redacted: a Pyroscope endpoint may carry userinfo, which Go's
-				// http.Client turns into a Basic auth header. This record goes
-				// to stdout and the OTLP log pipeline, i.e. out of the process.
+				// Both fields are redacted: a Pyroscope endpoint may carry
+				// userinfo, which Go's http.Client turns into a Basic auth
+				// header, and the error can quote the endpoint back (Pyroscope
+				// parses the address and returns net/url's error verbatim).
+				// This record goes to stdout and the OTLP log pipeline, i.e.
+				// out of the process.
 				slog.String("endpoint", redact.URL(cfg.profilingEndpoint)),
-				slog.Any("error", startErr),
+				slog.String("error", redact.EndpointInText(startErr.Error(), cfg.profilingEndpoint)),
 			)
 		} else {
 			profilerCloser = closer

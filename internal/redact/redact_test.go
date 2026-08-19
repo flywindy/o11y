@@ -58,3 +58,37 @@ func TestURLNeverLeaksThePassword(t *testing.T) {
 		assert.NotContains(t, redact.URL(raw), secret, "input %q leaked its credential", raw)
 	}
 }
+
+// TestEndpointInText covers the second half of the leak: redacting the endpoint
+// attribute is pointless if the error logged beside it quotes the endpoint back.
+// net/url renders a parse failure as `parse "<raw>": …`, and Pyroscope's client
+// returns that error verbatim.
+func TestEndpointInText(t *testing.T) {
+	const endpoint = "http://user:s3cret%zz@pyroscope:4040"
+	// The shape net/url actually produces, confirmed against the stdlib.
+	text := `parse "` + endpoint + `": invalid URL escape "%zz"`
+
+	got := redact.EndpointInText(text, endpoint)
+
+	assert.NotContains(t, got, "s3cret", "the credential must not survive into the logged error")
+	assert.Contains(t, got, "invalid URL escape", "the diagnostic part must survive")
+}
+
+func TestEndpointInTextLeavesUnrelatedTextAlone(t *testing.T) {
+	tests := []struct {
+		name     string
+		text     string
+		endpoint string
+		want     string
+	}{
+		{"endpoint absent", "connection refused", "http://u:p@host", "connection refused"},
+		{"empty endpoint", "some error", "", "some error"},
+		{"endpoint carries no credential", `dial "http://pyroscope:4040": refused`, "http://pyroscope:4040", `dial "http://pyroscope:4040": refused`},
+		{"every occurrence replaced", "http://u:p@h and http://u:p@h", "http://u:p@h", "http://redacted@h and http://redacted@h"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, redact.EndpointInText(tt.text, tt.endpoint))
+		})
+	}
+}

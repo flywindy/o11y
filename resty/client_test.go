@@ -632,6 +632,28 @@ func TestPanicDuringRequestEndsSpan(t *testing.T) {
 	assert.EqualValues(t, 1, totalClientDurationSamples(t, reader))
 }
 
+// TestPanicBeforeRawRequestKeepsServerAddress pins that the early-failure path
+// still resolves its target. resty runs before-request hooks before it builds
+// RawRequest, so a relative URL has nothing to resolve against except the
+// client's base URL — and the hook, not the request, is what holds the client.
+func TestPanicBeforeRawRequestKeepsServerAddress(t *testing.T) {
+	tp, mp, sr, _ := testProvidersWithReader()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.SetBaseURL("http://orders.internal:8080")
+	client.OnBeforeRequest(func(_ *restyclient.Client, _ *restyclient.Request) error {
+		panic("middleware exploded")
+	})
+
+	require.Panics(t, func() {
+		_, _ = client.R().Get("/orders")
+	})
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	assertAttr(t, spans[0], semconv.ServerAddressKey, "orders.internal")
+	assertAttr(t, spans[0], semconv.ServerPortKey, int64(8080))
+}
+
 // totalClientDurationSamples sums http.client.request.duration counts across
 // every data point, since attempts differ in their attribute sets.
 func totalClientDurationSamples(t *testing.T, reader *sdkmetric.ManualReader) uint64 {
