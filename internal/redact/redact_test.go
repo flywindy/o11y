@@ -8,6 +8,8 @@ import (
 	"github.com/flywindy/o11y/internal/redact"
 )
 
+// TestURL covers the endpoint shapes the SDK may be handed, including the
+// ones where userinfo must not survive into a log line.
 func TestURL(t *testing.T) {
 	tests := []struct {
 		name string
@@ -21,7 +23,15 @@ func TestURL(t *testing.T) {
 		{"password with url-unsafe bytes", "https://u:p%40ss%2Fword@host/path", "https://redacted@host/path"},
 		{"credentials with a query string", "http://u:p@host:4040/ingest?name=svc", "http://redacted@host:4040/ingest?name=svc"},
 		{"host-port only, no scheme", "pyroscope:4040", "pyroscope:4040"},
-		{"unparseable but contains an @", "http://u:p@host:4040/\x7f\x00", "[unparseable endpoint redacted]"},
+		{"unparseable but contains an @", "http://u:p@host:4040/\x7f\x00", "[endpoint redacted]"},
+		// url.Parse accepts these without error and reports no userinfo, so
+		// returning the input verbatim would print the credential in full.
+		{"opaque url hides the credential", "http:user:s3cret@host", "[endpoint redacted]"},
+		{"scheme-less opaque url", "user:s3cret@host:4040", "[endpoint redacted]"},
+		{"non-http opaque url", "mailto:user:s3cret@host", "[endpoint redacted]"},
+		// "@" the parser positively attributed to a path or query is not
+		// userinfo, so the endpoint stays legible.
+		{"at-sign in the path", "http://pyroscope:4040/ingest@v1", "http://pyroscope:4040/ingest@v1"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -39,6 +49,11 @@ func TestURLNeverLeaksThePassword(t *testing.T) {
 		"https://user:" + secret + "@pyroscope:4040/ingest?name=svc",
 		"http://" + secret + "@pyroscope:4040",
 		"http://user:" + secret + "@pyroscope:4040/\x7f",
+		// Opaque forms: url.Parse reports no userinfo for any of these.
+		"http:user:" + secret + "@pyroscope",
+		"user:" + secret + "@pyroscope:4040",
+		"mailto:user:" + secret + "@host",
+		"//user:" + secret + "@pyroscope:4040",
 	} {
 		assert.NotContains(t, redact.URL(raw), secret, "input %q leaked its credential", raw)
 	}

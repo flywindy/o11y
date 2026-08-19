@@ -247,22 +247,54 @@ func TestOTelHandler_GroupedRecordKeepsItsOwnAttrsNested(t *testing.T) {
 // from one grouped parent cannot leak attributes between them — the group
 // frames are copied on write rather than shared.
 func TestOTelHandler_DerivedHandlersAreIndependent(t *testing.T) {
-	var left, right bytes.Buffer
-	opts := &slog.HandlerOptions{ReplaceAttr: dropTime}
+	var buf bytes.Buffer
 
-	newSide := func(buf *bytes.Buffer) *slog.Logger {
-		return slog.New(o11ylog.NewOTelHandler(slog.NewJSONHandler(buf, opts))).WithGroup("g")
+	// Both children must come from the *same* parent: two separately built
+	// handlers share no backing array, so they would pass without exercising
+	// anything. The parent's in-group attrs are added across several calls so
+	// its frame slice carries spare capacity — the state in which two children
+	// appending their own attr write to the same array unless it is clipped.
+	parent := slog.New(o11ylog.NewOTelHandler(
+		slog.NewJSONHandler(&buf, &slog.HandlerOptions{ReplaceAttr: dropTime}))).
+		WithGroup("g").With("a", 1).With("b", 2).With("c", 3)
+
+	parent.With("only", "left").InfoContext(context.Background(), "msg")
+	parent.With("only", "right").InfoContext(context.Background(), "msg")
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	require.Len(t, lines, 2)
+
+	for i, want := range []string{"left", "right"} {
+		var rec map[string]any
+		require.NoError(t, json.Unmarshal([]byte(lines[i]), &rec))
+		group, ok := rec["g"].(map[string]any)
+		require.True(t, ok, "group missing in %s", lines[i])
+		assert.Equal(t, map[string]any{"a": 1.0, "b": 2.0, "c": 3.0, "only": want}, group,
+			"child %q must hold exactly the parent's attrs plus its own", want)
 	}
-	// Same parent shape, two independent children.
-	parentLeft, parentRight := newSide(&left), newSide(&right)
-	parentLeft.With("only", "left").InfoContext(context.Background(), "msg")
-	parentRight.With("only", "right").InfoContext(context.Background(), "msg")
+}
 
-	var recLeft, recRight map[string]any
-	require.NoError(t, json.Unmarshal(left.Bytes(), &recLeft))
-	require.NoError(t, json.Unmarshal(right.Bytes(), &recRight))
-	assert.Equal(t, map[string]any{"only": "left"}, recLeft["g"])
-	assert.Equal(t, map[string]any{"only": "right"}, recRight["g"])
+// TestOTelHandler_GroupedWithAttrsResolvesLogValuerOnce pins that opening a
+// group does not change when a LogValuer is resolved. Attrs installed inside a
+// group are held by this handler and re-attached to every record, so without
+// resolving them at derivation time a stateful or expensive value would be
+// resolved once per log call — while the same logger without a group resolves
+// it once, when the base handler preformats.
+func TestOTelHandler_GroupedWithAttrsResolvesLogValuerOnce(t *testing.T) {
+	var calls int
+	valuer := countingLogValuer{count: &calls, value: slog.StringValue("resolved")}
+
+	var buf bytes.Buffer
+	logger := slog.New(o11ylog.NewOTelHandler(slog.NewJSONHandler(&buf, nil))).
+		WithGroup("g").With("lazy", valuer)
+	require.Equal(t, 1, calls, "deriving the logger must resolve the value once")
+
+	for i := 0; i < 3; i++ {
+		logger.InfoContext(context.Background(), "msg")
+	}
+
+	assert.Equal(t, 1, calls, "logging must not re-resolve an attr installed at derivation time")
+	assert.Contains(t, buf.String(), `"lazy":"resolved"`)
 }
 
 func TestOTelHandler_DerivedHandlersAreConcurrentSafe(_ *testing.T) {

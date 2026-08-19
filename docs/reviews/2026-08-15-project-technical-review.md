@@ -1,175 +1,216 @@
-# o11y 專案技術審查報告(2026-08-15)
+# o11y Technical Review (2026-08-15)
 
-> 審查範圍:核心 SDK(root、`internal/`)、九個整合套件、`k8s/` 基礎設施、CI/CD 與工具鏈。
-> 審查角度:資深後端工程師 / SRE / 架構師。
-> 審查方法:全量程式碼閱讀 + `go build`/`go vet`/`go test`(全數通過)+ `go list -deps` 相依驗證 + manifest 交叉比對。
+> Scope: core SDK (root, `internal/`), the nine integration packages, the `k8s/`
+> infrastructure, and CI/CD plus tooling.
+> Perspective: senior backend engineer / SRE / architect.
+> Method: full source read + `go build` / `go vet` / `go test` (all passing) +
+> `go list -deps` dependency verification + manifest cross-comparison.
 >
-> **2026-08-15 更新:本報告已完成逐項查證**(實測重現 + 上游原始碼比對),
-> 查證結果與修復計畫見 [`2026-08-15-verification-and-remediation-plan.md`](./2026-08-15-verification-and-remediation-plan.md)。
-> 其中 **D4(Loki exporter)與 C4(minio 無測試)兩項原始指控經查不成立或過度誇大,已於下方就地更正**。
+> **Update 2026-08-15: every finding here has since been independently
+> verified** (empirical reproduction plus upstream source comparison). The
+> verdicts and the resulting plan are in
+> [`2026-08-15-verification-and-remediation-plan.md`](./2026-08-15-verification-and-remediation-plan.md).
+> **Two original findings — D4 (Loki exporter) and C4 (minio test coverage) —
+> did not survive verification and are corrected in place below.**
 
 ---
 
-## 總評
+## Overall assessment
 
-這是一個**遠高於平均水準**的 observability SDK 專案:25 篇 ADR 完整記錄設計決策、以
-`scripts/check_integrations.go` 把 ADR 0003/0008 政策做成 CI 閘門、無全域 OTel 狀態污染、
-冪等的 Shutdown、初始化失敗路徑的資源清理、以及對 metric cardinality 的系統性防護,都是
-少見的工程紀律。測試在 `-race` 下全綠,註解一貫解釋「為什麼」而非「做什麼」。
+This is an observability SDK **well above the usual standard**: 25 ADRs
+recording the design decisions, ADR 0003/0008 policy enforced as a CI gate by
+`scripts/check_integrations.go`, no global OTel state mutation, idempotent
+`Shutdown`, resource cleanup on every init-failure path, and systematic metric
+cardinality protection. Tests are green under `-race`, and comments
+consistently explain *why* rather than *what*.
 
-但在更廣泛採用(多團隊引用)之前,有**四個必須先處理的結構性/正確性問題**(P0),
-以及一批一致性債與基礎設施缺陷。以下依優先級列出。
+Before wider adoption across teams, though, there are **four structural or
+correctness problems that should be fixed first** (P0), plus a body of
+consistency debt and infrastructure gaps. Ordered by priority below.
 
 ---
 
-## P0 — 廣泛採用前必須修復
+## P0 — fix before wider adoption
 
-### A1.(架構)root 套件把四個資料庫 driver 連結進每個使用者的 binary
+### A1. (Architecture) The root package links four database drivers into every consumer's binary
 
-`o11y.go:24-32、250-256` 為了收集 `MetricViews(...)` 直接 import 了
-`cassandra/`、`minio/`、`mongo/`、`redis/` 子套件。已用 `go list -deps` 驗證:
-**任何只想要 tracing+logging 的服務,import root 套件後,binary 會被連結進
-gocql、minio-go/v7、mongo-driver/v2(含 AWS auth stack)、go-redis/v9 全套。**
+`o11y.go:24-32, 250-256` imports the `cassandra/`, `minio/`, `mongo/`, and
+`redis/` sub-packages purely to collect `MetricViews(...)`. Verified with
+`go list -deps`: **any service that only wants tracing and logging still links
+gocql, minio-go/v7, mongo-driver/v2 (including its AWS auth stack), and
+go-redis/v9 once it imports the root package.**
 
-影響:
-- 使用者繼承所有 driver 的 CVE 面(govulncheck 噪音)、binary 體積、`go.sum` 膨脹;
-- MVS 版本衝突風險(使用者若釘住舊版 mongo-driver 會與 SDK 打架);
-- 相依方向反轉:SDK core 不應依賴整合層。
+Impact:
 
-各 `views.go` 本身只 import OTel(view 定義是純字串 scope 比對),但 Go 以套件為連結單位,
-import 套件就會連結整包。**修法(擇一,由小到大):**
-1. 把每個整合的 view 定義搬到 leaf 套件(如 `redis/views` 子套件或 `internal/views`,
-   以 scope-name 字串常數比對,不 import driver),root 改 import leaf;
-2. root 不再主動收集 views,改由整合套件在 wiring 時透過既有的 `ExtraViews` seam 註冊;
-3. 長期:仿 otel-contrib 拆成 per-integration Go modules(`o11y/redis` 各自獨立
-   `go.mod`),徹底隔離相依。單一 module 目前也把 `nats-io/nats-server/v2`
-  (僅測試用的完整 NATS server)列為 direct dependency,拆 module 可一併解決。
+- Consumers inherit the CVE surface of all four drivers (govulncheck noise),
+  the binary size, and the `go.sum` growth.
+- MVS version-conflict risk: a service pinned to an older mongo-driver now
+  negotiates with the SDK's pin.
+- Inverted dependency direction: an SDK core should not depend on its
+  integration layer.
 
-### A2.(核心正確性)`Logger.WithGroup` 之後 `traceId`/`spanId` 被巢狀進群組,破壞 log-trace 關聯契約
+Each `views.go` imports only OTel (the view definitions are plain scope-name
+string matches), but Go links at package granularity, so importing the package
+links all of it. **Options, smallest first:**
 
-`internal/log/handler.go:27-35, 49-51` — `OtelSlogHandler.Handle` 在 `WithGroup`
-已委派給底層 JSON handler 之後才用 `r.AddAttrs` 注入 traceId,record-level attr 會被
-qualify 進打開的群組。因此:
+1. Move each integration's view definitions into a leaf package (e.g. a
+   `redis/views` sub-package or `internal/views`) that matches on scope-name
+   string constants and imports no driver; the root imports the leaf.
+2. Stop collecting views in the root entirely and have integrations register
+   them at wiring time through the existing `ExtraViews` seam.
+3. Longer term: follow otel-contrib and split into per-integration Go modules
+   (`o11y/redis` with its own `go.mod`), fully isolating the dependencies. The
+   single module also currently lists `nats-io/nats-server/v2` (a full NATS
+   server used only in tests) as a direct dependency, which a split would
+   resolve at the same time.
+
+### A2. (Core correctness) `traceId`/`spanId` nest inside the group after `Logger.WithGroup`, breaking the log-trace correlation contract
+
+`internal/log/handler.go:27-35, 49-51` — `OtelSlogHandler.Handle` injects
+traceId with `r.AddAttrs` *after* `WithGroup` has been delegated to the
+underlying JSON handler, so the record-level attrs are qualified into the open
+group:
 
 ```go
 sdk.Logger.WithGroup("req").ErrorContext(ctx, ...)
-// stdout 輸出 {"req":{"traceId":...}} 而非頂層 traceId
+// stdout emits {"req":{"traceId":...}} instead of a top-level traceId
 ```
 
-`o11y.go:64-70` 承諾的頂層關聯欄位對任何 `WithGroup` 衍生 logger 靜默失效,
-Loki/Fluentd 查詢與 trace 關聯直接斷掉;且 stdout 與 OTLP 兩路輸出(otelslog 從 ctx
-取 trace context,維持 record-level)行為分歧。此路徑無測試。修法:handler 記錄群組
-深度、或在 pre-group base handler 注入。
+The top-level correlation field promised at `o11y.go:64-70` silently fails for
+any logger derived via `WithGroup`, breaking Loki/Fluentd queries and trace
+correlation outright. The two output paths also diverge: the OTLP side
+(otelslog takes trace context from ctx and keeps it record-level) is
+unaffected. This path has no test. Fix: have the handler track group depth, or
+inject via the pre-group base handler.
 
-### A3.(resty)request-level retry condition 觸發重試時,attempt span 洩漏(永不 End、metric 少記)
+### A3. (resty) Attempt spans leak when a request-level retry condition triggers the retry (never ended, sample never recorded)
 
-`resty/hook.go:292-302` 的 `retryableResponse` 只檢查 `c.RetryConditions`,但 resty
-v2.17.2 實際會合併 request-level 條件(`request.go:1071`)。使用者用
-`req.AddRetryCondition(...)`(無 client-level 條件)時,`afterResponse` 不會結束
-attempt-1 的 span,`h.retry` 又因 `err == nil` 提前返回 —— 每次重試漏掉一個 span
-(永不匯出)與一筆 `http.client.request.duration` 樣本;retry-exhausted 標記同樣失效。
-無對應測試。
+`retryableResponse` at `resty/hook.go:292-302` checks only
+`c.RetryConditions`, but resty v2.17.2 merges in the request-level conditions
+(`request.go:1071`). When a caller uses `req.AddRetryCondition(...)` with no
+client-level condition, `afterResponse` does not end attempt 1's span and
+`h.retry` returns early because `err == nil` — so each retry drops one span
+(never exported) and one `http.client.request.duration` sample. The
+retry-exhausted marker fails the same way. No test covers this.
 
-### A4.(redis)套件自己發出的 pool metrics 沒有任何 view —— `db.client.connection.create_time` 用預設(毫秒級)bucket 匯出
+### A4. (redis) The package's own pool metrics have no views — `db.client.connection.create_time` exports with default (millisecond-scale) buckets
 
-`redis/views.go:21-63` 只設定 `db.client.operation.duration` 與舊版 redisotel 複數名
-的 drop-views;`redis/metrics.go:32-79` 實際發出的單數名 instrument
-(`db.client.connection.count/.idle.max/.idle.min/.max/.timeouts/.create_time`)無 view 匹配。
-`create_time` 單位是秒,卻沿用 OTel 預設邊界 `[0,5,10,…10000]`,幾乎所有 dial 都落在第一個
-bucket,直方圖對 pool sizing(該套件明文宣稱的用途,`redis/hook.go:88-95`)完全無用。
-mongo 與 cassandra 在相同 instrument 上都有釘 bucket 與 allow-keys,redis 是唯一漏掉的。
+`redis/views.go:21-63` configures only `db.client.operation.duration` plus
+drop-views for the legacy plural redisotel names. The singular instruments the
+package actually emits at `redis/metrics.go:32-79`
+(`db.client.connection.count/.idle.max/.idle.min/.max/.timeouts/.create_time`)
+match no view. `create_time` is in seconds yet keeps OTel's default boundaries
+`[0, 5, 10, … 10000]`, so essentially every dial lands in the first bucket and
+the histogram is useless for the pool sizing it explicitly claims to support
+(`redis/hook.go:88-95`). mongo and cassandra both pin buckets and allow-keys on
+the same instrument; redis is the only one that does not.
 
 ---
 
-## P1 — 高優先(正確性 / 一致性 / 基礎設施)
+## P1 — high priority (correctness / consistency / infrastructure)
 
-### 核心 SDK
+### Core SDK
 
-| # | 位置 | 問題 |
+| # | Location | Problem |
 |---|------|------|
-| B1 | `internal/metrics/metrics.go:373-388` | OTLP push 路徑:`runtime.Start` 失敗時只 shutdown exporter,`MeterProvider`(含 PeriodicReader goroutine)洩漏,每個 interval 對已關閉的 exporter 報錯。Prometheus 路徑(`initPrometheus`)有正確處理,兩邊應對稱。 |
-| B2 | `options.go:603` + 各 exporter 一律傳 `WithEndpointURL` | 標準 `OTEL_EXPORTER_OTLP_*ENDPOINT` 環境變數**永遠被靜默覆蓋**(預設 `http://localhost:4318` 無條件生效),與 SDK 尊重 `OTEL_TRACES_SAMPLER`、`OTEL_RESOURCE_ATTRIBUTES`、`OTEL_EXPORTER_OTLP_HEADERS` 的行為不一致。用標準 OTel 部署清單的服務會把遙測送去 localhost 而毫無警告。建議:caller 未設 `WithOTLPEndpoint` 時尊重 env var,或至少在文件與啟動 log 明示。 |
-| B3 | `internal/profiling/profiling.go:85-93` | profiler `Stop()` 失敗時 `profilerStarted` 不重置,配合 `Shutdown` 的 `sync.Once`,整個 process 永久無法再啟動 profiling。建議無條件重置。 |
-| B4 | `internal/log/handler.go:30-34, 96-105` | `Handle` 未 `Clone` 就 `AddAttrs`,違反 slog handler 撰寫指南。SDK 內部因 `MultiHandler` 有 clone 而安全,但 `sdk.Logger.Handler()` 是公開的,使用者自行 fan-out 時會跨 handler 汙染。 |
-| B5 | `o11y.go:358-360, 388-390` | profiling endpoint 原文寫入 log;URL 內嵌 userinfo(`http://user:pass@host`)會把憑證洩進 log。建議 log 前 redact userinfo。 |
+| B1 | `internal/metrics/metrics.go:373-388` | OTLP push path: when `runtime.Start` fails only the exporter is shut down, leaking the `MeterProvider` (and its PeriodicReader goroutine), which then errors against a closed exporter every interval. The Prometheus path (`initPrometheus`) handles this correctly; the two should be symmetric. |
+| B2 | `options.go:603` plus every exporter always passing `WithEndpointURL` | The standard `OTEL_EXPORTER_OTLP_*ENDPOINT` environment variables are **always silently overridden** (the `http://localhost:4318` default applies unconditionally), inconsistent with the SDK honouring `OTEL_TRACES_SAMPLER`, `OTEL_RESOURCE_ATTRIBUTES`, and `OTEL_EXPORTER_OTLP_HEADERS`. A service using standard OTel deployment manifests sends telemetry to localhost with no warning. Suggested: honour the env var when the caller has not set `WithOTLPEndpoint`, or at minimum say so loudly in the docs and at startup. |
+| B3 | `internal/profiling/profiling.go:85-93` | `profilerStarted` is not reset when the profiler's `Stop()` fails; combined with `Shutdown`'s `sync.Once`, profiling can never be started again for the life of the process. Suggested: reset unconditionally. |
+| B4 | `internal/log/handler.go:30-34, 96-105` | `Handle` calls `AddAttrs` without `Clone`, violating the slog handler guide. Safe inside the SDK because `MultiHandler` clones, but `sdk.Logger.Handler()` is public, so a caller's own fan-out can corrupt attrs across handlers. |
+| B5 | `o11y.go:358-360, 388-390` | The profiling endpoint is logged verbatim; a URL with embedded userinfo (`http://user:pass@host`) leaks the credential into the logs. Suggested: redact userinfo before logging. |
 
-### 整合套件
+### Integration packages
 
-| # | 位置 | 問題 |
+| # | Location | Problem |
 |---|------|------|
-| C1 | `http/server.go:17-19`、`gin/middleware.go:17-19` | 文件承諾「絕不回退到全域 OTel state」,但 otelhttp/otelgin 的 option 對 nil 是忽略,`NewServerHandler(next, nil, nil, nil)` 會**靜默使用全域 provider** —— 正是文件排除的行為。且九個套件對 nil provider 有三種姿態(回錯誤 / 靜默 no-op / 靜默用全域),應統一(建議:一律回錯誤,與 redis/mongo/cassandra/nats/es 對齊)。 |
-| C2 | `cassandra/observer.go:104-108, 270-286` | `db.namespace` label 來自解析 statement 文字,**無 value cap**(`WithMaxUniqueCollections` 只管 `db.collection.name`)。keyspace-per-tenant 部署或 tokenizer 誤判時 cardinality 無界。 |
-| C3 | `mongo/pool_metrics.go:146-160, 214-219, 323-339` | (a) fallback pool 名含單調遞增序號,client 重建(重連/配置重載)時每次產生新 label value,舊 series 以 sync UpDownCounter 永久留存 → 緩慢無界成長;(b) `cleanup()` 在 `Disconnect` 之前執行(兩個 defer 的自然順序)會吞掉歸零事件,`db.client.connection.count` 凍結在非零值。 |
-| C4 | `minio/client.go:353-382` | 阻塞行為屬實(棄讀 channel + 不可取消 ctx → goroutine 與 span 永久懸置),但**嚴重度下修**:`client.go:350-352` 已明文記載這是繼承自 minio-go 的契約。且「完全無測試」的說法**不成立** —— `client_test.go:436-443` 有 ListObjects 測試,只是僅涵蓋完整排空的 happy path。 |
-| C5 | 低嚴重度批次 | ES 對 3xx 標 span Error(與 SDK 其他 HTTP 套件 ≥400 不一致);redis `commandText` 先組完整字串(10MB SET → 10MB 暫時配置)再截斷;mongo pool 事件單一 mutex 且 `Add` 在臨界區內;resty 錯誤路徑丟失 `server.address`;resty 無 `OnPanic` hook(panic 時 span 不 End);minio metric 樣本缺 system attribute。 |
+| C1 | `http/server.go:17-19`, `gin/middleware.go:17-19` | The docs promise "never falls back to process-wide OpenTelemetry globals", but otelhttp/otelgin ignore nil options, so `NewServerHandler(next, nil, nil, nil)` **silently uses the global provider** — precisely the behaviour the docs exclude. Across the nine packages there are three different postures for a nil provider (return an error / silently no-op / silently use globals); these should be unified (suggested: return an error everywhere, matching redis/mongo/cassandra/nats/es). |
+| C2 | `cassandra/observer.go:104-108, 270-286` | The `db.namespace` label is derived from parsed statement text with **no value cap** (`WithMaxUniqueCollections` bounds only `db.collection.name`). Cardinality is unbounded under keyspace-per-tenant deployments or when the tokenizer misreads a statement. |
+| C3 | `mongo/pool_metrics.go:146-160, 214-219, 323-339` | (a) The fallback pool name carries a monotonically increasing sequence, so every client rebuild (reconnect / config reload) mints a new label value and the stale series live forever on sync UpDownCounters — slow unbounded growth. (b) Running `cleanup()` before `Disconnect` (the natural order of two defers) swallows the zeroing events, freezing `db.client.connection.count` at a non-zero value. |
+| C4 | `minio/client.go:353-382` | The blocking behaviour is real (abandoned channel + non-cancellable ctx leaves the goroutine and span suspended forever), but **the severity is lowered**: `client.go:350-352` already documents this as an inherited minio-go contract. The claim of "no test coverage at all" **does not hold** — `client_test.go:436-443` does test ListObjects; it only covers the drain-to-completion happy path. |
+| C5 | Low-severity batch | Elasticsearch marks 3xx as span Error (inconsistent with ≥400 in the SDK's other HTTP packages); redis `commandText` builds the full string (a 10 MB SET allocates 10 MB transiently) before truncating; mongo pool events funnel through a single mutex with `Add` calls inside the critical section; the resty error path loses `server.address`; resty has no `OnPanic` hook (a panic leaves the span unended); minio metric samples omit the system attribute. |
 
-### K8s 基礎設施(kind 開發環境定位,但需修)
+### Kubernetes infrastructure (positioned as a kind dev environment, but needs fixes)
 
-| # | 位置 | 問題 |
+| # | Location | Problem |
 |---|------|------|
-| D1 | `k8s/infrastructure/base/{cassandra,elasticsearch}.yaml` | **未被任何 kustomization 引用的重複 manifest,且已漂移**:頂層 elasticsearch.yaml:32 是 `runAsGroup: 0`(root group),components 版本是 `1000`。直接刪除兩個頂層檔案。 |
-| D2 | `components/nats/nats.yaml:10` | JetStream 已啟用但 StatefulSet **完全沒有儲存 volume**(連 emptyDir 都沒有),stream/KV 寫在 overlay fs,容器重啟即消失。至少加 volumeClaimTemplate 或明示 emptyDir。 |
-| D3 | `monitor/otel-collector.yaml:25-28, 92-102` | 全部遙測的單一入口沒有 `memory_limiter` processor、沒有 resource limits、沒有 probes(collector 有 `health_check` extension 可用)。遙測突發時被 OOMKill、in-flight 資料全丟。 |
-| D4 | `monitor/otel-collector.yaml:35-50, 67-70` | ~~使用已被移除的 loki exporter,升版即掛~~ **← 查證後更正,見下方「更正記錄」**。實情:`loki` exporter 自 2024-07-09 起**標記棄用但仍持續發佈**(最新 v0.130.0 > 專案釘的 0.121.0),目前**沒有壞**,也非迫在眉睫。屬應排程處理的技術債:遷移到 `otlphttp` 打 Loki 原生 OTLP endpoint(`/otlp`),並連動調整 Grafana derived-field regex。 |
-| D5 | monitor 全部 + mongodb + nats | 整個 monitor stack(prometheus/loki/tempo/grafana/alloy)無 probes、無 resources、無 securityContext、全部 emptyDir(Grafana 連 volume 都沒有);與 minio/cassandra/es/pyroscope 的模範寫法(non-root、drop ALL、seccomp、PVC、明確的 production-override 註解)形成強烈反差 —— **最容易被複製到 production 的那一半反而最沒防護**。mongodb 無認證且以 root 執行,亦無 dev-only 註解。 |
-| D6 | `monitor/grafana.yaml:117-118` vs `monitor/tempo.yaml` | Grafana service map 指向 Prometheus,但 Tempo 沒開 `metrics_generator` → node graph 永遠空白的死功能。二擇一:補 metrics_generator 或移除設定。 |
-| D7 | `kind-config.yaml:5-11` | 未設 `listenAddress`,host 的 4318(無認證 OTLP)、4223(`no_tls` WebSocket NATS)、4040(Pyroscope ingest)綁 `0.0.0.0`,共享網路上任何人可注入。加 `listenAddress: "127.0.0.1"`。 |
-| D8 | Loki / Prometheus | 無 retention 設定(Loki 預設不啟用 retention → 無界成長;Prometheus 無 size cap),長壽 kind node 會磁碟壓力驅逐其他 pod。 |
+| D1 | `k8s/infrastructure/base/{cassandra,elasticsearch}.yaml` | **Duplicate manifests referenced by no kustomization, and already drifted**: the top-level `elasticsearch.yaml:32` has `runAsGroup: 0` (root group) where the components copy has `1000`. Delete both top-level files. |
+| D2 | `components/nats/nats.yaml:10` | JetStream is enabled but the StatefulSet has **no storage volume at all** (not even an emptyDir), so streams and KV write to the container overlay filesystem and vanish on restart. Add at least a volumeClaimTemplate, or an explicit emptyDir. |
+| D3 | `monitor/otel-collector.yaml:25-28, 92-102` | The single ingress point for all telemetry has no `memory_limiter` processor, no resource limits, and no probes (the collector ships a `health_check` extension). A telemetry burst OOM-kills it and drops everything in flight. |
+| D4 | `monitor/otel-collector.yaml:35-50, 67-70` | ~~Uses a loki exporter that has been removed; the next image bump breaks it~~ **← corrected after verification.** In fact the `loki` exporter has been **deprecated since 2024-07-09 but is still published** (latest v0.130.0, well past the project's pinned 0.121.0), so nothing is broken today and nothing is imminent. This is scheduled tech debt: migrate to `otlphttp` against Loki's native OTLP endpoint (`/otlp`), adjusting the Grafana derived-field regex at the same time. |
+| D5 | All of monitor, plus mongodb and nats | The entire monitor stack (prometheus/loki/tempo/grafana/alloy) has no probes, no resources, no securityContext, and uses emptyDir throughout (Grafana has no volume at all). That contrasts sharply with the exemplary minio/cassandra/es/pyroscope manifests (non-root, drop ALL, seccomp, PVCs, explicit production-override comments) — **the half most likely to be copied to production is the half with no hardening**. mongodb runs unauthenticated as root, also with no dev-only comment. |
+| D6 | `monitor/grafana.yaml:117-118` vs `monitor/tempo.yaml` | Grafana's service map points at Prometheus, but Tempo has no `metrics_generator` enabled, so the node graph is a permanently empty dead feature. Either add the metrics_generator or remove the setting. |
+| D7 | `kind-config.yaml:5-11` | No `listenAddress`, so host ports 4318 (unauthenticated OTLP), 4223 (`no_tls` NATS WebSocket), and 4040 (Pyroscope ingest) bind to `0.0.0.0` and anyone on a shared network can inject. Add `listenAddress: "127.0.0.1"`. |
+| D8 | Loki / Prometheus | No retention configured (Loki disables retention by default, so it grows unbounded; Prometheus has no size cap), so a long-lived kind node will evict other pods under disk pressure. |
 
-### CI/CD 與工具鏈
+### CI/CD and tooling
 
-| # | 問題 |
+| # | Problem |
 |---|------|
-| E1 | CI 註解多處聲稱「由 Dependabot/Renovate 管理升級」,但 repo **沒有 `.github/dependabot.yml`**:SHA-pinned actions、golangci-lint v2.11.4、govulncheck v1.3.0、`GOVULNCHECK_GOTOOLCHAIN` pin 會靜默腐化,vuln job 的價值隨 toolchain 老化衰減。 |
-| E2 | `k8s/` 完全沒有 CI 驗證(無 `kustomize build`、kubeconform、yamllint)—— D1 的漂移與 D4 的 deprecated exporter 正是這類 job 能攔下的。 |
-| E3 | `CLAUDE.md`/`GEMINI.md` symlink 指向 `C:/Users/SheepRocket/Projects/o11y/AGENTS.md`(Windows 絕對路徑),在作者機器以外全部壞掉。改成相對 symlink `AGENTS.md`。 |
-| E4 | 其他:coverage 有上傳但無門檻;無 release/tag 自動化(CHANGELOG 手維護);`internal/trace` 無測試檔;action SHA pin 缺 `# vX.Y.Z` 註解;Makefile `examples` 缺 CI 版的 no-dir guard;`docs/guide.md:293` 連到已搬移的 `base/prometheus.yaml`;`.golangci.yml` 可考慮加 `gosec`。 |
+| E1 | Several CI comments claim upgrades are "managed via Dependabot / Renovate", but the repo has **no `.github/dependabot.yml`**: the SHA-pinned actions, golangci-lint v2.11.4, govulncheck v1.3.0, and the `GOVULNCHECK_GOTOOLCHAIN` pin all rot silently, and the vuln job's value decays as its toolchain ages. |
+| E2 | `k8s/` has no CI validation at all (no `kustomize build`, kubeconform, or yamllint) — exactly the class of job that would have caught D1's drift and D4's deprecated exporter. |
+| E3 | The `CLAUDE.md` / `GEMINI.md` symlinks point at `C:/Users/SheepRocket/Projects/o11y/AGENTS.md` (a Windows absolute path) and are broken everywhere except the author's machine. Make them relative symlinks to `AGENTS.md`. |
+| E4 | Others: coverage is uploaded but has no threshold; no release/tag automation (the CHANGELOG is hand-maintained); `internal/trace` has no test file; the action SHA pins carry no `# vX.Y.Z` comments; the Makefile `examples` target lacks CI's no-directory guard; `docs/guide.md:293` links to the relocated `base/prometheus.yaml`; `.golangci.yml` could consider adding `gosec`. |
 
 ---
 
-## P2 — 觀察與建議(非缺陷)
+## P2 — observations and suggestions (not defects)
 
-1. **相依重量**:上游 `akira-core/instrumentation-go/otel-nats` 拖進 open-feature、
-   go-feature-flag、antlr、quic-go 等大量與 NATS instrumentation 無關的間接相依,
-   建議向上游反映或評估 fork 瘦身。
-2. **cardinality 內部預算**:`cardinalityLimitBudget(1000,200)` = 1000×16×64 ≈ 102 萬
-   attribute sets/stream,作為記憶體防線偏名義性(失控 key 可先吃數百 MB),16×64
-   乘數值得回頭檢視。
-3. **`/metrics` server**:`server.Serve` 錯誤被完全吞掉(bind 後失敗會靜默死掉);
-   `:0` 綁定後無法取得實際 port(測試用 TOCTOU workaround,平行下可能 flake)。
-4. **`o11ytest.CanceledRequestContext`** 回傳的是活的 context,命名暗示已取消 —— 公開
-   helper 的命名地雷。
-5. **API 演進**:`resty.Wrap` 不回傳 error 而 `redis.Wrap` 回傳 `(client, error)`,
-   未來 resty 需要錯誤路徑時是 breaking change;pre-1.0 現在統一最便宜。
-
----
-
-## 值得保留與推廣的優點
-
-- **ADR 紀律 + 政策即程式碼**:ADR 0003(無全域狀態)/0008(sourcing 三層模型)由
-  `check_integrations.go` 在 CI 強制執行,semconv 基線(v1.39.0)與升級策略(ADR 0006)
-  明確,上游升版有 span-name 基線測試對照(`docs/upstream-otel-nats.md`)。
-- **初始化與關閉語意**:Init 失敗路徑逐層回收、Shutdown 冪等且 error join、
-  profiling 的 warn-and-continue 與 trace-to-profile wrapper 的延遲安裝(避免懸空
-  profile id)都設計得很細。
-- **cardinality 工程**:export-boundary cap(route/collection)+ 共享預算 + scope 限定
-  view + Prometheus label 正規化碰撞偵測,是多數內部 SDK 沒有的深度。
-- **redis/resty 的 weak-pointer + `runtime.AddCleanup` 去重機制**、nats 的
-  `wrapMessageBatch` goroutine 生命週期處理,經查證皆正確且無洩漏。
-- **CI 基本盤**:SHA-pinned actions、race+coverage、govulncheck 用刻意打過補丁的
-  toolchain(理由寫在註解)、least-privilege permissions、timeouts、concurrency 取消。
-- 四個 datastore component manifest(minio/cassandra/es/pyroscope)是模範等級的
-  dev manifest,可作為 monitor stack 補課的樣板。
+1. **Dependency weight**: the upstream `akira-core/instrumentation-go/otel-nats`
+   drags in open-feature, go-feature-flag, antlr, quic-go and other indirect
+   dependencies unrelated to NATS instrumentation. Worth raising upstream or
+   evaluating a slimmed fork.
+2. **Internal cardinality budget**: `cardinalityLimitBudget(1000, 200)` =
+   1000×16×64 ≈ 1.02 M attribute sets per stream, which is nominal as a memory
+   guard (a runaway key can consume hundreds of MB first). The 16×64
+   multipliers are worth revisiting.
+3. **`/metrics` server**: `server.Serve` errors are swallowed entirely (a
+   post-bind failure dies silently); there is no way to discover the actual
+   port after binding `:0` (tests use a TOCTOU workaround that can flake in
+   parallel).
+4. **`o11ytest.CanceledRequestContext`** returns a live context while the name
+   implies it is already cancelled — a naming hazard on a public helper.
+5. **API evolution**: `resty.Wrap` returns no error while `redis.Wrap` returns
+   `(client, error)`; if resty ever needs an error path that is a breaking
+   change. Unifying now, pre-1.0, is the cheapest it will ever be.
 
 ---
 
-## 建議執行順序
+## Strengths worth keeping and spreading
 
-1. **本週**:刪除 D1 漂移重複檔;修 A2(traceId WithGroup)、A3(resty span 洩漏)、
-   A4(redis views)—— 三者都是局部、便宜的修復;補 E3 symlink、E1 dependabot.yml。
-2. **短期(1-2 sprint)**:A1 破除 root→integration import(先做 leaf-package 方案,
-   per-module 拆分另開 ADR);B1/B3/B4;C1 統一 nil-provider 姿態(pre-1.0 是最後窗口);
-   D2/D3/D4;E2 manifest CI。
-3. **中期**:B2(OTLP env var 精確語意,建議寫成 ADR);C2/C3/C4;D5-D8 monitor stack
-   補課(probes/resources/securityContext/retention + production overlay 註解);
-   release 自動化與 coverage 門檻。
+- **ADR discipline plus policy-as-code**: ADR 0003 (no global state) and 0008
+  (the three-tier sourcing model) are enforced in CI by
+  `check_integrations.go`; the semconv baseline (v1.39.0) and upgrade strategy
+  (ADR 0006) are explicit; upstream bumps are diffed against span-name baseline
+  tests (`docs/upstream-otel-nats.md`).
+- **Init and shutdown semantics**: layered cleanup on init failure, idempotent
+  Shutdown with joined errors, profiling's warn-and-continue, and the deferred
+  installation of the trace-to-profile wrapper (avoiding dangling profile IDs)
+  are all carefully designed.
+- **Cardinality engineering**: export-boundary caps (route/collection), shared
+  budgets, scope-restricted views, and Prometheus label-normalization collision
+  detection — a depth most internal SDKs do not have.
+- **The weak-pointer + `runtime.AddCleanup` dedup machinery in redis/resty**
+  and the nats `wrapMessageBatch` goroutine lifecycle were verified correct and
+  leak-free.
+- **CI fundamentals**: SHA-pinned actions, race + coverage, govulncheck against
+  a deliberately patched toolchain (with the reasoning in a comment),
+  least-privilege permissions, timeouts, and concurrency cancellation.
+- The four datastore component manifests (minio/cassandra/es/pyroscope) are
+  model dev manifests and can serve as the template when the monitor stack
+  catches up.
+
+---
+
+## Suggested execution order
+
+1. **This week**: delete the D1 drifted duplicates; fix A2 (traceId under
+   WithGroup), A3 (resty span leak), and A4 (redis views) — all three are
+   local, cheap fixes; fix the E3 symlink and add E1's dependabot.yml.
+2. **Short term (1–2 sprints)**: A1, breaking the root→integration import
+   (start with the leaf-package option; a per-module split deserves its own
+   ADR); B1/B3/B4; C1 unifying the nil-provider posture (pre-1.0 is the last
+   window); D2/D3/D4; E2 manifest CI.
+3. **Medium term**: B2 (exact OTLP env-var semantics, worth an ADR); C2/C3/C4;
+   D5–D8, bringing the monitor stack up to standard (probes, resources,
+   securityContext, retention, production-overlay comments); release automation
+   and a coverage threshold.

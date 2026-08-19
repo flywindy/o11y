@@ -128,11 +128,20 @@ func (h *OtelSlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	if len(h.groups) == 0 {
 		return &OtelSlogHandler{base: h.base.WithAttrs(attrs)}
 	}
+	// Resolve now, once, as the base handler would when it preformats attrs at
+	// derivation time. Held attrs are re-attached to every record, so an
+	// unresolved LogValuer would otherwise be resolved once per log call —
+	// making a stateful or expensive value behave differently purely because a
+	// group was open.
+	resolved := make([]slog.Attr, len(attrs))
+	for i, attr := range attrs {
+		resolved[i], _ = resolveAttr(attr)
+	}
 	groups := slices.Clone(h.groups)
 	last := len(groups) - 1
 	// Clip so appending cannot write into an array a sibling handler derived
 	// from the same parent is also holding.
-	groups[last].attrs = append(slices.Clip(groups[last].attrs), attrs...)
+	groups[last].attrs = append(slices.Clip(groups[last].attrs), resolved...)
 	return &OtelSlogHandler{base: h.base, groups: groups}
 }
 

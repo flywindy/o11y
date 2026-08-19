@@ -17,12 +17,14 @@ import (
 )
 
 type fakeProfiler struct {
-	stopErr error
-	stopped bool
+	stopErr   error
+	stopped   bool
+	stopCalls int
 }
 
 func (f *fakeProfiler) Stop() error {
 	f.stopped = true
+	f.stopCalls++
 	return f.stopErr
 }
 
@@ -186,9 +188,11 @@ func TestCloser_ReleasesSlotEvenWhenStopFails(t *testing.T) {
 
 	// The error still reaches the caller — the slot is released regardless.
 	require.ErrorIs(t, closer(context.Background()), stopErr)
-	assert.True(t, failing.stopped)
+	assert.Equal(t, 1, failing.stopCalls, "the failing profiler must be stopped exactly once")
 
 	second, err := Start(context.Background(), Config{ServiceName: "profiled-svc", Endpoint: "http://alloy:4040"})
 	require.NoError(t, err, "a failed Stop must not permanently poison profiling for the process")
 	require.NoError(t, second(context.Background()))
+	assert.Equal(t, 1, healthy.stopCalls, "the replacement profiler must be stopped exactly once")
+	assert.Equal(t, 1, failing.stopCalls, "the failed closer must not be re-invoked")
 }

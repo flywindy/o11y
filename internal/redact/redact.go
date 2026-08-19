@@ -11,6 +11,11 @@ import (
 // operator is diagnosing an auth failure — without revealing them.
 const placeholder = "redacted"
 
+// redactedWhole replaces an endpoint whose structure could not be accounted
+// for. Echoing such a value risks printing a credential the parser did not
+// attribute to userinfo.
+const redactedWhole = "[endpoint redacted]"
+
 // URL returns raw with any embedded userinfo replaced, so an endpoint can be
 // logged without leaking the credentials it carries.
 //
@@ -20,9 +25,12 @@ const placeholder = "redacted"
 // endpoints while never writing one verbatim to stdout or the OTLP log
 // pipeline, both of which carry the record out of the process.
 //
-// A value that does not parse is returned unchanged when it cannot contain
-// userinfo, and reduced to a fixed placeholder when it might: an endpoint the
-// SDK cannot interpret is not one it can prove is safe to log.
+// The contract is deliberately one-sided: a value is echoed only when every
+// "@" in it has been positively accounted for as something other than
+// userinfo. Anything else — an endpoint that does not parse, or one where a
+// credential could be hiding in a position url.Parse does not treat as
+// userinfo — is replaced wholesale, because the cost of a less useful log line
+// is far below the cost of printing a secret.
 func URL(raw string) string {
 	if raw == "" || !strings.Contains(raw, "@") {
 		// No userinfo is possible without an "@", so the common case skips
@@ -31,11 +39,20 @@ func URL(raw string) string {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "[unparseable endpoint redacted]"
+		return redactedWhole
 	}
-	if u.User == nil {
-		return raw
+	if u.User != nil {
+		u.User = url.User(placeholder)
+		return u.String()
 	}
-	u.User = url.User(placeholder)
-	return u.String()
+	// No userinfo was parsed, yet the value contains "@". url.Parse only
+	// recognises userinfo in a hierarchical URL ("scheme://user:pass@host");
+	// given an opaque one ("scheme:user:pass@host") it leaves the credential
+	// in Opaque, where returning raw would print it in full.
+	if strings.Contains(u.Opaque, "@") || strings.Contains(u.Host, "@") {
+		return redactedWhole
+	}
+	// Every remaining "@" sits in the path, query, or fragment — positions the
+	// parser has attributed, and which userinfo cannot occupy.
+	return raw
 }
