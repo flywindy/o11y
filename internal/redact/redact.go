@@ -3,6 +3,7 @@ package redact
 
 import (
 	"net/url"
+	"regexp"
 	"strings"
 )
 
@@ -57,17 +58,35 @@ func URL(raw string) string {
 	return raw
 }
 
-// EndpointInText returns text with every occurrence of endpoint replaced by its
-// redacted form.
+// urlUserinfo matches the userinfo of a hierarchical URL anywhere in a string:
+// a scheme, "://", then everything up to the first "@". Userinfo cannot contain
+// an unencoded "/" or "@", so stopping at the first one keeps the match inside
+// a single URL.
+var urlUserinfo = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/@\s"']+@`)
+
+// InText returns text with credentials removed, for text that is about to be
+// logged. The userinfo of every URL-shaped substring is replaced, and any
+// occurrence of one of knownEndpoints is replaced by its redacted form.
 //
-// Redacting the endpoint attribute alone is not enough: net/url renders a parse
+// Redacting an endpoint attribute alone is not enough: net/url renders a parse
 // failure as `parse "<raw>": …`, so an error logged beside a redacted endpoint
 // hands back the very credential the redaction removed. Pyroscope's client
 // parses the address and returns that error verbatim, which puts the leak on
 // the same warning that reports the failure.
-func EndpointInText(text, endpoint string) string {
-	if endpoint == "" || !strings.Contains(text, endpoint) {
-		return text
+//
+// The scrub is deliberately not keyed on the configured endpoint alone. The
+// value that ends up in the error is not always the one the SDK configured —
+// pyroscope-go overrides it from PYROSCOPE_ADHOC_SERVER_ADDRESS before parsing
+// (api.go:57-59 in v1.3.0) — so matching only known endpoints would pass an
+// overridden one straight through. knownEndpoints still matter because they
+// catch opaque forms ("scheme:user:pass@host") that the URL shape above does
+// not.
+func InText(text string, knownEndpoints ...string) string {
+	for _, endpoint := range knownEndpoints {
+		if endpoint == "" || !strings.Contains(text, endpoint) {
+			continue
+		}
+		text = strings.ReplaceAll(text, endpoint, URL(endpoint))
 	}
-	return strings.ReplaceAll(text, endpoint, URL(endpoint))
+	return urlUserinfo.ReplaceAllString(text, "${1}"+placeholder+"@")
 }

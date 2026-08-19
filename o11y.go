@@ -396,7 +396,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 				// This record goes to stdout and the OTLP log pipeline, i.e.
 				// out of the process.
 				slog.String("endpoint", redact.URL(cfg.profilingEndpoint)),
-				slog.String("error", redact.EndpointInText(startErr.Error(), cfg.profilingEndpoint)),
+				slog.String("error", redact.InText(startErr.Error(), cfg.profilingEndpoint)),
 			)
 		} else {
 			profilerCloser = closer
