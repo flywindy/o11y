@@ -58,10 +58,12 @@ protocols:
 - **CVE surface.** `govulncheck` reports against the whole linked graph, so a
   Mongo-driver advisory becomes noise for a service that has never opened a
   Mongo connection — and noise is what makes a real advisory get skipped.
-- **Version constraints.** MVS resolves these modules for every consumer. A
-  service pinned to an older `mongo-driver` for its own reasons now negotiates
-  with the SDK's pin.
-- **`go.sum` and build time**, proportional to the above.
+- **`go.mod` / `go.sum` entries.** A consumer that imports only the root package
+  still records all four drivers as indirect requirements.
+- **Version constraints.** MVS resolves these modules for every consumer: a
+  service that pins an older `mongo-driver` for its own reasons is still raised
+  to the SDK's version. Note this one survives Option A — see §Options.
+- **Build time**, proportional to the above.
 
 ### What the coupling is *not*
 
@@ -118,14 +120,25 @@ func MetricViews(buckets []float64) []sdkmetric.View { return views.Redis(bucket
 - **Non-breaking.** `o11yredis.MetricViews` keeps working for the documented
   self-built-`MeterProvider` case.
 - **Zero-config correctness preserved** — `Init` still composes every view.
-- **Prototyped**: the edge removal compiles and yields the measured numbers
-  above.
+- **Prototyped and measured** (all figures below verified on a scratch consumer
+  module against a patched copy of the SDK):
+  - binary 27.7 MB → 23.8 MB; driver packages linked 77 → 0;
+  - the consumer's `go.mod` indirect requirements and `go.sum` entries for all
+    four drivers **disappear** after `go mod tidy` — Go 1.17+ graph pruning
+    records only what the consumer's import graph needs;
+  - the pruned graph shrinks accordingly (`go mod graph` gocql edges 9 → 1).
+- **What it does *not* deliver — MVS isolation.** The integrations stay in the
+  same module, so `o11y`'s own `go.mod` keeps requiring all four drivers and
+  that requirement edge stays in the graph. Measured: a consumer that explicitly
+  requires `gocql v1.6.0` is still resolved to **v1.7.0**, exactly as before.
+  Any goal phrased as "let consumers pin their own driver versions" needs
+  Option B; Option A does not move it at all.
 - The `otelmongo.ScopeName` constant is duplicated as a string, guarded by an
   equality assertion test in the `mongo` package (which already imports
   `otelmongo`), so a scope rename upstream fails a test rather than silently
   detaching a view from its instrument.
-- **Does not** isolate anything else. If an integration later needs a
-  driver-typed symbol in its view or option surface, the edge returns.
+- If an integration later needs a driver-typed symbol in its view or option
+  surface, the edge returns.
 
 ### Option B — Split each integration into its own Go module
 
@@ -174,12 +187,21 @@ internal services", each with a different stack).
 
 **Option A now; Option B as a separate, later decision.**
 
-A is non-breaking, prototyped, buys the entire measured benefit, and is
-reversible. B is the more complete answer but its cost is concentrated in
-release engineering rather than in code, and that cost is worth paying only
-once there is evidence the leaf-package discipline is failing — for example, the
-first integration that genuinely needs a driver-typed symbol in its view
-surface, or a real MVS conflict reported by a consumer.
+A is non-breaking, prototyped, and buys the linkage benefits — binary size,
+linked-package count, the consumer's `go.mod`/`go.sum`, and govulncheck noise —
+in full, while being reversible. It buys **none** of the module-resolution
+benefit: version selection is unchanged, so a consumer that needs to pin a
+driver version is no better off than today.
+
+That makes the choice sharper than it first looks. If the motivation is
+"consumers should not carry, link, or scan drivers they do not use", A is
+sufficient and cheap. If the motivation includes "consumers should control
+their own driver versions", **only B delivers it**, and adopting A first would
+mean paying the disruption twice.
+
+B's cost is concentrated in release engineering rather than in code, so the
+recommendation stands only under the first motivation. Which motivation applies
+is the decision this ADR is asking for.
 
 Taking A first does not foreclose B: the leaf packages A creates are exactly
 what a module split would need anyway.
@@ -188,15 +210,21 @@ what a module split would need anyway.
 
 ## Consequences
 
-**For consuming services** — no source change. After upgrading and running
-`go mod tidy`, the four driver modules leave the graph of any service that does
-not use them directly; binaries shrink by roughly 14%; `govulncheck` output
+**For consuming services** — no source change, and no migration step. After
+upgrading and running `go mod tidy`, the four driver modules leave the
+`go.mod` and `go.sum` of any service that does not import them directly;
+binaries shrink by roughly 14%; `govulncheck`, which works from the call graph,
 narrows to what the service actually links.
 
-One migration hazard: a service that (incorrectly) relied on one of these
-drivers reaching it transitively, without its own `require`, will fail to
-compile. The fix is a `go get` of the driver it was already using. This should
-be called out in the CHANGELOG rather than left to be discovered.
+Two things checked and found *not* to be consequences, because an earlier draft
+of this ADR asserted both:
+
+- **No compile break for transitive users.** A service that imports a driver
+  without requiring it still builds, because `o11y`'s requirement edge remains
+  in the module graph and resolves; `go mod tidy` then promotes it to an
+  explicit `require`. There is nothing for the CHANGELOG to warn about.
+- **No change to version selection.** See §Options — a consumer pinning an
+  older driver is still raised to the SDK's version.
 
 **For the SDK** — one more package layer to keep straight, and a duplicated
 scope-name constant with a test to guard it. New integrations that own metrics
@@ -207,9 +235,10 @@ must put their view definitions in the leaf package; this belongs in the ADR
 
 ## Open decision
 
-1. **A or B?** The recommendation is A, with B deferred until there is evidence
-   it is needed. A team that already intends to split modules for release-cadence
-   reasons may prefer to spend the disruption once.
+1. **A or B?** This turns on whether consumer-controlled driver versions matter.
+   A does not provide them; only B does. If they do not matter, A is the cheap
+   and reversible answer. If they do — or if the team already intends to split
+   modules for release-cadence reasons — the disruption is better spent once, on B.
 2. **Where do the leaf packages live?** `internal/views` (one package, four
    functions — simplest, but "internal" understates that these definitions are
    the substance of a public API) or `<integration>/views` per package (more

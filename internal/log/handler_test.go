@@ -297,6 +297,40 @@ func TestOTelHandler_GroupedWithAttrsResolvesLogValuerOnce(t *testing.T) {
 	assert.Contains(t, buf.String(), `"lazy":"resolved"`)
 }
 
+// TestOTelHandler_GroupedWithAttrsRunsReplaceAttrPerRecord pins the known cost
+// of owning the grouping, so it is a recorded trade-off rather than a surprise.
+// Attrs held inside a group are re-attached to every record, so a base handler
+// with ReplaceAttr configured sees them once per record; stdlib preformats them
+// once when the logger is derived. Preformatting would require opening the
+// group on the base handler, which is what buried traceId in the first place.
+func TestOTelHandler_GroupedWithAttrsRunsReplaceAttrPerRecord(t *testing.T) {
+	countPresetReplacements := func(build func(*bytes.Buffer, *slog.HandlerOptions) slog.Handler) int {
+		var calls int
+		var buf bytes.Buffer
+		opts := &slog.HandlerOptions{ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+			if a.Key == "preset" {
+				calls++
+			}
+			return a
+		}}
+		logger := slog.New(build(&buf, opts)).WithGroup("g").With("preset", "v")
+		logger.InfoContext(context.Background(), "one")
+		logger.InfoContext(context.Background(), "two")
+		return calls
+	}
+
+	stdlib := countPresetReplacements(func(b *bytes.Buffer, o *slog.HandlerOptions) slog.Handler {
+		return slog.NewJSONHandler(b, o)
+	})
+	wrapped := countPresetReplacements(func(b *bytes.Buffer, o *slog.HandlerOptions) slog.Handler {
+		return o11ylog.NewOTelHandler(slog.NewJSONHandler(b, o))
+	})
+
+	assert.Equal(t, 1, stdlib, "stdlib preformats a grouped attr once, at derivation")
+	assert.Equal(t, 2, wrapped,
+		"the wrapper re-attaches held attrs per record; change this only alongside the doc comment on OtelSlogHandler")
+}
+
 func TestOTelHandler_DerivedHandlersAreConcurrentSafe(_ *testing.T) {
 	base := slog.NewJSONHandler(io.Discard, nil)
 	parent := slog.New(o11ylog.NewOTelHandler(base)).WithGroup("g").With("shared", "v")

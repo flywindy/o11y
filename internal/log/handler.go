@@ -35,6 +35,16 @@ const (
 //
 // A group opened on the base handler before it was passed to NewOTelHandler is
 // outside this handler's control and still nests the identifiers.
+//
+// Owning the grouping has one cost, and it is inherent rather than incidental:
+// attributes installed inside a group are re-attached to every record instead
+// of being preformatted once by the base handler, so a base handler configured
+// with slog.HandlerOptions.ReplaceAttr runs that callback per record for them
+// (stdlib runs it once, when the logger is derived). Preformatting them would
+// mean calling WithGroup on the base handler, which is exactly what buries the
+// trace identifiers — the two cannot both be had. The SDK's own stdout handler
+// sets no ReplaceAttr, so this costs nothing there; it is visible only to a
+// caller who wraps a base handler that uses one.
 type OtelSlogHandler struct {
 	base slog.Handler
 	// groups holds the currently open groups, outermost first. It is nil for
