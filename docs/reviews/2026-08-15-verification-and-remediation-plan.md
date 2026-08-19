@@ -338,7 +338,7 @@ give NATS JetStream `volumeClaimTemplates`; add `memory_limiter` + resources +
 minio/cassandra standard with probes, resources, and securityContext plus
 "production must override" comments; add `listenAddress: "127.0.0.1"` to
 `kind-config.yaml`; configure retention for Loki and Prometheus.
-**Consumer impact: 🟢 none** (local kind dev cluster only).
+**Consumer impact: 🟢 none** (local kind development cluster only).
 
 #### PR#11 — `chore(k8s)`: migrate the Collector from loki to otlphttp (D4) + Grafana service map (D6)
 

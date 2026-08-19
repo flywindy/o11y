@@ -100,7 +100,7 @@ func Wrap(
 				metric.WithUnit("s"),
 			)
 		}
-		h := newHook(rc, tp, duration, prop, cfg)
+		h := newHook(tp, duration, prop, cfg)
 		rc.OnBeforeRequest(h.beforeRequest)
 		rc.OnSuccess(h.success)
 		// The retry hook is what ends an attempt span that resty decided to

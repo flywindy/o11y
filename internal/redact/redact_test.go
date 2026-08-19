@@ -40,8 +40,8 @@ func TestURL(t *testing.T) {
 	}
 }
 
-// TestURLNeverLeaksThePassword is the property that matters: whatever shape the
-// endpoint takes, the secret must not survive into the logged string.
+// TestURLNeverLeaksThePassword is the property that matters for URL: whatever
+// shape the endpoint takes, the secret must not survive into the logged string.
 func TestURLNeverLeaksThePassword(t *testing.T) {
 	const secret = "sup3r-s3cret-token"
 	for _, raw := range []string{
@@ -90,6 +90,30 @@ func TestInTextRedactsEndpointsItWasNotToldAbout(t *testing.T) {
 	assert.Contains(t, got, "adhoc-host", "the host stays, so the failure is still diagnosable")
 }
 
+// TestInTextClosesTheShapesPatternsMiss covers the forms that successive review
+// rounds found slipping past pattern matching. None of them is handled by a
+// dedicated pattern; all are caught by the closing rule that no "@" may survive.
+func TestInTextClosesTheShapesPatternsMiss(t *testing.T) {
+	const secret = "s3cret"
+	tests := []struct {
+		name string
+		text string
+	}{
+		{"escaped quote in userinfo", `parse "http://user:sec\"` + secret + `@host": net/url: invalid userinfo`},
+		{"space in userinfo", `parse "http://user:sec ` + secret + `@host": net/url: invalid userinfo`},
+		{"opaque url, not a known endpoint", `parse "http:user:` + secret + `@host": bad`},
+		{"scheme-relative url", `parse "//user:` + secret + `@host": bad`},
+		{"no scheme at all", `dial user:` + secret + `@host:4040: refused`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// No knownEndpoints: the caller cannot know the overridden value.
+			got := redact.InText(tt.text)
+			assert.NotContains(t, got, secret, "credential survived: %s", got)
+		})
+	}
+}
+
 func TestInTextLeavesUnrelatedTextAlone(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -102,7 +126,9 @@ func TestInTextLeavesUnrelatedTextAlone(t *testing.T) {
 		{"no credential anywhere", `dial "http://pyroscope:4040": refused`, "http://pyroscope:4040", `dial "http://pyroscope:4040": refused`},
 		{"every occurrence replaced", "http://u:p@h and http://u:p@h", "http://u:p@h", "http://redacted@h and http://redacted@h"},
 		{"opaque form needs the known endpoint", `parse "http:u:p@h": bad`, "http:u:p@h", `parse "[endpoint redacted]": bad`},
-		{"an email address is not a URL credential", "notify ops@example.com on failure", "", "notify ops@example.com on failure"},
+		// The cost of the closing rule: text keeping an "@" for an innocent
+		// reason is sacrificed rather than reasoned about.
+		{"an unrelated at-sign is sacrificed to the rule", "notify ops@example.com on failure", "", "[endpoint redacted]"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

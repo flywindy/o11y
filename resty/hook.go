@@ -30,11 +30,6 @@ type hook struct {
 	duration metric.Float64Histogram
 	prop     propagation.TextMapPropagator
 	cfg      config
-	// client is the wrapped client this hook was installed on. resty's retry
-	// hook signature passes only (*Response, error) and Request keeps its
-	// client unexported, so the reference is held here to keep target
-	// resolution accurate on the retry path.
-	client *restyclient.Client
 }
 
 type requestState struct {
@@ -57,7 +52,6 @@ type targetAttrs struct {
 }
 
 func newHook(
-	client *restyclient.Client,
 	tp trace.TracerProvider,
 	duration metric.Float64Histogram,
 	prop propagation.TextMapPropagator,
@@ -71,7 +65,6 @@ func newHook(
 		duration: duration,
 		prop:     prop,
 		cfg:      cfg,
-		client:   client,
 	}
 }
 
@@ -110,6 +103,12 @@ func (h *hook) beforeRequest(c *restyclient.Client, req *restyclient.Request) er
 		route:      route,
 		attempt:    req.Attempt,
 		retryCount: c.RetryCount,
+		// Resolve the target now, while the invoking client is in hand. This
+		// is the only hook resty passes it to, and Client.Clone() shallow-copies
+		// the hook slice, so a clone that changes BaseURL shares this hook —
+		// a client reference captured at Wrap time would be the wrong one.
+		// Later stages upgrade this from RawRequest once resty has built it.
+		target: requestTarget(c, req),
 	}
 	ctx = context.WithValue(ctx, stateKey{}, state)
 	state.ctx = ctx
@@ -141,7 +140,7 @@ func (h *hook) finishResponse(
 	state *requestState,
 	retryable bool,
 ) {
-	state.target = requestTarget(c, resp.Request)
+	state.target = resolvedTarget(c, resp.Request, state)
 	statusCode := resp.StatusCode()
 	attrs := append(targetAttributes(state.target), semconv.HTTPResponseStatusCode(statusCode))
 	if statusCode == http.StatusRequestTimeout || statusCode == http.StatusGatewayTimeout {
@@ -197,8 +196,9 @@ func (h *hook) retry(resp *restyclient.Response, err error) {
 	if err == nil {
 		// resty hands the retry hook the raw operation error, which is nil when
 		// the decision came from inspecting the response rather than a
-		// transport failure.
-		h.finishResponse(h.client, resp, state, true)
+		// transport failure. A response exists here, so RawRequest is built and
+		// resolvedTarget needs no client.
+		h.finishResponse(nil, resp, state, true)
 		return
 	}
 	h.finishError(resp.Request, state, err, isLastAttempt(state))
@@ -242,11 +242,7 @@ func (h *hook) finishError(req *restyclient.Request, state *requestState, err er
 			req = responseErr.Response.Request
 		}
 	}
-	// Resolve against the wrapped client: on an early failure (a panicking or
-	// erroring before-request hook) RawRequest is not built yet, so a relative
-	// URL needs the client's base URL to yield server.address and server.port —
-	// the dimensions most wanted when a host is misbehaving.
-	state.target = requestTarget(h.client, req)
+	state.target = resolvedTarget(nil, req, state)
 
 	attrs := append(targetAttributes(state.target),
 		semconv.ErrorTypeKey.String(errType),
@@ -264,6 +260,18 @@ func (h *hook) finishError(req *restyclient.Request, state *requestState, err er
 		metricAttrs = append(metricAttrs, semconv.HTTPResponseStatusCode(statusCode))
 	}
 	h.finish(req, state, codes.Error, err.Error(), err, attrs, metricAttrs)
+}
+
+// resolvedTarget prefers the fully resolved URL resty builds into RawRequest,
+// and otherwise keeps what beforeRequest resolved against the invoking client.
+// The fallback is what carries server.address through an early failure — a
+// panicking or erroring before-request hook runs before RawRequest exists, so
+// there is nothing else left to resolve a relative URL against.
+func resolvedTarget(c *restyclient.Client, req *restyclient.Request, state *requestState) targetAttrs {
+	if req != nil && req.RawRequest != nil && req.RawRequest.URL != nil {
+		return requestTarget(c, req)
+	}
+	return state.target
 }
 
 func (h *hook) finish(

@@ -675,3 +675,30 @@ func totalClientDurationSamples(t *testing.T, reader *sdkmetric.ManualReader) ui
 	}
 	return total
 }
+
+// TestClonedClientResolvesAgainstItsOwnBaseURL pins the reason the target is
+// captured in the before-request hook rather than from a client stored at Wrap
+// time. Client.Clone() shallow-copies the hook slice, so a clone shares the
+// wrapper's hooks; a captured client reference would still point at the
+// original and resolve a relative URL against the wrong base.
+func TestClonedClientResolvesAgainstItsOwnBaseURL(t *testing.T) {
+	tp, mp, sr, _ := testProvidersWithReader()
+	original := NewClient(tp, mp, propagation.TraceContext{})
+	original.SetBaseURL("http://original.internal:1111")
+
+	clone := original.Clone()
+	clone.SetBaseURL("http://cloned.internal:2222")
+	clone.OnBeforeRequest(func(_ *restyclient.Client, _ *restyclient.Request) error {
+		// Fail before resty builds RawRequest, so only the client's base URL
+		// can resolve the relative path.
+		return errors.New("middleware refused the request")
+	})
+
+	_, err := clone.R().Get("/orders")
+	require.Error(t, err)
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	assertAttr(t, spans[0], semconv.ServerAddressKey, "cloned.internal")
+	assertAttr(t, spans[0], semconv.ServerPortKey, int64(2222))
+}

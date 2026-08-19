@@ -161,8 +161,11 @@ its own module with its own `go.mod` and release cadence.
 
 ### Option C — Caller registers views explicitly
 
-Drop the collection from `Init`; a service passes
-`o11y.WithExtraMetricViews(o11yredis.MetricViews(...))`.
+Drop the collection from `Init`; a service registers the views itself, through
+an option this ADR would have to add — there is no such public option today
+(the existing seam is the internal `metrics.Config.ExtraViews` field), so read
+`o11y.WithExtraMetricViews(o11yredis.MetricViews(...))` below as the API Option
+C implies rather than one that exists.
 
 - Cleanest possible dependency direction: the root package never names an
   integration.

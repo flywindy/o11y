@@ -61,12 +61,12 @@ func URL(raw string) string {
 // urlUserinfo matches the userinfo of a hierarchical URL anywhere in a string:
 // a scheme, "://", then everything up to the first "@". Userinfo cannot contain
 // an unencoded "/" or "@", so stopping at the first one keeps the match inside
-// a single URL.
+// a single URL. It is a best-effort tidier, not the safety property — see
+// InText.
 var urlUserinfo = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/@\s"']+@`)
 
 // InText returns text with credentials removed, for text that is about to be
-// logged. The userinfo of every URL-shaped substring is replaced, and any
-// occurrence of one of knownEndpoints is replaced by its redacted form.
+// logged.
 //
 // Redacting an endpoint attribute alone is not enough: net/url renders a parse
 // failure as `parse "<raw>": …`, so an error logged beside a redacted endpoint
@@ -74,13 +74,24 @@ var urlUserinfo = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/@\s"']+@`)
 // parses the address and returns that error verbatim, which puts the leak on
 // the same warning that reports the failure.
 //
-// The scrub is deliberately not keyed on the configured endpoint alone. The
-// value that ends up in the error is not always the one the SDK configured —
-// pyroscope-go overrides it from PYROSCOPE_ADHOC_SERVER_ADDRESS before parsing
-// (api.go:57-59 in v1.3.0) — so matching only known endpoints would pass an
-// overridden one straight through. knownEndpoints still matter because they
-// catch opaque forms ("scheme:user:pass@host") that the URL shape above does
-// not.
+// The safety property here is deliberately *not* pattern matching. Earlier
+// versions of this function tried to enumerate the shapes a credential can
+// take, and each round of review found another one they missed: an endpoint
+// overridden via PYROSCOPE_ADHOC_SERVER_ADDRESS so it matches no known value;
+// an opaque URL ("scheme:user:pass@host") or a scheme-relative one
+// ("//user:pass@host"), neither carrying the "://" the pattern anchors on; a
+// quote or space inside the userinfo, which net/url escapes so the raw endpoint
+// no longer appears in the error at all. Chasing shapes is unbounded, so the
+// rule is closed instead:
+//
+//	userinfo cannot exist without an "@", so if no "@" survives, no
+//	credential survives.
+//
+// The known endpoints and the pattern above run first because they keep the
+// common cases readable. Whatever they leave behind is checked against that
+// rule, and text that fails it is replaced wholesale rather than reasoned
+// about. Losing the detail of one warning costs an operator an indirection; a
+// leaked credential costs a rotation.
 func InText(text string, knownEndpoints ...string) string {
 	for _, endpoint := range knownEndpoints {
 		if endpoint == "" || !strings.Contains(text, endpoint) {
@@ -88,5 +99,13 @@ func InText(text string, knownEndpoints ...string) string {
 		}
 		text = strings.ReplaceAll(text, endpoint, URL(endpoint))
 	}
-	return urlUserinfo.ReplaceAllString(text, "${1}"+placeholder+"@")
+	text = urlUserinfo.ReplaceAllString(text, "${1}"+placeholder+"@")
+	// The check runs against a probe with this function's own placeholders
+	// stripped: a successful substitution leaves a "redacted@" behind, and
+	// counting that as an unaccounted-for "@" would discard every text it just
+	// made safe.
+	if strings.Contains(strings.ReplaceAll(text, placeholder+"@", ""), "@") {
+		return redactedWhole
+	}
+	return text
 }

@@ -12,6 +12,13 @@
 > [`2026-08-15-verification-and-remediation-plan.md`](./2026-08-15-verification-and-remediation-plan.md).
 > **Two original findings — D4 (Loki exporter) and C4 (minio test coverage) —
 > did not survive verification and are corrected in place below.**
+>
+> **Status.** This document is the point-in-time review and its findings are
+> left as they were written. Fixed since: **A2, A3, A4, B1, B3, B5**, and the
+> resty items in **C5** (`OnPanic`, `server.address` on the error path). **B4**
+> is fixed for the SDK's own handler chain. Everything else — A1, B2, C1, C2,
+> C3, C4, the whole of D, and E1/E2/E4 — is open, and sequenced in the
+> remediation plan. E3 is open; the symlink is still a Windows absolute path.
 
 ---
 
