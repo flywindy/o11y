@@ -382,6 +382,16 @@ func testProviders() (trace.TracerProvider, *sdkmetric.MeterProvider, *tracetest
 	return tp, mp, sr
 }
 
+// testProvidersWithReader mirrors testProviders but also returns the reader, so
+// a test can assert on recorded duration samples.
+func testProvidersWithReader() (trace.TracerProvider, *sdkmetric.MeterProvider, *tracetest.SpanRecorder, *sdkmetric.ManualReader) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	return tp, mp, sr, reader
+}
+
 func endedClientSpans(sr *tracetest.SpanRecorder) []sdktrace.ReadOnlySpan {
 	all := sr.Ended()
 	out := make([]sdktrace.ReadOnlySpan, 0, len(all))
@@ -459,4 +469,236 @@ func findClientDurationPoint(t *testing.T, rm metricdata.ResourceMetrics) metric
 	}
 	t.Fatal("http.client.request.duration metric not found")
 	return metricdata.HistogramDataPoint[float64]{}
+}
+
+// ---------------------------------------------------------------------------
+// Retry-driven span completion
+//
+// resty owns the retry decision and evaluates the request's own conditions
+// appended to the client's. Request.AddRetryCondition writes to an unexported
+// field, so the wrapper cannot reproduce that decision and must consume resty's
+// retry hook instead of re-deriving it.
+// ---------------------------------------------------------------------------
+
+// retryConditionStyles registers the same 503-retry rule the two ways resty
+// supports. Telemetry must not depend on which one a caller picked.
+var retryConditionStyles = []struct {
+	name  string
+	apply func(*restyclient.Client, *restyclient.Request)
+}{
+	{"client-level", func(c *restyclient.Client, _ *restyclient.Request) {
+		c.AddRetryCondition(func(resp *restyclient.Response, _ error) bool {
+			return resp != nil && resp.StatusCode() == http.StatusServiceUnavailable
+		})
+	}},
+	{"request-level", func(_ *restyclient.Client, r *restyclient.Request) {
+		r.AddRetryCondition(func(resp *restyclient.Response, _ error) bool {
+			return resp != nil && resp.StatusCode() == http.StatusServiceUnavailable
+		})
+	}},
+}
+
+// TestRetryEndsEverySpanForBothConditionStyles is the regression test: a
+// request that retried on a condition registered with req.AddRetryCondition
+// used to leave every attempt span but the last unended, and its duration
+// sample unrecorded, because the wrapper asked the client for conditions the
+// request held privately.
+func TestRetryEndsEverySpanForBothConditionStyles(t *testing.T) {
+	for _, style := range retryConditionStyles {
+		t.Run(style.name, func(t *testing.T) {
+			tp, mp, sr, reader := testProvidersWithReader()
+			var count atomic.Int32
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if count.Add(1) == 1 {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer ts.Close()
+
+			client := NewClient(tp, mp, propagation.TraceContext{})
+			client.SetRetryCount(1).
+				SetRetryWaitTime(time.Millisecond).
+				SetRetryMaxWaitTime(time.Millisecond)
+			req := client.R()
+			style.apply(client, req)
+
+			resp, err := req.Get(ts.URL)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, resp.StatusCode())
+			require.EqualValues(t, 2, count.Load(), "the server must have seen both attempts")
+
+			spans := endedClientSpans(sr)
+			require.Len(t, spans, 2, "every attempt must produce an ended span")
+			assertAttr(t, spans[0], semconv.HTTPResponseStatusCodeKey, int64(http.StatusServiceUnavailable))
+			assertAttr(t, spans[1], semconv.HTTPResponseStatusCodeKey, int64(http.StatusOK))
+			assertAttr(t, spans[1], semconv.HTTPRequestResendCountKey, int64(1))
+
+			assert.EqualValues(t, 2, totalClientDurationSamples(t, reader),
+				"each attempt must record an http.client.request.duration sample")
+		})
+	}
+}
+
+// TestRetryExhaustedMarkedForBothConditionStyles pins the attribute that
+// depended on the same blind re-derivation: the wrapper now takes "resty
+// decided to retry" from the hook firing rather than recomputing it, so the
+// marker survives on the request-level path too.
+func TestRetryExhaustedMarkedForBothConditionStyles(t *testing.T) {
+	for _, style := range retryConditionStyles {
+		t.Run(style.name, func(t *testing.T) {
+			tp, mp, sr, reader := testProvidersWithReader()
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}))
+			defer ts.Close()
+
+			client := NewClient(tp, mp, propagation.TraceContext{})
+			client.SetRetryCount(1).
+				SetRetryWaitTime(time.Millisecond).
+				SetRetryMaxWaitTime(time.Millisecond)
+			req := client.R()
+			style.apply(client, req)
+
+			resp, err := req.Get(ts.URL)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode())
+
+			spans := endedClientSpans(sr)
+			require.Len(t, spans, 2)
+			assertNoAttr(t, spans[0], restyRetryExhaustedKey)
+			assertAttr(t, spans[1], restyRetryExhaustedKey, true)
+			assert.EqualValues(t, 2, totalClientDurationSamples(t, reader))
+		})
+	}
+}
+
+// TestRetrySpanTargetAttributesSurviveTheRetryPath guards the client reference
+// the retry hook now carries: resty's hook signature passes no client, and
+// resolving the target without one loses server.address exactly when a host is
+// misbehaving.
+func TestRetrySpanTargetAttributesSurviveTheRetryPath(t *testing.T) {
+	tp, mp, sr := testProviders()
+	var count atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if count.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.SetRetryCount(1).
+		SetRetryWaitTime(time.Millisecond).
+		SetRetryMaxWaitTime(time.Millisecond).
+		SetBaseURL(ts.URL)
+	req := client.R()
+	req.AddRetryCondition(func(resp *restyclient.Response, _ error) bool {
+		return resp != nil && resp.StatusCode() == http.StatusServiceUnavailable
+	})
+
+	// A relative path: only the client's base URL can resolve it to a host.
+	_, err := req.Get("/orders")
+	require.NoError(t, err)
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 2)
+	host, _, splitErr := net.SplitHostPort(strings.TrimPrefix(ts.URL, "http://"))
+	require.NoError(t, splitErr)
+	assertAttr(t, spans[0], semconv.ServerAddressKey, host)
+}
+
+// TestPanicDuringRequestEndsSpan covers the last path that could leave a span
+// open: resty unwinds a panic through its panic hooks only.
+func TestPanicDuringRequestEndsSpan(t *testing.T) {
+	tp, mp, sr, reader := testProvidersWithReader()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	// Registered after the wrapper's own before-request hook, so the span
+	// exists by the time this runs.
+	client.OnBeforeRequest(func(_ *restyclient.Client, _ *restyclient.Request) error {
+		panic("middleware exploded")
+	})
+
+	require.Panics(t, func() {
+		_, _ = client.R().Get("http://127.0.0.1:1/")
+	})
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1, "the attempt span must be ended even when the request panics")
+	assert.Equal(t, codes.Error, spans[0].Status().Code)
+	assert.EqualValues(t, 1, totalClientDurationSamples(t, reader))
+}
+
+// TestPanicBeforeRawRequestKeepsServerAddress pins that the early-failure path
+// still resolves its target. resty runs before-request hooks before it builds
+// RawRequest, so a relative URL has nothing to resolve against except the
+// client's base URL — and the hook, not the request, is what holds the client.
+func TestPanicBeforeRawRequestKeepsServerAddress(t *testing.T) {
+	tp, mp, sr, _ := testProvidersWithReader()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.SetBaseURL("http://orders.internal:8080")
+	client.OnBeforeRequest(func(_ *restyclient.Client, _ *restyclient.Request) error {
+		panic("middleware exploded")
+	})
+
+	require.Panics(t, func() {
+		_, _ = client.R().Get("/orders")
+	})
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	assertAttr(t, spans[0], semconv.ServerAddressKey, "orders.internal")
+	assertAttr(t, spans[0], semconv.ServerPortKey, int64(8080))
+}
+
+// totalClientDurationSamples sums http.client.request.duration counts across
+// every data point, since attempts differ in their attribute sets.
+func totalClientDurationSamples(t *testing.T, reader *sdkmetric.ManualReader) uint64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	var total uint64
+	for _, scope := range rm.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if m.Name != "http.client.request.duration" {
+				continue
+			}
+			hist, ok := m.Data.(metricdata.Histogram[float64])
+			require.True(t, ok)
+			for _, dp := range hist.DataPoints {
+				total += dp.Count
+			}
+		}
+	}
+	return total
+}
+
+// TestClonedClientResolvesAgainstItsOwnBaseURL pins the reason the target is
+// captured in the before-request hook rather than from a client stored at Wrap
+// time. Client.Clone() shallow-copies the hook slice, so a clone shares the
+// wrapper's hooks; a captured client reference would still point at the
+// original and resolve a relative URL against the wrong base.
+func TestClonedClientResolvesAgainstItsOwnBaseURL(t *testing.T) {
+	tp, mp, sr, _ := testProvidersWithReader()
+	original := NewClient(tp, mp, propagation.TraceContext{})
+	original.SetBaseURL("http://original.internal:1111")
+
+	clone := original.Clone()
+	clone.SetBaseURL("http://cloned.internal:2222")
+	clone.OnBeforeRequest(func(_ *restyclient.Client, _ *restyclient.Request) error {
+		// Fail before resty builds RawRequest, so only the client's base URL
+		// can resolve the relative path.
+		return errors.New("middleware refused the request")
+	})
+
+	_, err := clone.R().Get("/orders")
+	require.Error(t, err)
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	assertAttr(t, spans[0], semconv.ServerAddressKey, "cloned.internal")
+	assertAttr(t, spans[0], semconv.ServerPortKey, int64(2222))
 }

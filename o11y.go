@@ -26,6 +26,7 @@ import (
 	o11ylog "github.com/flywindy/o11y/internal/log"
 	"github.com/flywindy/o11y/internal/metrics"
 	"github.com/flywindy/o11y/internal/profiling"
+	"github.com/flywindy/o11y/internal/redact"
 	"github.com/flywindy/o11y/internal/trace"
 	o11yminio "github.com/flywindy/o11y/minio"
 	o11ymongo "github.com/flywindy/o11y/mongo"
@@ -67,7 +68,10 @@ type SDK struct {
 	//   • OTel Collector – OTLP/HTTP → Loki (full OTel Log Data Model; service
 	//                    identity comes from the shared Resource, not per-record attrs)
 	// When a span is active in the context, traceId and spanId are included
-	// automatically in both destinations.
+	// automatically in both destinations. They stay at the record's top level
+	// even on a logger derived with Logger.WithGroup, so log-to-trace queries
+	// keyed on the top-level field keep matching; the group still nests that
+	// logger's own attributes as usual.
 	// When WithLogEnabled(false) is set, only the stdout destination is active.
 	Logger *slog.Logger
 
@@ -357,7 +361,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	case !cfg.profilingEnabled && cfg.profilingEndpoint != "":
 		logger.WarnContext(ctx, "profiling pillar disabled; Pyroscope endpoint ignored",
 			slog.String("toggle", "O11Y_PROFILING_ENABLED"),
-			slog.String("endpoint", cfg.profilingEndpoint),
+			slog.String("endpoint", redact.URL(cfg.profilingEndpoint)),
 		)
 	case cfg.profilingEnabled && cfg.profilingEndpoint == "":
 		logger.WarnContext(ctx, "profiling pillar enabled but no Pyroscope endpoint set; profiler not started",
@@ -385,8 +389,14 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 				return nil, startErr
 			}
 			logger.WarnContext(ctx, "profiling disabled after Pyroscope start failure",
-				slog.String("endpoint", cfg.profilingEndpoint),
-				slog.Any("error", startErr),
+				// Both fields are redacted: a Pyroscope endpoint may carry
+				// userinfo, which Go's http.Client turns into a Basic auth
+				// header, and the error can quote the endpoint back (Pyroscope
+				// parses the address and returns net/url's error verbatim).
+				// This record goes to stdout and the OTLP log pipeline, i.e.
+				// out of the process.
+				slog.String("endpoint", redact.URL(cfg.profilingEndpoint)),
+				slog.String("error", redact.InText(startErr.Error(), cfg.profilingEndpoint)),
 			)
 		} else {
 			profilerCloser = closer

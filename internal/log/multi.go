@@ -63,8 +63,11 @@ func (m *MultiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 }
 
 // WithGroup returns a new MultiHandler where each underlying handler has the
-// given group name applied.
+// given group name applied. An empty name is a no-op, per the slog contract.
 func (m *MultiHandler) WithGroup(name string) slog.Handler {
+	if name == "" {
+		return m
+	}
 	handlers := make([]slog.Handler, len(m.handlers))
 	for i, h := range m.handlers {
 		handlers[i] = h.WithGroup(name)

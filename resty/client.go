@@ -102,10 +102,13 @@ func Wrap(
 		}
 		h := newHook(tp, duration, prop, cfg)
 		rc.OnBeforeRequest(h.beforeRequest)
-		rc.OnAfterResponse(h.afterResponse)
 		rc.OnSuccess(h.success)
+		// The retry hook is what ends an attempt span that resty decided to
+		// retry. It is authoritative: resty owns the retry decision, and the
+		// request-level half of the condition set is unreadable from here.
 		rc.AddRetryHook(h.retry)
 		rc.OnError(h.error)
+		rc.OnPanic(h.panicked)
 
 		entry.done = true
 		entry.cleanup = runtime.AddCleanup(rc, cleanupWrappedClient, cleanupArg{key: key, ref: entry.ref})

@@ -103,25 +103,17 @@ func (h *hook) beforeRequest(c *restyclient.Client, req *restyclient.Request) er
 		route:      route,
 		attempt:    req.Attempt,
 		retryCount: c.RetryCount,
+		// Resolve the target now, while the invoking client is in hand. This
+		// is the only hook resty passes it to, and Client.Clone() shallow-copies
+		// the hook slice, so a clone that changes BaseURL shares this hook —
+		// a client reference captured at Wrap time would be the wrong one.
+		// Later stages upgrade this from RawRequest once resty has built it.
+		target: requestTarget(c, req),
 	}
 	ctx = context.WithValue(ctx, stateKey{}, state)
 	state.ctx = ctx
 	req.SetContext(ctx)
 	h.prop.Inject(ctx, propagation.HeaderCarrier(req.Header))
-	return nil
-}
-
-func (h *hook) afterResponse(c *restyclient.Client, resp *restyclient.Response) error {
-	if resp == nil || resp.Request == nil {
-		return nil
-	}
-	state := stateFromContext(resp.Request.Context())
-	if state == nil || state.finished {
-		return nil
-	}
-	if h.retryableResponse(c, resp) {
-		h.finishResponse(c, resp, state)
-	}
 	return nil
 }
 
@@ -133,11 +125,22 @@ func (h *hook) success(c *restyclient.Client, resp *restyclient.Response) {
 	if state == nil || state.finished {
 		return
 	}
-	h.finishResponse(c, resp, state)
+	// Reaching the success hook means resty made no retry decision for this
+	// attempt: any decision fires the retry hook first, which ends the span.
+	h.finishResponse(c, resp, state, false)
 }
 
-func (h *hook) finishResponse(c *restyclient.Client, resp *restyclient.Response, state *requestState) {
-	state.target = requestTarget(c, resp.Request)
+// finishResponse ends the attempt span for a request that produced a response.
+// retryable reports whether resty decided this attempt warranted a retry; it is
+// passed in rather than re-derived because the wrapper cannot see the full
+// condition set (see hook.retry).
+func (h *hook) finishResponse(
+	c *restyclient.Client,
+	resp *restyclient.Response,
+	state *requestState,
+	retryable bool,
+) {
+	state.target = resolvedTarget(c, resp.Request, state)
 	statusCode := resp.StatusCode()
 	attrs := append(targetAttributes(state.target), semconv.HTTPResponseStatusCode(statusCode))
 	if statusCode == http.StatusRequestTimeout || statusCode == http.StatusGatewayTimeout {
@@ -148,7 +151,7 @@ func (h *hook) finishResponse(c *restyclient.Client, resp *restyclient.Response,
 		errType = strconv.Itoa(statusCode)
 		attrs = append(attrs, semconv.ErrorTypeKey.String(errType))
 	}
-	if isLastAttempt(state) && h.retryableResponse(c, resp) {
+	if isLastAttempt(state) && retryable {
 		attrs = append(attrs, restyRetryExhaustedKey.Bool(true))
 		addRetryExhaustedEvent(state.parentCtx)
 	}
@@ -174,15 +177,48 @@ func isErrorStatusCode(code int) bool {
 	return code >= 400 && code < 600
 }
 
+// retry runs on every retry decision resty makes, including the one taken on
+// the final attempt. Reaching this hook is itself the signal that the attempt
+// was retryable: resty evaluates the merged condition set — the request's own
+// conditions appended to the client's (Request.AddRetryCondition writes to an
+// unexported field) — so the wrapper cannot reproduce that decision. It used to
+// try, via the client-level conditions alone, and a request that retried on a
+// condition registered with req.AddRetryCondition therefore left every attempt
+// span but the last unended and its duration sample unrecorded.
 func (h *hook) retry(resp *restyclient.Response, err error) {
-	if resp == nil || resp.Request == nil || err == nil {
+	if resp == nil || resp.Request == nil {
 		return
 	}
 	state := stateFromContext(resp.Request.Context())
 	if state == nil || state.finished {
 		return
 	}
+	if err == nil {
+		// resty hands the retry hook the raw operation error, which is nil when
+		// the decision came from inspecting the response rather than a
+		// transport failure. A response exists here, so RawRequest is built and
+		// resolvedTarget needs no client.
+		h.finishResponse(nil, resp, state, true)
+		return
+	}
 	h.finishError(resp.Request, state, err, isLastAttempt(state))
+}
+
+// panicked ends the attempt span when a middleware or transport panics. resty
+// unwinds through its panic hooks only, so without this the span started in
+// beforeRequest would never be ended.
+func (h *hook) panicked(req *restyclient.Request, err error) {
+	if req == nil {
+		return
+	}
+	state := stateFromContext(req.Context())
+	if state == nil || state.finished {
+		return
+	}
+	if err == nil {
+		err = errors.New("resty: panic during request")
+	}
+	h.finishError(req, state, err, false)
 }
 
 func (h *hook) error(req *restyclient.Request, err error) {
@@ -206,7 +242,7 @@ func (h *hook) finishError(req *restyclient.Request, state *requestState, err er
 			req = responseErr.Response.Request
 		}
 	}
-	state.target = requestTarget(nil, req)
+	state.target = resolvedTarget(nil, req, state)
 
 	attrs := append(targetAttributes(state.target),
 		semconv.ErrorTypeKey.String(errType),
@@ -224,6 +260,18 @@ func (h *hook) finishError(req *restyclient.Request, state *requestState, err er
 		metricAttrs = append(metricAttrs, semconv.HTTPResponseStatusCode(statusCode))
 	}
 	h.finish(req, state, codes.Error, err.Error(), err, attrs, metricAttrs)
+}
+
+// resolvedTarget prefers the fully resolved URL resty builds into RawRequest,
+// and otherwise keeps what beforeRequest resolved against the invoking client.
+// The fallback is what carries server.address through an early failure — a
+// panicking or erroring before-request hook runs before RawRequest exists, so
+// there is nothing else left to resolve a relative URL against.
+func resolvedTarget(c *restyclient.Client, req *restyclient.Request, state *requestState) targetAttrs {
+	if req != nil && req.RawRequest != nil && req.RawRequest.URL != nil {
+		return requestTarget(c, req)
+	}
+	return state.target
 }
 
 func (h *hook) finish(
@@ -287,18 +335,6 @@ func (h *hook) spanName(req *restyclient.Request, method, route string) string {
 		return method + " " + route
 	}
 	return method
-}
-
-func (h *hook) retryableResponse(c *restyclient.Client, resp *restyclient.Response) bool {
-	if c == nil || resp == nil || len(c.RetryConditions) == 0 {
-		return false
-	}
-	for _, condition := range c.RetryConditions {
-		if condition != nil && condition(resp, nil) {
-			return true
-		}
-	}
-	return false
 }
 
 func stateFromContext(ctx context.Context) *requestState {

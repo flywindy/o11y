@@ -15,8 +15,10 @@ concurrency:
 
 env:
   # Review this pin when Go publishes a new 1.25.x security patch.
-  # go1.25.12 picks up the GO-2026-5856 crypto/tls (ECH privacy leak) fix.
-  GOVULNCHECK_GOTOOLCHAIN: go1.25.12
+  # go1.25.13 fixes seven stdlib advisories that go1.25.12 is affected by,
+  # including GO-2026-6088 (encoding/xml recursion depth), GO-2026-5972
+  # (encoding/asn1 recursion depth), and GO-2026-5026 (x/net/idna Punycode).
+  GOVULNCHECK_GOTOOLCHAIN: go1.25.13
 
 jobs:
   test:

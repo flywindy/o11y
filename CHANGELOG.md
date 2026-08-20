@@ -13,6 +13,98 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+### Fixed
+
+- `log`: `traceId` and `spanId` are now always written at the log record's top
+  level, including on loggers derived with `Logger.WithGroup`. Previously the
+  handler forwarded the group to the JSON handler beneath it, and because a
+  handler's record attributes are qualified into whatever groups are open, the
+  identifiers were emitted inside the group — `{"req":{"traceId":…}}` instead of
+  a top-level `traceId`. Any Loki/Fluentd query, Grafana derived field, or
+  log-to-trace correlation keyed on the top-level field silently matched nothing
+  for those loggers. The group continues to nest that logger's own attributes;
+  only the two trace identifiers are hoisted. Grouping behaviour is otherwise
+  unchanged and is now pinned against `slog`'s own handler by an equivalence
+  test covering ten `WithGroup`/`WithAttrs` shapes.
+- `log`: `OtelSlogHandler` and `BaggageHandler` no longer add attributes to the
+  `slog.Record` they were handed without cloning it first. The record belongs to
+  the caller and may share its attribute array with a sibling handler, so
+  writing through it violates the `slog.Handler` contract; a caller fanning
+  `sdk.Logger.Handler()` out alongside another attribute-adding handler could
+  see slog's `!BUG` marker appear in the sibling's output. The SDK's own handler
+  chain was unaffected because `MultiHandler` already clones per delivery.
+- `log`: `WithGroup("")` is now the no-op the `slog.Handler` contract requires
+  on `OtelSlogHandler`, `BaggageHandler`, and `MultiHandler`. `BaggageHandler`
+  additionally kept its preset-key set instead of discarding it for a group that
+  was never opened.
+- `redis`: the pool instruments this package emits itself are now covered by
+  metric views. `db.client.connection.create_time` records seconds but matched
+  no view, so it kept OTel's default millisecond-scale boundaries
+  (`[0, 5, 10, … 10000]`) and every Redis dial fell into the first bucket,
+  making the histogram useless for the pool sizing it exists to support. It now
+  follows `WithHistogramBuckets` like the MongoDB and Cassandra wrappers, which
+  already pinned the same instrument. `db.client.connection.count`,
+  `.idle.max`, `.idle.min`, `.max`, and `.timeouts` gained the allow-keys
+  backstop those wrappers also carry, so a stray attribute cannot widen them.
+- `resty`: every attempt span is now ended, and its
+  `http.client.request.duration` sample recorded, when a request retries on a
+  condition registered with `req.AddRetryCondition`. The wrapper re-derived
+  resty's retry decision from the client-level conditions alone, but resty
+  evaluates the request's own conditions appended to the client's and
+  `Request.AddRetryCondition` writes to an unexported field, so the wrapper
+  judged such responses non-retryable and left every attempt but the last
+  unended and unrecorded — understating client error rates and P99s exactly on
+  the requests that were struggling. The retry hook, which resty fires on every
+  retry decision, is now authoritative; `OnAfterResponse` and the
+  `retryableResponse` helper are gone. See the 2026-08-15 amendment to
+  [ADR 0011](docs/adr/0011-resty-integration.md).
+- `resty`: `resty.retry.exhausted` is now set on the final attempt of a
+  request-level retry too, for the same reason — the marker is taken from
+  resty's decision rather than recomputed.
+- `resty`: the retry path keeps `server.address` and `server.port` on spans and
+  metric samples for relative URLs. resty's retry-hook signature carries no
+  client, so the target was previously resolved without the base URL.
+- `resty`: a panicking middleware or transport no longer leaves the attempt
+  span open; resty unwinds through its panic hooks only, and `OnPanic` is now
+  registered.
+- `metrics`: a failure to register runtime metrics on the OTLP push path no
+  longer leaks the MeterProvider. `sdkmetric.NewPeriodicReader` starts its
+  export goroutine at construction and only the provider's `Shutdown` drains
+  it, but the failure path released just the exporter — so the goroutine
+  outlived the failed `Init` and exported against a closed exporter once per
+  interval for the life of the process. The Prometheus path already handled
+  this; both are now covered by tests.
+- `profiling`: a Pyroscope `Stop` that returns an error no longer strands the
+  process-wide pprof slot. The flag tracks whether this process holds the
+  profiler, not whether shutdown was clean, and `SDK.Shutdown` runs each closer
+  at most once — so a single `Stop` failure previously made every later
+  `Init` with profiling enabled fail with `ErrAlreadyStarted`, with no way to
+  recover short of a restart.
+- `profiling`: the Pyroscope endpoint is redacted before it is logged. An
+  endpoint of the form `scheme://user:password@host` is a working
+  authentication mechanism — Go's `http.Client` turns userinfo into a Basic
+  `Authorization` header — and the two warning paths that name the endpoint
+  write to stdout *and* the OTLP log pipeline, carrying the credential out of
+  the process. Such endpoints keep working; only the logged form changes.
+
+### Migration
+
+- No API change. Services that adopted the previous (incorrect) nesting — for
+  example a Loki query or Grafana derived field reading `req.traceId` rather
+  than `traceId` — should move those back to the top-level field.
+- `db_client_connection_create_time_bucket` changes shape for Redis: its `le`
+  boundaries move from OTel's millisecond defaults to the SDK's second-scale
+  set. Any PromQL written against the old boundaries needs updating — though in
+  practice the old histogram carried no usable signal, since every sample sat
+  in the first bucket.
+- **Resty telemetry volume increases** for services that retry via
+  `req.AddRetryCondition`: spans and `http_client_request_duration` samples that
+  were previously dropped now appear, one per retried attempt. Dashboards and
+  alerts reading client request rate or error rate will show a step change on
+  rollout. This is the missing data arriving, not a traffic change — but it is
+  worth announcing before the release so an on-call reading the graph does not
+  chase a phantom incident.
+
 ---
 
 ## [0.11.0] - 2026-08-12
