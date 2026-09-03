@@ -809,3 +809,68 @@ func TestInitMeter_MaxUniqueCollectionsSharesBudgetAcrossInstruments(t *testing.
 		}
 	}
 }
+
+// TestInitMeter_MaxUniqueCollectionsCapsElasticsearchIndices pins the
+// export-boundary cap for db.collection.name on the Elasticsearch client metric
+// (ADR 0027 §4). Unlike a Cassandra schema, Elasticsearch index names commonly
+// roll by date, so this cap is the guard that keeps a per-day index from minting
+// an unbounded series set. It also pins that the Elasticsearch budget is
+// independent of the Cassandra one: with a cap of 1, each integration keeps its
+// own first value rather than the second integration seen overflowing to
+// "other".
+func TestInitMeter_MaxUniqueCollectionsCapsElasticsearchIndices(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.MaxUniqueCollections = 1
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	cassandraHist, err := mp.Meter("github.com/flywindy/o11y/cassandra").
+		Float64Histogram("db.client.operation.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	cassandraHist.Record(context.Background(), 0.01, metric.WithAttributes(
+		semconv.DBSystemNameCassandra,
+		semconv.DBCollectionName("keep_table"),
+	))
+
+	esHist, err := mp.Meter("github.com/flywindy/o11y/elasticsearch").
+		Float64Histogram("db.client.operation.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	for _, index := range []string{"keep-index", "logs-2026.09.02", "logs-2026.09.03"} {
+		esHist.Record(context.Background(), 0.01, metric.WithAttributes(
+			semconv.DBSystemNameElasticsearch,
+			semconv.DBOperationName("search"),
+			semconv.DBCollectionName(index),
+		))
+	}
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	require.Contains(t, body, "db_client_operation_duration_seconds")
+
+	assert.Contains(t, body, `db_collection_name="keep-index"`)
+	assert.Contains(t, body, `db_collection_name="other"`)
+	assert.NotContains(t, body, `db_collection_name="logs-2026.09.02"`)
+	assert.NotContains(t, body, `db_collection_name="logs-2026.09.03"`)
+	// The Cassandra table is admitted by its own budget, not evicted by the
+	// Elasticsearch overflow.
+	assert.Contains(t, body, `db_collection_name="keep_table"`)
+
+	var esOther bool
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "db_client_operation_duration_seconds_count{") &&
+			strings.Contains(line, `db_collection_name="other"`) &&
+			strings.Contains(line, `db_system_name="elasticsearch"`) &&
+			strings.HasSuffix(line, "} 2") {
+			esOther = true
+		}
+	}
+	assert.True(t, esOther, "overflow indices should merge to one Elasticsearch duration series with count 2")
+}

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -13,8 +15,13 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 )
@@ -51,14 +58,87 @@ func attrMap(kvs []attribute.KeyValue) map[attribute.Key]attribute.Value {
 	return m
 }
 
+// noopMeter is the MeterProvider for tests that only assert spans.
+func noopMeter() metric.MeterProvider { return metricnoop.NewMeterProvider() }
+
+// recordingMeter returns a MeterProvider backed by a ManualReader so tests can
+// collect the db.client.operation.duration samples the facade records.
+func recordingMeter(views ...sdkmetric.View) (metric.MeterProvider, *sdkmetric.ManualReader) {
+	reader := sdkmetric.NewManualReader()
+	return sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader), sdkmetric.WithView(views...)), reader
+}
+
+// collectDuration collects the reader and returns the
+// db.client.operation.duration histogram recorded under this package's
+// instrumentation scope, failing the test when it is absent.
+func collectDuration(t *testing.T, reader *sdkmetric.ManualReader) metricdata.Histogram[float64] {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	for _, sm := range rm.ScopeMetrics {
+		if sm.Scope.Name != instrumentationName {
+			continue
+		}
+		for _, m := range sm.Metrics {
+			if m.Name != "db.client.operation.duration" {
+				continue
+			}
+			if m.Unit != "s" {
+				t.Errorf("unit = %q, want s", m.Unit)
+			}
+			h, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok {
+				t.Fatalf("data type = %T, want Histogram[float64]", m.Data)
+			}
+			return h
+		}
+	}
+	t.Fatalf("db.client.operation.duration not recorded under scope %s", instrumentationName)
+	return metricdata.Histogram[float64]{}
+}
+
+// singleDataPoint asserts the histogram holds exactly one data point with one
+// sample and returns it.
+func singleDataPoint(t *testing.T, h metricdata.Histogram[float64]) metricdata.HistogramDataPoint[float64] {
+	t.Helper()
+	if len(h.DataPoints) != 1 {
+		t.Fatalf("got %d data points, want 1", len(h.DataPoints))
+	}
+	dp := h.DataPoints[0]
+	if dp.Count != 1 {
+		t.Fatalf("sample count = %d, want 1", dp.Count)
+	}
+	return dp
+}
+
+func dpAttrs(dp metricdata.HistogramDataPoint[float64]) map[attribute.Key]attribute.Value {
+	return attrMap(dp.Attributes.ToSlice())
+}
+
 func TestNewClient_NilTracerProvider(t *testing.T) {
-	if _, err := NewClient(elastic.Config{}, nil); err == nil ||
+	if _, err := NewClient(elastic.Config{}, nil, noopMeter()); err == nil ||
 		!strings.Contains(err.Error(), "tracer provider must not be nil") {
 		t.Fatalf("NewClient(nil tp): got %v, want tracer-provider error", err)
 	}
-	if _, err := NewTypedClient(elastic.Config{}, nil); err == nil ||
+	if _, err := NewTypedClient(elastic.Config{}, nil, noopMeter()); err == nil ||
 		!strings.Contains(err.Error(), "tracer provider must not be nil") {
 		t.Fatalf("NewTypedClient(nil tp): got %v, want tracer-provider error", err)
+	}
+}
+
+// TestNewClient_NilMeterProvider: the metric layer is SDK-owned and must never
+// fall back to the global MeterProvider (ADR 0003), so a nil mp is rejected the
+// same way a nil tp is.
+func TestNewClient_NilMeterProvider(t *testing.T) {
+	if _, err := NewClient(elastic.Config{}, noop.NewTracerProvider(), nil); err == nil ||
+		!strings.Contains(err.Error(), "meter provider must not be nil") {
+		t.Fatalf("NewClient(nil mp): got %v, want meter-provider error", err)
+	}
+	if _, err := NewTypedClient(elastic.Config{}, noop.NewTracerProvider(), nil); err == nil ||
+		!strings.Contains(err.Error(), "meter provider must not be nil") {
+		t.Fatalf("NewTypedClient(nil mp): got %v, want meter-provider error", err)
 	}
 }
 
@@ -69,7 +149,7 @@ func TestSearch_EmitsClientSpan(t *testing.T) {
 	srv := esStub(t, http.StatusOK)
 	tp, rec := recordingProvider()
 
-	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp)
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp, noopMeter())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -134,7 +214,7 @@ func TestSearchBody_OptIn(t *testing.T) {
 		t.Helper()
 		srv := esStub(t, http.StatusOK)
 		tp, rec := recordingProvider()
-		client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp, opts...)
+		client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp, noopMeter(), opts...)
 		if err != nil {
 			t.Fatalf("NewClient: %v", err)
 		}
@@ -173,7 +253,7 @@ func TestSearchBody_NilBodyNoPanic(t *testing.T) {
 	srv := esStub(t, http.StatusOK)
 	tp, rec := recordingProvider()
 
-	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp, WithSearchBody(true))
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp, noopMeter(), WithSearchBody(true))
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -205,7 +285,7 @@ func TestTypedClient_Do_EmitsSpan(t *testing.T) {
 	srv := esStub(t, http.StatusOK)
 	tp, rec := recordingProvider()
 
-	client, err := NewTypedClient(elastic.Config{Addresses: []string{srv.URL}}, tp)
+	client, err := NewTypedClient(elastic.Config{Addresses: []string{srv.URL}}, tp, noopMeter())
 	if err != nil {
 		t.Fatalf("NewTypedClient: %v", err)
 	}
@@ -246,7 +326,7 @@ func TestTypedClient_Do_HTTPErrorKeepsStatusCode(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	tp, rec := recordingProvider()
-	client, err := NewTypedClient(elastic.Config{Addresses: []string{srv.URL}}, tp)
+	client, err := NewTypedClient(elastic.Config{Addresses: []string{srv.URL}}, tp, noopMeter())
 	if err != nil {
 		t.Fatalf("NewTypedClient: %v", err)
 	}
@@ -280,7 +360,7 @@ func TestFailedRequest_StatusErrorNoErrorType(t *testing.T) {
 		Addresses:    []string{"http://127.0.0.1:1"},
 		MaxRetries:   0,
 		DisableRetry: true,
-	}, tp)
+	}, tp, noopMeter())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -322,7 +402,7 @@ func TestProviderWiring(t *testing.T) {
 	t.Cleanup(func() { otel.SetTracerProvider(originalGlobal) })
 
 	tp, rec := recordingProvider()
-	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp)
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp, noopMeter())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -345,7 +425,7 @@ func TestProviderWiring(t *testing.T) {
 // Start, the no-op tracer path panics when it calls ContextWithSpan(nil, ...).
 func TestSearch_NoContextNoopProviderNoPanic(t *testing.T) {
 	srv := esStub(t, http.StatusOK)
-	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, noop.NewTracerProvider())
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, noop.NewTracerProvider(), noopMeter())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -365,7 +445,7 @@ func TestHTTPError_SetsErrorStatus(t *testing.T) {
 	srv := esStub(t, http.StatusInternalServerError)
 	tp, rec := recordingProvider()
 
-	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}, DisableRetry: true}, tp)
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}, DisableRetry: true}, tp, noopMeter())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -413,7 +493,7 @@ func TestHTTPError_RetryThenSuccess(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	tp, rec := recordingProvider()
-	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp)
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp, noopMeter())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -449,7 +529,7 @@ func TestSpanName_NoIndex_OmitsTarget(t *testing.T) {
 	srv := esStub(t, http.StatusOK)
 	tp, rec := recordingProvider()
 
-	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp)
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp, noopMeter())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -481,7 +561,7 @@ func TestHTTP3xx_MarksError(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	tp, rec := recordingProvider()
-	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}, DisableRetry: true}, tp)
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}, DisableRetry: true}, tp, noopMeter())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -523,7 +603,7 @@ func TestProductCheckFailure_StaysError(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	tp, rec := recordingProvider()
-	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}, DisableRetry: true}, tp)
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}, DisableRetry: true}, tp, noopMeter())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -582,7 +662,7 @@ func TestRetryThenTransportError_NoStaleStatusCode(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	tp, rec := recordingProvider()
-	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp)
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp, noopMeter())
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -613,5 +693,459 @@ func TestRetryThenTransportError_NoStaleStatusCode(t *testing.T) {
 	}
 	if _, present := attrMap(span.Attributes())["http.response.status_code"]; present {
 		t.Error("http.response.status_code present, want absent (503 was an earlier retried attempt, not the terminal transport error)")
+	}
+}
+
+// TestSearch_RecordsOperationDuration is the core ADR 0027 contract: one
+// db.client.operation.duration sample per request, recorded under this
+// package's own instrumentation scope with the current semconv v1.39.0 keys
+// (not the legacy spellings the upstream span carries), and correlated to the
+// ES CLIENT span via an exemplar.
+func TestSearch_RecordsOperationDuration(t *testing.T) {
+	srv := esStub(t, http.StatusOK)
+	tp, rec := recordingProvider()
+	mp, reader := recordingMeter()
+
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp, mp)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	res, err := client.Search(
+		client.Search.WithContext(context.Background()),
+		client.Search.WithIndex("my-index"),
+	)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	_ = res.Body.Close()
+
+	dp := singleDataPoint(t, collectDuration(t, reader))
+	if dp.Sum <= 0 {
+		t.Errorf("duration sum = %v, want > 0", dp.Sum)
+	}
+	attrs := dpAttrs(dp)
+	if got := attrs[semconv.DBSystemNameKey].AsString(); got != "elasticsearch" {
+		t.Errorf("db.system.name = %q, want elasticsearch", got)
+	}
+	if got := attrs[semconv.DBOperationNameKey].AsString(); got != "search" {
+		t.Errorf("db.operation.name = %q, want search", got)
+	}
+	if got := attrs[semconv.DBCollectionNameKey].AsString(); got != "my-index" {
+		t.Errorf("db.collection.name = %q, want my-index", got)
+	}
+	srvURL, _ := url.Parse(srv.URL)
+	if got := attrs[semconv.ServerAddressKey].AsString(); got != srvURL.Hostname() {
+		t.Errorf("server.address = %q, want %q", got, srvURL.Hostname())
+	}
+	wantPort, _ := strconv.Atoi(srvURL.Port())
+	if got := attrs[semconv.ServerPortKey].AsInt64(); got != int64(wantPort) {
+		t.Errorf("server.port = %d, want %d", got, wantPort)
+	}
+	if _, ok := attrs[semconv.ErrorTypeKey]; ok {
+		t.Error("error.type present on a successful request; want absent")
+	}
+	// The metric is SDK-owned, so the legacy upstream keys must not leak in.
+	for _, legacy := range []attribute.Key{"db.system", "db.operation", "db.elasticsearch.path_parts.index", "url.full"} {
+		if _, ok := attrs[legacy]; ok {
+			t.Errorf("legacy/span-only key %s present on the metric", legacy)
+		}
+	}
+
+	spans := rec.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want 1", len(spans))
+	}
+	if len(dp.Exemplars) != 1 {
+		t.Fatalf("got %d exemplars, want 1 (recorded against the ES span context)", len(dp.Exemplars))
+	}
+	if got, want := dp.Exemplars[0].SpanID, spans[0].SpanContext().SpanID(); string(got) != string(want[:]) {
+		t.Errorf("exemplar span id = %x, want the ES client span %x", got, want)
+	}
+}
+
+// TestMetric_HTTPErrorClassifiedByStatus asserts an ES HTTP error response is
+// classified on the metric by its status code (error.type = "500"), the same
+// > 299 boundary the span status uses.
+func TestMetric_HTTPErrorClassifiedByStatus(t *testing.T) {
+	srv := esStub(t, http.StatusInternalServerError)
+	tp, _ := recordingProvider()
+	mp, reader := recordingMeter()
+
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}, DisableRetry: true}, tp, mp)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	res, err := client.Search(
+		client.Search.WithContext(context.Background()),
+		client.Search.WithIndex("my-index"),
+	)
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	_ = res.Body.Close()
+
+	attrs := dpAttrs(singleDataPoint(t, collectDuration(t, reader)))
+	if got := attrs[semconv.ErrorTypeKey].AsString(); got != "500" {
+		t.Errorf("error.type = %q, want 500", got)
+	}
+	if got := attrs[semconv.DBOperationNameKey].AsString(); got != "search" {
+		t.Errorf("db.operation.name = %q, want search (kept on failures)", got)
+	}
+}
+
+// TestMetric_TypedResponseErrorClassifiedByStatus asserts the typed API's
+// ElasticsearchError (RecordError after decoding the error body, but with a
+// final response in hand) is classified by status code, not by Go type.
+func TestMetric_TypedResponseErrorClassifiedByStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"type":"illegal_argument_exception","reason":"bad request"},"status":400}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	tp, _ := recordingProvider()
+	mp, reader := recordingMeter()
+	client, err := NewTypedClient(elastic.Config{Addresses: []string{srv.URL}}, tp, mp)
+	if err != nil {
+		t.Fatalf("NewTypedClient: %v", err)
+	}
+	if _, err := client.Search().Index("my-index").Do(context.Background()); err == nil {
+		t.Fatal("typed Search.Do: want ES response error, got nil")
+	}
+
+	attrs := dpAttrs(singleDataPoint(t, collectDuration(t, reader)))
+	if got := attrs[semconv.ErrorTypeKey].AsString(); got != "400" {
+		t.Errorf("error.type = %q, want 400", got)
+	}
+	if got := attrs[semconv.DBCollectionNameKey].AsString(); got != "my-index" {
+		t.Errorf("db.collection.name = %q, want my-index (typed .Do path records the index)", got)
+	}
+}
+
+// TestMetric_TransportErrorClassifiedByType asserts a terminal transport
+// failure is classified by the Go error type (the classification the SDK's
+// other integrations use), never by a stale status code, and carries no
+// server.port for an unreachable node only when the transport never selected
+// one.
+func TestMetric_TransportErrorClassifiedByType(t *testing.T) {
+	tp, _ := recordingProvider()
+	mp, reader := recordingMeter()
+	client, err := NewClient(elastic.Config{
+		Addresses:    []string{"http://127.0.0.1:1"},
+		MaxRetries:   0,
+		DisableRetry: true,
+	}, tp, mp)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	_, searchErr := client.Search(
+		client.Search.WithContext(context.Background()),
+		client.Search.WithIndex("my-index"),
+	)
+	if searchErr == nil {
+		t.Fatal("Search against unroutable address: got nil error, want failure")
+	}
+
+	attrs := dpAttrs(singleDataPoint(t, collectDuration(t, reader)))
+	// The low-level API returns the transport error unwrapped, so the label is
+	// exactly what the shared classifier yields for it.
+	if got, want := attrs[semconv.ErrorTypeKey].AsString(), errorType(searchErr); got != want {
+		t.Errorf("error.type = %q, want %q", got, want)
+	}
+	if _, err := strconv.Atoi(attrs[semconv.ErrorTypeKey].AsString()); err == nil {
+		t.Error("error.type is a status code on a transport failure; want the error type")
+	}
+}
+
+// TestMetric_ContextCanceledClassifiedBySentinel asserts a caller cancellation
+// maps to the stable "context.Canceled" label rather than a transport wrapper
+// type, so dashboards can separate caller cancellations from node failures.
+func TestMetric_ContextCanceledClassifiedBySentinel(t *testing.T) {
+	srv := esStub(t, http.StatusOK)
+	tp, _ := recordingProvider()
+	mp, reader := recordingMeter()
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}, DisableRetry: true}, tp, mp)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := client.Search(client.Search.WithContext(ctx), client.Search.WithIndex("my-index")); err == nil {
+		t.Fatal("Search with canceled context: got nil error, want failure")
+	}
+
+	attrs := dpAttrs(singleDataPoint(t, collectDuration(t, reader)))
+	if got := attrs[semconv.ErrorTypeKey].AsString(); got != "context.Canceled" {
+		t.Errorf("error.type = %q, want context.Canceled", got)
+	}
+}
+
+// TestMetric_RetryThenSuccessIsOneSuccessfulSample asserts a request retried
+// from a 503 to a 200 records a single sample (one per request, not per
+// attempt) with no error.type — the terminal outcome, as with the span.
+func TestMetric_RetryThenSuccessIsOneSuccessfulSample(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	tp, _ := recordingProvider()
+	mp, reader := recordingMeter()
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp, mp)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	res, err := client.Search(client.Search.WithContext(context.Background()), client.Search.WithIndex("my-index"))
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	_ = res.Body.Close()
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("server calls = %d, want 2 (one retry)", got)
+	}
+
+	attrs := dpAttrs(singleDataPoint(t, collectDuration(t, reader)))
+	if _, ok := attrs[semconv.ErrorTypeKey]; ok {
+		t.Errorf("error.type = %q on a retried 503->200; want absent", attrs[semconv.ErrorTypeKey].AsString())
+	}
+}
+
+// TestMetric_ProductCheckFailureIsAnError asserts a 200 that fails the client's
+// product check is a failure on the metric too (classified by error type), not
+// a success with a 200 stashed from the response.
+func TestMetric_ProductCheckFailureIsAnError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json") // no X-Elastic-Product
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	tp, _ := recordingProvider()
+	mp, reader := recordingMeter()
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}, DisableRetry: true}, tp, mp)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if _, err := client.Search(client.Search.WithContext(context.Background()), client.Search.WithIndex("my-index")); err == nil {
+		t.Fatal("Search: want product-check error, got nil")
+	}
+
+	attrs := dpAttrs(singleDataPoint(t, collectDuration(t, reader)))
+	got, ok := attrs[semconv.ErrorTypeKey]
+	if !ok {
+		t.Fatal("error.type absent on a product-check failure; want present")
+	}
+	if got.AsString() == "200" {
+		t.Error("error.type = 200: the stale response code must not classify a product-check failure")
+	}
+}
+
+// TestMetric_CollectionLabelPolicy pins the db.collection.name rules (ADR 0027
+// §4): present for a single index (wildcards included), absent for a
+// comma-separated multi-index request, absent when no index is addressed, and
+// absent under WithCollectionMetricLabel(false) while the span keeps its index
+// path part.
+func TestMetric_CollectionLabelPolicy(t *testing.T) {
+	search := func(t *testing.T, indices []string, opts ...Option) (map[attribute.Key]attribute.Value, sdktrace.ReadOnlySpan) {
+		t.Helper()
+		srv := esStub(t, http.StatusOK)
+		tp, rec := recordingProvider()
+		mp, reader := recordingMeter()
+		client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp, mp, opts...)
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		res, err := client.Search(client.Search.WithContext(context.Background()), client.Search.WithIndex(indices...))
+		if err != nil {
+			t.Fatalf("Search: %v", err)
+		}
+		_ = res.Body.Close()
+		spans := rec.Ended()
+		if len(spans) != 1 {
+			t.Fatalf("got %d spans, want 1", len(spans))
+		}
+		return dpAttrs(singleDataPoint(t, collectDuration(t, reader))), spans[0]
+	}
+
+	t.Run("single index", func(t *testing.T) {
+		attrs, _ := search(t, []string{"orders"})
+		if got := attrs[semconv.DBCollectionNameKey].AsString(); got != "orders" {
+			t.Errorf("db.collection.name = %q, want orders", got)
+		}
+	})
+	t.Run("wildcard is one addressed name", func(t *testing.T) {
+		attrs, _ := search(t, []string{"logs-*"})
+		if got := attrs[semconv.DBCollectionNameKey].AsString(); got != "logs-*" {
+			t.Errorf("db.collection.name = %q, want logs-*", got)
+		}
+	})
+	t.Run("multi-index omitted", func(t *testing.T) {
+		attrs, span := search(t, []string{"a", "b"})
+		if v, ok := attrs[semconv.DBCollectionNameKey]; ok {
+			t.Errorf("db.collection.name = %q for a multi-index search; want absent", v.AsString())
+		}
+		if got := attrMap(span.Attributes())["db.elasticsearch.path_parts.index"].AsString(); got != "a,b" {
+			t.Errorf("span path part = %q, want a,b (span keeps the full list)", got)
+		}
+	})
+	t.Run("no index omitted", func(t *testing.T) {
+		attrs, _ := search(t, nil)
+		if v, ok := attrs[semconv.DBCollectionNameKey]; ok {
+			t.Errorf("db.collection.name = %q for an index-less search; want absent", v.AsString())
+		}
+		if got := attrs[semconv.DBOperationNameKey].AsString(); got != "search" {
+			t.Errorf("db.operation.name = %q, want search", got)
+		}
+	})
+	t.Run("opt-out keeps span attribute", func(t *testing.T) {
+		attrs, span := search(t, []string{"orders"}, WithCollectionMetricLabel(false))
+		if v, ok := attrs[semconv.DBCollectionNameKey]; ok {
+			t.Errorf("db.collection.name = %q under WithCollectionMetricLabel(false); want absent", v.AsString())
+		}
+		if got := attrMap(span.Attributes())["db.elasticsearch.path_parts.index"].AsString(); got != "orders" {
+			t.Errorf("span path part = %q, want orders (opt-out is metric-only)", got)
+		}
+	})
+}
+
+// TestMetric_RecordedWhenSpanNotSampled asserts the metric does not depend on
+// the span being sampled: metrics are not sampled, and the per-request state
+// travels in the context regardless of the span's recording state.
+func TestMetric_RecordedWhenSpanNotSampled(t *testing.T) {
+	srv := esStub(t, http.StatusOK)
+	rec := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.NeverSample()), sdktrace.WithSpanProcessor(rec))
+	mp, reader := recordingMeter()
+
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp, mp)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	res, err := client.Search(client.Search.WithContext(context.Background()), client.Search.WithIndex("my-index"))
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	_ = res.Body.Close()
+
+	if got := len(rec.Ended()); got != 0 {
+		t.Fatalf("got %d recorded spans under NeverSample, want 0", got)
+	}
+	dp := singleDataPoint(t, collectDuration(t, reader))
+	attrs := dpAttrs(dp)
+	if got := attrs[semconv.DBCollectionNameKey].AsString(); got != "my-index" {
+		t.Errorf("db.collection.name = %q, want my-index (labels do not depend on span recording)", got)
+	}
+	if len(dp.Exemplars) != 0 {
+		t.Errorf("got %d exemplars for an unsampled span, want 0", len(dp.Exemplars))
+	}
+}
+
+// TestMetric_NoopTracerStillRecords asserts the metric is independent of the
+// tracing side entirely: a no-op TracerProvider (spans discarded) still yields
+// the duration sample.
+func TestMetric_NoopTracerStillRecords(t *testing.T) {
+	srv := esStub(t, http.StatusOK)
+	mp, reader := recordingMeter()
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, noop.NewTracerProvider(), mp)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	res, err := client.Search(client.Search.WithIndex("my-index"))
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	_ = res.Body.Close()
+	singleDataPoint(t, collectDuration(t, reader))
+}
+
+// TestMeterProviderWiring asserts the metric lands on the supplied
+// MeterProvider, not the global one (ADR 0003).
+func TestMeterProviderWiring(t *testing.T) {
+	srv := esStub(t, http.StatusOK)
+
+	globalMP, globalReader := recordingMeter()
+	originalGlobal := otel.GetMeterProvider()
+	otel.SetMeterProvider(globalMP)
+	t.Cleanup(func() { otel.SetMeterProvider(originalGlobal) })
+
+	tp, _ := recordingProvider()
+	mp, reader := recordingMeter()
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp, mp)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	res, err := client.Search(client.Search.WithContext(context.Background()))
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	_ = res.Body.Close()
+
+	singleDataPoint(t, collectDuration(t, reader))
+	var rm metricdata.ResourceMetrics
+	if err := globalReader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect global: %v", err)
+	}
+	if got := len(rm.ScopeMetrics); got != 0 {
+		t.Errorf("global provider recorded %d scopes, want 0 (no global fallback)", got)
+	}
+}
+
+// TestMetricViews_BoundLabelsAndBuckets pins the MetricViews contract: the
+// SDK's bucket boundaries replace OTel's millisecond-scale defaults, and the
+// allow-keys filter is the backstop that drops any key outside the documented
+// label set.
+func TestMetricViews_BoundLabelsAndBuckets(t *testing.T) {
+	buckets := []float64{0.005, 0.05, 0.5, 5}
+	srv := esStub(t, http.StatusOK)
+	tp, _ := recordingProvider()
+	mp, reader := recordingMeter(MetricViews(buckets)...)
+
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp, mp)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	res, err := client.Search(client.Search.WithContext(context.Background()), client.Search.WithIndex("my-index"))
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	_ = res.Body.Close()
+
+	h := collectDuration(t, reader)
+	dp := singleDataPoint(t, h)
+	if got := dp.Bounds; len(got) != len(buckets) {
+		t.Fatalf("bucket bounds = %v, want %v", got, buckets)
+	}
+	for i := range buckets {
+		if dp.Bounds[i] != buckets[i] {
+			t.Fatalf("bucket bounds = %v, want %v", dp.Bounds, buckets)
+		}
+	}
+	allowed := map[attribute.Key]bool{
+		semconv.DBSystemNameKey: true, semconv.DBOperationNameKey: true, semconv.DBCollectionNameKey: true,
+		semconv.ServerAddressKey: true, semconv.ServerPortKey: true, semconv.ErrorTypeKey: true,
+	}
+	for _, kv := range dp.Attributes.ToSlice() {
+		if !allowed[kv.Key] {
+			t.Errorf("label %s escaped the allow-keys view", kv.Key)
+		}
+	}
+
+	// A foreign scope's identically named instrument must not match the view.
+	views := MetricViews(buckets)
+	if _, matched := views[0](sdkmetric.Instrument{Name: "db.client.operation.duration"}); matched {
+		t.Error("view matched an unscoped db.client.operation.duration; it must be scoped to this package")
 	}
 }

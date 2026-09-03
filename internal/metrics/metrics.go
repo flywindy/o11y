@@ -73,10 +73,12 @@ type Config struct {
 	MaxUniqueRoutes     int
 
 	// MaxUniqueCollections caps distinct db.collection.name values on the
-	// Cassandra client metrics at the export boundary, collapsing the overflow to
-	// "other". A Cassandra schema is DDL-fixed and small, so this guards against
-	// the SDK's CQL tokenizer mis-reading a statement shape rather than against
-	// normal schema growth.
+	// Cassandra and Elasticsearch client metrics at the export boundary,
+	// collapsing the overflow to "other", with an independent budget per
+	// integration (see collectionCapScopes). For Cassandra, whose schema is
+	// DDL-fixed and small, this guards against the SDK's CQL tokenizer
+	// mis-reading a statement shape; for Elasticsearch it bounds date-rolled
+	// index names.
 	MaxUniqueCollections int
 
 	// ExtraHTTPServerAttrKeys augments the SDK-managed attribute allow-list
@@ -114,6 +116,22 @@ const (
 	sdkCardinalityCollectionBudget = 128
 )
 
+// capInstrument pairs an instrument name with the Prometheus family name it is
+// exposed as, so the OTLP and Prometheus cap rules key on the same instrument.
+type capInstrument struct {
+	instrument string
+	family     string
+}
+
+// collectionCapScope is one SDK integration whose client metrics carry
+// db.collection.name, with the instrumentation scope it records under and the
+// budget its instruments share.
+type collectionCapScope struct {
+	scope       string
+	budget      string
+	instruments []capInstrument
+}
+
 // cassandraScope is the instrumentation scope the cassandra package records
 // under. The collection cap is restricted to it because instrument names are not
 // unique across scopes: db.client.operation.duration is the standard semconv name
@@ -133,12 +151,35 @@ const cassandraCollectionBudget = "cassandra/db.collection.name"
 
 // cassandraCollectionInstruments are the Cassandra client metrics that carry
 // db.collection.name, paired with the Prometheus family name each is exposed as.
-var cassandraCollectionInstruments = []struct {
-	instrument string
-	family     string
-}{
+var cassandraCollectionInstruments = []capInstrument{
 	{instrument: "db.client.operation.duration", family: "db_client_operation_duration_seconds"},
 	{instrument: "cassandra.query.attempts", family: "cassandra_query_attempts_total"},
+}
+
+// elasticsearchScope is the instrumentation scope the elasticsearch package
+// records its SDK-owned metric under (ADR 0027 §5). It gets its own scoped rule
+// and its own budget: an Elasticsearch index name and a Cassandra table are
+// unrelated dimensions, so one integration's overflow must not evict the other's
+// values from the exported label set.
+const elasticsearchScope = "github.com/flywindy/o11y/elasticsearch"
+
+// elasticsearchCollectionBudget is the distinct-value budget for the
+// Elasticsearch index label. Only one instrument carries it today; the budget
+// key keeps a future ES instrument (e.g. an attempts counter) consistent with the
+// duration histogram about which indices overflowed.
+const elasticsearchCollectionBudget = "elasticsearch/db.collection.name"
+
+// elasticsearchCollectionInstruments are the Elasticsearch client metrics that
+// carry db.collection.name.
+var elasticsearchCollectionInstruments = []capInstrument{
+	{instrument: "db.client.operation.duration", family: "db_client_operation_duration_seconds"},
+}
+
+// collectionCapScopes lists every integration the db.collection.name cap
+// applies to. Each entry is scoped and budgeted independently.
+var collectionCapScopes = []collectionCapScope{
+	{scope: cassandraScope, budget: cassandraCollectionBudget, instruments: cassandraCollectionInstruments},
+	{scope: elasticsearchScope, budget: elasticsearchCollectionBudget, instruments: elasticsearchCollectionInstruments},
 }
 
 // otlpCapRules builds the export-boundary attribute caps for the OTLP push path.
@@ -159,14 +200,16 @@ func otlpCapRules(cfg Config) []metricscap.Rule {
 		)
 	}
 	if cfg.MaxUniqueCollections > 0 {
-		for _, inst := range cassandraCollectionInstruments {
-			rules = append(rules, metricscap.Rule{
-				InstrumentName: inst.instrument,
-				ScopeName:      cassandraScope,
-				Key:            semconv.DBCollectionNameKey,
-				Max:            cfg.MaxUniqueCollections,
-				BudgetKey:      cassandraCollectionBudget,
-			})
+		for _, sc := range collectionCapScopes {
+			for _, inst := range sc.instruments {
+				rules = append(rules, metricscap.Rule{
+					InstrumentName: inst.instrument,
+					ScopeName:      sc.scope,
+					Key:            semconv.DBCollectionNameKey,
+					Max:            cfg.MaxUniqueCollections,
+					BudgetKey:      sc.budget,
+				})
+			}
 		}
 	}
 	return rules
@@ -192,14 +235,16 @@ func prometheusCapRules(cfg Config) []metricscap.PrometheusRule {
 		)
 	}
 	if cfg.MaxUniqueCollections > 0 {
-		for _, inst := range cassandraCollectionInstruments {
-			rules = append(rules, metricscap.PrometheusRule{
-				MetricName: inst.family,
-				ScopeName:  cassandraScope,
-				LabelName:  "db_collection_name",
-				Max:        cfg.MaxUniqueCollections,
-				BudgetKey:  cassandraCollectionBudget,
-			})
+		for _, sc := range collectionCapScopes {
+			for _, inst := range sc.instruments {
+				rules = append(rules, metricscap.PrometheusRule{
+					MetricName: inst.family,
+					ScopeName:  sc.scope,
+					LabelName:  "db_collection_name",
+					Max:        cfg.MaxUniqueCollections,
+					BudgetKey:  sc.budget,
+				})
+			}
 		}
 	}
 	return rules

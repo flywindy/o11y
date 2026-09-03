@@ -1,6 +1,6 @@
 # ADR 0020 — Elasticsearch Integration
 
-**Status**: Accepted
+**Status**: Accepted — amended 2026-09-03 by ADR 0027 (client metrics added; §3 signature and §6 deferral superseded)
 **Date**: 2026-06-04 (accepted 2026-06-14, on implementation)
 **Relates to**: ADR 0003 (global state policy), ADR 0006 (semconv upgrade
 strategy), ADR 0008 (instrumentation sourcing policy), ADR 0004 (NATS — the
@@ -255,6 +255,10 @@ endpoints the upstream instrumentation supports.
 
 ### 6. Metrics: deferred (v1 trace-only), same posture as NATS
 
+> **Superseded (2026-09-03).** Revisit trigger 1 below fired; ADR 0027 adds an
+> SDK-owned `db.client.operation.duration` at the seam this section names. The
+> text is kept as the record of the v1 decision — see the Amendment at the end.
+
 The integration is **trace-only** in v1. No `MeterProvider`, no SDK-owned ES
 metrics. This mirrors the NATS decision (ADR 0004 amendment), and contrasts with
 MongoDB (ADR 0014) and Cassandra (ADR 0019), for concrete reasons:
@@ -429,3 +433,35 @@ _All resolved at implementation (2026-06-14):_
    `github.com/elastic/go-elasticsearch/v8` and
    `github.com/elastic/elastic-transport-go/v8`, and both have rows in ADR
    0003's Approved-integrations table.
+
+---
+
+## Amendment (2026-09-03) — Metrics added (ADR 0027)
+
+The first §6 revisit trigger fired: the consumer needs client-attributed
+Elasticsearch operation latency and error rate as unsampled metrics on the same
+dashboards as its own counters. The second trigger has not: the pinned
+`elastic-transport-go/v8 v8.8.0` instrumentation is still trace-only (verified by
+source read in ADR 0027). ADR 0027 therefore adds a **justified-T3 metric layer**
+at the `Instrumentation` seam §6 itself identified as the highest-value target —
+`db.client.operation.duration`, one sample per request from `Start` to `Close`,
+labeled with the current semconv v1.39.0 keys (`db.system.name`,
+`db.operation.name`, `db.collection.name`, `server.address`, `server.port`,
+`error.type`).
+
+What changes in this ADR's decisions:
+
+- **§3 signature.** `NewClient` / `NewTypedClient` now take
+  `(cfg, tp, mp, opts...)`; `mp` is required and rejected when nil. The
+  "deliberate divergence" rationale (no metrics, so no `mp`) no longer applies,
+  and the shape converges on `cassandra.NewSession` / `mongo.Connect`. The
+  no-propagator decision stands.
+- **§6 and §7 ("Any SDK-owned ES metrics").** Superseded by ADR 0027 §2–§5.
+  Per-attempt counters and transport gauges remain deferred there (§8).
+- **§4 (unchanged).** The span side is untouched: the upstream still emits the
+  legacy keys on its span and the facade still normalizes only status; the
+  metric does not inherit that drift because it is SDK-owned.
+- **Open question 2** ("client-attributed bulk-indexing metrics — deferred") is
+  now resolved by ADR 0027, including the bulk caveat that the index label is
+  present only when the bulk call sets `WithIndex`.
+

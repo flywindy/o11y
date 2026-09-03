@@ -13,6 +13,42 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+### Added
+
+- `elasticsearch`: SDK-owned `db.client.operation.duration` histogram
+  ([ADR 0027](docs/adr/0027-elasticsearch-metrics.md)). The upstream
+  `go-elasticsearch` instrumentation is trace-only, so the facade now records
+  one sample per request (start to end, retries included) on the SDK
+  `MeterProvider`, labeled with the current semconv v1.39.0 keys —
+  `db.system.name`, `db.operation.name` (endpoint id), `db.collection.name`
+  (index), `server.address` / `server.port` (the node the final attempt was
+  routed to), and `error.type` on failures (the HTTP status code as a string
+  when Elasticsearch answered, otherwise `context.Canceled` /
+  `context.DeadlineExceeded` / the Go error type). The metric is recorded
+  whether or not the span is sampled and carries an exemplar pointing at the
+  ES span. Recorded under the instrumentation scope
+  `github.com/flywindy/o11y/elasticsearch`.
+- `elasticsearch.WithCollectionMetricLabel(bool)` (default `true`): controls the
+  `db.collection.name` metric label. The label is emitted only when a request
+  addresses exactly one index (no index or a comma-separated list omits it; a
+  wildcard/alias is kept as written). Opt out for date-rolled index names.
+- `elasticsearch.MetricViews(buckets)`: scoped view applying the SDK histogram
+  buckets and an allow-keys filter; composed into `o11y.Init` automatically.
+  `o11y.WithMaxUniqueCollections` now also caps the Elasticsearch index label at
+  the export boundary, under its own budget separate from Cassandra's, on both
+  the Prometheus and OTLP paths.
+
+### Changed
+
+- **Breaking** — `elasticsearch.NewClient` and `elasticsearch.NewTypedClient`
+  take a `metric.MeterProvider` after the `TracerProvider`:
+  `NewClient(cfg, tp, mp, opts...)`. `mp` is required and rejected when nil, as
+  `tp` already was; the facade never falls back to the global `MeterProvider`.
+  ADR 0020 §3 had made the `(cfg, tp, opts)` shape a deliberate divergence
+  because the integration emitted no metrics; with an SDK-owned metric the
+  signature converges on the `cassandra.NewSession` / `mongo.Connect` shape.
+  There is still no propagator parameter.
+
 ### Fixed
 
 - `log`: `traceId` and `spanId` are now always written at the log record's top
@@ -89,7 +125,14 @@ adopters can plan their upgrades.
 
 ### Migration
 
-- No API change. Services that adopted the previous (incorrect) nesting — for
+- `elasticsearch.NewClient(cfg, tp, opts...)` → `NewClient(cfg, tp, mp, opts...)`
+  (same for `NewTypedClient`); pass `obs.MeterProvider()`. Services that build
+  their own `MeterProvider` should register `elasticsearch.MetricViews(buckets)`
+  via `sdkmetric.WithView` and a cardinality cap for `db.collection.name`, or
+  pass `elasticsearch.WithCollectionMetricLabel(false)`. Dashboards keyed on
+  `db_client_operation_duration_seconds` gain a `db_system_name="elasticsearch"`
+  series set on rollout.
+- Otherwise no API change. Services that adopted the previous (incorrect) nesting — for
   example a Loki query or Grafana derived field reading `req.traceId` rather
   than `traceId` — should move those back to the top-level field.
 - `db_client_connection_create_time_bucket` changes shape for Redis: its `le`

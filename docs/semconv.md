@@ -596,11 +596,15 @@ that build their own MeterProvider must register the same views via
 Spans are emitted by the **first-party** OpenTelemetry instrumentation built
 into `github.com/elastic/go-elasticsearch/v8` (in the shared
 `github.com/elastic/elastic-transport-go/v8` transport, pinned at v8.8.0). The
-SDK-owned `elasticsearch` facade only wires the SDK `TracerProvider` into the
-client and sets the search-body default; it emits no attributes of its own.
-The integration is **trace-only** in v1 — no metrics (ADR 0020 §6). See ADR
-0020 for the design and the ADR 0008 §2 evaluation that justifies the T2
-sourcing.
+SDK-owned `elasticsearch` facade wires the SDK `TracerProvider` into the client,
+sets the search-body default, and normalizes span name and HTTP status (ADR
+0020). The upstream is trace-only, so the **metric** below is SDK-owned: one
+`db.client.operation.duration` sample per request, recorded under the
+instrumentation scope `github.com/flywindy/o11y/elasticsearch` with the
+**current** semconv v1.39.0 keys — it does not inherit the legacy spellings the
+span carries (ADR 0027). See ADR 0020 for the span design and the ADR 0008 §2
+evaluation that justifies the T2 sourcing, and ADR 0027 for the justified-T3
+metric layer.
 
 ### Span Attributes (as emitted by the pinned upstream)
 
@@ -646,14 +650,50 @@ defers to it and emits no status code, so a stale code from an earlier retried
 attempt is never reported. `error.type` is not synthesized — classify failures
 by status + `http.response.status_code`.
 
+### Instruments
+
+| Name | Kind | Unit | Attributes |
+|---|---|---|---|
+| `db.client.operation.duration` | Float64Histogram | `s` | `db.system.name`, `db.operation.name`, `db.collection.name` ‡, `server.address`, `server.port`, `error.type` (failures only). One sample per request, measured `Start → Close` (spans retries and the product check, like the span); scope `github.com/flywindy/o11y/elasticsearch`. |
+
+- `db.operation.name` is the endpoint id the generated API passes to the
+  instrumentation (`search`, `bulk`, `index`, `indices.create`, …) — a fixed set.
+- `server.address` / `server.port` are the node the **terminal** attempt was
+  routed to (the transport rewrites the request URL per attempt); omitted when
+  the transport never selected a node.
+- `error.type` follows the same terminal-outcome rule as the span status
+  (ADR 0027 §3): the HTTP status code as a string (`"429"`, `"500"`, `"302"`)
+  when the request returned a response with status `> 299` — including the
+  typed API's `ElasticsearchError` — and, for a terminal failure with no usable
+  response (transport failure, cancellation, product-check failure),
+  `context.Canceled` / `context.DeadlineExceeded` or the Go error type. Absent
+  on success. A status stashed from an earlier retried attempt is never used.
+- `db.namespace` is **not** a metric label: the cluster name is only available
+  from Elastic Cloud response headers.
+
+**‡ `db.collection.name` on the metric** (ADR 0027 §4) is the index path part,
+**on by default**, emitted only when the request addresses exactly one index:
+omitted when there is no index path part (cross-index `_search`,
+`cluster.health`, a `bulk` whose index is set per action line) and for a
+comma-separated multi-index list (`WithIndex("a", "b")`), which is semconv's
+"single collection" condition failing. A wildcard or alias (`logs-*`) is one
+addressed name and is kept as written. Opt out per client with
+`elasticsearch.WithCollectionMetricLabel(false)` — advisable when index names
+roll by date. Cardinality is bounded by the `MetricViews()` allow-keys view
+installed via `o11y.Init`'s `ExtraViews`, and `o11y.WithMaxUniqueCollections`
+(default `200`) collapses index values beyond the cap to `"other"` under an
+Elasticsearch-specific budget, independent of the Cassandra one. Services that
+build their own MeterProvider must register the views and a cap themselves.
+
 ### Explicitly NOT Emitted
 
 | Key | Reason |
 |---|---|
-| `error.type` | Neither the upstream nor the facade emits it — the upstream supplies no value and the SDK does not synthesize one. Failures are classified by span **status = Error** plus `http.response.status_code` (ADR 0020 §4 †). |
-| `db.collection.name` | The index is recorded only as the `db.elasticsearch.path_parts.index` path variable; the transport never emits `db.collection.name` (ADR 0020 §4 ‡). |
-| `db.system.name` / `db.operation.name` / `db.query.text` / `db.operation.parameter.*` | The current-semconv spellings are not emitted; the facade inherits the legacy keys above rather than normalizing at the boundary (ADR 0020 §4, option (a)). |
-| Any Elasticsearch metric | Trace-only in v1; operators rely on `elasticsearch_exporter` for ES health and span duration for per-call latency (ADR 0020 §6). |
+| `error.type` (on spans) | Neither the upstream nor the facade sets it on the span — the upstream supplies no value and the SDK does not synthesize one there. Span failures are classified by **status = Error** plus `http.response.status_code` (ADR 0020 §4 †). It **is** emitted on the metric (Instruments above). |
+| `db.collection.name` (on spans) | The span records the index only as the `db.elasticsearch.path_parts.index` path variable; the transport never emits `db.collection.name` on the span (ADR 0020 §4 ‡). The metric derives it from that path part (ADR 0027 §4). |
+| `db.system.name` / `db.operation.name` / `db.query.text` / `db.operation.parameter.*` (on spans) | The current-semconv spellings are not emitted on the span; the facade inherits the legacy keys above rather than normalizing at the boundary (ADR 0020 §4, option (a)). The SDK-owned metric uses the current spellings. |
+| `db.namespace` (on the metric) | The cluster name is only available from Elastic Cloud response headers; not emitted as a metric label (ADR 0027 §3). |
+| Per-attempt / retry counter, transport gauges | Deferred with named triggers (ADR 0027 §8); `elasticsearch_exporter` covers server-side ES health. |
 
 ## Logs
 
@@ -681,7 +721,7 @@ Data Model attributes automatically.
 | `resty.error.kind`, `resty.retry.exhausted` | `resty` wrapper | Resty-specific bounded failure class and retry-budget marker. Standard `error.type` remains present; these keys preserve operator-facing retry and transport semantics without adding metric cardinality. |
 | `object_store.*` namespace (`system.name`, `operation.name`, `bucket.name`, `object.key`, `object.size`) | `minio` wrapper | OTel object-store semconv is at status Development and only the AWS-S3 page exists, framed as AWS-SDK / `rpc.system=aws-api`. The SDK-owned `object_store.*` namespace is package-local but shaped to mirror current OTel naming patterns; future migration to a blessed convention is expected to be a key rename. See ADR 0018 §4 and References. |
 | `minio.error.kind`, `minio.client.operation.duration` | `minio` wrapper | MinIO-specific bounded SRE classification (span-only) and per-operation duration histogram. No stable OTel object-store metric exists, so the instrument name stays package-local; standard `error.type` is co-emitted on spans and as the metric failure label. |
-| Legacy ES keys (`db.system`, `db.operation`, `db.statement`, `db.elasticsearch.*`) | `go-elasticsearch/v8` first-party instrumentation | The pinned `elastic-transport-go/v8 v8.8.0` predates DB semconv stabilization and emits these deprecated spellings on its own span. A T2 facade has no seam to rewrite them, so the drift is accepted and documented (ADR 0020 §4, option (a)) rather than normalized via a span processor. A compatibility test pins the exact emitted keys; an upstream fix is inherited for free. |
+| Legacy ES keys (`db.system`, `db.operation`, `db.statement`, `db.elasticsearch.*`) | `go-elasticsearch/v8` first-party instrumentation | The pinned `elastic-transport-go/v8 v8.8.0` predates DB semconv stabilization and emits these deprecated spellings on its own span. A T2 facade has no seam to rewrite them, so the drift is accepted and documented (ADR 0020 §4, option (a)) rather than normalized via a span processor. A compatibility test pins the exact emitted keys; an upstream fix is inherited for free. The SDK-owned `db.client.operation.duration` (ADR 0027) is unaffected and uses the current keys. |
 | `cassandra.query.attempts`, `cassandra.connection.attempts`, `cassandra.query.attempt` | `cassandra` wrapper | SDK-owned names for the client-side attempt/retry/speculative-execution signal, which server-side exporters cannot provide. semconv v1.39.0 defines no attempts metric or attribute; kept package-local (per ADR 0019 §7.B) so they are easy to retire/rename if semconv later standardizes one. |
 
 Any new deviation must list:

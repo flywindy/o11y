@@ -13,42 +13,53 @@ import (
 // rules are keyed on instrument name and attribute key rather than on the
 // rendered family and label names.
 
-func TestOTLPCapRulesIncludeCassandraCollectionCap(t *testing.T) {
+func TestOTLPCapRulesIncludeCollectionCaps(t *testing.T) {
 	rules := otlpCapRules(Config{MaxUniqueRoutes: 1000, MaxUniqueCollections: 200})
 
-	byInstrument := map[string]int{}
+	byScopedInstrument := map[string]int{}
 	for _, r := range rules {
 		if r.Key == semconv.DBCollectionNameKey {
-			byInstrument[r.InstrumentName] = r.Max
+			byScopedInstrument[r.ScopeName+"|"+r.InstrumentName] = r.Max
 		}
 	}
 	assert.Equal(t, map[string]int{
-		"db.client.operation.duration": 200,
-		"cassandra.query.attempts":     200,
-	}, byInstrument)
+		cassandraScope + "|db.client.operation.duration":     200,
+		cassandraScope + "|cassandra.query.attempts":         200,
+		elasticsearchScope + "|db.client.operation.duration": 200,
+	}, byScopedInstrument)
 }
 
-// Every collection rule must name the Cassandra scope and share one budget.
-// db.client.operation.duration is the standard semconv instrument name, also
-// emitted by Redis/MongoDB and by caller-defined instrumentation, so an
-// unscoped rule would rewrite foreign streams; independent budgets would let the
-// two instruments disagree about which tables overflowed.
-func TestCassandraCapRulesAreScopedAndShareABudget(t *testing.T) {
+// Every collection rule must name its integration's scope and share that
+// integration's budget. db.client.operation.duration is the standard semconv
+// instrument name, also emitted by Redis/MongoDB and by caller-defined
+// instrumentation, so an unscoped rule would rewrite foreign streams;
+// independent budgets within one integration would let its instruments disagree
+// about which collections overflowed, while budgets must stay separate across
+// integrations so an Elasticsearch index overflow cannot evict Cassandra tables.
+func TestCollectionCapRulesAreScopedAndBudgetedPerIntegration(t *testing.T) {
 	cfg := Config{MaxUniqueRoutes: 1000, MaxUniqueCollections: 200}
+	budgets := map[string]string{
+		cassandraScope:     cassandraCollectionBudget,
+		elasticsearchScope: elasticsearchCollectionBudget,
+	}
+	assert.NotEqual(t, cassandraCollectionBudget, elasticsearchCollectionBudget,
+		"integrations must not share one collection budget")
 
 	for _, r := range otlpCapRules(cfg) {
 		if r.Key != semconv.DBCollectionNameKey {
 			continue
 		}
-		assert.Equal(t, cassandraScope, r.ScopeName, "OTLP rule for %s must be scoped", r.InstrumentName)
-		assert.Equal(t, cassandraCollectionBudget, r.BudgetKey, "OTLP rule for %s must share the budget", r.InstrumentName)
+		want, ok := budgets[r.ScopeName]
+		assert.True(t, ok, "OTLP rule for %s must be scoped to a known integration, got %q", r.InstrumentName, r.ScopeName)
+		assert.Equal(t, want, r.BudgetKey, "OTLP rule for %s/%s must share its integration's budget", r.ScopeName, r.InstrumentName)
 	}
 	for _, r := range prometheusCapRules(cfg) {
 		if r.LabelName != "db_collection_name" {
 			continue
 		}
-		assert.Equal(t, cassandraScope, r.ScopeName, "Prometheus rule for %s must be scoped", r.MetricName)
-		assert.Equal(t, cassandraCollectionBudget, r.BudgetKey, "Prometheus rule for %s must share the budget", r.MetricName)
+		want, ok := budgets[r.ScopeName]
+		assert.True(t, ok, "Prometheus rule for %s must be scoped to a known integration, got %q", r.MetricName, r.ScopeName)
+		assert.Equal(t, want, r.BudgetKey, "Prometheus rule for %s/%s must share its integration's budget", r.ScopeName, r.MetricName)
 	}
 
 	// The route caps stay unscoped: http.server/client.request.duration are
@@ -92,7 +103,7 @@ func TestCapRulesAreIndependent(t *testing.T) {
 	}
 
 	collectionsOnly := otlpCapRules(Config{MaxUniqueCollections: 10})
-	assert.Len(t, collectionsOnly, 2)
+	assert.Len(t, collectionsOnly, 3) // two Cassandra instruments + one Elasticsearch
 	for _, r := range collectionsOnly {
 		assert.Equal(t, semconv.DBCollectionNameKey, r.Key)
 	}
@@ -112,8 +123,10 @@ func TestCapRulePathsCoverTheSameInstruments(t *testing.T) {
 	for _, r := range prometheusCapRules(cfg) {
 		families[r.MetricName] = true
 	}
-	for _, inst := range cassandraCollectionInstruments {
-		assert.True(t, families[inst.family],
-			"Prometheus path is missing a cap rule for %s", inst.instrument)
+	for _, sc := range collectionCapScopes {
+		for _, inst := range sc.instruments {
+			assert.True(t, families[inst.family],
+				"Prometheus path is missing a cap rule for %s/%s", sc.scope, inst.instrument)
+		}
 	}
 }
