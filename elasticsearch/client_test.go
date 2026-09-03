@@ -1322,7 +1322,7 @@ func TestTyped_IsSuccessPathFollowsEndpointContract(t *testing.T) {
 	})
 	t.Run("500 rejected", func(t *testing.T) {
 		srv := esStub(t, http.StatusInternalServerError)
-		tp, _ := recordingProvider()
+		tp, rec := recordingProvider()
 		mp, reader := recordingMeter()
 		client, err := NewTypedClient(elastic.Config{Addresses: []string{srv.URL}, DisableRetry: true}, tp, mp)
 		if err != nil {
@@ -1331,11 +1331,83 @@ func TestTyped_IsSuccessPathFollowsEndpointContract(t *testing.T) {
 		if _, err := client.Exists("my-index", "1").IsSuccess(context.Background()); err == nil {
 			t.Fatal("Exists.IsSuccess on 500: want error, got nil")
 		}
+		// IsSuccess reports a rejected status through a plain generated error,
+		// not an ElasticsearchError; the facade must still classify it by HTTP
+		// status, exactly like a typed Do failure (Codex review on PR #90).
 		attrs := dpAttrs(singleDataPoint(t, collectDuration(t, reader)))
-		if _, ok := attrs[semconv.ErrorTypeKey]; !ok {
-			t.Error("error.type absent on a rejected 500; want present")
+		if got := attrs[semconv.ErrorTypeKey].AsString(); got != "500" {
+			t.Errorf("error.type = %q, want 500 (typed IsSuccess rejected status)", got)
+		}
+		if got := attrs[semconv.DBResponseStatusCodeKey].AsString(); got != "500" {
+			t.Errorf("db.response.status_code = %q, want 500", got)
+		}
+		spans := rec.Ended()
+		if len(spans) != 1 {
+			t.Fatalf("got %d spans, want 1", len(spans))
+		}
+		if got := spans[0].Status().Code; got != codes.Error {
+			t.Errorf("span status = %v, want Error", got)
+		}
+		if got := attrMap(spans[0].Attributes())["http.response.status_code"].AsInt64(); got != http.StatusInternalServerError {
+			t.Errorf("http.response.status_code = %d, want 500", got)
 		}
 	})
+	t.Run("retried 503 then transport error is not a status failure", func(t *testing.T) {
+		// The IsSuccess message match must be paired with the terminal status:
+		// a transport error after a retried 503 carries no such message, so
+		// the stale 503 must not leak into error.type.
+		var calls int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if atomic.AddInt32(&calls, 1) == 1 {
+				w.Header().Set("X-Elastic-Product", "Elasticsearch")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			if hj, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hj.Hijack(); err == nil {
+					_ = conn.Close()
+				}
+			}
+		}))
+		t.Cleanup(srv.Close)
+		tp, _ := recordingProvider()
+		mp, reader := recordingMeter()
+		client, err := NewTypedClient(elastic.Config{Addresses: []string{srv.URL}}, tp, mp)
+		if err != nil {
+			t.Fatalf("NewTypedClient: %v", err)
+		}
+		if _, err := client.Exists("my-index", "1").IsSuccess(context.Background()); err == nil {
+			t.Fatal("Exists.IsSuccess: want transport error, got nil")
+		}
+		attrs := dpAttrs(singleDataPoint(t, collectDuration(t, reader)))
+		if got := attrs[semconv.ErrorTypeKey].AsString(); got == "" || got == "503" {
+			t.Errorf("error.type = %q, want a transport error class, not the stale 503", got)
+		}
+		if v, ok := attrs[semconv.DBResponseStatusCodeKey]; ok {
+			t.Errorf("db.response.status_code = %q, want absent", v.AsString())
+		}
+	})
+}
+
+// TestTypedStatusErrorPattern pins the generated IsSuccess error format the
+// facade relies on (ADR 0006 compatibility pin) and the pairing rule.
+func TestTypedStatusErrorPattern(t *testing.T) {
+	gen := errors.New("an error happened during the Exists query execution, status code: 500")
+	if !typedStatusError(gen, 500) {
+		t.Error("generated IsSuccess error with matching terminal status must classify as a status error")
+	}
+	if typedStatusError(gen, 503) {
+		t.Error("a status mismatch (stale earlier attempt) must not classify as a status error")
+	}
+	if typedStatusError(gen, 0) {
+		t.Error("no terminal response must not classify as a status error")
+	}
+	if typedStatusError(errors.New("dial tcp 127.0.0.1:1: connect: connection refused"), 503) {
+		t.Error("a transport error must never classify as a status error")
+	}
+	if typedStatusError(errors.New("an error happened during the Search query execution: read: connection reset"), 500) {
+		t.Error("the typed Perform transport wrapper (no status code) must not classify as a status error")
+	}
 }
 
 // TestLowLevel_404FollowsIsError pins the low-level contract the typed rule is

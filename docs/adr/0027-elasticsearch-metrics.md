@@ -119,9 +119,16 @@ the same terminal-outcome decision the span status uses (ADR 0020 §4):
     accept list from the API spec — `Get`, `Delete`, `Exists`, `ClearScroll`,
     `ClosePointInTime`, and hundreds more return a 404 as a normal result with a
     nil error (`slices.Contains([]int{404}, res.StatusCode)` in v8.19.3's
-    generated `Do`) — and surfaces only the statuses it does not accept as a
-    `*types.ElasticsearchError` through `RecordError`. That `RecordError` is the
-    exact failure signal, so an **accepted status is a success**: no
+    generated `Do`) — and surfaces only the statuses it does not accept through
+    `RecordError`: `Do` terminators as a `*types.ElasticsearchError`, `IsSuccess`
+    terminators (`Exists`, `Delete().IsSuccess`, …) as the generated error
+    `an error happened during the <Endpoint> query execution, status code: N`
+    (identical across all 320 generated files; not an `ElasticsearchError`).
+    The facade recognizes the latter only when the message matches **and** its
+    status equals the terminal status `AfterResponse` stashed, so a transport
+    error or a stale retried status can never be misread; the format is pinned
+    by a compatibility test (ADR 0006). That `RecordError` is the exact failure
+    signal, so an **accepted status is a success**: no
     `error.type`, no `db.response.status_code`, span status UNSET (the span
     keeps `http.response.status_code` for context). Without this rule every
     not-found lookup would count toward error rates. The typed 400/500 case
@@ -359,9 +366,11 @@ a `ManualReader`:
   `db.response.status_code`; a retried 503 → transport error carries the
   transport class and no stale `"503"`;
 - typed-client accepted statuses: a `Get` 404 (`Do`) and an `Exists` 404
-  (`IsSuccess`) are successes on span and metric, an `Exists` 500 is a failure,
-  and a low-level `Get` 404 stays a failure per `IsError` — pinning the
-  documented asymmetry;
+  (`IsSuccess`) are successes on span and metric, an `Exists` 500 is a failure
+  classified `"500"` on both (the generated `IsSuccess` message is pinned), a
+  retried 503 → transport error on `IsSuccess` carries the transport class and
+  no stale `"503"`, and a low-level `Get` 404 stays a failure per `IsError` —
+  pinning the documented asymmetry;
 - `db.collection.name` policy: single index, wildcard kept, multi-index
   omitted, no index omitted, `WithCollectionMetricLabel(false)` omits the label
   while the span keeps its path part;

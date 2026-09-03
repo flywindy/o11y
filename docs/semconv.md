@@ -647,10 +647,11 @@ Error for status `> 299` — the same boundary as the client's own
 from a 5xx to a 2xx is not marked Error. **Typed client:** the generated
 endpoints accept some non-2xx statuses as normal results (a 404 from `Get`,
 `Delete`, `Exists`, `ClearScroll`, … returns with a nil error) and surface only
-rejected statuses as a `*types.ElasticsearchError` through `RecordError`; the
-facade follows that contract, so an accepted status is UNSET with
-`http.response.status_code` recorded, and only an `ElasticsearchError` is
-Error (ADR 0027 §3). When `RecordError` already fired (a
+rejected statuses through `RecordError` (a `*types.ElasticsearchError` from `Do`
+terminators, the generated rejected-status error from `IsSuccess` terminators);
+the facade follows that contract, so an accepted status is UNSET with
+`http.response.status_code` recorded, and only a rejected one is Error
+(ADR 0027 §3). When `RecordError` already fired (a
 terminal transport error, cancellation, or product-check failure) the facade
 defers to it and emits no status code, so a stale code from an earlier retried
 attempt is never reported. `error.type` is not synthesized — classify failures
@@ -671,8 +672,10 @@ by status + `http.response.status_code`.
   (ADR 0027 §3): the HTTP status code as a string (`"429"`, `"500"`, `"302"`)
   when the response is an HTTP failure under the client API's own contract —
   low-level: status `> 299` (`esapi.Response.IsError`); typed: the endpoint
-  surfaced it as an `ElasticsearchError`, so a status the endpoint accepts
-  (a `Get`/`Exists` 404) is **not** a failure — and, for a terminal failure
+  rejected it (an `ElasticsearchError` from a `Do` terminator, or the generated
+  rejected-status error from an `IsSuccess` terminator), so a status the
+  endpoint accepts (a `Get`/`Exists` 404) is **not** a failure — and, for a
+  terminal failure
   with no usable response (transport failure, cancellation, product-check
   failure),
   `context.Canceled` / `context.DeadlineExceeded` or the Go error type. Absent

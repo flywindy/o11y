@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -292,9 +293,11 @@ type responseState struct {
 	statusCode int
 	errored    bool
 	err        error
-	// esError records that RecordError fired with a *types.ElasticsearchError:
-	// the typed API decoded an ES error response the endpoint does not accept.
-	// It is the typed client's HTTP-failure signal (see httpFailed).
+	// esError records that RecordError fired for an ES response the typed
+	// endpoint rejected: a *types.ElasticsearchError from a Do terminator, or
+	// the generated rejected-status error from an IsSuccess terminator (see
+	// typedStatusError). It is the typed client's HTTP-failure signal (see
+	// httpFailed).
 	esError bool
 }
 
@@ -394,7 +397,7 @@ func (g instrumentation) RecordError(ctx context.Context, err error) {
 	if !ok {
 		return
 	}
-	if isTypedResponseError(err) {
+	if isTypedResponseError(err) || (g.cfg.typed && typedStatusError(err, st.statusCode)) {
 		st.esError = true
 		return
 	}
@@ -405,6 +408,37 @@ func (g instrumentation) RecordError(ctx context.Context, err error) {
 func isTypedResponseError(err error) bool {
 	var esErr *estypes.ElasticsearchError
 	return errors.As(err, &esErr)
+}
+
+// typedStatusErrorPattern matches the error the typed API's generated IsSuccess
+// terminators build for a rejected status (go-elasticsearch v8.19.3 typedapi,
+// identical across all 320 generated files):
+//
+//	fmt.Errorf("an error happened during the <Endpoint> query execution, status code: %d", res.StatusCode)
+//
+// Unlike the Do terminators, IsSuccess does not wrap the status in a
+// *types.ElasticsearchError, so this message is the only carrier of the fact
+// that the request returned a response the endpoint rejected. A compatibility
+// test pins the format (ADR 0006): an upstream change makes the typed IsSuccess
+// 500 test fail with a Go error type label instead of "500".
+var typedStatusErrorPattern = regexp.MustCompile(`^an error happened during the .+ query execution, status code: (\d+)$`)
+
+// typedStatusError reports whether err is the typed API's generated rejected-
+// status error for the response the request actually ended on: the message
+// matches typedStatusErrorPattern and its status equals the terminal status
+// stashed by AfterResponse. Both conditions must hold so a transport error (no
+// such message) or a stale status from an earlier retried attempt can never be
+// misread as an HTTP failure.
+func typedStatusError(err error, terminalStatus int) bool {
+	if err == nil || terminalStatus == 0 {
+		return false
+	}
+	m := typedStatusErrorPattern.FindStringSubmatch(err.Error())
+	if m == nil {
+		return false
+	}
+	code, convErr := strconv.Atoi(m[1])
+	return convErr == nil && code == terminalStatus
 }
 
 // Close runs once per request (deferred by the generated API, after any
@@ -447,9 +481,12 @@ func (g instrumentation) Close(ctx context.Context) {
 //   - Typed client: each generated endpoint carries an accept list from the API
 //     spec — Get, Delete, Exists, ClearScroll, ClosePointInTime, … return a 404
 //     as a normal result with a nil error — and surfaces only the statuses it
-//     does not accept as a *types.ElasticsearchError through RecordError. That
-//     RecordError is the exact failure signal, so an accepted status is a
-//     success and is not counted toward error rates (ADR 0027 §3).
+//     does not accept through RecordError: Do terminators as a
+//     *types.ElasticsearchError, IsSuccess terminators as the generated
+//     rejected-status error (typedStatusError). That RecordError is the exact
+//     failure signal, so an accepted status is a success and is not counted
+//     toward error rates, while a rejected one is classified by its HTTP
+//     status on both terminators (ADR 0027 §3).
 func (g instrumentation) httpFailed(st *responseState) bool {
 	if g.cfg.typed {
 		return st.esError
