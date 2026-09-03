@@ -740,9 +740,10 @@ The upstream is trace-only, so the **metric is SDK-owned** ([ADR
 call to its end (retries included), labeled with `db.system.name`,
 `db.operation.name` (the endpoint id — `search`, `bulk`, `index`, …),
 `db.collection.name` (the index), `server.address` / `server.port` (the node the
-final attempt was routed to), and `error.type` on failures — the HTTP status
-code as a string (`"429"`, `"500"`) when ES answered, or `context.Canceled` /
-`context.DeadlineExceeded` / the Go error type for a transport-level failure.
+final attempt was routed to), and on failures `error.type` — the HTTP status
+code as a string (`"429"`, `"500"`) when ES answered, paired with
+`db.response.status_code`, or `context.Canceled` / `context.DeadlineExceeded` /
+the Go error type (e.g. `*net.OpError`) for a transport-level failure.
 Unlike the span, the metric carries the current semconv keys. It is recorded
 whether or not the span is sampled, and its exemplar points at the ES span.
 

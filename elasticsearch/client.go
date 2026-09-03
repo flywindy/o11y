@@ -447,6 +447,14 @@ func (g instrumentation) metricAttrs(st *responseState) []attribute.KeyValue {
 	if errType := metricErrorType(st); errType != "" {
 		attrs = append(attrs, semconv.ErrorTypeKey.String(errType))
 	}
+	// semconv: when a domain defines its own status codes, set error.type to
+	// capture every failure AND record the domain attribute. For Elasticsearch
+	// db.response.status_code is the HTTP status; it is recorded on failed
+	// responses only (same bounded value set as error.type), never on success,
+	// so it adds no cardinality on the hot path.
+	if !st.errored && st.statusCode > 299 {
+		attrs = append(attrs, semconv.DBResponseStatusCode(strconv.Itoa(st.statusCode)))
+	}
 	return attrs
 }
 
@@ -484,16 +492,28 @@ func metricErrorType(st *responseState) string {
 // errorType classifies a terminal error for the error.type attribute,
 // preferring the stable context sentinels over the concrete Go type name
 // (same rule as the cassandra and redis packages).
+//
+// fmt wrappers are unwrapped first: the typed client's Perform wraps every
+// transport failure with fmt.Errorf("...: %w", err) before calling RecordError
+// (go-elasticsearch v8.19.3 typedapi), so without this every typed-client
+// transport failure would collapse into one "*fmt.wrapError" bucket instead of
+// the underlying failure class (e.g. "*net.OpError").
 func errorType(err error) string {
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
 		return "context.DeadlineExceeded"
 	case errors.Is(err, context.Canceled):
 		return "context.Canceled"
-	default:
-		if typ := reflect.TypeOf(err); typ != nil {
-			return typ.String()
-		}
-		return "_OTHER"
 	}
+	for err != nil {
+		typ := reflect.TypeOf(err)
+		if typ == nil {
+			break
+		}
+		if name := typ.String(); !strings.HasPrefix(name, "*fmt.") {
+			return name
+		}
+		err = errors.Unwrap(err)
+	}
+	return "_OTHER"
 }

@@ -110,9 +110,13 @@ const (
 	sdkCardinalityMethodBudget = 16
 	sdkCardinalityStatusBudget = 64
 
-	// sdkCardinalityCollectionBudget is the per-table envelope for the Cassandra
-	// query metrics: db.operation.name × server.address/port × error.type, the
-	// other bounded dimensions a db.collection.name series is multiplied by.
+	// sdkCardinalityCollectionBudget is the per-collection envelope for the
+	// Cassandra and Elasticsearch query metrics: db.operation.name ×
+	// server.address/port × error.type (× db.response.status_code for ES, which
+	// shares error.type's values), the other bounded dimensions a
+	// db.collection.name series is multiplied by. Elasticsearch has more endpoint
+	// ids than Cassandra has statement verbs, but a service exercises a handful
+	// per index; the route budget dominates at the shipped defaults anyway.
 	sdkCardinalityCollectionBudget = 128
 )
 

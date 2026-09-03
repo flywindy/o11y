@@ -654,7 +654,7 @@ by status + `http.response.status_code`.
 
 | Name | Kind | Unit | Attributes |
 |---|---|---|---|
-| `db.client.operation.duration` | Float64Histogram | `s` | `db.system.name`, `db.operation.name`, `db.collection.name` ‡, `server.address`, `server.port`, `error.type` (failures only). One sample per request, measured `Start → Close` (spans retries and the product check, like the span); scope `github.com/flywindy/o11y/elasticsearch`. |
+| `db.client.operation.duration` | Float64Histogram | `s` | `db.system.name`, `db.operation.name`, `db.collection.name` ‡, `server.address`, `server.port`, `error.type` (failures only), `db.response.status_code` (HTTP failures only). One sample per request, measured `Start → Close` (spans retries and the product check, like the span); scope `github.com/flywindy/o11y/elasticsearch`. |
 
 - `db.operation.name` is the endpoint id the generated API passes to the
   instrumentation (`search`, `bulk`, `index`, `indices.create`, …) — a fixed set.
@@ -668,6 +668,17 @@ by status + `http.response.status_code`.
   response (transport failure, cancellation, product-check failure),
   `context.Canceled` / `context.DeadlineExceeded` or the Go error type. Absent
   on success. A status stashed from an earlier retried attempt is never used.
+  Reported values (semconv asks for the list): `"300"`–`"599"`,
+  `context.Canceled`, `context.DeadlineExceeded`, the terminal transport
+  error's Go type unwrapped past `fmt` wrappers (`*net.OpError`,
+  `*net.DNSError`, `*tls.CertificateVerificationError`, `*url.Error`),
+  `*errors.errorString` (product-check failure), and typed-client decoder
+  types such as `*json.SyntaxError`.
+- `db.response.status_code` is the domain-specific status attribute semconv
+  recommends alongside `error.type`: for Elasticsearch it is the HTTP status of
+  the terminal response, recorded only when that status is `> 299` (so its
+  values equal the status branch of `error.type`, and successful requests add
+  no series).
 - `db.namespace` is **not** a metric label: the cluster name is only available
   from Elastic Cloud response headers.
 
@@ -693,6 +704,7 @@ build their own MeterProvider must register the views and a cap themselves.
 | `db.collection.name` (on spans) | The span records the index only as the `db.elasticsearch.path_parts.index` path variable; the transport never emits `db.collection.name` on the span (ADR 0020 §4 ‡). The metric derives it from that path part (ADR 0027 §4). |
 | `db.system.name` / `db.operation.name` / `db.query.text` / `db.operation.parameter.*` (on spans) | The current-semconv spellings are not emitted on the span; the facade inherits the legacy keys above rather than normalizing at the boundary (ADR 0020 §4, option (a)). The SDK-owned metric uses the current spellings. |
 | `db.namespace` (on the metric) | The cluster name is only available from Elastic Cloud response headers; not emitted as a metric label (ADR 0027 §3). |
+| `db.response.status_code` (on spans) | The facade records the terminal HTTP status on the span as `http.response.status_code` (ADR 0020 §4); the metric carries `db.response.status_code` on failures (ADR 0027 §3). Successful responses carry no status on the metric. |
 | Per-attempt / retry counter, transport gauges | Deferred with named triggers (ADR 0027 §8); `elasticsearch_exporter` covers server-side ES health. |
 
 ## Logs

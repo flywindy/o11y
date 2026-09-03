@@ -22,9 +22,10 @@ adopters can plan their upgrades.
   `MeterProvider`, labeled with the current semconv v1.39.0 keys —
   `db.system.name`, `db.operation.name` (endpoint id), `db.collection.name`
   (index), `server.address` / `server.port` (the node the final attempt was
-  routed to), and `error.type` on failures (the HTTP status code as a string
-  when Elasticsearch answered, otherwise `context.Canceled` /
-  `context.DeadlineExceeded` / the Go error type). The metric is recorded
+  routed to), and on failures `error.type` (the HTTP status code as a string
+  when Elasticsearch answered, paired with `db.response.status_code`;
+  otherwise `context.Canceled` / `context.DeadlineExceeded` / the Go error
+  type, unwrapped past the typed client's `fmt` wrapper). The metric is recorded
   whether or not the span is sampled and carries an exemplar pointing at the
   ES span. Recorded under the instrumentation scope
   `github.com/flywindy/o11y/elasticsearch`.

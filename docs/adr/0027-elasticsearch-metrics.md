@@ -93,6 +93,7 @@ pinned package source (see *Semconv verification* below).
 | `db.collection.name` | Conditionally Required | `RecordPathPart("index", …)` — see §4 | schema-shaped; capped by `o11y.WithMaxUniqueCollections` |
 | `server.address` / `server.port` | Recommended | `AfterRequest` — the request URL, which the transport rewrites in place on every attempt with the node it selected, so the value is the node the **terminal** attempt was routed to | the cluster's node set (fixed per deployment); omitted when the transport never selected a node |
 | `error.type` | Conditionally Required (failures only) | `RecordError` / `AfterResponse` — see below | bounded: HTTP status codes plus a handful of Go error types |
+| `db.response.status_code` | Recommended (failures only here) | `AfterResponse` — the terminal response's HTTP status as a string, only when it is `> 299` | HTTP status codes; identical value set to the status branch of `error.type` |
 
 **`error.type` classification.** Semconv asks for `error.type` only on failure
 and lets HTTP-level failures be classified by status code. The facade applies
@@ -110,6 +111,31 @@ the same terminal-outcome decision the span status uses (ADR 0020 §4):
   The typed API's `ElasticsearchError` (which runs `RecordError` after decoding
   the error body but still has a final response) falls in this branch, so a
   typed 400 and a low-level 400 label identically.
+
+**`db.response.status_code` accompanies `error.type` on HTTP failures.**
+semconv's `error.type` guidance says that when a domain defines its own status
+codes, instrumentation should record the domain-specific attribute *and* set
+`error.type` to capture every failure. For Elasticsearch the domain attribute is
+`db.response.status_code` (Recommended on `db.client.operation.duration`), whose
+value is the HTTP status. It is recorded only when the request returned a
+response with status `> 299` — never on success and never from a stale retried
+attempt — so its value set is exactly the status branch of `error.type` and it
+adds no cardinality. It is deliberately *not* set on success (semconv marks it
+Conditionally Required only "if the operation failed"), so a 200/201 split
+does not multiply series.
+
+**Reported `error.type` values.** semconv asks instrumentations to document the
+error classes they report. This package reports: HTTP status codes as strings
+(`"300"`–`"599"`); `context.Canceled` and `context.DeadlineExceeded`; the Go
+type of the terminal transport error, unwrapped past `fmt` wrappers
+(typically `*net.OpError`, `*net.DNSError`, `*tls.CertificateVerificationError`,
+`*url.Error`); `*errors.errorString` for the client's product-check failure
+(the upstream builds it with `errors.New`); and, on the typed client, a decoder
+error type (e.g. `*json.SyntaxError`) for an undecodable body. The `fmt`
+unwrapping matters because the typed client's `Perform` wraps every transport
+failure with `fmt.Errorf("…: %w", err)` before `RecordError`, which would
+otherwise collapse all typed-client transport failures into one
+`*fmt.wrapError` bucket (pinned by a test).
 
 **`db.namespace` is not emitted on the metric.** The upstream learns the cluster
 name only from Elastic Cloud response headers (`X-Found-Handling-Cluster`);
@@ -259,6 +285,7 @@ grepped: `$(go env GOMODCACHE)/go.opentelemetry.io/otel@v1.44.0/semconv/v1.39.0/
 | `ServerAddressKey` | `server.address` | — |
 | `ServerPortKey` | `server.port` | — |
 | `ErrorTypeKey` | `error.type` | — |
+| `DBResponseStatusCodeKey` | `db.response.status_code` | — (HTTP status for Elasticsearch) |
 | `DBNamespaceKey` (not emitted, §3) | `db.namespace` | `db.elasticsearch.cluster.name` |
 
 The Go code references these constants, never string literals
@@ -290,11 +317,14 @@ a `ManualReader`:
   unit `s`, with the exact §3 label set and **no** legacy span keys; exemplar
   span id equals the ES CLIENT span's;
 - `error.type` = `"500"` (low-level 5xx), `"400"` (typed `ElasticsearchError`),
-  the Go error type for a transport failure (asserted equal to the shared
-  classifier applied to the returned error, and not numeric),
-  `"context.Canceled"` for a caller cancellation, and present-but-not-`"200"`
+  each paired with the same `db.response.status_code`; `*net.OpError` for a
+  refused connection on both the low-level and the typed client (the latter
+  proves the `fmt` unwrapping), with no `db.response.status_code`;
+  `"context.Canceled"` for a caller cancellation; and present-but-not-`"200"`
   for a product-check failure on a 200;
-- a retried 503 → 200 is one sample with no `error.type`;
+- a retried 503 → 200 is one sample with no `error.type` and no
+  `db.response.status_code`; a retried 503 → transport error carries the
+  transport class and no stale `"503"`;
 - `db.collection.name` policy: single index, wildcard kept, multi-index
   omitted, no index omitted, `WithCollectionMetricLabel(false)` omits the label
   while the span keeps its path part;

@@ -43,6 +43,7 @@ func MetricViews(histogramBuckets []float64) []sdkmetric.View {
 					semconv.ServerAddressKey,
 					semconv.ServerPortKey,
 					semconv.ErrorTypeKey,
+					semconv.DBResponseStatusCodeKey,
 				),
 			},
 		),

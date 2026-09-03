@@ -447,7 +447,7 @@ at the `Instrumentation` seam §6 itself identified as the highest-value target 
 `db.client.operation.duration`, one sample per request from `Start` to `Close`,
 labeled with the current semconv v1.39.0 keys (`db.system.name`,
 `db.operation.name`, `db.collection.name`, `server.address`, `server.port`,
-`error.type`).
+`error.type`, and `db.response.status_code` on HTTP failures).
 
 What changes in this ADR's decisions:
 

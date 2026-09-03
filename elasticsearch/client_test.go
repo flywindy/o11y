@@ -744,6 +744,9 @@ func TestSearch_RecordsOperationDuration(t *testing.T) {
 	if _, ok := attrs[semconv.ErrorTypeKey]; ok {
 		t.Error("error.type present on a successful request; want absent")
 	}
+	if _, ok := attrs[semconv.DBResponseStatusCodeKey]; ok {
+		t.Error("db.response.status_code present on a successful request; want absent (failures only)")
+	}
 	// The metric is SDK-owned, so the legacy upstream keys must not leak in.
 	for _, legacy := range []attribute.Key{"db.system", "db.operation", "db.elasticsearch.path_parts.index", "url.full"} {
 		if _, ok := attrs[legacy]; ok {
@@ -788,6 +791,11 @@ func TestMetric_HTTPErrorClassifiedByStatus(t *testing.T) {
 	if got := attrs[semconv.ErrorTypeKey].AsString(); got != "500" {
 		t.Errorf("error.type = %q, want 500", got)
 	}
+	// The domain-specific status attribute accompanies error.type (semconv
+	// error.type guidance: record the domain attribute and error.type both).
+	if got := attrs[semconv.DBResponseStatusCodeKey].AsString(); got != "500" {
+		t.Errorf("db.response.status_code = %q, want 500", got)
+	}
 	if got := attrs[semconv.DBOperationNameKey].AsString(); got != "search" {
 		t.Errorf("db.operation.name = %q, want search (kept on failures)", got)
 	}
@@ -818,6 +826,9 @@ func TestMetric_TypedResponseErrorClassifiedByStatus(t *testing.T) {
 	attrs := dpAttrs(singleDataPoint(t, collectDuration(t, reader)))
 	if got := attrs[semconv.ErrorTypeKey].AsString(); got != "400" {
 		t.Errorf("error.type = %q, want 400", got)
+	}
+	if got := attrs[semconv.DBResponseStatusCodeKey].AsString(); got != "400" {
+		t.Errorf("db.response.status_code = %q, want 400", got)
 	}
 	if got := attrs[semconv.DBCollectionNameKey].AsString(); got != "my-index" {
 		t.Errorf("db.collection.name = %q, want my-index (typed .Do path records the index)", got)
@@ -857,6 +868,14 @@ func TestMetric_TransportErrorClassifiedByType(t *testing.T) {
 	}
 	if _, err := strconv.Atoi(attrs[semconv.ErrorTypeKey].AsString()); err == nil {
 		t.Error("error.type is a status code on a transport failure; want the error type")
+	}
+	// A refused connection surfaces from net.Dialer as *net.OpError on every
+	// platform; pin it so the classifier's output is a concrete, known bucket.
+	if got := attrs[semconv.ErrorTypeKey].AsString(); got != "*net.OpError" {
+		t.Errorf("error.type = %q, want *net.OpError", got)
+	}
+	if _, ok := attrs[semconv.DBResponseStatusCodeKey]; ok {
+		t.Error("db.response.status_code present on a transport failure; want absent (no response)")
 	}
 }
 
@@ -1136,6 +1155,7 @@ func TestMetricViews_BoundLabelsAndBuckets(t *testing.T) {
 	allowed := map[attribute.Key]bool{
 		semconv.DBSystemNameKey: true, semconv.DBOperationNameKey: true, semconv.DBCollectionNameKey: true,
 		semconv.ServerAddressKey: true, semconv.ServerPortKey: true, semconv.ErrorTypeKey: true,
+		semconv.DBResponseStatusCodeKey: true,
 	}
 	for _, kv := range dp.Attributes.ToSlice() {
 		if !allowed[kv.Key] {
@@ -1147,5 +1167,70 @@ func TestMetricViews_BoundLabelsAndBuckets(t *testing.T) {
 	views := MetricViews(buckets)
 	if _, matched := views[0](sdkmetric.Instrument{Name: "db.client.operation.duration"}); matched {
 		t.Error("view matched an unscoped db.client.operation.duration; it must be scoped to this package")
+	}
+}
+
+// TestMetric_TypedTransportErrorNotFmtWrapper: the typed client's Perform
+// wraps a transport failure with fmt.Errorf("...: %w", err) before calling
+// RecordError, so a naive type-name classifier would label every typed-client
+// transport failure "*fmt.wrapError" — one useless bucket instead of the
+// underlying failure class. The label must be the wrapped error's type.
+func TestMetric_TypedTransportErrorNotFmtWrapper(t *testing.T) {
+	tp, _ := recordingProvider()
+	mp, reader := recordingMeter()
+	client, err := NewTypedClient(elastic.Config{
+		Addresses:    []string{"http://127.0.0.1:1"},
+		MaxRetries:   0,
+		DisableRetry: true,
+	}, tp, mp)
+	if err != nil {
+		t.Fatalf("NewTypedClient: %v", err)
+	}
+	if _, err := client.Search().Index("my-index").Do(context.Background()); err == nil {
+		t.Fatal("typed Search.Do against unroutable address: got nil error, want failure")
+	}
+
+	attrs := dpAttrs(singleDataPoint(t, collectDuration(t, reader)))
+	if got := attrs[semconv.ErrorTypeKey].AsString(); got != "*net.OpError" {
+		t.Errorf("error.type = %q, want *net.OpError (the wrapped transport error), not a fmt wrapper", got)
+	}
+}
+
+// TestMetric_RetryThenTransportErrorNoStaleStatus asserts that a 503 retried
+// into a terminal transport error records the transport error class and no
+// db.response.status_code — the stale 503 from the earlier attempt must not
+// classify the caller's outcome (mirrors the span rule in ADR 0020 §4).
+func TestMetric_RetryThenTransportErrorNoStaleStatus(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.Header().Set("X-Elastic-Product", "Elasticsearch")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		if hj, ok := w.(http.Hijacker); ok {
+			if conn, _, err := hj.Hijack(); err == nil {
+				_ = conn.Close()
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	tp, _ := recordingProvider()
+	mp, reader := recordingMeter()
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp, mp)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if _, err := client.Search(client.Search.WithContext(context.Background()), client.Search.WithIndex("my-index")); err == nil {
+		t.Fatal("Search: want transport error after retries, got nil")
+	}
+
+	attrs := dpAttrs(singleDataPoint(t, collectDuration(t, reader)))
+	if got := attrs[semconv.ErrorTypeKey].AsString(); got == "" || got == "503" {
+		t.Errorf("error.type = %q, want a transport error class, not the stale 503", got)
+	}
+	if v, ok := attrs[semconv.DBResponseStatusCodeKey]; ok {
+		t.Errorf("db.response.status_code = %q, want absent (terminal outcome had no response)", v.AsString())
 	}
 }
