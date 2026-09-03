@@ -644,7 +644,13 @@ returned a response it records `http.response.status_code` and sets status =
 Error for status `> 299` — the same boundary as the client's own
 `esapi.Response.IsError`, so 3xx redirect/proxy errors are flagged alongside
 4xx/5xx. Successful calls are left **UNSET** (no forced `Ok`); a request retried
-from a 5xx to a 2xx is not marked Error. When `RecordError` already fired (a
+from a 5xx to a 2xx is not marked Error. **Typed client:** the generated
+endpoints accept some non-2xx statuses as normal results (a 404 from `Get`,
+`Delete`, `Exists`, `ClearScroll`, … returns with a nil error) and surface only
+rejected statuses as a `*types.ElasticsearchError` through `RecordError`; the
+facade follows that contract, so an accepted status is UNSET with
+`http.response.status_code` recorded, and only an `ElasticsearchError` is
+Error (ADR 0027 §3). When `RecordError` already fired (a
 terminal transport error, cancellation, or product-check failure) the facade
 defers to it and emits no status code, so a stale code from an earlier retried
 attempt is never reported. `error.type` is not synthesized — classify failures
@@ -663,9 +669,12 @@ by status + `http.response.status_code`.
   the transport never selected a node.
 - `error.type` follows the same terminal-outcome rule as the span status
   (ADR 0027 §3): the HTTP status code as a string (`"429"`, `"500"`, `"302"`)
-  when the request returned a response with status `> 299` — including the
-  typed API's `ElasticsearchError` — and, for a terminal failure with no usable
-  response (transport failure, cancellation, product-check failure),
+  when the response is an HTTP failure under the client API's own contract —
+  low-level: status `> 299` (`esapi.Response.IsError`); typed: the endpoint
+  surfaced it as an `ElasticsearchError`, so a status the endpoint accepts
+  (a `Get`/`Exists` 404) is **not** a failure — and, for a terminal failure
+  with no usable response (transport failure, cancellation, product-check
+  failure),
   `context.Canceled` / `context.DeadlineExceeded` or the Go error type. Absent
   on success. A status stashed from an earlier retried attempt is never used.
   Reported values (semconv asks for the list): `"300"`–`"599"`,
@@ -676,9 +685,9 @@ by status + `http.response.status_code`.
   types such as `*json.SyntaxError`.
 - `db.response.status_code` is the domain-specific status attribute semconv
   recommends alongside `error.type`: for Elasticsearch it is the HTTP status of
-  the terminal response, recorded only when that status is `> 299` (so its
-  values equal the status branch of `error.type`, and successful requests add
-  no series).
+  the terminal response, recorded only when that response is an HTTP failure
+  under the same rule (so its values equal the status branch of `error.type`,
+  and successful requests — accepted typed 404s included — add no series).
 - `db.namespace` is **not** a metric label: the cluster name is only available
   from Elastic Cloud response headers.
 

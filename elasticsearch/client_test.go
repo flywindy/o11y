@@ -1234,3 +1234,136 @@ func TestMetric_RetryThenTransportErrorNoStaleStatus(t *testing.T) {
 		t.Errorf("db.response.status_code = %q, want absent (terminal outcome had no response)", v.AsString())
 	}
 }
+
+// esStubWithBody is esStub with a caller-supplied JSON body, for typed-API
+// endpoints that decode the response even on an accepted non-2xx status.
+func esStubWithBody(t *testing.T, status int, body string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Elastic-Product", "Elasticsearch")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestTyped_AcceptedStatusIsNotAFailure pins the typed-client failure contract
+// (ADR 0027 §3, Codex review on PR #90): a status the generated endpoint accepts
+// as a normal result — Get returns a 404 with a nil error and Found=false — is a
+// success on both the span (status UNSET, http.response.status_code kept) and
+// the metric (no error.type, no db.response.status_code). Only a response the
+// endpoint surfaces as an ElasticsearchError counts as an HTTP failure.
+func TestTyped_AcceptedStatusIsNotAFailure(t *testing.T) {
+	srv := esStubWithBody(t, http.StatusNotFound, `{"_index":"my-index","_id":"1","found":false}`)
+	tp, rec := recordingProvider()
+	mp, reader := recordingMeter()
+	client, err := NewTypedClient(elastic.Config{Addresses: []string{srv.URL}}, tp, mp)
+	if err != nil {
+		t.Fatalf("NewTypedClient: %v", err)
+	}
+
+	res, err := client.Get("my-index", "1").Do(context.Background())
+	if err != nil {
+		t.Fatalf("typed Get.Do on 404: got error %v, want nil (404 is an accepted status for Get)", err)
+	}
+	if res.Found {
+		t.Fatal("typed Get.Do on 404: Found = true, want false")
+	}
+
+	spans := rec.Ended()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want 1", len(spans))
+	}
+	if got := spans[0].Status().Code; got != codes.Unset {
+		t.Errorf("span status = %v, want Unset (accepted 404 is not a failure)", got)
+	}
+	if got := attrMap(spans[0].Attributes())["http.response.status_code"].AsInt64(); got != http.StatusNotFound {
+		t.Errorf("http.response.status_code = %d, want 404 (still recorded for context)", got)
+	}
+
+	attrs := dpAttrs(singleDataPoint(t, collectDuration(t, reader)))
+	if v, ok := attrs[semconv.ErrorTypeKey]; ok {
+		t.Errorf("error.type = %q on an accepted 404; want absent", v.AsString())
+	}
+	if v, ok := attrs[semconv.DBResponseStatusCodeKey]; ok {
+		t.Errorf("db.response.status_code = %q on an accepted 404; want absent", v.AsString())
+	}
+	if got := attrs[semconv.DBOperationNameKey].AsString(); got != "get" {
+		t.Errorf("db.operation.name = %q, want get", got)
+	}
+}
+
+// TestTyped_IsSuccessPathFollowsEndpointContract covers the typed API's
+// IsSuccess terminator: Exists returns (false, nil) on 404 — a success — but
+// reports any other non-2xx as an error through RecordError, which the metric
+// classifies as a failure.
+func TestTyped_IsSuccessPathFollowsEndpointContract(t *testing.T) {
+	t.Run("404 accepted", func(t *testing.T) {
+		srv := esStub(t, http.StatusNotFound)
+		tp, rec := recordingProvider()
+		mp, reader := recordingMeter()
+		client, err := NewTypedClient(elastic.Config{Addresses: []string{srv.URL}}, tp, mp)
+		if err != nil {
+			t.Fatalf("NewTypedClient: %v", err)
+		}
+		exists, err := client.Exists("my-index", "1").IsSuccess(context.Background())
+		if err != nil || exists {
+			t.Fatalf("Exists.IsSuccess on 404 = (%v, %v), want (false, nil)", exists, err)
+		}
+		if got := rec.Ended()[0].Status().Code; got != codes.Unset {
+			t.Errorf("span status = %v, want Unset", got)
+		}
+		attrs := dpAttrs(singleDataPoint(t, collectDuration(t, reader)))
+		if v, ok := attrs[semconv.ErrorTypeKey]; ok {
+			t.Errorf("error.type = %q on an accepted 404; want absent", v.AsString())
+		}
+	})
+	t.Run("500 rejected", func(t *testing.T) {
+		srv := esStub(t, http.StatusInternalServerError)
+		tp, _ := recordingProvider()
+		mp, reader := recordingMeter()
+		client, err := NewTypedClient(elastic.Config{Addresses: []string{srv.URL}, DisableRetry: true}, tp, mp)
+		if err != nil {
+			t.Fatalf("NewTypedClient: %v", err)
+		}
+		if _, err := client.Exists("my-index", "1").IsSuccess(context.Background()); err == nil {
+			t.Fatal("Exists.IsSuccess on 500: want error, got nil")
+		}
+		attrs := dpAttrs(singleDataPoint(t, collectDuration(t, reader)))
+		if _, ok := attrs[semconv.ErrorTypeKey]; !ok {
+			t.Error("error.type absent on a rejected 500; want present")
+		}
+	})
+}
+
+// TestLowLevel_404FollowsIsError pins the low-level contract the typed rule is
+// deliberately not applied to: the low-level API returns every response as
+// (*Response, nil) and its own error test, esapi.Response.IsError, reports a
+// 404 as an error, so the facade does too (ADR 0020 §4). The asymmetry with the
+// typed client is documented, not accidental.
+func TestLowLevel_404FollowsIsError(t *testing.T) {
+	srv := esStub(t, http.StatusNotFound)
+	tp, rec := recordingProvider()
+	mp, reader := recordingMeter()
+	client, err := NewClient(elastic.Config{Addresses: []string{srv.URL}}, tp, mp)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	res, err := client.Get("my-index", "1", client.Get.WithContext(context.Background()))
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	_ = res.Body.Close()
+	if !res.IsError() {
+		t.Fatal("esapi.Response.IsError() = false on 404; the low-level contract changed")
+	}
+	if got := rec.Ended()[0].Status().Code; got != codes.Error {
+		t.Errorf("span status = %v, want Error (mirrors IsError)", got)
+	}
+	attrs := dpAttrs(singleDataPoint(t, collectDuration(t, reader)))
+	if got := attrs[semconv.ErrorTypeKey].AsString(); got != "404" {
+		t.Errorf("error.type = %q, want 404", got)
+	}
+}

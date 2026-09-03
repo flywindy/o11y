@@ -22,13 +22,13 @@ import (
 	"sync"
 
 	o11ycassandra "github.com/flywindy/o11y/cassandra"
-	o11yes "github.com/flywindy/o11y/elasticsearch"
 	"github.com/flywindy/o11y/internal/baggageattrs"
 	o11ylog "github.com/flywindy/o11y/internal/log"
 	"github.com/flywindy/o11y/internal/metrics"
 	"github.com/flywindy/o11y/internal/profiling"
 	"github.com/flywindy/o11y/internal/redact"
 	"github.com/flywindy/o11y/internal/trace"
+	"github.com/flywindy/o11y/internal/views"
 	o11yminio "github.com/flywindy/o11y/minio"
 	o11ymongo "github.com/flywindy/o11y/mongo"
 	o11yredis "github.com/flywindy/o11y/redis"
@@ -260,7 +260,10 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 					),
 					o11ycassandra.MetricViews(cfg.histogramBuckets)...,
 				),
-				o11yes.MetricViews(cfg.histogramBuckets)...,
+				// Elasticsearch's view comes from the driver-free leaf package so
+				// the root package does not link the go-elasticsearch client
+				// (ADR 0026 Option A, ADR 0027 §5).
+				views.Elasticsearch(cfg.histogramBuckets)...,
 			),
 			MaxUniqueRoutes:         cfg.maxUniqueRoutes,
 			MaxUniqueCollections:    cfg.maxUniqueCollections,

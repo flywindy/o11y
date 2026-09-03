@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/flywindy/o11y/internal/metricscap"
+	"github.com/flywindy/o11y/internal/views"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/contrib/instrumentation/runtime"
@@ -165,7 +166,7 @@ var cassandraCollectionInstruments = []capInstrument{
 // and its own budget: an Elasticsearch index name and a Cassandra table are
 // unrelated dimensions, so one integration's overflow must not evict the other's
 // values from the exported label set.
-const elasticsearchScope = "github.com/flywindy/o11y/elasticsearch"
+const elasticsearchScope = views.ElasticsearchScope
 
 // elasticsearchCollectionBudget is the distinct-value budget for the
 // Elasticsearch index label. Only one instrument carries it today; the budget

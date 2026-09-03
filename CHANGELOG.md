@@ -25,7 +25,11 @@ adopters can plan their upgrades.
   routed to), and on failures `error.type` (the HTTP status code as a string
   when Elasticsearch answered, paired with `db.response.status_code`;
   otherwise `context.Canceled` / `context.DeadlineExceeded` / the Go error
-  type, unwrapped past the typed client's `fmt` wrapper). The metric is recorded
+  type, unwrapped past the typed client's `fmt` wrapper). "Failure" follows
+  each client API's own contract: `esapi.Response.IsError` (status > 299) for
+  the low-level client, and for the typed client the endpoint's accept list —
+  a 404 from typed `Get`/`Delete`/`Exists` is a normal result and is not
+  counted, on the metric or the span. The metric is recorded
   regardless of span sampling; separately, the SDK's default trace-based
   exemplar filter attaches an exemplar pointing at the ES span only when that
   span is sampled. Recorded under the instrumentation scope
@@ -36,6 +40,12 @@ adopters can plan their upgrades.
   wildcard/alias is kept as written). Opt out for date-rolled index names.
 - `elasticsearch.MetricViews(buckets)`: scoped view applying the SDK histogram
   buckets and an allow-keys filter; composed into `o11y.Init` automatically.
+  The definition lives in the driver-free `internal/views` leaf package (ADR
+  0026 Option A, applied to this integration), so the root `o11y` package does
+  **not** link the go-elasticsearch client: `go list -deps .` stays at 591
+  packages rather than the 1,432 a direct import would add, and the ADR 0008
+  gate now fails if any `github.com/elastic/` package enters the root build
+  graph.
   `o11y.WithMaxUniqueCollections` now also caps the Elasticsearch index label at
   the export boundary, under its own budget separate from Cassandra's, on both
   the Prometheus and OTLP paths.

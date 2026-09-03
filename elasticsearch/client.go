@@ -19,13 +19,17 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/flywindy/o11y/internal/views"
 )
 
 // instrumentationName is the instrumentation scope the SDK-owned Elasticsearch
 // metrics are recorded under (ADR 0027 §5). Spans keep the upstream tracer
 // scope ("elasticsearch-api"): the first-party instrumentation owns them and the
-// facade only wraps its callbacks.
-const instrumentationName = "github.com/flywindy/o11y/elasticsearch"
+// facade only wraps its callbacks. The constant is defined in the driver-free
+// internal/views package so the root package and internal/metrics can name the
+// scope without importing the go-elasticsearch client.
+const instrumentationName = views.ElasticsearchScope
 
 // Option configures Elasticsearch instrumentation behavior.
 type Option func(*config)
@@ -36,6 +40,11 @@ type config struct {
 	// default: the zero-value config then means "shipped defaults", so a config
 	// literal built in a test cannot silently disagree with what NewClient does.
 	collectionMetricLabelDisabled bool
+	// typed records whether the instrumentation serves a typed client
+	// (NewTypedClient) rather than the low-level one. The two APIs expose ES
+	// HTTP error responses to the caller under different contracts, so the
+	// facade's failure classification follows each (see httpFailed).
+	typed bool
 }
 
 // collectionMetricLabel reports whether db.collection.name is recorded as a
@@ -134,7 +143,7 @@ func NewClient(
 	mp metric.MeterProvider,
 	opts ...Option,
 ) (*elastic.Client, error) {
-	if err := instrument(&cfg, tp, mp, opts...); err != nil {
+	if err := instrument(&cfg, tp, mp, false, opts...); err != nil {
 		return nil, fmt.Errorf("elasticsearch new client: %w", err)
 	}
 	client, err := elastic.NewClient(cfg)
@@ -154,7 +163,11 @@ func NewClient(
 //
 // Call typed requests with their .Do(ctx) terminator (e.g.
 // client.Search().Index("idx").Do(ctx)) to get a fully populated span and
-// metric sample. The lower-level .Perform(ctx) escape hatch is NOT fully
+// metric sample. Failure classification follows the typed API's own contract:
+// a status the generated endpoint accepts as a normal result (a 404 from Get,
+// Delete, Exists, ClearScroll, …, returned with a nil error) is a success on
+// both the span and the metric; only a response the endpoint surfaces as an
+// *types.ElasticsearchError is an HTTP failure. The lower-level .Perform(ctx) escape hatch is NOT fully
 // instrumented: in go-elasticsearch v8.19.3 typed Perform starts the span on a
 // shadowed local context and then builds the request with the original
 // context, so path parts, request attributes, error status, and the metric's
@@ -166,7 +179,7 @@ func NewTypedClient(
 	mp metric.MeterProvider,
 	opts ...Option,
 ) (*elastic.TypedClient, error) {
-	if err := instrument(&cfg, tp, mp, opts...); err != nil {
+	if err := instrument(&cfg, tp, mp, true, opts...); err != nil {
 		return nil, fmt.Errorf("elasticsearch new typed client: %w", err)
 	}
 	client, err := elastic.NewTypedClient(cfg)
@@ -186,7 +199,7 @@ func NewTypedClient(
 // NewOtelInstrumentation). Because tp is rejected when nil, the fallback never
 // fires and no otel.SetX call is on this path (ADR 0003). The meter is created
 // from mp directly; no global MeterProvider is consulted on any path.
-func instrument(cfg *elastic.Config, tp trace.TracerProvider, mp metric.MeterProvider, opts ...Option) error {
+func instrument(cfg *elastic.Config, tp trace.TracerProvider, mp metric.MeterProvider, typed bool, opts ...Option) error {
 	if tp == nil {
 		return errors.New("tracer provider must not be nil")
 	}
@@ -194,6 +207,7 @@ func instrument(cfg *elastic.Config, tp trace.TracerProvider, mp metric.MeterPro
 		return errors.New("meter provider must not be nil")
 	}
 	c := newConfig(opts)
+	c.typed = typed
 	inst, err := newInstruments(mp.Meter(instrumentationName, metric.WithSchemaURL(semconv.SchemaURL)))
 	if err != nil {
 		return err
@@ -278,6 +292,10 @@ type responseState struct {
 	statusCode int
 	errored    bool
 	err        error
+	// esError records that RecordError fired with a *types.ElasticsearchError:
+	// the typed API decoded an ES error response the endpoint does not accept.
+	// It is the typed client's HTTP-failure signal (see httpFailed).
+	esError bool
 }
 
 func stateFromContext(ctx context.Context) (*responseState, bool) {
@@ -372,13 +390,16 @@ func (g instrumentation) AfterResponse(ctx context.Context, res *http.Response) 
 // can classify it into error.type.
 func (g instrumentation) RecordError(ctx context.Context, err error) {
 	g.Instrumentation.RecordError(ctx, err)
-	if isTypedResponseError(err) {
+	st, ok := stateFromContext(ctx)
+	if !ok {
 		return
 	}
-	if st, ok := stateFromContext(ctx); ok {
-		st.errored = true
-		st.err = err
+	if isTypedResponseError(err) {
+		st.esError = true
+		return
 	}
+	st.errored = true
+	st.err = err
 }
 
 func isTypedResponseError(err error) bool {
@@ -405,13 +426,35 @@ func (g instrumentation) Close(ctx context.Context) {
 		if !st.errored && st.statusCode != 0 {
 			if span := trace.SpanFromContext(ctx); span.IsRecording() {
 				span.SetAttributes(semconv.HTTPResponseStatusCode(st.statusCode))
-				if st.statusCode > 299 {
+				if g.httpFailed(st) {
 					span.SetStatus(codes.Error, http.StatusText(st.statusCode))
 				}
 			}
 		}
 	}
 	g.Instrumentation.Close(ctx)
+}
+
+// httpFailed reports whether a request that returned a response (no terminal
+// RecordError from a transport/product-check failure) is an ES HTTP failure.
+// The decision follows the contract each client API exposes to its caller, so
+// the span status and the metric's error.type agree with what the caller sees:
+//
+//   - Low-level client: the API returns every response as (*Response, nil) and
+//     offers esapi.Response.IsError (status > 299) as its error test, so that
+//     boundary is used (ADR 0020 §4). A 404 from client.Get is therefore a
+//     failure here, as IsError reports it.
+//   - Typed client: each generated endpoint carries an accept list from the API
+//     spec — Get, Delete, Exists, ClearScroll, ClosePointInTime, … return a 404
+//     as a normal result with a nil error — and surfaces only the statuses it
+//     does not accept as a *types.ElasticsearchError through RecordError. That
+//     RecordError is the exact failure signal, so an accepted status is a
+//     success and is not counted toward error rates (ADR 0027 §3).
+func (g instrumentation) httpFailed(st *responseState) bool {
+	if g.cfg.typed {
+		return st.esError
+	}
+	return st.statusCode > 299
 }
 
 // recordDuration records the db.client.operation.duration sample for a request.
@@ -445,7 +488,7 @@ func (g instrumentation) metricAttrs(st *responseState) []attribute.KeyValue {
 			attrs = append(attrs, semconv.ServerPort(st.server.port))
 		}
 	}
-	if errType := metricErrorType(st); errType != "" {
+	if errType := g.metricErrorType(st); errType != "" {
 		attrs = append(attrs, semconv.ErrorTypeKey.String(errType))
 	}
 	// semconv: when a domain defines its own status codes, set error.type to
@@ -453,7 +496,7 @@ func (g instrumentation) metricAttrs(st *responseState) []attribute.KeyValue {
 	// db.response.status_code is the HTTP status; it is recorded on failed
 	// responses only (same bounded value set as error.type), never on success,
 	// so it adds no cardinality on the hot path.
-	if !st.errored && st.statusCode > 299 {
+	if !st.errored && st.statusCode != 0 && g.httpFailed(st) {
 		attrs = append(attrs, semconv.DBResponseStatusCode(strconv.Itoa(st.statusCode)))
 	}
 	return attrs
@@ -476,15 +519,15 @@ func singleIndex(index string) string {
 //   - A terminal error reported by RecordError (transport failure, context
 //     cancellation, product-check failure) is classified like the SDK's other
 //     integrations: the stable context sentinels, else the Go error type.
-//   - An ES HTTP error response — including a typed-API ElasticsearchError,
-//     which still has a final response — is classified by its status code as a
-//     string ("429", "500"), the HTTP client semconv's error.type convention,
-//     with the same > 299 boundary the span status uses.
-func metricErrorType(st *responseState) string {
+//   - An ES HTTP error response — per the client API's own contract, see
+//     httpFailed — is classified by its status code as a string ("429",
+//     "500"), the HTTP client semconv's error.type convention, so it matches
+//     the span status decision exactly.
+func (g instrumentation) metricErrorType(st *responseState) string {
 	switch {
 	case st.errored:
 		return errorType(st.err)
-	case st.statusCode > 299:
+	case st.statusCode != 0 && g.httpFailed(st):
 		return strconv.Itoa(st.statusCode)
 	}
 	return ""

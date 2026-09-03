@@ -106,11 +106,26 @@ the same terminal-outcome decision the span status uses (ADR 0020 §4):
   the cassandra and redis packages use. A status code stashed from an earlier
   retried attempt is **never** used here (it would be stale).
 - Otherwise the request returned a response: `error.type` is the status code
-  as a string (`"429"`, `"500"`, `"302"`) when it is `> 299` — the boundary
-  `esapi.Response.IsError` and the span status share — and absent on success.
-  The typed API's `ElasticsearchError` (which runs `RecordError` after decoding
-  the error body but still has a final response) falls in this branch, so a
-  typed 400 and a low-level 400 label identically.
+  as a string (`"429"`, `"500"`, `"302"`) when the response is an **HTTP
+  failure under the client API's own contract**, and absent otherwise. The two
+  APIs expose ES error responses differently, so the facade follows each
+  (`httpFailed`), and the span status uses the same decision:
+  - **Low-level client** (`NewClient`): every response is returned as
+    `(*Response, nil)` and the API's own error test is
+    `esapi.Response.IsError` (status `> 299`), so that boundary is used
+    (ADR 0020 §4). A 404 from `client.Get` is a failure here, as `IsError`
+    reports it to the caller.
+  - **Typed client** (`NewTypedClient`): each generated endpoint carries an
+    accept list from the API spec — `Get`, `Delete`, `Exists`, `ClearScroll`,
+    `ClosePointInTime`, and hundreds more return a 404 as a normal result with a
+    nil error (`slices.Contains([]int{404}, res.StatusCode)` in v8.19.3's
+    generated `Do`) — and surfaces only the statuses it does not accept as a
+    `*types.ElasticsearchError` through `RecordError`. That `RecordError` is the
+    exact failure signal, so an **accepted status is a success**: no
+    `error.type`, no `db.response.status_code`, span status UNSET (the span
+    keeps `http.response.status_code` for context). Without this rule every
+    not-found lookup would count toward error rates. The typed 400/500 case
+    still labels identically to the low-level one.
 
 **`db.response.status_code` accompanies `error.type` on HTTP failures.**
 semconv's `error.type` guidance says that when a domain defines its own status
@@ -188,20 +203,35 @@ Callers who want per-index bulk series should set the index on the request.
 ### 5. Instrumentation scope, views, and `o11y.Init` wiring
 
 - The meter is created from the supplied `MeterProvider` under the scope
-  `github.com/flywindy/o11y/elasticsearch` (constant `instrumentationName`,
-  schema URL semconv v1.39.0). Spans keep the upstream tracer scope
-  (`elasticsearch-api`); the two are independent.
-- `elasticsearch.MetricViews(histogramBuckets)` returns a view scoped to that
-  instrumentation scope that (a) applies the SDK's bucket policy
-  (`WithHistogramBuckets`) instead of OTel's millisecond defaults and (b)
-  installs an allow-keys filter for exactly the §3 label set. The scope filter
-  matters because `db.client.operation.duration` is also emitted by the Redis,
-  MongoDB, and Cassandra wrappers; an unscoped view would create a duplicate,
-  conflicting stream.
-- `o11y.Init` composes the views into `internal/metrics.Config.ExtraViews`
-  alongside the redis/mongo/minio/cassandra views, and `internal/metrics`
-  registers the §4 cap rule. Services that build their own `MeterProvider`
-  must register `MetricViews` via `sdkmetric.WithView(...)` and an equivalent
+  `github.com/flywindy/o11y/elasticsearch` (constant
+  `views.ElasticsearchScope`, schema URL semconv v1.39.0). Spans keep the
+  upstream tracer scope (`elasticsearch-api`); the two are independent.
+- **The view definition lives in the driver-free leaf package
+  `internal/views`** (`views.Elasticsearch(histogramBuckets)`), which imports
+  only OpenTelemetry; `elasticsearch.MetricViews` is a one-line public
+  re-export. This applies ADR 0026 Option A to this integration ahead of that
+  ADR's decision, for a concrete reason: the root package had never linked
+  `go-elasticsearch` (the integration was trace-only), and importing the
+  `elasticsearch` package from `o11y.go` for its view alone would have made the
+  client — 841 generated typed-API packages — a compile-time dependency of
+  every consumer of the root package. Measured with `go list -deps .`: 590
+  packages on `main`, 1,432 with the direct import, **591 with the leaf
+  package** (the one addition is `internal/views` itself), and zero
+  `github.com/elastic/*` packages. `scripts/check_integrations.go` now asserts
+  the root package's build graph contains no `github.com/elastic/` package, so
+  the edge cannot return unnoticed. The other four integrations' views stay
+  where ADR 0026 finds them; moving them is that ADR's decision.
+- The view (a) applies the SDK's bucket policy (`WithHistogramBuckets`)
+  instead of OTel's millisecond defaults and (b) installs an allow-keys filter
+  for exactly the §3 label set. The scope filter matters because
+  `db.client.operation.duration` is also emitted by the Redis, MongoDB, and
+  Cassandra wrappers; an unscoped view would create a duplicate, conflicting
+  stream.
+- `o11y.Init` composes `views.Elasticsearch` into
+  `internal/metrics.Config.ExtraViews` alongside the redis/mongo/minio/cassandra
+  views, and `internal/metrics` registers the §4 cap rule keyed on the same
+  scope constant. Services that build their own `MeterProvider` must register
+  `elasticsearch.MetricViews` via `sdkmetric.WithView(...)` and an equivalent
   cardinality cap themselves.
 
 ### 6. Public API: `MeterProvider` becomes a positional parameter (breaking)
@@ -302,7 +332,10 @@ The Go code references these constants, never string literals
   satisfy the gate.
 - **ADR 0008 §5 table**: Elasticsearch row amended ("trace-only, metrics
   deferred" → "plus SDK-owned `db.client.operation.duration`, ADR 0027").
-- **ADR 0020**: amendment recorded (§3 signature, §6 superseded).
+- **ADR 0020**: amendment recorded (§3 signature, §6 superseded, §4 span
+  status refined for typed accepted statuses).
+- **ADR 0008 §7 gate**: `scripts/check_integrations.go` gains the root
+  build-graph check described in §5.
 - **`docs/semconv.md`**: Instruments table added to the Elasticsearch section;
   the "Any Elasticsearch metric" not-emitted row removed.
 
@@ -325,6 +358,10 @@ a `ManualReader`:
 - a retried 503 → 200 is one sample with no `error.type` and no
   `db.response.status_code`; a retried 503 → transport error carries the
   transport class and no stale `"503"`;
+- typed-client accepted statuses: a `Get` 404 (`Do`) and an `Exists` 404
+  (`IsSuccess`) are successes on span and metric, an `Exists` 500 is a failure,
+  and a low-level `Get` 404 stays a failure per `IsError` — pinning the
+  documented asymmetry;
 - `db.collection.name` policy: single index, wildcard kept, multi-index
   omitted, no index omitted, `WithCollectionMetricLabel(false)` omits the label
   while the span keeps its path part;

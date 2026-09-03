@@ -458,9 +458,16 @@ What changes in this ADR's decisions:
   no-propagator decision stands.
 - **§6 and §7 ("Any SDK-owned ES metrics").** Superseded by ADR 0027 §2–§5.
   Per-attempt counters and transport gauges remain deferred there (§8).
-- **§4 (unchanged).** The span side is untouched: the upstream still emits the
-  legacy keys on its span and the facade still normalizes only status; the
-  metric does not inherit that drift because it is SDK-owned.
+- **§4 span status, refined for the typed client.** The `> 299` boundary
+  mirrors `esapi.Response.IsError` and stays the rule for the low-level client.
+  For the typed client the generated endpoints accept some non-2xx statuses as
+  normal results (a 404 from `Get`, `Delete`, `Exists`, … returns with a nil
+  error) and surface only rejected statuses as a `*types.ElasticsearchError`
+  through `RecordError`; the facade now uses that signal, so an accepted status
+  leaves the typed span UNSET (with `http.response.status_code` still
+  recorded) instead of Error. The attribute keys are otherwise untouched: the
+  upstream still emits the legacy spellings on its span, and the metric does not
+  inherit that drift because it is SDK-owned (ADR 0027 §3).
 - **Open question 2** ("client-attributed bulk-indexing metrics — deferred") is
   now resolved by ADR 0027, including the bulk caveat that the index label is
   present only when the bulk call sets `WithIndex`.

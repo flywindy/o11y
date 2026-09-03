@@ -743,7 +743,11 @@ call to its end (retries included), labeled with `db.system.name`,
 final attempt was routed to), and on failures `error.type` — the HTTP status
 code as a string (`"429"`, `"500"`) when ES answered, paired with
 `db.response.status_code`, or `context.Canceled` / `context.DeadlineExceeded` /
-the Go error type (e.g. `*net.OpError`) for a transport-level failure.
+the Go error type (e.g. `*net.OpError`) for a transport-level failure. "Failure"
+follows each client API's own contract: the low-level client's
+`esapi.Response.IsError` (status > 299), and for the typed client the
+endpoint's accept list — a 404 from typed `Get`, `Delete`, or `Exists` is a
+normal result, not an error, on both the metric and the span.
 Unlike the span, the metric carries the current semconv keys. It is recorded
 whether or not the span is sampled, and its exemplar points at the ES span.
 
