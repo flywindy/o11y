@@ -80,10 +80,11 @@ func WithSearchBody(enabled bool) Option {
 //
 // Bounding: MetricViews' allow-keys filter governs which keys reach the series,
 // and o11y.WithMaxUniqueCollections collapses index values beyond its cap to
-// "other". The cap lives in the SDK's export pipeline, so it applies only to a
-// MeterProvider built by o11y.Init. A caller passing their own MeterProvider to
-// NewClient gets the view (it travels with MetricViews) but not the cap, and
-// should register an equivalent cap or a cardinality limit on that provider.
+// "other". Both are attached to the MeterProvider o11y.Init builds; neither
+// travels with the mp argument. A caller passing their own SDK MeterProvider to
+// NewClient must register elasticsearch.MetricViews(...) on that provider (via
+// sdkmetric.WithView) to get the bucket and allow-keys views, and should add an
+// equivalent cap or a cardinality limit on that provider for this label.
 func WithCollectionMetricLabel(enabled bool) Option {
 	return func(cfg *config) {
 		cfg.collectionMetricLabelDisabled = !enabled

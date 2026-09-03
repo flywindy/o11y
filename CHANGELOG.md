@@ -26,8 +26,9 @@ adopters can plan their upgrades.
   when Elasticsearch answered, paired with `db.response.status_code`;
   otherwise `context.Canceled` / `context.DeadlineExceeded` / the Go error
   type, unwrapped past the typed client's `fmt` wrapper). The metric is recorded
-  whether or not the span is sampled and carries an exemplar pointing at the
-  ES span. Recorded under the instrumentation scope
+  regardless of span sampling; separately, the SDK's default trace-based
+  exemplar filter attaches an exemplar pointing at the ES span only when that
+  span is sampled. Recorded under the instrumentation scope
   `github.com/flywindy/o11y/elasticsearch`.
 - `elasticsearch.WithCollectionMetricLabel(bool)` (default `true`): controls the
   `db.collection.name` metric label. The label is emitted only when a request
