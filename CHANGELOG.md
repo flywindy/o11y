@@ -13,6 +13,10 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+---
+
+## [0.12.0] - 2026-09-04
+
 ### Added
 
 - `elasticsearch`: SDK-owned `db.client.operation.duration` histogram
