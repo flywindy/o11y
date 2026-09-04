@@ -709,6 +709,7 @@ import (
 client, err := o11ies.NewClient(
     elastic.Config{Addresses: []string{"http://localhost:9200"}},
     obs.TracerProvider(),
+    obs.MeterProvider(),
 )
 if err != nil {
     obs.Logger.ErrorContext(ctx, "Elasticsearch client failed", slog.Any("error", err))
@@ -725,20 +726,53 @@ if err != nil {
 defer res.Body.Close()
 ```
 
-The integration is **trace-only** (no `MeterProvider` or propagator parameter):
-the upstream instrumentation accepts only a `TracerProvider`, and it does not
-propagate trace context toward Elasticsearch. `tp` is required and rejected when
-nil — the facade never falls back to the global `TracerProvider`. Spans are
-named per the cross-package convention, e.g. `elasticsearch.search my-index`,
-and an ES HTTP error response (4xx/5xx, or a 3xx redirect) is reflected as span
-status Error with `http.response.status_code`.
+Spans come from the upstream instrumentation on the SDK `TracerProvider`; it
+does not propagate trace context toward Elasticsearch, so there is no propagator
+parameter. Both `tp` and `mp` are required and rejected when nil — the facade
+never falls back to the global providers. Spans are named per the cross-package
+convention, e.g. `elasticsearch.search my-index`, and an ES HTTP error response
+(4xx/5xx, or a 3xx redirect) is reflected as span status Error with
+`http.response.status_code`.
+
+The upstream is trace-only, so the **metric is SDK-owned** ([ADR
+0027](adr/0027-elasticsearch-metrics.md)): every request records one
+`db.client.operation.duration` sample on `mp`, measured from the start of the
+call to its end (retries included), labeled with `db.system.name`,
+`db.operation.name` (the endpoint id — `search`, `bulk`, `index`, …),
+`db.collection.name` (the index), `server.address` / `server.port` (the node the
+final attempt was routed to), and on failures `error.type` — the HTTP status
+code as a string (`"429"`, `"500"`) when ES answered, paired with
+`db.response.status_code`, or `context.Canceled` / `context.DeadlineExceeded` /
+the Go error type (e.g. `*net.OpError`) for a transport-level failure. "Failure"
+follows each client API's own contract: the low-level client's
+`esapi.Response.IsError` (status > 299), and for the typed client the
+endpoint's accept list — a 404 from typed `Get`, `Delete`, or `Exists` is a
+normal result, not an error, on both the metric and the span.
+Unlike the span, the metric carries the current semconv keys. It is recorded
+whether or not the span is sampled, and its exemplar points at the ES span.
+
+`db.collection.name` is on by default and emitted only when the request
+addresses a single index (no index, or a comma-separated list, omits it; a
+wildcard such as `logs-*` is kept). Because Elasticsearch index names often roll
+by date, opt out when yours do:
+
+```go
+client, err := o11ies.NewClient(cfg, obs.TracerProvider(), obs.MeterProvider(),
+    o11ies.WithCollectionMetricLabel(false))
+```
+
+`o11y.WithMaxUniqueCollections` additionally caps the distinct index values at
+the export boundary (overflow becomes `"other"`), under a budget separate from
+Cassandra's. Note that `client.Bulk` carries the index label only when the call
+sets `WithIndex`; a bulk body that names the index per action line records
+`db.operation.name="bulk"` with no index.
 
 Search query **bodies** are not captured by default, because they can be large
 and may carry user-supplied terms (PII). Opt in only when that data is safe for
 your trace backend:
 
 ```go
-client, err := o11ies.NewClient(cfg, obs.TracerProvider(), o11ies.WithSearchBody(true))
+client, err := o11ies.NewClient(cfg, obs.TracerProvider(), obs.MeterProvider(), o11ies.WithSearchBody(true))
 ```
 
 `WithSearchBody` governs only the request *body* (`db.statement`). The span's

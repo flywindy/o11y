@@ -147,7 +147,7 @@ ADR:
 | `resty/` | (planned T3) | **Justified T3** (no maintained otelresty passes §2) | ADR 0011 (forthcoming) |
 | Future: gRPC | n/a | T2 over `otelgrpc` | future ADR |
 | Cassandra (`gocql`) | n/a | **Justified T3** — SDK-owned observers. The `otelgocql` contrib module this row originally predicted was **removed** in contrib v1.19.0 and emitted pre-stable semconv, so no candidate passes §2. | ADR 0019 |
-| Elasticsearch (`go-elasticsearch/v8`) | n/a | T2 over the client's first-party OTel instrumentation (`elastic-transport-go`); trace-only, metrics deferred per the ADR 0004 posture. | ADR 0020 |
+| Elasticsearch (`go-elasticsearch/v8`) | n/a | T2 over the client's first-party OTel instrumentation (`elastic-transport-go`) for spans, plus a **justified-T3** SDK-owned `db.client.operation.duration` recorded at the same `Instrumentation` seam (the upstream is trace-only and no candidate metric library exists). | ADR 0020, ADR 0027 |
 | Future: Redis (`go-redis`) | n/a | T2 over `redisotel` (built into `go-redis` v9) | future ADR |
 | Future: Valkey (`valkey-go`) | n/a | T2 over the upstream OTel hook, kept **architecturally consistent with Redis**: same package shape, same option names, same metric naming. Valkey and Redis differ at the protocol-fork level but at this SDK's API surface they should be interchangeable. | future ADR |
 | Future: pgx | n/a | T2 over `otelpgx` | future ADR |

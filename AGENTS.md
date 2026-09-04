@@ -45,6 +45,7 @@ so that every log entry is automatically enriched with `traceId` and `spanId`.
 | `gin/` | T2 facade over `otelgin` plus typed gin error recording |
 | `nats/` | T2 facade over NATS Core and JetStream instrumentation |
 | `mongo/` | T2 facade over MongoDB driver instrumentation plus SDK-owned pool metrics |
+| `elasticsearch/` | T2 facade over go-elasticsearch's first-party OTel tracing plus an SDK-owned `db.client.operation.duration` (justified T3, ADR 0027) |
 | `redis/` | SDK-owned Redis/Valkey instrumentation over go-redis/v9 |
 | `internal/` | SDK-owned logging, tracing, metrics, and test utilities |
 | `examples/` | Runnable examples for supported integrations; `examples/README.md` documents how to run each |
@@ -251,6 +252,7 @@ Full ADR documents live in [`docs/adr/`](docs/adr/).
 | HTTP integration | `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` — wrapped by the `http/` package | Provides `NewServerHandler` and `NewTransport` with SDK providers and propagator wired explicitly. See [ADR 0009](docs/adr/0009-replace-http-with-otelhttp.md) |
 | Gin integration | `go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin` — wrapped by the `gin/` package | Provides canonical middleware ordering and typed `gin.error.type` events for `c.Errors`. See [ADR 0010](docs/adr/0010-gin-integration.md) |
 | Redis / Valkey integration | SDK-owned bounded T3 wrapper over `github.com/redis/go-redis/v9` | Avoids legacy `redisotel` semconv and sensitive defaults while emitting SDK-controlled spans, metrics, and views. See [ADR 0013](docs/adr/0013-redis-valkey-integration.md) |
+| Elasticsearch integration | T2 facade over `go-elasticsearch/v8`'s first-party OTel tracing (`elastic-transport-go`), plus an SDK-owned `db.client.operation.duration` recorded at the same `Instrumentation` seam | The upstream is trace-only and emits legacy span keys (accepted and pinned); the metric is SDK-owned so it carries current semconv keys, is unsampled, and shares the cross-integration histogram. `NewClient(cfg, tp, mp, opts...)`. See [ADR 0020](docs/adr/0020-elasticsearch-integration.md) and [ADR 0027](docs/adr/0027-elasticsearch-metrics.md) |
 
 ---
 

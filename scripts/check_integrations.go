@@ -10,6 +10,7 @@ import (
 	"go/token"
 	"go/types"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -31,6 +32,7 @@ func main() {
 	errs = append(errs, checkGoModIntegrations()...)
 	errs = append(errs, checkTierAnnotations()...)
 	errs = append(errs, checkNoGlobalSetters()...)
+	errs = append(errs, checkRootDoesNotLinkDrivers()...)
 	if len(errs) > 0 {
 		for _, err := range errs {
 			fmt.Fprintln(os.Stderr, err)
@@ -263,4 +265,34 @@ func shouldSkipDir(name string) bool {
 	default:
 		return false
 	}
+}
+
+// rootForbiddenDepPrefixes are module paths the root o11y package must never
+// link. The root package composes every integration's metric views into
+// o11y.Init; a view that lives beside its driver would make that driver a
+// compile-time dependency of every consumer of the root package, even one that
+// never uses the integration (ADR 0026 Option A). Elasticsearch is the first
+// integration held to this: its view lives in the driver-free internal/views
+// package (ADR 0027 §5), and this check keeps it that way.
+var rootForbiddenDepPrefixes = []string{
+	"github.com/elastic/",
+}
+
+// checkRootDoesNotLinkDrivers asserts, via the build graph rather than source
+// imports, that the root package's transitive dependencies contain none of
+// rootForbiddenDepPrefixes.
+func checkRootDoesNotLinkDrivers() []error {
+	out, err := exec.Command("go", "list", "-deps", "-f", "{{.ImportPath}}", ".").Output()
+	if err != nil {
+		return []error{fmt.Errorf("go list -deps .: %w", err)}
+	}
+	var errs []error
+	for _, dep := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		for _, prefix := range rootForbiddenDepPrefixes {
+			if strings.HasPrefix(dep, prefix) {
+				errs = append(errs, fmt.Errorf("root package links %s: integration drivers must stay out of the root package's dependency graph (ADR 0026 Option A / ADR 0027 §5)", dep))
+			}
+		}
+	}
+	return errs
 }

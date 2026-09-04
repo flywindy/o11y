@@ -9,8 +9,10 @@
 // docker.elastic.co/elasticsearch/elasticsearch:8.19.3`). It loops through
 // Index → Search every few seconds so each request appears as a
 // SpanKindClient span carrying the upstream's db.system / db.operation /
-// db.elasticsearch.path_parts.* attributes. WithSearchBody(true) additionally
-// records the search query body as db.statement.
+// db.elasticsearch.path_parts.* attributes and records one
+// db.client.operation.duration sample labeled by operation and index.
+// WithSearchBody(true) additionally records the search query body as
+// db.statement.
 package main
 
 import (
@@ -75,10 +77,11 @@ func run(ctx context.Context) error {
 		Password:  os.Getenv("ELASTICSEARCH_PASSWORD"),
 	}
 
-	// Trace-only: the facade takes the TracerProvider and nothing else
-	// (ADR 0020 §3/§6). WithSearchBody(true) opts into recording search
-	// query bodies as db.statement.
-	client, err := o11yes.NewClient(cfg, obs.TracerProvider(), o11yes.WithSearchBody(true))
+	// Spans come from the client's first-party instrumentation on the SDK
+	// TracerProvider; the SDK-owned db.client.operation.duration histogram is
+	// recorded on the SDK MeterProvider (ADR 0027). WithSearchBody(true) opts
+	// into recording search query bodies as db.statement.
+	client, err := o11yes.NewClient(cfg, obs.TracerProvider(), obs.MeterProvider(), o11yes.WithSearchBody(true))
 	if err != nil {
 		return fmt.Errorf("construct Elasticsearch client: %w", err)
 	}

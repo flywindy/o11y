@@ -174,9 +174,11 @@ request appears as a `SpanKindClient` span carrying the upstream's `db.system`
 / `db.operation` / `db.elasticsearch.path_parts.*` attributes (legacy semconv
 keys, see [`docs/semconv.md`](../docs/semconv.md)). It builds the client with
 `WithSearchBody(true)`, so the search query body is recorded as `db.statement`.
-The integration is trace-only (ADR 0020 §6). Override the endpoint and
-credentials via `ELASTICSEARCH_URL`, `ELASTICSEARCH_USERNAME`, and
-`ELASTICSEARCH_PASSWORD`.
+Each request also records one SDK-owned `db.client.operation.duration` sample
+labeled `db_operation_name="index"` / `"search"` and
+`db_collection_name="o11y-demo"` (ADR 0027), visible in Prometheus once the
+push reaches the Collector. Override the endpoint and credentials via
+`ELASTICSEARCH_URL`, `ELASTICSEARCH_USERNAME`, and `ELASTICSEARCH_PASSWORD`.
 
 ### Cassandra
 

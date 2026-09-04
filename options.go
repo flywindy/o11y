@@ -570,17 +570,24 @@ func WithMaxUniqueRoutes(n int) Option {
 
 // WithMaxUniqueCollections sets the distinct db.collection.name export cap for
 // the Cassandra client metrics (db.client.operation.duration and
-// cassandra.query.attempts). Values <= 0 use DefaultMaxUniqueCollections.
+// cassandra.query.attempts) and the Elasticsearch client metric
+// (db.client.operation.duration, where the collection is the index). Values
+// <= 0 use DefaultMaxUniqueCollections. Each integration has its own budget of
+// n values, so an Elasticsearch overflow never evicts Cassandra tables or vice
+// versa.
 //
-// Table values beyond the cap are collapsed to the literal label "other" at the
+// Values beyond the cap are collapsed to the literal label "other" at the
 // export boundary, the same mechanism WithMaxUniqueRoutes applies to http.route.
-// Because a Cassandra schema's tables are DDL-fixed, reaching the cap normally
-// means the SDK's CQL tokenizer mis-read a statement shape rather than that the
-// schema genuinely grew; an "other" bucket appearing on these metrics is worth
-// investigating rather than raising the cap.
+// Because a Cassandra schema's tables are DDL-fixed, reaching the cap there
+// normally means the SDK's CQL tokenizer mis-read a statement shape rather than
+// that the schema genuinely grew; an "other" bucket on the Cassandra metrics is
+// worth investigating rather than raising the cap. Elasticsearch index names
+// commonly roll by date, so an "other" bucket there is the expected signal to
+// opt the label out (below) rather than a defect.
 //
 // Callers who would rather not carry the label at all should pass
-// cassandra.WithCollectionMetricLabel(false) to NewSession instead — this cap
+// cassandra.WithCollectionMetricLabel(false) to NewSession or
+// elasticsearch.WithCollectionMetricLabel(false) to NewClient instead — this cap
 // bounds the label, it does not remove it.
 func WithMaxUniqueCollections(n int) Option {
 	return func(c *Config) {
