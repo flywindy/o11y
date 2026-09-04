@@ -144,9 +144,9 @@ adopters can plan their upgrades.
   pass `elasticsearch.WithCollectionMetricLabel(false)`. Dashboards keyed on
   `db_client_operation_duration_seconds` gain a `db_system_name="elasticsearch"`
   series set on rollout.
-- Otherwise no API change. Services that adopted the previous (incorrect) nesting — for
-  example a Loki query or Grafana derived field reading `req.traceId` rather
-  than `traceId` — should move those back to the top-level field.
+- `log`: no API change. Services that adopted the previous (incorrect) nesting —
+  for example a Loki query or Grafana derived field reading `req.traceId`
+  rather than `traceId` — should move those back to the top-level field.
 - `db_client_connection_create_time_bucket` changes shape for Redis: its `le`
   boundaries move from OTel's millisecond defaults to the SDK's second-scale
   set. Any PromQL written against the old boundaries needs updating — though in
