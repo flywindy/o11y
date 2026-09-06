@@ -581,3 +581,45 @@ Behaviour changes to plan for:
   services use `gin.New()` with the o11y middleware before `gin.Recovery()`;
   custom instrument labels come from closed enums with a registry guard test;
   `pkg/obs` sets the OTel globals so bare `otelhttp` transports do export.
+
+---
+
+## 7. Addendum — re-check against newchat `main@e48a37f` (o11y v0.12.0)
+
+newchat has since merged one commit (#472): `go.mod` → o11y v0.12.0,
+`pkg/searchengine` passes the `MeterProvider`, and four `docs/specs/o11y/*`
+files were refreshed. Re-running every check above against that head:
+
+| ID | Before | After | Note |
+|---|---|---|---|
+| APP-3 | open | **done** | `factory.go:80` passes `obs.MeterProvider()`; `Observability` has `MeterProvider()`; doubles updated; docs refreshed. |
+| SDK-8 | open | **moot for newchat** | The migration was done by hand; a guide section is still worth adding for other consumers. |
+| APP-1 | open | open | Still only `docker-local/` sets `O11Y_ENABLED`; the one `deploy/` file with any of the variables is `chat-frontend`; 18 compose files still lack `OTEL_SERVICE_NAME`. |
+| APP-2 | open | open | `pkg/atrest/metrics.go` and `bot-message-worker/metrics.go` still use `promauto`. |
+| APP-4 | open | open | 14 `ConnectWithMetrics` vs 17 `Connect` in `main.go`. |
+| APP-5 | open | open | 10 raw `ExecuteBatch` sites. |
+| APP-6..APP-11 | open | open | No `SetErrorHandler`/`SetLogger`, goroutine dispatch in `natsrouter`, bare `otelhttp` in `restyutil`/`oidc`, 0 `obsctx` users, 6 services without `obs.Init`. |
+| SDK-1..7, 9..29 | open | open | Nothing on the newchat side can close these. |
+
+Net: 1 of 42 items closed. The v0.12.0 upgrade delivers the ES metric to
+search-service and search-sync-worker (and the Redis create-time bucket fix),
+which is what the release was for; it does not touch the P0 items.
+
+One new SDK item surfaced by newchat's upgrade notes
+(`storage-dependency-metrics.md` §4):
+
+#### SDK-30 · P2 · Low-level ES client counts routine 404s as failures; no per-operation override — CONFIRMED
+
+- The facade follows `esapi.Response.IsError` (status > 299) for the low-level
+  client (`elasticsearch/client.go:454-487`); the typed client's accept-list
+  exemption does not apply. `elasticsearch` exposes only `WithSearchBody` and
+  `WithCollectionMetricLabel`.
+- newchat's `GetDoc` (a per-request Valkey-miss path) and `GetIndexMapping`
+  legitimately 404, so every such call records `error_type="404"` and sets the
+  span status to Error. newchat had to write a two-selector PromQL union to
+  exclude 404 for exactly those two `db_operation_name` values, and pins the
+  operation strings with tests so the query cannot drift.
+- Fix: `elasticsearch.WithAcceptedStatuses(op string, statuses ...int)` (or a
+  `WithSuccessFn(func(op string, status int) bool)`) applied to both the
+  metric's `error.type` and the span status, mirroring the typed client's
+  accept list; document the low-level default prominently.
