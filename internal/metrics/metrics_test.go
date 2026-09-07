@@ -874,3 +874,82 @@ func TestInitMeter_MaxUniqueCollectionsCapsElasticsearchIndices(t *testing.T) {
 	}
 	assert.True(t, esOther, "overflow indices should merge to one Elasticsearch duration series with count 2")
 }
+
+// TestInitMeter_ReservedAttributeKeysAreDropped pins that an attribute whose
+// Prometheus label name collides with one the exporter already owns
+// (service_name, otel_scope_name, ...) is dropped from the series instead of
+// failing the whole scrape. Before this guard, one such Record call made
+// /metrics answer HTTP 500 until the process restarted.
+func TestInitMeter_ReservedAttributeKeysAreDropped(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	counter, err := mp.Meter("app").Int64Counter("app_collision")
+	require.NoError(t, err)
+	counter.Add(context.Background(), 1, metric.WithAttributes(
+		attribute.String("service.name", "evil"),
+		attribute.String("service_namespace", "evil"),
+		attribute.String("otel.scope.name", "evil"),
+		attribute.String("outcome", "ok"),
+	))
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	var found bool
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "app_collision_total{") {
+			continue
+		}
+		found = true
+		assert.Contains(t, line, `outcome="ok"`, "non-reserved attributes survive")
+		assert.Contains(t, line, `service_name="test-svc"`, "the resource constant label wins")
+		assert.Contains(t, line, `service_namespace="platform"`)
+		assert.NotContains(t, line, "evil")
+	}
+	assert.True(t, found, "the family must still be exported: %s", body)
+}
+
+// TestInitMeter_ReservedKeyGuardKeepsViewedInstrumentsSingle pins that the
+// catch-all reserved-key view declines instruments an SDK view already
+// matched. A second stream on those would carry the reader-default
+// aggregation and export as a duplicate family with the wrong buckets.
+func TestInitMeter_ReservedKeyGuardKeepsViewedInstrumentsSingle(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	hist, err := mp.Meter("test").Float64Histogram("http.server.request.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	hist.Record(context.Background(), 0.01, metric.WithAttributes(
+		semconv.HTTPRequestMethodKey.String("GET"),
+		semconv.HTTPRoute("/orders/{id}"),
+		semconv.HTTPResponseStatusCode(http.StatusOK),
+		attribute.String("service.name", "evil"),
+	))
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	assert.Equal(t, 1, strings.Count(body, "# TYPE http_server_request_duration_seconds histogram"),
+		"exactly one family for the viewed instrument: %s", body)
+	assert.Contains(t, body, `le="0.1"`, "the SDK view's buckets apply")
+	assert.NotContains(t, body, `le="25"`, "no second stream with OTel default buckets")
+	assert.NotContains(t, body, "evil")
+	assert.Contains(t, body, `http_route="/orders/{id}"`)
+}
