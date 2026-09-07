@@ -5,9 +5,9 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
-	"strings"
 
 	"github.com/flywindy/o11y/internal/baggageattrs"
+	"github.com/flywindy/o11y/internal/metrics"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
@@ -526,42 +526,12 @@ var reservedHTTPServerPromLabels = []string{
 	"otel_scope_schema_url",
 }
 
-// normalizePrometheusLabelName mirrors the classic non-UTF8 Prometheus label
-// normalization that otelprom (via github.com/prometheus/otlptranslator)
-// applies on export: any rune outside [a-zA-Z0-9] becomes '_', adjacent
-// underscores collapse to a single one, and a leading digit is prefixed
-// with "key_" so the result is a syntactically valid Prometheus label.
-//
-// Reproducing the same rules at option-time is what lets us detect
-// collisions before they reach the exporter, where two distinct attribute
-// values would otherwise be silently merged into one label value.
+// normalizePrometheusLabelName mirrors the Prometheus label normalization
+// otelprom applies on export; see metrics.NormalizePrometheusLabelName.
+// Reproducing the same rules at option-time is what lets us detect collisions
+// before they reach the exporter.
 func normalizePrometheusLabelName(key string) string {
-	if key == "" {
-		return ""
-	}
-	var b strings.Builder
-	b.Grow(len(key))
-	prevUnderscore := false
-	for _, r := range key {
-		valid := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
-		if valid {
-			b.WriteRune(r)
-			prevUnderscore = false
-			continue
-		}
-		if !prevUnderscore {
-			b.WriteRune('_')
-			prevUnderscore = true
-		}
-	}
-	out := b.String()
-	if out == "" {
-		return ""
-	}
-	if first := out[0]; first >= '0' && first <= '9' {
-		out = "key_" + out
-	}
-	return out
+	return metrics.NormalizePrometheusLabelName(key)
 }
 
 // WithMaxUniqueRoutes sets the distinct http.route export cap. Values <= 0

@@ -294,6 +294,18 @@ By default the SDK exposes a `/metrics` endpoint on `:2112` for Prometheus to sc
 curl http://localhost:2112/metrics   # inspect raw output
 ```
 
+**Reserved attribute keys.** Those four labels, and the `otel_scope_name` /
+`otel_scope_version` / `otel_scope_schema_url` labels the exporter adds, are
+owned by the SDK. An attribute recorded on any instrument whose key
+normalizes to one of them (`service.name`, `service_name`, `service-name`,
+...) is dropped from the exported series rather than exported: the
+Prometheus client rejects a series that carries the same label twice, and
+because aggregation is cumulative that rejection would otherwise follow the
+process until restart. Should a family still fail to gather for any other
+reason, `/metrics` keeps serving the healthy families with HTTP 200 and the
+SDK logs one `WARN` (repeats of the same error are suppressed for five
+minutes) naming the family to fix.
+
 Set `WithMetricsAddr(":9090")` to move the listener, or `WithMetricsOTLPEndpoint(url)`
 to switch from the Prometheus pull model to OTLP push (useful for serverless
 deployments that cannot be scraped). See the

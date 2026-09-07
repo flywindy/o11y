@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"time"
@@ -21,7 +22,6 @@ import (
 	"github.com/flywindy/o11y/internal/metricscap"
 	"github.com/flywindy/o11y/internal/views"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/contrib/instrumentation/runtime"
 	"go.opentelemetry.io/otel/attribute"
 	otlpmetrichttp "go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
@@ -96,6 +96,10 @@ type Config struct {
 	// `le="1"` → `le="1.0"` bucket-boundary format change that OpenMetrics
 	// introduces, at the cost of disabling trace-to-metric linkage.
 	Exemplars bool
+
+	// Logger receives the Prometheus handler's gather errors (rate-limited).
+	// Optional; nil discards them.
+	Logger *slog.Logger
 }
 
 // Closer is a function that shuts down a component. For the Prometheus path it
@@ -335,14 +339,13 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 	// Resource attributes in the allow filter become constant labels on every
 	// series, so service_namespace="..." is guaranteed on every instrument including runtime.
 	// The key "deployment.environment.name" matches the pinned semconv version.
+	constKeys := make([]attribute.Key, 0, len(resourceConstantLabelKeys))
+	for _, k := range resourceConstantLabelKeys {
+		constKeys = append(constKeys, attribute.Key(k))
+	}
 	exporter, err := otelprom.New(
 		otelprom.WithRegisterer(reg),
-		otelprom.WithResourceAsConstantLabels(attribute.NewAllowKeysFilter(
-			"service.namespace",
-			"service.name",
-			"service.version",
-			"deployment.environment.name",
-		)),
+		otelprom.WithResourceAsConstantLabels(attribute.NewAllowKeysFilter(constKeys...)),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("metrics: create prometheus exporter: %w", err)
@@ -395,9 +398,7 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 	// `le` label (e.g. `le="1"` → `le="1.0"`); callers whose dashboards or
 	// recording rules cannot tolerate that one-time series-identity change
 	// can suppress the renegotiation via WithExemplars(false).
-	mux.Handle("/metrics", promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{
-		EnableOpenMetrics: cfg.Exemplars,
-	}))
+	mux.Handle("/metrics", newMetricsHandler(gatherer, cfg.Exemplars, cfg.Logger))
 	server := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -465,7 +466,11 @@ func meterProviderOptions(reader sdkmetric.Reader, res *resource.Resource, views
 	opts := []sdkmetric.Option{
 		sdkmetric.WithReader(reader),
 		sdkmetric.WithResource(res),
-		sdkmetric.WithView(views...),
+		// Every stream, on every instrument, drops attribute keys that would
+		// collide with the exporter's own labels (see reserved.go). Applied on
+		// both exporter paths so a caller's series look the same regardless
+		// of transport.
+		sdkmetric.WithView(guardReservedKeys(views)...),
 	}
 	if limit := cardinalityLimitBudget(maxUniqueRoutes, maxUniqueCollections); limit > 0 {
 		opts = append(opts, sdkmetric.WithCardinalityLimit(limit))

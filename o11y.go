@@ -232,7 +232,21 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		tpShutdown = tp.Shutdown
 	}
 
-	// 3. Initialize MeterProvider + Prometheus scrape endpoint. On failure,
+	// 3. Build the stdout JSON handler. It is shared by the dual-output (log
+	//    enabled) and stdout-only (log disabled) loggers built in step 5, and
+	//    it is built before the MeterProvider so the Prometheus handler can
+	//    report scrape errors through it: the OTLP logger does not exist yet at
+	//    that point, and stdout is collected in-cluster anyway.
+	stdoutAttrs := []slog.Attr{slog.String("service.name", cfg.serviceName)}
+	if cfg.environment != "" {
+		stdoutAttrs = append(stdoutAttrs, slog.String("environment", cfg.environment))
+	}
+	stdoutBase := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: cfg.logLevel,
+	}).WithAttrs(stdoutAttrs)
+	stdoutHandler := o11ylog.NewOTelHandler(stdoutBase)
+
+	// 4. Initialize MeterProvider + Prometheus scrape endpoint. On failure,
 	//    shut down the already-initialized tracer to avoid leaking its
 	//    background batch processor. The shared Resource is passed so that
 	//    service identity attributes are identical across all three providers.
@@ -269,6 +283,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 			MaxUniqueCollections:    cfg.maxUniqueCollections,
 			ExtraHTTPServerAttrKeys: cfg.extraHTTPServerAttrKeys,
 			Exemplars:               cfg.exemplars,
+			Logger:                  slog.New(stdoutHandler),
 		})
 		if initErr != nil {
 			_ = tpShutdown(ctx)
@@ -277,17 +292,6 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		mpInternal, meterProviderPublic = mp, mp
 		metricsCloser, mpShutdown = closer, mp.Shutdown
 	}
-
-	// 4. Build the stdout JSON handler, shared by both the dual-output (log
-	//    enabled) and stdout-only (log disabled) paths below.
-	stdoutAttrs := []slog.Attr{slog.String("service.name", cfg.serviceName)}
-	if cfg.environment != "" {
-		stdoutAttrs = append(stdoutAttrs, slog.String("environment", cfg.environment))
-	}
-	stdoutBase := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: cfg.logLevel,
-	}).WithAttrs(stdoutAttrs)
-	stdoutHandler := o11ylog.NewOTelHandler(stdoutBase)
 
 	// 5. Initialize LoggerProvider and build the dual-output logger.
 	//    When log is disabled, only the stdout handler is active; no OTLP
