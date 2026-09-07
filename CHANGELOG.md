@@ -23,7 +23,9 @@ adopters can plan their upgrades.
   `deployment.environment.name`) so the identity options stay authoritative;
   the keys the SDK detects itself (`telemetry.sdk.*`, `process.pid`,
   `process.executable.name`, `process.runtime.name` / `.version`,
-  `host.name`); any alias that renders as the same Prometheus label as one of
+  `host.name`) and the rest of the `telemetry.sdk.*` and `process.*`
+  namespaces, so `process.command_args` cannot be added back from the
+  outside; any alias that renders as the same Prometheus label as one of
   those (`service_name`, `process_pid`, `host-name` — otelprom would join the
   two values into one `target_info` label); and any key that would render as
   an invalid label name (`__meta__` would make otelprom disable `target_info`
@@ -52,8 +54,9 @@ adopters can plan their upgrades.
   `WithResourceAttributes` when the Resource is built. An environment key
   that is only an alias of an SDK-owned key (`telemetry_sdk_name` next to the
   detected `telemetry.sdk.name`, `service-name` next to `service.name`), of
-  a key given to `WithResourceAttributes`, or that the Prometheus exporter
-  cannot translate, is dropped with a startup warning instead of being joined
+  a key given to `WithResourceAttributes`, that falls in `telemetry.sdk.*`
+  or `process.*`, or that the Prometheus exporter cannot translate, is
+  dropped with a startup warning instead of being joined
   into that label's `target_info` value (`"evil;opentelemetry"`). The OTel
   providers merge the raw environment back into their own Resource, so the
   SDK renders `target_info` itself on the Prometheus pull path and ships

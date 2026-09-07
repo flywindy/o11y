@@ -335,9 +335,9 @@ func WithServiceNamespace(namespace string) Option {
 // point and log record, so keep them to values that are true for the whole
 // process lifetime and are safe to store in every backend.
 //
-// Four groups of keys are not accepted and are dropped with a startup
-// warning, so the identity options and the SDK's own detectors stay the
-// single source of truth and target_info stays exportable:
+// These keys are not accepted and are dropped with a startup warning, so
+// the identity options and the SDK's own detectors stay the single source
+// of truth and target_info stays exportable:
 //
 //   - the identity keys service.name, service.version, service.namespace and
 //     deployment.environment.name, and any alias that renders as the same
@@ -346,9 +346,11 @@ func WithServiceNamespace(namespace string) Option {
 //   - the detected keys — telemetry.sdk.name / .language / .version,
 //     process.pid, process.executable.name, process.runtime.name / .version,
 //     host.name — and their aliases (telemetry_sdk_name, process_pid,
-//     host-name), for the same reason; the rest of the telemetry.sdk.*
-//     namespace is refused too, since it identifies the OpenTelemetry SDK,
-//     not the service;
+//     host-name), for the same reason; the rest of the telemetry.sdk.* and
+//     process.* namespaces are refused too — the former identifies the
+//     OpenTelemetry SDK, not the service, and the latter would reopen the
+//     door to process.command_args, which the SDK's own detectors leave out
+//     on purpose;
 //   - any key that renders as a label name Prometheus rejects ("__meta__",
 //     punctuation-only keys) or one the exporter reserves elsewhere: the
 //     exporter would then disable target_info for the process;
@@ -380,6 +382,10 @@ func WithResourceAttributes(attrs ...attribute.KeyValue) Option {
 			case metrics.IsTelemetrySDKKey(kv.Key):
 				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
 					"WithResourceAttributes: ignoring %q; telemetry.sdk.* identifies the OpenTelemetry SDK, not the service",
+					string(kv.Key)))
+			case metrics.IsProcessKey(kv.Key):
+				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
+					"WithResourceAttributes: ignoring %q; process.* is collected by the SDK itself, and process.command_args / process.owner are deliberately not exported",
 					string(kv.Key)))
 			case metrics.IsReservedAttributeKey(kv.Key):
 				c.initWarnings = append(c.initWarnings, fmt.Sprintf(

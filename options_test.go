@@ -458,6 +458,8 @@ func TestWithResourceAttributes(t *testing.T) {
 		attribute.String("process_pid", "alias"),                  // same label as the detected process.pid
 		attribute.String("host-name", "alias"),                    // same label as the detected host.name
 		attribute.String("telemetry.sdk.extra", "namespace"),      // not detected, but the SDK's namespace
+		attribute.String("process.command_args", "--db-password"), // the namespace the detectors deliberately narrow
+		attribute.String("process_owner", "root"),                 // same namespace, alias spelling
 		attribute.String("__meta__", "reserved shape"),
 		attribute.String("...", "punctuation only"),
 		attribute.Int("app.shard", 3),
@@ -473,7 +475,7 @@ func TestWithResourceAttributes(t *testing.T) {
 		attribute.String("app.foo", "a"),
 	}, cfg.resourceAttrs, "only caller-owned keys are kept, in order, one per Prometheus label")
 
-	require.Len(t, cfg.initWarnings, 14, "one warning per dropped attribute")
+	require.Len(t, cfg.initWarnings, 16, "one warning per dropped attribute")
 	assert.Contains(t, cfg.initWarnings[0], "empty key")
 	for i, key := range []string{"service.name", "service.version", "service.namespace", "deployment.environment.name"} {
 		assert.Contains(t, cfg.initWarnings[i+1], strconv.Quote(key))
@@ -494,11 +496,14 @@ func TestWithResourceAttributes(t *testing.T) {
 		assert.Contains(t, cfg.initWarnings[7+i], "detects itself")
 	}
 	assert.Contains(t, cfg.initWarnings[10], `"telemetry.sdk.extra"`)
-	assert.Contains(t, cfg.initWarnings[11], `"__meta__"`)
-	assert.Contains(t, cfg.initWarnings[11], "target_info")
-	assert.Contains(t, cfg.initWarnings[12], `"..."`)
-	assert.Contains(t, cfg.initWarnings[13], `"app_foo"`)
-	assert.Contains(t, cfg.initWarnings[13], `"app.foo"`, "the alias names the earlier key it collides with")
+	assert.Contains(t, cfg.initWarnings[11], `"process.command_args"`)
+	assert.Contains(t, cfg.initWarnings[11], "deliberately not exported")
+	assert.Contains(t, cfg.initWarnings[12], `"process_owner"`)
+	assert.Contains(t, cfg.initWarnings[13], `"__meta__"`)
+	assert.Contains(t, cfg.initWarnings[13], "target_info")
+	assert.Contains(t, cfg.initWarnings[14], `"..."`)
+	assert.Contains(t, cfg.initWarnings[15], `"app_foo"`)
+	assert.Contains(t, cfg.initWarnings[15], `"app.foo"`, "the alias names the earlier key it collides with")
 }
 
 func TestWithResourceAttributesAppendsAcrossCalls(t *testing.T) {
