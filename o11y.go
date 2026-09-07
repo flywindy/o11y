@@ -638,7 +638,12 @@ func validateHistogramBuckets(buckets []float64) error {
 // normalizeEnvironment returns the canonical deployment environment name for
 // the given input, or an error if the value is not recognized. An empty input
 // is rejected so that unset environments cannot silently propagate to telemetry.
+//
+// Matching ignores case and surrounding whitespace: the value almost always
+// comes from a deployment manifest or a Helm values file, and "PROD" or a
+// trailing space must not turn into a crash loop at startup.
 func normalizeEnvironment(env string) (string, error) {
+	env = strings.ToLower(strings.TrimSpace(env))
 	if env == "" {
 		return "", errors.New("deployment environment is required (use WithEnvironment); " +
 			"accepted values: production, staging, development, testing")

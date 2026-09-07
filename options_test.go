@@ -404,3 +404,33 @@ func TestWithMaxUniqueCollections_IndependentOfRouteCap(t *testing.T) {
 	WithMaxUniqueRoutes(7)(cfg)
 	assert.Equal(t, 25, cfg.maxUniqueCollections)
 }
+
+// TestNormalizeEnvironment pins the canonical value each accepted spelling
+// resolves to, including case and whitespace variants that typically come
+// from deployment manifests.
+func TestNormalizeEnvironment(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"production", "production"},
+		{"Production", "production"},
+		{"PROD", "production"},
+		{" prod ", "production"},
+		{"Staging", "staging"},
+		{"STG", "staging"},
+		{"\tdev\n", "development"},
+		{"Develop", "development"},
+		{"TEST", "testing"},
+	}
+	for _, tc := range cases {
+		got, err := normalizeEnvironment(tc.in)
+		require.NoErrorf(t, err, "normalizeEnvironment(%q)", tc.in)
+		assert.Equalf(t, tc.want, got, "normalizeEnvironment(%q)", tc.in)
+	}
+
+	for _, in := range []string{"", "   ", "uat", "prod-eu"} {
+		_, err := normalizeEnvironment(in)
+		require.Errorf(t, err, "normalizeEnvironment(%q) should be rejected", in)
+	}
+}

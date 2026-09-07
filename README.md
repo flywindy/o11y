@@ -159,7 +159,7 @@ _Required — Init returns an error if any of these are missing:_
 |--------|-------------|
 | `WithServiceName(name)` | OTel `service.name` resource attribute |
 | `WithServiceVersion(ver)` | OTel `service.version`; used for canary/rollback tracking |
-| `WithEnvironment(env)` | OTel `deployment.environment.name`; accepted: `production`, `staging`, `development`, `testing` (aliases like `prod`/`stg` are normalized) |
+| `WithEnvironment(env)` | OTel `deployment.environment.name`; accepted: `production`, `staging`, `development`, `testing` (aliases like `prod`/`stg` are normalized; matching ignores case and surrounding whitespace) |
 | `WithServiceNamespace(ns)` | OTel `service.namespace`; identifies the owning team/product, maps to k8s namespace |
 
 _OTLP (shared by traces and logs):_
@@ -174,7 +174,7 @@ _Tracing:_
 | Option | Default | Description |
 |--------|---------|-------------|
 | `WithSamplingRatio(ratio)` | unset → OTel default/env | Configure SDK-side head sampling as `ParentBased(TraceIDRatioBased(ratio))`; `ratio` must be in `[0.0, 1.0]` |
-| `WithTraceSampler(sampler)` | unset → OTel default/env | Escape hatch for a custom `sdktrace.Sampler`; a non-nil sampler overrides `OTEL_TRACES_SAMPLER` for this SDK instance |
+| `WithTraceSampler(sampler)` | unset → OTel default/env | Escape hatch for a custom `sdktrace.Sampler`; a non-nil sampler overrides `OTEL_TRACES_SAMPLER` and any earlier `WithSamplingRatio` for this SDK instance; `nil` is a no-op |
 | `WithBaggageAttributes(keys ...string)` | `nil` | Materialize up to 8 application-defined W3C baggage keys onto spans and SDK log records. Keys must not collide with semconv, Resource, SDK, or slog fields |
 | `WithUserBaggage()` | off | Materialize the PII-bearing semconv `user.name` baggage member; use `ContextWithUser` to set it after authentication |
 
