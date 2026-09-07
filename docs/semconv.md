@@ -49,8 +49,18 @@ every signal so that service identity is identical across backends.
 | `service.namespace` | string | `WithServiceNamespace` | yes |
 | `deployment.environment.name` | string | `WithEnvironment` (canonicalized: `production` / `staging` / `development` / `testing`) | yes |
 | `host.*` | various | `resource.WithHost()` | detected |
-| `process.*` | various | `resource.WithProcess()` | detected |
+| `process.pid` | int | `resource.WithProcessPID()` | detected |
+| `process.executable.name` | string | `resource.WithProcessExecutableName()` | detected |
+| `process.runtime.name` | string | `resource.WithProcessRuntimeName()` | detected |
+| `process.runtime.version` | string | `resource.WithProcessRuntimeVersion()` | detected |
+| `telemetry.sdk.name` / `.language` / `.version` | string | `resource.WithTelemetrySDK()` | detected |
+| (caller-provided) | various | `WithResourceAttributes(...)`; identity keys above are rejected | optional |
 | (env-provided) | various | `resource.WithFromEnv()` / `OTEL_RESOURCE_ATTRIBUTES` | optional |
+
+`process.command_args`, `process.owner`, `process.executable.path` and
+`process.runtime.description` are deliberately not collected: the Resource is
+exported unfiltered (`target_info`, every span, every log record), and the
+first two can carry credentials passed on the command line.
 
 ---
 

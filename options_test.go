@@ -439,3 +439,95 @@ func TestNormalizeEnvironment(t *testing.T) {
 		require.Errorf(t, err, "normalizeEnvironment(%q) should be rejected", in)
 	}
 }
+
+func TestWithResourceAttributes(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.initWarnings = nil
+
+	WithResourceAttributes(
+		attribute.String("k8s.pod.name", "room-service-7d9f-x2kq"),
+		attribute.String("", "no key"),
+		attribute.String("service.name", "impostor"),
+		attribute.String("service.version", "9.9.9"),
+		attribute.String("service.namespace", "elsewhere"),
+		attribute.String("deployment.environment.name", "production"),
+		attribute.Int("app.shard", 3),
+	)(cfg)
+
+	assert.Equal(t, []attribute.KeyValue{
+		attribute.String("k8s.pod.name", "room-service-7d9f-x2kq"),
+		attribute.Int("app.shard", 3),
+	}, cfg.resourceAttrs, "only caller-owned keys are kept, in order")
+
+	require.Len(t, cfg.initWarnings, 5, "one warning per dropped attribute")
+	assert.Contains(t, cfg.initWarnings[0], "empty key")
+	for i, key := range []string{"service.name", "service.version", "service.namespace", "deployment.environment.name"} {
+		assert.Contains(t, cfg.initWarnings[i+1], strconv.Quote(key))
+	}
+}
+
+func TestWithResourceAttributesAppendsAcrossCalls(t *testing.T) {
+	cfg := defaultConfig()
+	WithResourceAttributes(attribute.String("a", "1"))(cfg)
+	WithResourceAttributes(attribute.String("b", "2"))(cfg)
+	assert.Equal(t, []attribute.KeyValue{attribute.String("a", "1"), attribute.String("b", "2")}, cfg.resourceAttrs)
+}
+
+// TestBuildResource_ProcessDetectorsAreNarrow pins the detector set: the
+// resource identifies the process by pid, executable name and runtime, and
+// never carries process.command_args or process.owner, which would otherwise
+// be exported unfiltered on target_info, every span and every log record.
+func TestBuildResource_ProcessDetectorsAreNarrow(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.serviceName, cfg.serviceVersion, cfg.namespace, cfg.environment = "svc", "1.0.0", "platform", "development"
+
+	res, err := buildResource(context.Background(), cfg)
+	require.NoError(t, err)
+	attrs := res.Set()
+
+	for _, key := range []attribute.Key{
+		"process.pid", "process.executable.name",
+		"process.runtime.name", "process.runtime.version",
+		"telemetry.sdk.name", "telemetry.sdk.language", "telemetry.sdk.version",
+		"host.name",
+	} {
+		_, ok := attrs.Value(key)
+		assert.True(t, ok, "%s should be detected", key)
+	}
+	for _, key := range []attribute.Key{
+		"process.command_args", "process.owner",
+		"process.executable.path", "process.runtime.description",
+	} {
+		_, ok := attrs.Value(key)
+		assert.False(t, ok, "%s must not be collected", key)
+	}
+	v, _ := attrs.Value("telemetry.sdk.language")
+	assert.Equal(t, "go", v.AsString())
+}
+
+// TestBuildResource_MergeOrder checks the documented precedence: identity
+// options beat WithResourceAttributes, which beats OTEL_RESOURCE_ATTRIBUTES.
+func TestBuildResource_MergeOrder(t *testing.T) {
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "app.shard=env,k8s.pod.name=from-env,only.env=1")
+	t.Setenv("OTEL_SERVICE_NAME", "from-env")
+
+	cfg := defaultConfig()
+	cfg.serviceName, cfg.serviceVersion, cfg.namespace, cfg.environment = "svc", "1.0.0", "platform", "development"
+	WithResourceAttributes(attribute.String("app.shard", "code"))(cfg)
+
+	res, err := buildResource(context.Background(), cfg)
+	require.NoError(t, err)
+	attrs := res.Set()
+
+	want := map[attribute.Key]string{
+		"service.name": "svc",      // identity beats OTEL_SERVICE_NAME
+		"app.shard":    "code",     // code beats env
+		"k8s.pod.name": "from-env", // env still contributes keys code did not set
+		"only.env":     "1",
+	}
+	for key, val := range want {
+		v, ok := attrs.Value(key)
+		require.True(t, ok, "%s missing", key)
+		assert.Equal(t, val, v.AsString(), key)
+	}
+}

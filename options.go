@@ -10,6 +10,7 @@ import (
 	"github.com/flywindy/o11y/internal/metrics"
 	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 )
 
 // DefaultMetricsAddr is the default listen address for the built-in
@@ -60,6 +61,10 @@ type Config struct {
 	otlpEndpoint   string
 	otlpHeaders    map[string]string
 	logLevel       slog.Level
+
+	// Resource attributes added by WithResourceAttributes, on top of the
+	// service identity above and the detected host / process / SDK set.
+	resourceAttrs []attribute.KeyValue
 
 	// Tracing
 	sampler          sdktrace.Sampler
@@ -322,6 +327,48 @@ func WithServiceNamespace(namespace string) Option {
 	return func(c *Config) {
 		c.namespace = namespace
 	}
+}
+
+// WithResourceAttributes adds attributes to the OTel Resource shared by the
+// trace, metrics and log providers, next to the service identity and the
+// detected host, process and SDK attributes. On the Prometheus path they
+// appear on `target_info`; on OTLP they travel with every span, metric data
+// point and log record, so keep them to values that are true for the whole
+// process lifetime and are safe to store in every backend.
+//
+// Keys the SDK owns — service.name, service.version, service.namespace and
+// deployment.environment.name — are not accepted here: they are dropped with
+// a startup warning so the identity options stay the single source of truth.
+// An attribute with an empty key is dropped the same way. Values given here
+// override the same key from OTEL_RESOURCE_ATTRIBUTES; the last value wins
+// when a key is given twice.
+func WithResourceAttributes(attrs ...attribute.KeyValue) Option {
+	return func(c *Config) {
+		for _, kv := range attrs {
+			switch {
+			case kv.Key == "":
+				c.initWarnings = append(c.initWarnings,
+					"WithResourceAttributes: ignoring an attribute with an empty key")
+			case isSDKResourceIdentityKey(kv.Key):
+				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
+					"WithResourceAttributes: ignoring %q; it is set by the SDK's identity options (WithServiceName / WithServiceVersion / WithServiceNamespace / WithEnvironment)",
+					string(kv.Key)))
+			default:
+				c.resourceAttrs = append(c.resourceAttrs, kv)
+			}
+		}
+	}
+}
+
+// isSDKResourceIdentityKey reports whether key is one of the four resource
+// attributes the identity options own.
+func isSDKResourceIdentityKey(key attribute.Key) bool {
+	switch key {
+	case semconv.ServiceNameKey, semconv.ServiceVersionKey,
+		semconv.ServiceNamespaceKey, semconv.DeploymentEnvironmentNameKey:
+		return true
+	}
+	return false
 }
 
 // WithMetricsOTLPEndpoint switches the metrics exporter from Prometheus pull

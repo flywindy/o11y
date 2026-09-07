@@ -13,6 +13,34 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+### Added
+
+- `WithResourceAttributes(attrs ...attribute.KeyValue)` adds caller-owned
+  attributes to the Resource shared by traces, metrics and logs (for example
+  `k8s.pod.name` when it is not supplied through `OTEL_RESOURCE_ATTRIBUTES`).
+  The four identity keys (`service.name`, `service.version`,
+  `service.namespace`, `deployment.environment.name`) are rejected with the
+  usual startup warning so the identity options stay authoritative; a key set
+  here overrides the same key from `OTEL_RESOURCE_ATTRIBUTES`.
+
+### Changed
+
+- resource: the SDK no longer uses `resource.WithProcess()`. That detector
+  also collects `process.command_args` and `process.owner`, and the Resource
+  is exported unfiltered — as `target_info` labels on the Prometheus path and
+  on every span and log record over OTLP — so any credential passed as a
+  command-line flag landed in Prometheus, Tempo and Loki. The process is now
+  identified by `process.pid`, `process.executable.name`,
+  `process.runtime.name` and `process.runtime.version` only;
+  `process.executable.path` and `process.runtime.description` are dropped
+  with the other two. `resource.WithTelemetrySDK()` is added at the same
+  time, so `telemetry.sdk.name` / `.language` / `.version` — required by the
+  semantic conventions and assumed by Grafana's service graph — now appear
+  on `target_info`. Dashboards or joins that read `process_command_args`,
+  `process_owner`, `process_executable_path` or
+  `process_runtime_description` from `target_info` will find those labels
+  gone; no series name changes.
+
 ### Fixed
 
 - `metrics`: a single mislabeled datapoint can no longer take the whole
