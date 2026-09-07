@@ -454,6 +454,10 @@ func TestWithResourceAttributes(t *testing.T) {
 		attribute.String("telemetry.sdk.name", "not-opentelemetry"),
 		attribute.String("service_name", "alias-of-service.name"), // same Prometheus label as service.name
 		attribute.String("Service-Version", "alias"),              // normalizes to Service_Version, distinct from service_version
+		attribute.String("telemetry_sdk_name", "alias"),           // same label as the detected telemetry.sdk.name
+		attribute.String("process_pid", "alias"),                  // same label as the detected process.pid
+		attribute.String("host-name", "alias"),                    // same label as the detected host.name
+		attribute.String("telemetry.sdk.extra", "namespace"),      // not detected, but the SDK's namespace
 		attribute.String("__meta__", "reserved shape"),
 		attribute.String("...", "punctuation only"),
 		attribute.Int("app.shard", 3),
@@ -465,17 +469,30 @@ func TestWithResourceAttributes(t *testing.T) {
 		attribute.Int("app.shard", 3),
 	}, cfg.resourceAttrs, "only caller-owned keys are kept, in order")
 
-	require.Len(t, cfg.initWarnings, 9, "one warning per dropped attribute")
+	require.Len(t, cfg.initWarnings, 13, "one warning per dropped attribute")
 	assert.Contains(t, cfg.initWarnings[0], "empty key")
 	for i, key := range []string{"service.name", "service.version", "service.namespace", "deployment.environment.name"} {
 		assert.Contains(t, cfg.initWarnings[i+1], strconv.Quote(key))
 		assert.Contains(t, cfg.initWarnings[i+1], "identity options")
 	}
 	assert.Contains(t, cfg.initWarnings[5], `"telemetry.sdk.name"`)
+	assert.Contains(t, cfg.initWarnings[5], "detects itself")
 	assert.Contains(t, cfg.initWarnings[6], `"service_name"`)
-	assert.Contains(t, cfg.initWarnings[6], "target_info")
-	assert.Contains(t, cfg.initWarnings[7], `"__meta__"`)
-	assert.Contains(t, cfg.initWarnings[8], `"..."`)
+	assert.Contains(t, cfg.initWarnings[6], `"service.name"`, "the alias names the key it collides with")
+	assert.Contains(t, cfg.initWarnings[6], "identity options")
+	for i, want := range []struct{ key, owner string }{
+		{"telemetry_sdk_name", "telemetry.sdk.name"},
+		{"process_pid", "process.pid"},
+		{"host-name", "host.name"},
+	} {
+		assert.Contains(t, cfg.initWarnings[7+i], strconv.Quote(want.key))
+		assert.Contains(t, cfg.initWarnings[7+i], strconv.Quote(want.owner))
+		assert.Contains(t, cfg.initWarnings[7+i], "detects itself")
+	}
+	assert.Contains(t, cfg.initWarnings[10], `"telemetry.sdk.extra"`)
+	assert.Contains(t, cfg.initWarnings[11], `"__meta__"`)
+	assert.Contains(t, cfg.initWarnings[11], "target_info")
+	assert.Contains(t, cfg.initWarnings[12], `"..."`)
 }
 
 func TestWithResourceAttributesAppendsAcrossCalls(t *testing.T) {
