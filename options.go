@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/flywindy/o11y/internal/baggageattrs"
 	"github.com/flywindy/o11y/internal/metrics"
@@ -336,12 +337,22 @@ func WithServiceNamespace(namespace string) Option {
 // point and log record, so keep them to values that are true for the whole
 // process lifetime and are safe to store in every backend.
 //
-// Keys the SDK owns — service.name, service.version, service.namespace and
-// deployment.environment.name — are not accepted here: they are dropped with
-// a startup warning so the identity options stay the single source of truth.
-// An attribute with an empty key is dropped the same way. Values given here
-// override the same key from OTEL_RESOURCE_ATTRIBUTES; the last value wins
-// when a key is given twice.
+// Four groups of keys are not accepted and are dropped with a startup
+// warning, so the identity options and the SDK's own detectors stay the
+// single source of truth and target_info stays exportable:
+//
+//   - the identity keys service.name, service.version, service.namespace and
+//     deployment.environment.name;
+//   - telemetry.sdk.*, which identifies the OpenTelemetry SDK, not the service;
+//   - any key that normalizes to a Prometheus label the exporter already owns
+//     (service_name, service-name and the like collide with the identity
+//     constants on target_info, where otelprom joins the two values with ";"),
+//     or to a label name Prometheus rejects ("__meta__", punctuation-only
+//     keys) — the exporter would then disable target_info for the process;
+//   - an empty key.
+//
+// Values given here override the same key from OTEL_RESOURCE_ATTRIBUTES; the
+// last value wins when a key is given twice.
 func WithResourceAttributes(attrs ...attribute.KeyValue) Option {
 	return func(c *Config) {
 		for _, kv := range attrs {
@@ -353,12 +364,23 @@ func WithResourceAttributes(attrs ...attribute.KeyValue) Option {
 				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
 					"WithResourceAttributes: ignoring %q; it is set by the SDK's identity options (WithServiceName / WithServiceVersion / WithServiceNamespace / WithEnvironment)",
 					string(kv.Key)))
+			case strings.HasPrefix(string(kv.Key), telemetrySDKKeyPrefix):
+				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
+					"WithResourceAttributes: ignoring %q; telemetry.sdk.* is detected by the SDK and identifies the OpenTelemetry SDK, not the service",
+					string(kv.Key)))
+			case metrics.IsReservedAttributeKey(kv.Key):
+				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
+					"WithResourceAttributes: ignoring %q; as the Prometheus label %q it would collide with a label the exporter already owns on target_info, or is not a valid label name",
+					string(kv.Key), metrics.NormalizePrometheusLabelName(string(kv.Key))))
 			default:
 				c.resourceAttrs = append(c.resourceAttrs, kv)
 			}
 		}
 	}
 }
+
+// telemetrySDKKeyPrefix is the namespace resource.WithTelemetrySDK() owns.
+const telemetrySDKKeyPrefix = "telemetry.sdk."
 
 // isSDKResourceIdentityKey reports whether key is one of the four resource
 // attributes the identity options own.

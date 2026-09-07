@@ -18,10 +18,15 @@ adopters can plan their upgrades.
 - `WithResourceAttributes(attrs ...attribute.KeyValue)` adds caller-owned
   attributes to the Resource shared by traces, metrics and logs (for example
   `k8s.pod.name` when it is not supplied through `OTEL_RESOURCE_ATTRIBUTES`).
-  The four identity keys (`service.name`, `service.version`,
-  `service.namespace`, `deployment.environment.name`) are rejected with the
-  usual startup warning so the identity options stay authoritative; a key set
-  here overrides the same key from `OTEL_RESOURCE_ATTRIBUTES`.
+  Rejected with the usual startup warning: the four identity keys
+  (`service.name`, `service.version`, `service.namespace`,
+  `deployment.environment.name`) so the identity options stay authoritative;
+  `telemetry.sdk.*`, which the SDK detects itself; and any key that would
+  normalize to a Prometheus label the exporter already owns or to an invalid
+  label name (`service_name` would be joined into the `service_name` constant
+  on `target_info`, `__meta__` would make otelprom disable `target_info` for
+  the process). A key set here overrides the same key from
+  `OTEL_RESOURCE_ATTRIBUTES`.
 
 ### Changed
 

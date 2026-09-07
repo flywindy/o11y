@@ -166,7 +166,7 @@ _Resource (shared by traces, metrics and logs):_
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `WithResourceAttributes(attrs ...attribute.KeyValue)` | `nil` | Add attributes to the OTel Resource next to the identity above and the detected set (`host.*`, `process.pid`, `process.executable.name`, `process.runtime.name` / `.version`, `telemetry.sdk.*`, plus `OTEL_RESOURCE_ATTRIBUTES`). They appear on `target_info` and on every span and log record, so use process-lifetime values only. The four identity keys are rejected with a startup warning; a key set here overrides the same key from `OTEL_RESOURCE_ATTRIBUTES` |
+| `WithResourceAttributes(attrs ...attribute.KeyValue)` | `nil` | Add attributes to the OTel Resource next to the identity above and the detected set (`host.*`, `process.pid`, `process.executable.name`, `process.runtime.name` / `.version`, `telemetry.sdk.*`, plus `OTEL_RESOURCE_ATTRIBUTES`). They appear on `target_info` and on every span and log record, so use process-lifetime values only. Rejected with a startup warning: the four identity keys, `telemetry.sdk.*`, and any key that would normalize to a label the Prometheus exporter already owns or to an invalid label name (`service_name`, `__meta__`). A key set here overrides the same key from `OTEL_RESOURCE_ATTRIBUTES` |
 
 The SDK deliberately does not use `resource.WithProcess()`: it would also
 collect `process.command_args` and `process.owner`, and the Resource is
