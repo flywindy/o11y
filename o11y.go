@@ -466,7 +466,18 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 // Resource merge order is "later wins", so OTEL_RESOURCE_ATTRIBUTES sits at
 // the bottom, WithResourceAttributes above it, and the identity options on
 // top — a value set in code always beats the environment, and the identity
-// keys cannot be overridden by either.
+// keys cannot be overridden by either. Merging only de-duplicates exact
+// keys, and the Prometheus exporter would join two attributes that render as
+// the same label into one target_info value ("evil;svc"), so the environment
+// is read through metrics.EnvResourceAttributes rather than
+// resource.WithFromEnv: it applies the same guard WithResourceAttributes
+// applies at option time and drops, with a warning, any environment key
+// that is an alias of an SDK-owned key or of a caller-given one. The OTel
+// providers merge resource.Environment() back into whatever Resource they
+// are handed, so the guard cannot reach the provider-side Resource; it does
+// reach target_info, which the Prometheus path renders from this Resource
+// (internal/metrics targetInfoCollector), and the warning tells the
+// operator to fix the environment either way.
 //
 // The process detectors are the narrow ones on purpose. resource.WithProcess()
 // also collects process.command_args and process.owner, and the whole
@@ -478,8 +489,10 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 // ErrPartialResource is treated as non-fatal: some detectors (e.g. process info
 // on restricted hosts) may fail, but the remaining attributes are still useful.
 func buildResource(ctx context.Context, cfg *Config) (*resource.Resource, error) {
+	envAttrs, envWarnings := metrics.EnvResourceAttributes(ctx, cfg.resourceAttrs)
+	cfg.initWarnings = append(cfg.initWarnings, envWarnings...)
 	opts := []resource.Option{
-		resource.WithFromEnv(),
+		resource.WithAttributes(envAttrs...),
 		resource.WithTelemetrySDK(),
 		resource.WithProcessPID(),
 		resource.WithProcessExecutableName(),

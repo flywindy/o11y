@@ -55,7 +55,7 @@ every signal so that service identity is identical across backends.
 | `process.runtime.version` | string | `resource.WithProcessRuntimeVersion()` | detected |
 | `telemetry.sdk.name` / `.language` / `.version` | string | `resource.WithTelemetrySDK()` | detected |
 | (caller-provided) | various | `WithResourceAttributes(...)`; rejected: the four identity keys above, every detected key above (`telemetry.sdk.*`, `process.*`, `host.name`), any alias that renders as the same Prometheus label as one of those (`service_name`, `process_pid`, `host-name`), and any key that would render as an invalid label (`__meta__`) | optional |
-| (env-provided) | various | `resource.WithFromEnv()` / `OTEL_RESOURCE_ATTRIBUTES` | optional |
+| (env-provided) | various | `OTEL_RESOURCE_ATTRIBUTES` / `OTEL_SERVICE_NAME`, read as `resource.WithFromEnv()` does and passed through the same guard as `WithResourceAttributes` (an alias of an SDK-owned or caller-given key is dropped with a warning) | optional |
 
 `process.command_args`, `process.owner`, `process.executable.path` and
 `process.runtime.description` are deliberately not collected, because the

@@ -27,8 +27,9 @@ adopters can plan their upgrades.
   those (`service_name`, `process_pid`, `host-name` — otelprom would join the
   two values into one `target_info` label); and any key that would render as
   an invalid label name (`__meta__` would make otelprom disable `target_info`
-  for the process). A key set here overrides the same key from
-  `OTEL_RESOURCE_ATTRIBUTES`.
+  for the process); and an alias of a key given earlier to the option
+  (`app.foo` then `app_foo`), for the same reason. A key set here overrides
+  the same key from `OTEL_RESOURCE_ATTRIBUTES`.
 
 ### Changed
 
@@ -47,6 +48,15 @@ adopters can plan their upgrades.
   `process_owner`, `process_executable_path` or
   `process_runtime_description` from `target_info` will find those labels
   gone; no series name changes.
+- resource: `OTEL_RESOURCE_ATTRIBUTES` now goes through the same guard as
+  `WithResourceAttributes` when the Resource is built. An environment key
+  that is only an alias of an SDK-owned key (`telemetry_sdk_name` next to the
+  detected `telemetry.sdk.name`, `service-name` next to `service.name`), of
+  a key given to `WithResourceAttributes`, or that the Prometheus exporter
+  cannot translate, is dropped with a startup warning instead of being joined
+  into that label's `target_info` value (`"evil;opentelemetry"`). Exact keys
+  are unaffected: `OTEL_SERVICE_NAME` still seeds `service.name` and the
+  identity options still override it.
 
 ### Fixed
 
