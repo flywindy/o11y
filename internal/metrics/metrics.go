@@ -444,6 +444,10 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []s
 	if rules := otlpCapRules(cfg); len(rules) > 0 {
 		cappedExporter = metricscap.NewExporter(exporter, rules...)
 	}
+	// Ship res, not the provider's Resource: the provider merges the raw
+	// environment back in, which would resurrect an alias
+	// EnvResourceAttributes dropped. See guardedResourceExporter.
+	cappedExporter = withGuardedResource(cappedExporter, res)
 
 	var initSucceeded bool
 	var provider *sdkmetric.MeterProvider

@@ -99,10 +99,15 @@ func IsTelemetrySDKKey(key attribute.Key) bool {
 //     sorted order, so the choice is deterministic).
 //
 // The OTel providers merge resource.Environment() back into the Resource
-// they are given, so on the OTLP path a dropped alias still travels as its
-// own, distinct attribute (harmless: nothing joins it). On the Prometheus
-// path target_info is rendered by targetInfoCollector from the guarded
-// Resource, which is where the filtering takes effect.
+// they are given, so the provider-side Resource still carries a dropped
+// alias. The metrics paths correct for that where the Resource is
+// exported: target_info is rendered by targetInfoCollector from the guarded
+// Resource on the Prometheus pull path, and guardedResourceExporter ships
+// the guarded Resource on the OTLP push path, so no Prometheus translation
+// on either path sees the alias. Spans and log records still carry it as
+// its own, distinct attribute: those providers offer no seam short of
+// mutating the process environment, and no Prometheus label is derived
+// from them; the startup warning names the key to remove.
 func EnvResourceAttributes(ctx context.Context, callerAttrs []attribute.KeyValue) (kept []attribute.KeyValue, warnings []string) {
 	envRes, err := resource.New(ctx, resource.WithFromEnv())
 	if err != nil && !errors.Is(err, resource.ErrPartialResource) {
