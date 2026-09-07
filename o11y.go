@@ -475,9 +475,11 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 // that is an alias of an SDK-owned key or of a caller-given one. The OTel
 // providers merge resource.Environment() back into whatever Resource they
 // are handed, so the guard cannot reach the provider-side Resource; it does
-// reach target_info, which the Prometheus path renders from this Resource
-// (internal/metrics targetInfoCollector), and the warning tells the
-// operator to fix the environment either way.
+// reach everything the metrics paths export — target_info on the Prometheus
+// path (internal/metrics targetInfoCollector) and the Resource on the OTLP
+// push path (guardedResourceExporter) — and the warning tells the operator
+// to fix the environment for spans and logs, which carry the alias as a
+// distinct attribute.
 //
 // The process detectors are the narrow ones on purpose. resource.WithProcess()
 // also collects process.command_args and process.owner, and the whole
