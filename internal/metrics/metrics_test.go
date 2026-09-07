@@ -1057,7 +1057,7 @@ func TestGuardScopeAttributes_DropsCollidingScopeAttributes(t *testing.T) {
 // narrow process detector set as o11y.buildResource.
 func TestInitMeter_StandaloneResourceOmitsCommandArgs(t *testing.T) {
 	addr := testutil.FreeAddr(t)
-	mp, closer, err := metrics.InitMeter(context.Background(), baseConfig(addr))
+	mp, closer, err := metrics.InitMeter(t.Context(), baseConfig(addr))
 	require.NoError(t, err)
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1069,6 +1069,10 @@ func TestInitMeter_StandaloneResourceOmitsCommandArgs(t *testing.T) {
 	body := testutil.ScrapeMetrics(t.Context(), t, addr)
 	assert.Contains(t, body, `telemetry_sdk_name="opentelemetry"`)
 	assert.Contains(t, body, `process_runtime_name="go"`)
-	assert.NotContains(t, body, "process_command_args")
-	assert.NotContains(t, body, "process_owner")
+	for _, unwanted := range []string{
+		"process_command_args", "process_owner",
+		"process_executable_path", "process_runtime_description",
+	} {
+		assert.NotContains(t, body, unwanted)
+	}
 }
