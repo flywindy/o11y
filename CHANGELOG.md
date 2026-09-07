@@ -21,11 +21,13 @@ adopters can plan their upgrades.
   Rejected with the usual startup warning: the four identity keys
   (`service.name`, `service.version`, `service.namespace`,
   `deployment.environment.name`) so the identity options stay authoritative;
-  `telemetry.sdk.*`, which the SDK detects itself; and any key that would
-  normalize to a Prometheus label the exporter already owns or to an invalid
-  label name (`service_name` would be joined into the `service_name` constant
-  on `target_info`, `__meta__` would make otelprom disable `target_info` for
-  the process). A key set here overrides the same key from
+  the keys the SDK detects itself (`telemetry.sdk.*`, `process.pid`,
+  `process.executable.name`, `process.runtime.name` / `.version`,
+  `host.name`); any alias that renders as the same Prometheus label as one of
+  those (`service_name`, `process_pid`, `host-name` — otelprom would join the
+  two values into one `target_info` label); and any key that would render as
+  an invalid label name (`__meta__` would make otelprom disable `target_info`
+  for the process). A key set here overrides the same key from
   `OTEL_RESOURCE_ATTRIBUTES`.
 
 ### Changed

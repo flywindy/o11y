@@ -342,13 +342,18 @@ func WithServiceNamespace(namespace string) Option {
 // single source of truth and target_info stays exportable:
 //
 //   - the identity keys service.name, service.version, service.namespace and
-//     deployment.environment.name;
-//   - telemetry.sdk.*, which identifies the OpenTelemetry SDK, not the service;
-//   - any key that normalizes to a Prometheus label the exporter already owns
-//     (service_name, service-name and the like collide with the identity
-//     constants on target_info, where otelprom joins the two values with ";"),
-//     or to a label name Prometheus rejects ("__meta__", punctuation-only
-//     keys) — the exporter would then disable target_info for the process;
+//     deployment.environment.name, and any alias that renders as the same
+//     Prometheus label (service_name, service-name): otelprom would join the
+//     two values into one target_info label, "evil;svc";
+//   - the detected keys — telemetry.sdk.name / .language / .version,
+//     process.pid, process.executable.name, process.runtime.name / .version,
+//     host.name — and their aliases (telemetry_sdk_name, process_pid,
+//     host-name), for the same reason; the rest of the telemetry.sdk.*
+//     namespace is refused too, since it identifies the OpenTelemetry SDK,
+//     not the service;
+//   - any key that renders as a label name Prometheus rejects ("__meta__",
+//     punctuation-only keys) or one the exporter reserves elsewhere: the
+//     exporter would then disable target_info for the process;
 //   - an empty key.
 //
 // Values given here override the same key from OTEL_RESOURCE_ATTRIBUTES; the
@@ -360,13 +365,17 @@ func WithResourceAttributes(attrs ...attribute.KeyValue) Option {
 			case kv.Key == "":
 				c.initWarnings = append(c.initWarnings,
 					"WithResourceAttributes: ignoring an attribute with an empty key")
-			case isSDKResourceIdentityKey(kv.Key):
+			case sdkOwnedResourceKey(kv.Key, identityResourceKeys) != "":
 				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
-					"WithResourceAttributes: ignoring %q; it is set by the SDK's identity options (WithServiceName / WithServiceVersion / WithServiceNamespace / WithEnvironment)",
-					string(kv.Key)))
-			case strings.HasPrefix(string(kv.Key), telemetrySDKKeyPrefix):
+					"WithResourceAttributes: ignoring %q; it would collide with %q, which is set by the SDK's identity options (WithServiceName / WithServiceVersion / WithServiceNamespace / WithEnvironment)",
+					string(kv.Key), string(sdkOwnedResourceKey(kv.Key, identityResourceKeys))))
+			case sdkOwnedResourceKey(kv.Key, detectedResourceKeys) != "":
 				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
-					"WithResourceAttributes: ignoring %q; telemetry.sdk.* is detected by the SDK and identifies the OpenTelemetry SDK, not the service",
+					"WithResourceAttributes: ignoring %q; it would collide with %q, which the SDK detects itself",
+					string(kv.Key), string(sdkOwnedResourceKey(kv.Key, detectedResourceKeys))))
+			case strings.HasPrefix(metrics.NormalizePrometheusLabelName(string(kv.Key)), telemetrySDKLabelPrefix):
+				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
+					"WithResourceAttributes: ignoring %q; telemetry.sdk.* identifies the OpenTelemetry SDK, not the service",
 					string(kv.Key)))
 			case metrics.IsReservedAttributeKey(kv.Key):
 				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
@@ -379,18 +388,47 @@ func WithResourceAttributes(attrs ...attribute.KeyValue) Option {
 	}
 }
 
-// telemetrySDKKeyPrefix is the namespace resource.WithTelemetrySDK() owns.
-const telemetrySDKKeyPrefix = "telemetry.sdk."
+// identityResourceKeys are the resource attributes the identity options own.
+var identityResourceKeys = []attribute.Key{
+	semconv.ServiceNameKey,
+	semconv.ServiceVersionKey,
+	semconv.ServiceNamespaceKey,
+	semconv.DeploymentEnvironmentNameKey,
+}
 
-// isSDKResourceIdentityKey reports whether key is one of the four resource
-// attributes the identity options own.
-func isSDKResourceIdentityKey(key attribute.Key) bool {
-	switch key {
-	case semconv.ServiceNameKey, semconv.ServiceVersionKey,
-		semconv.ServiceNamespaceKey, semconv.DeploymentEnvironmentNameKey:
-		return true
+// detectedResourceKeys are the resource attributes buildResource's detectors
+// set (see the resource.Option list there). They are listed so a caller
+// cannot shadow one through WithResourceAttributes, by the exact key or by
+// an alias that renders as the same Prometheus label.
+var detectedResourceKeys = []attribute.Key{
+	semconv.TelemetrySDKNameKey,
+	semconv.TelemetrySDKLanguageKey,
+	semconv.TelemetrySDKVersionKey,
+	semconv.ProcessPIDKey,
+	semconv.ProcessExecutableNameKey,
+	semconv.ProcessRuntimeNameKey,
+	semconv.ProcessRuntimeVersionKey,
+	semconv.HostNameKey,
+}
+
+// telemetrySDKLabelPrefix is the Prometheus form of the telemetry.sdk.*
+// namespace resource.WithTelemetrySDK() owns.
+const telemetrySDKLabelPrefix = "telemetry_sdk_"
+
+// sdkOwnedResourceKey returns the key in owned that key would render as the
+// same Prometheus label as, or "" when there is none. The comparison is on
+// the normalized label because that is where the collision happens: otelprom
+// joins the values of two attributes that normalize alike into one
+// target_info label ("evil;svc"), so "service_name" or "service-name" must
+// be treated exactly like "service.name".
+func sdkOwnedResourceKey(key attribute.Key, owned []attribute.Key) attribute.Key {
+	label := metrics.NormalizePrometheusLabelName(string(key))
+	for _, k := range owned {
+		if metrics.NormalizePrometheusLabelName(string(k)) == label {
+			return k
+		}
 	}
-	return false
+	return ""
 }
 
 // WithMetricsOTLPEndpoint switches the metrics exporter from Prometheus pull
