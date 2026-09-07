@@ -432,7 +432,7 @@ func TestInit_TargetInfoCarriesNarrowProcessAndSDKAttributes(t *testing.T) {
 		o11y.WithMetricsAddr(addr),
 		o11y.WithResourceAttributes(attribute.String("k8s.pod.name", "test-svc-7d9f-x2kq")),
 	)
-	sdk, err := o11y.Init(context.Background(), opts...)
+	sdk, err := o11y.Init(t.Context(), opts...)
 	require.NoError(t, err)
 	defer testutil.MustShutdown(t.Context(), t, sdk)
 
@@ -466,7 +466,10 @@ func TestInit_TargetInfoCarriesNarrowProcessAndSDKAttributes(t *testing.T) {
 	} {
 		assert.Contains(t, line, want)
 	}
-	for _, unwanted := range []string{"process_command_args", "process_owner", "process_executable_path"} {
+	for _, unwanted := range []string{
+		"process_command_args", "process_owner",
+		"process_executable_path", "process_runtime_description",
+	} {
 		assert.NotContains(t, line, unwanted)
 	}
 }

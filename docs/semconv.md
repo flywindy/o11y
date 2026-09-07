@@ -54,13 +54,15 @@ every signal so that service identity is identical across backends.
 | `process.runtime.name` | string | `resource.WithProcessRuntimeName()` | detected |
 | `process.runtime.version` | string | `resource.WithProcessRuntimeVersion()` | detected |
 | `telemetry.sdk.name` / `.language` / `.version` | string | `resource.WithTelemetrySDK()` | detected |
-| (caller-provided) | various | `WithResourceAttributes(...)`; identity keys above are rejected | optional |
+| (caller-provided) | various | `WithResourceAttributes(...)`; `service.name`, `service.version`, `service.namespace` and `deployment.environment.name` are rejected | optional |
 | (env-provided) | various | `resource.WithFromEnv()` / `OTEL_RESOURCE_ATTRIBUTES` | optional |
 
 `process.command_args`, `process.owner`, `process.executable.path` and
-`process.runtime.description` are deliberately not collected: the Resource is
-exported unfiltered (`target_info`, every span, every log record), and the
-first two can carry credentials passed on the command line.
+`process.runtime.description` are deliberately not collected, because the
+Resource is exported unfiltered (`target_info`, every span, every log record):
+`process.command_args` can carry credentials passed on the command line;
+`process.owner` reveals which account runs the service, which no backend
+needs; the other two add only label bloat.
 
 ---
 
