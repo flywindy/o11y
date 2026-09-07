@@ -19,7 +19,8 @@ adopters can plan their upgrades.
   `/metrics` endpoint down. An attribute whose key normalizes to a label the
   Prometheus exporter already owns — the four resource constants
   (`service_name`, `service_namespace`, `service_version`,
-  `deployment_environment_name`) and the three `otel_scope_*` scope labels —
+  `deployment_environment_name`) and the `otel_scope_*` labels (name, version,
+  schema URL, and one per instrumentation-scope attribute) —
   made client_golang reject that family with "duplicate label names in
   constant and variable labels", and because aggregation is cumulative the
   rejection followed the process until restart; with promhttp's default error

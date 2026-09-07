@@ -294,9 +294,10 @@ By default the SDK exposes a `/metrics` endpoint on `:2112` for Prometheus to sc
 curl http://localhost:2112/metrics   # inspect raw output
 ```
 
-**Reserved attribute keys.** Those four labels, and the `otel_scope_name` /
-`otel_scope_version` / `otel_scope_schema_url` labels the exporter adds, are
-owned by the SDK. An attribute recorded on any instrument whose key
+**Reserved attribute keys.** Those four labels, and every `otel_scope_*`
+label the exporter adds (`otel_scope_name` / `_version` / `_schema_url`, plus
+`otel_scope_<attr>` for each instrumentation-scope attribute a meter was
+created with), are owned by the SDK. An attribute recorded on any instrument whose key
 normalizes to one of them (`service.name`, `service_name`, `service-name`,
 ...) is dropped from the exported series rather than exported: the
 Prometheus client rejects a series that carries the same label twice, and

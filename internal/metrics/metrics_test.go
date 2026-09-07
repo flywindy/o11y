@@ -894,12 +894,17 @@ func TestInitMeter_ReservedAttributeKeysAreDropped(t *testing.T) {
 		_ = mp.Shutdown(ctx)
 	}()
 
-	counter, err := mp.Meter("app").Int64Counter("app_collision")
+	// A meter created with instrumentation-scope attributes makes otelprom add
+	// otel_scope_<attr> labels too, so those keys are reserved as well.
+	counter, err := mp.Meter("app", metric.WithInstrumentationAttributes(
+		attribute.String("tier", "scope"),
+	)).Int64Counter("app_collision")
 	require.NoError(t, err)
 	counter.Add(context.Background(), 1, metric.WithAttributes(
 		attribute.String("service.name", "evil"),
 		attribute.String("service_namespace", "evil"),
 		attribute.String("otel.scope.name", "evil"),
+		attribute.String("otel.scope.tier", "evil"),
 		attribute.String("outcome", "ok"),
 	))
 
@@ -913,6 +918,7 @@ func TestInitMeter_ReservedAttributeKeysAreDropped(t *testing.T) {
 		assert.Contains(t, line, `outcome="ok"`, "non-reserved attributes survive")
 		assert.Contains(t, line, `service_name="test-svc"`, "the resource constant label wins")
 		assert.Contains(t, line, `service_namespace="platform"`)
+		assert.Contains(t, line, `otel_scope_tier="scope"`, "the scope attribute label wins")
 		assert.NotContains(t, line, "evil")
 	}
 	assert.True(t, found, "the family must still be exported: %s", body)

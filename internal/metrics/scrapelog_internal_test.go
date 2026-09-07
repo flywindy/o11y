@@ -129,11 +129,18 @@ func TestIsReservedAttributeKey(t *testing.T) {
 		"service.name", "service_name", "service-name",
 		"service.namespace", "service.version", "deployment.environment.name",
 		"otel.scope.name", "otel_scope_version", "otel.scope.schema_url",
+		// otelprom renders every instrumentation-scope attribute as
+		// otel_scope_<attr>, so the whole prefix is reserved.
+		"otel.scope.foo", "otel_scope_deployment", "otel.scope.x.y",
 	}
 	for _, k := range reserved {
 		assert.Truef(t, IsReservedAttributeKey(attribute.Key(k)), "%q should be reserved", k)
 	}
-	for _, k := range []string{"http.route", "service.instance.id", "chat.room.id", "servicename", ""} {
+	notReserved := []string{
+		"http.route", "service.instance.id", "chat.room.id", "servicename", "",
+		"otel.scope", "otel.scopes.name", "otel.library.name", "otelscope.name",
+	}
+	for _, k := range notReserved {
 		assert.Falsef(t, IsReservedAttributeKey(attribute.Key(k)), "%q should not be reserved", k)
 	}
 }
@@ -144,7 +151,7 @@ func TestIsReservedAttributeKey(t *testing.T) {
 func TestIsReservedAttributeKey_NoAllocations(t *testing.T) {
 	keys := []attribute.Key{
 		"http.route", "db.system.name", "server.address", "outcome",
-		"service.name", "service-namespace", "otel.scope.name", "deployment.environment.name",
+		"service.name", "service-namespace", "otel.scope.name", "otel.scope.foo", "deployment.environment.name",
 	}
 	allocs := testing.AllocsPerRun(1000, func() {
 		for _, k := range keys {
@@ -169,5 +176,9 @@ func TestNormalizedEqualsMatchesNormalizer(t *testing.T) {
 			assert.Equalf(t, NormalizePrometheusLabelName(k) == want, normalizedEquals(k, want),
 				"normalizedEquals(%q, %q)", k, want)
 		}
+	}
+	for _, k := range []string{"otel.scope.name", "otel.scope.foo", "otel..scope..x", "otel.scope", "otel.scopes.x", "otel_scope_", "o", ""} {
+		assert.Equalf(t, strings.HasPrefix(NormalizePrometheusLabelName(k), scopeLabelPrefix),
+			normalizedHasPrefix(k, scopeLabelPrefix), "normalizedHasPrefix(%q)", k)
 	}
 }

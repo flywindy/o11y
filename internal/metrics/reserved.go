@@ -19,8 +19,11 @@ var resourceConstantLabelKeys = []string{
 
 // reservedPromLabels lists, in their post-normalization Prometheus form, the
 // label names the exporter already owns on every series: the four resource
-// constants above and the three scope labels otelprom adds
-// (otel_scope_name / _version / _schema_url).
+// constants above. otelprom additionally owns every label under the
+// scopeLabelPrefix — otel_scope_name / _version / _schema_url on every
+// series, plus otel_scope_<attr> for each instrumentation-scope attribute a
+// meter was created with — so that prefix is reserved as a whole rather than
+// enumerated.
 //
 // A datapoint attribute that normalizes to one of these names cannot be
 // exported: otelprom appends the constant labels after the datapoint's own
@@ -35,8 +38,11 @@ var resourceConstantLabelKeys = []string{
 var reservedPromLabels = map[byte][]string{
 	's': {"service_namespace", "service_name", "service_version"},
 	'd': {"deployment_environment_name"},
-	'o': {"otel_scope_name", "otel_scope_version", "otel_scope_schema_url"},
 }
+
+// scopeLabelPrefix is the prefix otelprom puts on every label it derives from
+// the instrumentation scope (name, version, schema URL and scope attributes).
+const scopeLabelPrefix = "otel_scope_"
 
 // IsReservedAttributeKey reports whether key would render as a Prometheus
 // label the exporter already owns (see reservedPromLabels). The check runs
@@ -55,13 +61,14 @@ func IsReservedAttributeKey(key attribute.Key) bool {
 	// A key whose normalized form starts with a digit is prefixed "key_",
 	// which no reserved label starts with; any other first byte survives
 	// normalization as itself or as '_', so it selects the candidate group.
-	candidates, ok := reservedPromLabels[k[0]]
-	if !ok {
-		return false
-	}
-	for _, want := range candidates {
-		if normalizedEquals(k, want) {
-			return true
+	switch k[0] {
+	case 'o':
+		return normalizedHasPrefix(k, scopeLabelPrefix)
+	case 's', 'd':
+		for _, want := range reservedPromLabels[k[0]] {
+			if normalizedEquals(k, want) {
+				return true
+			}
 		}
 	}
 	return false
@@ -72,6 +79,23 @@ func IsReservedAttributeKey(key attribute.Key) bool {
 // start with a digit (see IsReservedAttributeKey for why that case is not
 // needed here).
 func normalizedEquals(key, want string) bool {
+	n, complete := normalizedMatchLen(key, want)
+	return complete && n == len(want)
+}
+
+// normalizedHasPrefix reports whether NormalizePrometheusLabelName(key) starts
+// with prefix, under the same conditions as normalizedEquals.
+func normalizedHasPrefix(key, prefix string) bool {
+	n, _ := normalizedMatchLen(key, prefix)
+	return n == len(prefix)
+}
+
+// normalizedMatchLen walks key applying the Prometheus label normalization
+// rules on the fly and compares the result byte by byte against want. It
+// returns how many bytes of want were matched and whether key was consumed
+// entirely while matching (false as soon as a byte differs or key outgrows
+// want). It never allocates.
+func normalizedMatchLen(key, want string) (matched int, complete bool) {
 	i := 0 // next byte of want to match
 	prevUnderscore := false
 	for _, r := range key {
@@ -87,11 +111,11 @@ func normalizedEquals(key, want string) bool {
 			prevUnderscore = true
 		}
 		if i >= len(want) || want[i] != out {
-			return false
+			return i, false
 		}
 		i++
 	}
-	return i == len(want)
+	return i, true
 }
 
 // notReserved is the attribute.Filter that keeps every attribute except the
