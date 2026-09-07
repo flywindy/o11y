@@ -426,6 +426,7 @@ func TestInit_OTLPHeadersForwarded(t *testing.T) {
 // without process_command_args / process_owner, and must carry a
 // WithResourceAttributes key.
 func TestInit_TargetInfoCarriesNarrowProcessAndSDKAttributes(t *testing.T) {
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "telemetry_sdk_name=evil,k8s_pod_name=evil,deploy.ring=canary")
 	srv := testutil.FakeOTLPServer(t)
 	addr := testutil.FreeAddr(t)
 	opts := append(commonOpts(srv.URL),
@@ -463,9 +464,11 @@ func TestInit_TargetInfoCarriesNarrowProcessAndSDKAttributes(t *testing.T) {
 		`process_pid=`,
 		`process_runtime_name="go"`,
 		`k8s_pod_name="test-svc-7d9f-x2kq"`,
+		`deploy_ring="canary"`,
 	} {
 		assert.Contains(t, line, want)
 	}
+	assert.NotContains(t, line, "evil", "environment aliases of SDK-owned or caller keys must not be joined into their labels")
 	for _, unwanted := range []string{
 		"process_command_args", "process_owner",
 		"process_executable_path", "process_runtime_description",

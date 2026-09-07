@@ -5,13 +5,11 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
-	"strings"
 
 	"github.com/flywindy/o11y/internal/baggageattrs"
 	"github.com/flywindy/o11y/internal/metrics"
 	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 )
 
 // DefaultMetricsAddr is the default listen address for the built-in
@@ -354,81 +352,65 @@ func WithServiceNamespace(namespace string) Option {
 //   - any key that renders as a label name Prometheus rejects ("__meta__",
 //     punctuation-only keys) or one the exporter reserves elsewhere: the
 //     exporter would then disable target_info for the process;
+//   - an alias of a key given earlier to this option (app.foo, then app_foo):
+//     the two would be joined into one label the same way;
 //   - an empty key.
 //
-// Values given here override the same key from OTEL_RESOURCE_ATTRIBUTES; the
-// last value wins when a key is given twice.
+// The same exact key given twice keeps the last value. Values given here
+// override the same key from OTEL_RESOURCE_ATTRIBUTES, and an environment
+// key that is only an alias of one given here is dropped with a warning;
+// the environment goes through the same guard as this option when the
+// Resource is built (see buildResource).
 func WithResourceAttributes(attrs ...attribute.KeyValue) Option {
 	return func(c *Config) {
 		for _, kv := range attrs {
+			owner, identity := metrics.ResourceKeyOwner(kv.Key)
 			switch {
 			case kv.Key == "":
 				c.initWarnings = append(c.initWarnings,
 					"WithResourceAttributes: ignoring an attribute with an empty key")
-			case sdkOwnedResourceKey(kv.Key, identityResourceKeys) != "":
+			case owner != "" && identity:
 				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
 					"WithResourceAttributes: ignoring %q; it would collide with %q, which is set by the SDK's identity options (WithServiceName / WithServiceVersion / WithServiceNamespace / WithEnvironment)",
-					string(kv.Key), string(sdkOwnedResourceKey(kv.Key, identityResourceKeys))))
-			case sdkOwnedResourceKey(kv.Key, detectedResourceKeys) != "":
+					string(kv.Key), string(owner)))
+			case owner != "":
 				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
 					"WithResourceAttributes: ignoring %q; it would collide with %q, which the SDK detects itself",
-					string(kv.Key), string(sdkOwnedResourceKey(kv.Key, detectedResourceKeys))))
-			case strings.HasPrefix(metrics.NormalizePrometheusLabelName(string(kv.Key)), telemetrySDKLabelPrefix):
+					string(kv.Key), string(owner)))
+			case metrics.IsTelemetrySDKKey(kv.Key):
 				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
 					"WithResourceAttributes: ignoring %q; telemetry.sdk.* identifies the OpenTelemetry SDK, not the service",
 					string(kv.Key)))
 			case metrics.IsReservedAttributeKey(kv.Key):
 				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
-					"WithResourceAttributes: ignoring %q; as the Prometheus label %q it would collide with a label the exporter already owns on target_info, or is not a valid label name",
+					"WithResourceAttributes: ignoring %q; as the Prometheus label %q it is reserved by the exporter or not a valid label name, and otelprom would disable target_info for the whole process",
 					string(kv.Key), metrics.NormalizePrometheusLabelName(string(kv.Key))))
 			default:
-				c.resourceAttrs = append(c.resourceAttrs, kv)
+				c.resourceAttrs = appendResourceAttribute(c, kv)
 			}
 		}
 	}
 }
 
-// identityResourceKeys are the resource attributes the identity options own.
-var identityResourceKeys = []attribute.Key{
-	semconv.ServiceNameKey,
-	semconv.ServiceVersionKey,
-	semconv.ServiceNamespaceKey,
-	semconv.DeploymentEnvironmentNameKey,
-}
-
-// detectedResourceKeys are the resource attributes buildResource's detectors
-// set (see the resource.Option list there). They are listed so a caller
-// cannot shadow one through WithResourceAttributes, by the exact key or by
-// an alias that renders as the same Prometheus label.
-var detectedResourceKeys = []attribute.Key{
-	semconv.TelemetrySDKNameKey,
-	semconv.TelemetrySDKLanguageKey,
-	semconv.TelemetrySDKVersionKey,
-	semconv.ProcessPIDKey,
-	semconv.ProcessExecutableNameKey,
-	semconv.ProcessRuntimeNameKey,
-	semconv.ProcessRuntimeVersionKey,
-	semconv.HostNameKey,
-}
-
-// telemetrySDKLabelPrefix is the Prometheus form of the telemetry.sdk.*
-// namespace resource.WithTelemetrySDK() owns.
-const telemetrySDKLabelPrefix = "telemetry_sdk_"
-
-// sdkOwnedResourceKey returns the key in owned that key would render as the
-// same Prometheus label as, or "" when there is none. The comparison is on
-// the normalized label because that is where the collision happens: otelprom
-// joins the values of two attributes that normalize alike into one
-// target_info label ("evil;svc"), so "service_name" or "service-name" must
-// be treated exactly like "service.name".
-func sdkOwnedResourceKey(key attribute.Key, owned []attribute.Key) attribute.Key {
-	label := metrics.NormalizePrometheusLabelName(string(key))
-	for _, k := range owned {
-		if metrics.NormalizePrometheusLabelName(string(k)) == label {
-			return k
+// appendResourceAttribute adds kv to c.resourceAttrs unless an earlier
+// attribute would render as the same Prometheus label: the same exact key is
+// replaced in place (last value wins, as documented), a different key with
+// the same label is dropped with a warning, because otelprom would join the
+// two values into one target_info label instead of keeping either.
+func appendResourceAttribute(c *Config, kv attribute.KeyValue) []attribute.KeyValue {
+	for i, prev := range c.resourceAttrs {
+		if prev.Key == kv.Key {
+			c.resourceAttrs[i] = kv
+			return c.resourceAttrs
+		}
+		if metrics.SameLabel(prev.Key, kv.Key) {
+			c.initWarnings = append(c.initWarnings, fmt.Sprintf(
+				"WithResourceAttributes: ignoring %q; it would render as the same Prometheus label as %q, given earlier",
+				string(kv.Key), string(prev.Key)))
+			return c.resourceAttrs
 		}
 	}
-	return ""
+	return append(c.resourceAttrs, kv)
 }
 
 // WithMetricsOTLPEndpoint switches the metrics exporter from Prometheus pull

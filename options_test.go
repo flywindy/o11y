@@ -461,15 +461,19 @@ func TestWithResourceAttributes(t *testing.T) {
 		attribute.String("__meta__", "reserved shape"),
 		attribute.String("...", "punctuation only"),
 		attribute.Int("app.shard", 3),
+		attribute.String("app.foo", "a"),
+		attribute.String("app_foo", "b"),                      // alias of app.foo given just before
+		attribute.String("k8s.pod.name", "replaced-in-place"), // same exact key: last value wins
 	)(cfg)
 
 	assert.Equal(t, []attribute.KeyValue{
-		attribute.String("k8s.pod.name", "room-service-7d9f-x2kq"),
+		attribute.String("k8s.pod.name", "replaced-in-place"),
 		attribute.String("Service-Version", "alias"),
 		attribute.Int("app.shard", 3),
-	}, cfg.resourceAttrs, "only caller-owned keys are kept, in order")
+		attribute.String("app.foo", "a"),
+	}, cfg.resourceAttrs, "only caller-owned keys are kept, in order, one per Prometheus label")
 
-	require.Len(t, cfg.initWarnings, 13, "one warning per dropped attribute")
+	require.Len(t, cfg.initWarnings, 14, "one warning per dropped attribute")
 	assert.Contains(t, cfg.initWarnings[0], "empty key")
 	for i, key := range []string{"service.name", "service.version", "service.namespace", "deployment.environment.name"} {
 		assert.Contains(t, cfg.initWarnings[i+1], strconv.Quote(key))
@@ -493,6 +497,8 @@ func TestWithResourceAttributes(t *testing.T) {
 	assert.Contains(t, cfg.initWarnings[11], `"__meta__"`)
 	assert.Contains(t, cfg.initWarnings[11], "target_info")
 	assert.Contains(t, cfg.initWarnings[12], `"..."`)
+	assert.Contains(t, cfg.initWarnings[13], `"app_foo"`)
+	assert.Contains(t, cfg.initWarnings[13], `"app.foo"`, "the alias names the earlier key it collides with")
 }
 
 func TestWithResourceAttributesAppendsAcrossCalls(t *testing.T) {
@@ -537,10 +543,20 @@ func TestBuildResource_ProcessDetectorsAreNarrow(t *testing.T) {
 // TestBuildResource_MergeOrder checks the documented precedence: identity
 // options beat WithResourceAttributes, which beats OTEL_RESOURCE_ATTRIBUTES.
 func TestBuildResource_MergeOrder(t *testing.T) {
-	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "app.shard=env,k8s.pod.name=from-env,only.env=1")
-	t.Setenv("OTEL_SERVICE_NAME", "from-env")
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", strings.Join([]string{
+		"app.shard=env",           // exact key also given in code: code wins
+		"app_shard=env-alias",     // alias of the code key: dropped, would be joined into app_shard
+		"k8s.pod.name=from-env",   // only in env: kept
+		"only.env=1",              // only in env: kept
+		"telemetry_sdk_name=evil", // alias of a detected key: dropped
+		"service-name=evil",       // alias of an identity key: dropped
+		"telemetry.sdk.extra=x",   // SDK namespace: dropped
+		"__meta__=x",              // untranslatable label: dropped
+	}, ","))
+	t.Setenv("OTEL_SERVICE_NAME", "from-env") // exact identity key: overridden, no warning
 
 	cfg := defaultConfig()
+	cfg.initWarnings = nil
 	cfg.serviceName, cfg.serviceVersion, cfg.namespace, cfg.environment = "svc", "1.0.0", "platform", "development"
 	WithResourceAttributes(attribute.String("app.shard", "code"))(cfg)
 
@@ -549,14 +565,45 @@ func TestBuildResource_MergeOrder(t *testing.T) {
 	attrs := res.Set()
 
 	want := map[attribute.Key]string{
-		"service.name": "svc",      // identity beats OTEL_SERVICE_NAME
-		"app.shard":    "code",     // code beats env
-		"k8s.pod.name": "from-env", // env still contributes keys code did not set
-		"only.env":     "1",
+		"service.name":       "svc",      // identity beats OTEL_SERVICE_NAME
+		"app.shard":          "code",     // code beats env
+		"k8s.pod.name":       "from-env", // env still contributes keys code did not set
+		"only.env":           "1",
+		"telemetry.sdk.name": "opentelemetry", // the detector's value, untouched by the env alias
 	}
 	for key, val := range want {
 		v, ok := attrs.Value(key)
 		require.True(t, ok, "%s missing", key)
 		assert.Equal(t, val, v.AsString(), key)
 	}
+	for _, key := range []attribute.Key{"app_shard", "telemetry_sdk_name", "service-name", "telemetry.sdk.extra", "__meta__"} {
+		_, ok := attrs.Value(key)
+		assert.False(t, ok, "%s must not reach the Resource", key)
+	}
+
+	require.Len(t, cfg.initWarnings, 5, "one warning per dropped environment attribute")
+	for _, want := range []struct{ key, names string }{
+		{"app_shard", `"app.shard"`},
+		{"telemetry_sdk_name", `"telemetry.sdk.name"`},
+		{"service-name", `"service.name"`},
+		{"telemetry.sdk.extra", "telemetry.sdk.*"},
+		{"__meta__", "target_info"},
+	} {
+		assertWarningFor(t, cfg.initWarnings, "OTEL_RESOURCE_ATTRIBUTES", want.key, want.names)
+	}
+}
+
+// assertWarningFor asserts that exactly one warning mentions key (quoted) and
+// that it carries prefix and detail. Environment attributes are visited in
+// sorted key order, so tests match by content rather than by index.
+func assertWarningFor(t *testing.T, warnings []string, prefix, key, detail string) {
+	t.Helper()
+	var matches []string
+	for _, w := range warnings {
+		if strings.Contains(w, strconv.Quote(key)) && strings.HasPrefix(w, prefix) {
+			matches = append(matches, w)
+		}
+	}
+	require.Len(t, matches, 1, "expected one warning for %q, got %v", key, warnings)
+	assert.Contains(t, matches[0], detail)
 }
