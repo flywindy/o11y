@@ -90,6 +90,30 @@ func TestInit_EnvironmentAliases(t *testing.T) {
 	}
 }
 
+// TestInit_EnvironmentIgnoresCaseAndWhitespace pins that a manifest value such
+// as "PROD" or one with stray whitespace still resolves to the canonical name
+// rather than failing Init.
+func TestInit_EnvironmentIgnoresCaseAndWhitespace(t *testing.T) {
+	srv := testutil.FakeOTLPServer(t)
+
+	accepted := []string{"Production", "PROD", " staging ", "\tDEV\n", "Test"}
+	for _, in := range accepted {
+		t.Run(fmt.Sprintf("%q", in), func(t *testing.T) {
+			opts := append(commonOpts(srv.URL), o11y.WithEnvironment(in))
+			sdk, err := o11y.Init(context.Background(), opts...)
+			require.NoError(t, err, "environment %q should be accepted", in)
+			testutil.MustShutdown(t.Context(), t, sdk)
+		})
+	}
+
+	t.Run("whitespace only is still unset", func(t *testing.T) {
+		opts := append(commonOpts(srv.URL), o11y.WithEnvironment("   "))
+		_, err := o11y.Init(context.Background(), opts...)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "deployment environment is required")
+	})
+}
+
 func TestInit_Success(t *testing.T) {
 	srv := testutil.FakeOTLPServer(t)
 
@@ -284,6 +308,23 @@ func TestInit_WithTraceSampler(t *testing.T) {
 
 		assert.False(t, startRootSpanSampled(sdk),
 			"WithTraceSampler(nil) should leave OTEL_TRACES_SAMPLER active")
+	})
+
+	t.Run("nil sampler keeps an earlier sampling ratio", func(t *testing.T) {
+		srv := testutil.FakeOTLPServer(t)
+		unsetEnvForTest(t, "OTEL_TRACES_SAMPLER")
+		unsetEnvForTest(t, "OTEL_TRACES_SAMPLER_ARG")
+
+		// A wrapper that maps its own config onto options commonly appends
+		// WithTraceSampler(nil) for "no custom sampler". That must be a
+		// no-op, not a reset to 100 % sampling.
+		opts := append(commonOpts(srv.URL), o11y.WithSamplingRatio(0), o11y.WithTraceSampler(nil))
+		sdk, err := o11y.Init(context.Background(), opts...)
+		require.NoError(t, err)
+		defer testutil.MustShutdown(t.Context(), t, sdk)
+
+		assert.False(t, startRootSpanSampled(sdk),
+			"WithTraceSampler(nil) must not discard WithSamplingRatio(0)")
 	})
 }
 

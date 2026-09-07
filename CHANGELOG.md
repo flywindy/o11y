@@ -13,6 +13,18 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+### Fixed
+
+- `WithTraceSampler(nil)` is now a no-op. It previously cleared an earlier
+  `WithSamplingRatio`, so a wrapper that appended `WithTraceSampler(nil)` for
+  "no custom sampler" silently put the service back at 100 % head sampling.
+  `nil` now leaves the ratio, or the OTel environment/default sampler path,
+  exactly as it was.
+- `WithEnvironment` matches case-insensitively and ignores surrounding
+  whitespace. `"PROD"`, `"Production"` or a value with a trailing space from a
+  manifest resolve to the canonical name instead of failing `Init` — and with
+  it the service — at startup.
+
 ---
 
 ## [0.12.0] - 2026-09-04
