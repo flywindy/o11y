@@ -71,26 +71,25 @@ func TestCollectionCapRulesAreScopedAndBudgetedPerIntegration(t *testing.T) {
 	}
 }
 
-// The SDK cardinality limit is one global per-stream guard, so it must cover
-// every capped dimension. Deriving it from routes alone lets a low
-// WithMaxUniqueRoutes collapse Cassandra table series into otel.metric.overflow
-// while they are still inside MaxUniqueCollections.
-func TestCardinalityLimitBudgetCoversBothDimensions(t *testing.T) {
-	routeOnly := cardinalityLimitBudget(1000, 0)
-	collectionOnly := cardinalityLimitBudget(0, 200)
-	assert.Positive(t, routeOnly)
-	assert.Positive(t, collectionOnly)
-
-	// A tiny route cap must not shrink the budget below what the collection cap
-	// needs; the limit is the larger of the two.
-	assert.Equal(t, collectionOnly, cardinalityLimitBudget(1, 200),
-		"a low route cap must not starve the collection dimension")
-	// At the shipped defaults the route budget dominates, so this is a no-op.
-	assert.Equal(t, routeOnly, cardinalityLimitBudget(1000, 200))
-	// Both disabled means no limit is installed.
-	assert.Zero(t, cardinalityLimitBudget(0, 0))
+// The SDK cardinality limit is one global per-stream guard that also bounds
+// application instruments, so it must be a real ceiling: a floor of the OTel
+// default, a small multiple of each export cap on top, never the theoretical
+// method × status envelope that made it 1,024,000 before.
+func TestCardinalityLimitBudget(t *testing.T) {
+	// Shipped defaults: 4 × 1000 routes.
+	assert.Equal(t, 4000, cardinalityLimitBudget(1000, 200, 0))
+	// The floor holds when the caps are lowered or disabled, so a low route
+	// cap neither starves the collection dimension nor drops below OTel's own
+	// default for application instruments.
+	assert.Equal(t, DefaultCardinalityLimit, cardinalityLimitBudget(1, 200, 0))
+	assert.Equal(t, DefaultCardinalityLimit, cardinalityLimitBudget(0, 0, 0))
+	// The larger cap wins.
+	assert.Equal(t, 8000, cardinalityLimitBudget(100, 2000, 0))
+	// An explicit override replaces the derivation entirely.
+	assert.Equal(t, 100, cardinalityLimitBudget(1000, 200, 100))
+	assert.Equal(t, 50000, cardinalityLimitBudget(1000, 200, 50000))
 	// Saturates instead of overflowing.
-	assert.Positive(t, cardinalityLimitBudget(int(^uint(0)>>1), 0))
+	assert.Positive(t, cardinalityLimitBudget(int(^uint(0)>>1), 0, 0))
 }
 
 // Each cap is independent: configuring one must not install or suppress the

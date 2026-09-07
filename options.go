@@ -36,6 +36,11 @@ const MaxBaggageAttributeKeys = 8
 // service's URL space.
 const DefaultMaxUniqueCollections = 200
 
+// DefaultCardinalityLimit is the floor of the SDK's per-stream cardinality
+// limit and the OTel SDK's own default; see WithCardinalityLimit for how the
+// effective limit is derived from the export caps.
+const DefaultCardinalityLimit = metrics.DefaultCardinalityLimit
+
 // defaultLatencyBuckets is the SLO-friendly histogram boundary set applied
 // to all http.server.* histograms when the caller does not override it.
 // Standardizing these boundaries across the company keeps P99 calculations
@@ -85,6 +90,7 @@ type Config struct {
 	disableDefaultViews     bool
 	maxUniqueRoutes         int
 	maxUniqueCollections    int
+	cardinalityLimit        int // 0 → derived from the export caps
 	extraHTTPServerAttrKeys []string
 	exemplars               bool
 
@@ -630,8 +636,9 @@ func normalizePrometheusLabelName(key string) string {
 }
 
 // WithMaxUniqueRoutes sets the distinct http.route export cap. Values <= 0
-// use DefaultMaxUniqueRoutes. The SDK also derives an in-process aggregation
-// cardinality budget from this value to guard against unbounded attribute sets.
+// use DefaultMaxUniqueRoutes. The SDK also derives its in-process cardinality
+// limit from this value (see WithCardinalityLimit) so the guard grows with
+// the cap.
 func WithMaxUniqueRoutes(n int) Option {
 	return func(c *Config) {
 		if n <= 0 {
@@ -639,6 +646,30 @@ func WithMaxUniqueRoutes(n int) Option {
 			return
 		}
 		c.maxUniqueRoutes = n
+	}
+}
+
+// WithCardinalityLimit sets the OTel SDK's per-stream cardinality limit: the
+// most series one instrument may hold in process — n-1 distinct attribute
+// sets plus a single otel.metric.overflow="true" series that absorbs every
+// further set.
+// It is the memory guard for every instrument, application instruments
+// included — the one thing that bounds a counter someone labels by room id
+// or user id — and the overflow series is the signal to alert on.
+//
+// Values <= 0 derive the limit from the export caps:
+// max(DefaultCardinalityLimit, 4 × MaxUniqueRoutes, 4 × MaxUniqueCollections),
+// which is 4,000 at the defaults. Set it explicitly only for a service whose
+// http.server.request.duration legitimately carries more method × route ×
+// status combinations than that; raising it is a memory decision that
+// belongs in code where a reviewer sees it.
+func WithCardinalityLimit(n int) Option {
+	return func(c *Config) {
+		if n <= 0 {
+			c.cardinalityLimit = 0
+			return
+		}
+		c.cardinalityLimit = n
 	}
 }
 

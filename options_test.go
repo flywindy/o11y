@@ -646,3 +646,18 @@ func assertWarningFor(t *testing.T, warnings []string, prefix, key, detail strin
 	assert.Contains(t, matches[0], detail)
 	return matches[0]
 }
+
+func TestWithCardinalityLimit(t *testing.T) {
+	cfg := defaultConfig()
+	assert.Zero(t, cfg.cardinalityLimit, "unset means derived from the export caps")
+
+	WithCardinalityLimit(20000)(cfg)
+	assert.Equal(t, 20000, cfg.cardinalityLimit)
+
+	WithCardinalityLimit(0)(cfg)
+	assert.Zero(t, cfg.cardinalityLimit, "zero returns to the derived limit")
+	WithCardinalityLimit(-5)(cfg)
+	assert.Zero(t, cfg.cardinalityLimit, "negative values return to the derived limit")
+
+	assert.Equal(t, 2000, DefaultCardinalityLimit)
+}
