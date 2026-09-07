@@ -82,6 +82,43 @@ func TestScrapeErrorLogger_RepeatsAfterWindow(t *testing.T) {
 	assert.Equal(t, 2, strings.Count(logs.String(), "boom"))
 }
 
+// TestScrapeErrorLogger_TracksEachMessageSeparately pins that alternating
+// errors — two broken families failing on successive scrapes — are each
+// logged once per window rather than on every scrape.
+func TestScrapeErrorLogger_TracksEachMessageSeparately(t *testing.T) {
+	var logs bytes.Buffer
+	l := newScrapeErrorLogger(slog.New(slog.NewTextHandler(&logs, nil)))
+	now := time.Unix(1_700_000_000, 0)
+	l.now = func() time.Time { return now }
+
+	for i := 0; i < 5; i++ {
+		l.Println("error gathering metrics:", "family-a")
+		l.Println("error gathering metrics:", "family-b")
+		now = now.Add(15 * time.Second)
+	}
+	assert.Equal(t, 1, strings.Count(logs.String(), "family-a"))
+	assert.Equal(t, 1, strings.Count(logs.String(), "family-b"))
+}
+
+// TestScrapeErrorLogger_TableIsBounded pins the memory guard: the table never
+// holds more than maxTrackedScrapeErrors entries, and the evicted (oldest)
+// message is logged again when it recurs.
+func TestScrapeErrorLogger_TableIsBounded(t *testing.T) {
+	var logs bytes.Buffer
+	l := newScrapeErrorLogger(slog.New(slog.NewTextHandler(&logs, nil)))
+	now := time.Unix(1_700_000_000, 0)
+	l.now = func() time.Time { return now }
+
+	for i := 0; i < maxTrackedScrapeErrors+8; i++ {
+		l.Println("error gathering metrics:", "family", i)
+		now = now.Add(time.Second)
+	}
+	assert.LessOrEqual(t, len(l.lastSeen), maxTrackedScrapeErrors)
+
+	l.Println("error gathering metrics:", "family", 0) // evicted, so logged again
+	assert.Equal(t, 2, strings.Count(logs.String(), `metrics: family 0"`))
+}
+
 func TestScrapeErrorLogger_NilLoggerDiscards(t *testing.T) {
 	l := newScrapeErrorLogger(nil)
 	assert.NotPanics(t, func() { l.Println("ignored") })
@@ -98,5 +135,39 @@ func TestIsReservedAttributeKey(t *testing.T) {
 	}
 	for _, k := range []string{"http.route", "service.instance.id", "chat.room.id", "servicename", ""} {
 		assert.Falsef(t, IsReservedAttributeKey(attribute.Key(k)), "%q should not be reserved", k)
+	}
+}
+
+// TestIsReservedAttributeKey_NoAllocations pins that the hot-path filter does
+// not allocate, for keys that are reserved and for the far more common keys
+// that are not.
+func TestIsReservedAttributeKey_NoAllocations(t *testing.T) {
+	keys := []attribute.Key{
+		"http.route", "db.system.name", "server.address", "outcome",
+		"service.name", "service-namespace", "otel.scope.name", "deployment.environment.name",
+	}
+	allocs := testing.AllocsPerRun(1000, func() {
+		for _, k := range keys {
+			IsReservedAttributeKey(k)
+		}
+	})
+	assert.Zero(t, allocs, "IsReservedAttributeKey must not allocate on the recording path")
+}
+
+// TestNormalizedEqualsMatchesNormalizer pins the allocation-free comparison
+// against the materializing normalizer across the key shapes it must agree on.
+func TestNormalizedEqualsMatchesNormalizer(t *testing.T) {
+	keys := []string{
+		"service.name", "service_name", "service-name", "service..name", "service__name",
+		"service.name.", ".service.name", "service.nam", "service.names", "servicename",
+		"Service.Name", "otel.scope.schema_url", "otel/scope/schema/url", "deployment.environment.name",
+		"1service.name", "", "s", "_",
+	}
+	targets := []string{"service_name", "otel_scope_schema_url", "deployment_environment_name"}
+	for _, k := range keys {
+		for _, want := range targets {
+			assert.Equalf(t, NormalizePrometheusLabelName(k) == want, normalizedEquals(k, want),
+				"normalizedEquals(%q, %q)", k, want)
+		}
 	}
 }
