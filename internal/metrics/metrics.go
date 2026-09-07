@@ -364,8 +364,12 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 		}
 	}()
 
+	// Every stream, on every instrument, drops attribute keys that would
+	// collide with a label otelprom synthesizes or the exposition format
+	// owns (see reserved.go). This is a property of the Prometheus rendering,
+	// so the OTLP path below exports attributes untouched.
 	provider = sdkmetric.NewMeterProvider(
-		meterProviderOptions(exporter, res, views, cfg.MaxUniqueRoutes, cfg.MaxUniqueCollections)...,
+		meterProviderOptions(exporter, res, guardReservedKeys(views), cfg.MaxUniqueRoutes, cfg.MaxUniqueCollections)...,
 	)
 
 	if cfg.RuntimeMetrics {
@@ -462,11 +466,7 @@ func meterProviderOptions(reader sdkmetric.Reader, res *resource.Resource, views
 	opts := []sdkmetric.Option{
 		sdkmetric.WithReader(reader),
 		sdkmetric.WithResource(res),
-		// Every stream, on every instrument, drops attribute keys that would
-		// collide with the exporter's own labels (see reserved.go). Applied on
-		// both exporter paths so a caller's series look the same regardless
-		// of transport.
-		sdkmetric.WithView(guardReservedKeys(views)...),
+		sdkmetric.WithView(views...),
 	}
 	if limit := cardinalityLimitBudget(maxUniqueRoutes, maxUniqueCollections); limit > 0 {
 		opts = append(opts, sdkmetric.WithCardinalityLimit(limit))

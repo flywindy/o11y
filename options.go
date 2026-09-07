@@ -456,8 +456,9 @@ func WithDisableDefaultViews() Option {
 //
 //   - matches a built-in label the SDK already exports (the view-allowed
 //     HTTP semconv keys, the four resource constants, every otelprom
-//     otel_scope_* label, and the exposition-format labels le / quantile —
-//     the same reserved set the metric views drop at record time), or
+//     otel_scope_* label, the exposition-format labels le / quantile, and
+//     the "__x__" reserved-name shape — the same reserved set the metric
+//     views drop at record time on the Prometheus path), or
 //   - matches another caller-supplied key from this or a prior
 //     WithExtraHTTPServerAttributeKeys call (e.g. "app.name" and "app_name"
 //     both normalize to "app_name"), or

@@ -905,6 +905,8 @@ func TestInitMeter_ReservedAttributeKeysAreDropped(t *testing.T) {
 		attribute.String("service_namespace", "evil"),
 		attribute.String("otel.scope.name", "evil"),
 		attribute.String("otel.scope.tier", "evil"),
+		attribute.String("__name__", "evil"),
+		attribute.String("...", "evil"),
 		attribute.String("outcome", "ok"),
 	))
 
