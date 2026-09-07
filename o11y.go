@@ -194,7 +194,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	}
 	// 1. Build a shared Resource so TracerProvider, MeterProvider, and
 	//    LoggerProvider all carry identical service-identity attributes.
-	res, err := buildResource(ctx, cfg)
+	res, providerRes, err := buildResource(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +218,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		if whitelist.Len() > 0 {
 			spanProcessors = append(spanProcessors, whitelist.NewSpanProcessor())
 		}
-		tp, p, initErr := trace.InitTracer(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, res, cfg.sampler, spanProcessors...)
+		tp, p, initErr := trace.InitTracer(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, providerRes, cfg.sampler, spanProcessors...)
 		if initErr != nil {
 			return nil, initErr
 		}
@@ -308,7 +308,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	var logger *slog.Logger
 
 	if cfg.logEnabled {
-		lp, initErr := o11ylog.InitLogger(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, res)
+		lp, initErr := o11ylog.InitLogger(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, providerRes)
 		if initErr != nil {
 			_ = metricsCloser(ctx)
 			_ = mpShutdown(ctx)
@@ -473,13 +473,18 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 // resource.WithFromEnv: it applies the same guard WithResourceAttributes
 // applies at option time and drops, with a warning, any environment key
 // that is an alias of an SDK-owned key or of a caller-given one. The OTel
-// providers merge resource.Environment() back into whatever Resource they
-// are handed, so the guard cannot reach the provider-side Resource; it does
-// reach everything the metrics paths export — target_info on the Prometheus
-// path (internal/metrics targetInfoCollector) and the Resource on the OTLP
-// push path (guardedResourceExporter) — and the warning tells the operator
-// to fix the environment for spans and logs, which carry the alias as a
-// distinct attribute.
+// providers merge resource.Environment() back underneath whatever Resource
+// they are handed, so a dropped key would return with its environment
+// value. The metrics paths export the guarded Resource directly
+// (target_info on the Prometheus path via internal/metrics
+// targetInfoCollector, the OTLP push path via guardedResourceExporter). The
+// trace and log providers have no such seam, so they receive providerRes:
+// the guarded Resource plus every dropped environment key with an empty
+// value, which wins the provider's merge by exact key. A span or log record
+// from a misconfigured environment thus carries process_command_args=""
+// instead of the command line, and the startup warning names the key to
+// remove. Mutating the process environment would be the only other way,
+// and this SDK does not touch process-global state.
 //
 // The process detectors are the narrow ones on purpose. resource.WithProcess()
 // also collects process.command_args and process.owner, and the whole
@@ -490,8 +495,8 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 //
 // ErrPartialResource is treated as non-fatal: some detectors (e.g. process info
 // on restricted hosts) may fail, but the remaining attributes are still useful.
-func buildResource(ctx context.Context, cfg *Config) (*resource.Resource, error) {
-	envAttrs, envWarnings := metrics.EnvResourceAttributes(ctx, cfg.resourceAttrs)
+func buildResource(ctx context.Context, cfg *Config) (res, providerRes *resource.Resource, err error) {
+	envAttrs, dropped, envWarnings := metrics.EnvResourceAttributes(ctx, cfg.resourceAttrs)
 	cfg.initWarnings = append(cfg.initWarnings, envWarnings...)
 	opts := []resource.Option{
 		resource.WithAttributes(envAttrs...),
@@ -513,11 +518,18 @@ func buildResource(ctx context.Context, cfg *Config) (*resource.Resource, error)
 	opts = append(opts, resource.WithAttributes(
 		semconv.ServiceNamespaceKey.String(cfg.namespace),
 	))
-	res, err := resource.New(ctx, opts...)
+	res, err = resource.New(ctx, opts...)
 	if err != nil && !errors.Is(err, resource.ErrPartialResource) {
-		return nil, fmt.Errorf("failed to create resource: %w", err)
+		return nil, nil, fmt.Errorf("failed to create resource: %w", err)
 	}
-	return res, nil
+	providerRes = res
+	if neutralized := metrics.NeutralizeEnvKeys(dropped); len(neutralized) > 0 {
+		providerRes, err = resource.Merge(res, resource.NewSchemaless(neutralized...))
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to neutralize environment resource keys: %w", err)
+		}
+	}
+	return res, providerRes, nil
 }
 
 // leveledHandler wraps a slog.Handler and gates Enabled on a minimum level.
