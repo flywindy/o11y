@@ -162,6 +162,17 @@ _Required — Init returns an error if any of these are missing:_
 | `WithEnvironment(env)` | OTel `deployment.environment.name`; accepted: `production`, `staging`, `development`, `testing` (aliases like `prod`/`stg` are normalized; matching ignores case and surrounding whitespace) |
 | `WithServiceNamespace(ns)` | OTel `service.namespace`; identifies the owning team/product, maps to k8s namespace |
 
+_Resource (shared by traces, metrics and logs):_
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `WithResourceAttributes(attrs ...attribute.KeyValue)` | `nil` | Add attributes to the OTel Resource next to the identity above and the detected set (`host.*`, `process.pid`, `process.executable.name`, `process.runtime.name` / `.version`, `telemetry.sdk.*`, plus `OTEL_RESOURCE_ATTRIBUTES`). They appear on `target_info` and on every span and log record, so use process-lifetime values only. The four identity keys are rejected with a startup warning; a key set here overrides the same key from `OTEL_RESOURCE_ATTRIBUTES` |
+
+The SDK deliberately does not use `resource.WithProcess()`: it would also
+collect `process.command_args` and `process.owner`, and the Resource is
+exported unfiltered, so a credential passed as a command-line flag would land
+in Prometheus, Tempo and Loki.
+
 _OTLP (shared by traces and logs):_
 
 | Option | Default | Description |

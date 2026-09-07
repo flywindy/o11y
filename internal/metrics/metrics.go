@@ -524,9 +524,16 @@ func resolveResource(ctx context.Context, cfg Config) (*resource.Resource, error
 		return nil, errors.New("metrics: Namespace is required")
 	}
 
+	// Same detector set as o11y.buildResource: the narrow process detectors,
+	// never resource.WithProcess(), so process.command_args and process.owner
+	// do not reach target_info.
 	resOpts := []resource.Option{
 		resource.WithFromEnv(),
-		resource.WithProcess(),
+		resource.WithTelemetrySDK(),
+		resource.WithProcessPID(),
+		resource.WithProcessExecutableName(),
+		resource.WithProcessRuntimeName(),
+		resource.WithProcessRuntimeVersion(),
 		resource.WithHost(),
 		resource.WithAttributes(
 			semconv.ServiceNameKey.String(cfg.ServiceName),

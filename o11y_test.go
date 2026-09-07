@@ -5,13 +5,16 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/flywindy/o11y"
 	"github.com/flywindy/o11y/internal/testutil"
+	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
@@ -415,5 +418,55 @@ func TestInit_OTLPHeadersForwarded(t *testing.T) {
 			"X-Scope-OrgID header must propagate on every OTLP request (request[%d])", i)
 		assert.Equal(t, "abc123", r.Header.Get("X-Honeycomb-Team"),
 			"custom auth header must propagate on every OTLP request (request[%d])", i)
+	}
+}
+
+// TestInit_TargetInfoCarriesNarrowProcessAndSDKAttributes scrapes the real
+// /metrics endpoint: target_info must identify the SDK and the process
+// without process_command_args / process_owner, and must carry a
+// WithResourceAttributes key.
+func TestInit_TargetInfoCarriesNarrowProcessAndSDKAttributes(t *testing.T) {
+	srv := testutil.FakeOTLPServer(t)
+	addr := testutil.FreeAddr(t)
+	opts := append(commonOpts(srv.URL),
+		o11y.WithMetricsAddr(addr),
+		o11y.WithResourceAttributes(attribute.String("k8s.pod.name", "test-svc-7d9f-x2kq")),
+	)
+	sdk, err := o11y.Init(context.Background(), opts...)
+	require.NoError(t, err)
+	defer testutil.MustShutdown(t.Context(), t, sdk)
+
+	var body string
+	require.Eventually(t, func() bool {
+		b, err := testutil.TryScrapeMetrics(t.Context(), addr)
+		if err != nil || !strings.Contains(b, "target_info{") {
+			return false
+		}
+		body = b
+		return true
+	}, 2*time.Second, 50*time.Millisecond, "target_info should be served")
+
+	var line string
+	for _, l := range strings.Split(body, "\n") {
+		if strings.HasPrefix(l, "target_info{") {
+			line = l
+			break
+		}
+	}
+	require.NotEmpty(t, line)
+
+	for _, want := range []string{
+		`service_name="test-svc"`,
+		`telemetry_sdk_name="opentelemetry"`,
+		`telemetry_sdk_language="go"`,
+		`process_executable_name=`,
+		`process_pid=`,
+		`process_runtime_name="go"`,
+		`k8s_pod_name="test-svc-7d9f-x2kq"`,
+	} {
+		assert.Contains(t, line, want)
+	}
+	for _, unwanted := range []string{"process_command_args", "process_owner", "process_executable_path"} {
+		assert.NotContains(t, line, unwanted)
 	}
 }

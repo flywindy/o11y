@@ -458,17 +458,39 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	}, nil
 }
 
-// buildResource creates an OTel Resource with service identity and host/process
-// metadata shared by all three providers (trace, metrics, logs).
+// buildResource creates the OTel Resource shared by all three providers
+// (trace, metrics, logs): the service identity from the options, the
+// caller's WithResourceAttributes, and the detected host, process and SDK
+// attributes.
+//
+// Resource merge order is "later wins", so OTEL_RESOURCE_ATTRIBUTES sits at
+// the bottom, WithResourceAttributes above it, and the identity options on
+// top — a value set in code always beats the environment, and the identity
+// keys cannot be overridden by either.
+//
+// The process detectors are the narrow ones on purpose. resource.WithProcess()
+// also collects process.command_args and process.owner, and the whole
+// resource is exported unfiltered — as target_info labels on the Prometheus
+// path and on every span and log record over OTLP — so a credential passed
+// as a command-line flag would land in every backend. PID, executable name
+// and runtime name/version identify the process without that risk.
+//
 // ErrPartialResource is treated as non-fatal: some detectors (e.g. process info
 // on restricted hosts) may fail, but the remaining attributes are still useful.
 func buildResource(ctx context.Context, cfg *Config) (*resource.Resource, error) {
 	opts := []resource.Option{
 		resource.WithFromEnv(),
-		resource.WithProcess(),
+		resource.WithTelemetrySDK(),
+		resource.WithProcessPID(),
+		resource.WithProcessExecutableName(),
+		resource.WithProcessRuntimeName(),
+		resource.WithProcessRuntimeVersion(),
 		resource.WithHost(),
-		resource.WithAttributes(semconv.ServiceNameKey.String(cfg.serviceName)),
 	}
+	if len(cfg.resourceAttrs) > 0 {
+		opts = append(opts, resource.WithAttributes(cfg.resourceAttrs...))
+	}
+	opts = append(opts, resource.WithAttributes(semconv.ServiceNameKey.String(cfg.serviceName)))
 	opts = append(opts,
 		resource.WithAttributes(semconv.ServiceVersionKey.String(cfg.serviceVersion)),
 		resource.WithAttributes(semconv.DeploymentEnvironmentNameKey.String(cfg.environment)),
