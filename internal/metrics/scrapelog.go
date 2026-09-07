@@ -39,22 +39,28 @@ func newMetricsHandler(gatherer prometheus.Gatherer, openMetrics bool, logger *s
 	})
 }
 
+// maxTrackedScrapeErrors bounds the per-message suppression table. Distinct
+// gather errors are rare (one per broken family, and the text is stable for a
+// given family), so the bound is a memory guard, not a working-set size.
+const maxTrackedScrapeErrors = 32
+
 // scrapeErrorLogger adapts promhttp's Println-style logger to slog and
-// suppresses repeats of the same message within scrapeErrorRepeatWindow.
+// suppresses repeats of each distinct message within scrapeErrorRepeatWindow.
+// Suppression is tracked per message, so two families failing on alternate
+// scrapes are each logged once per window rather than on every scrape.
 type scrapeErrorLogger struct {
 	logger *slog.Logger
 	now    func() time.Time
 
 	mu       sync.Mutex
-	lastMsg  string
-	lastSeen time.Time
+	lastSeen map[string]time.Time
 }
 
 func newScrapeErrorLogger(logger *slog.Logger) *scrapeErrorLogger {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	return &scrapeErrorLogger{logger: logger, now: time.Now}
+	return &scrapeErrorLogger{logger: logger, now: time.Now, lastSeen: make(map[string]time.Time)}
 }
 
 // Println implements promhttp.Logger.
@@ -63,13 +69,9 @@ func (l *scrapeErrorLogger) Println(v ...any) {
 	msg = msg[:len(msg)-1] // drop the trailing newline Sprintln adds
 
 	l.mu.Lock()
-	now := l.now()
-	repeat := msg == l.lastMsg && now.Sub(l.lastSeen) < scrapeErrorRepeatWindow
-	if !repeat {
-		l.lastMsg, l.lastSeen = msg, now
-	}
+	suppressed := l.noteLocked(msg)
 	l.mu.Unlock()
-	if repeat {
+	if suppressed {
 		return
 	}
 
@@ -78,4 +80,33 @@ func (l *scrapeErrorLogger) Println(v ...any) {
 		slog.String("error", msg),
 		slog.Duration("repeat_suppressed_for", scrapeErrorRepeatWindow),
 	)
+}
+
+// noteLocked records msg as seen now and reports whether it was already seen
+// inside the repeat window. Expired entries are dropped on every call, and
+// when the table is still full the oldest entry is evicted, so the table
+// never exceeds maxTrackedScrapeErrors. Callers hold l.mu.
+func (l *scrapeErrorLogger) noteLocked(msg string) (suppressed bool) {
+	now := l.now()
+	if seen, ok := l.lastSeen[msg]; ok && now.Sub(seen) < scrapeErrorRepeatWindow {
+		return true
+	}
+	for m, seen := range l.lastSeen {
+		if now.Sub(seen) >= scrapeErrorRepeatWindow {
+			delete(l.lastSeen, m)
+		}
+	}
+	if len(l.lastSeen) >= maxTrackedScrapeErrors {
+		var oldestMsg string
+		var oldest time.Time
+		first := true
+		for m, seen := range l.lastSeen {
+			if first || seen.Before(oldest) {
+				oldestMsg, oldest, first = m, seen, false
+			}
+		}
+		delete(l.lastSeen, oldestMsg)
+	}
+	l.lastSeen[msg] = now
+	return false
 }

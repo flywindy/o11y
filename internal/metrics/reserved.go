@@ -29,23 +29,69 @@ var resourceConstantLabelKeys = []string{
 // aggregation is cumulative the bad series lives until the process restarts.
 // With promhttp's default error handling that turned one mislabeled Record
 // call into a permanent HTTP 500 on /metrics for the whole pod.
-var reservedPromLabels = map[string]struct{}{
-	"service_namespace":           {},
-	"service_name":                {},
-	"service_version":             {},
-	"deployment_environment_name": {},
-	"otel_scope_name":             {},
-	"otel_scope_version":          {},
-	"otel_scope_schema_url":       {},
+//
+// Grouped by first byte so IsReservedAttributeKey can reject most keys after
+// one comparison; every entry is lowercase ASCII, as normalization produces.
+var reservedPromLabels = map[byte][]string{
+	's': {"service_namespace", "service_name", "service_version"},
+	'd': {"deployment_environment_name"},
+	'o': {"otel_scope_name", "otel_scope_version", "otel_scope_schema_url"},
 }
 
 // IsReservedAttributeKey reports whether key would render as a Prometheus
 // label the exporter already owns (see reservedPromLabels). The check runs
 // on the normalized form, so "service.name", "service_name" and
 // "service-name" are all reserved.
+//
+// It is installed as an AttributeFilter on every stream, which the OTel SDK
+// evaluates for every attribute of every measurement, so it must not
+// allocate: the comparison walks the key applying the normalization rules on
+// the fly instead of materializing the normalized string.
 func IsReservedAttributeKey(key attribute.Key) bool {
-	_, ok := reservedPromLabels[NormalizePrometheusLabelName(string(key))]
-	return ok
+	k := string(key)
+	if k == "" {
+		return false
+	}
+	// A key whose normalized form starts with a digit is prefixed "key_",
+	// which no reserved label starts with; any other first byte survives
+	// normalization as itself or as '_', so it selects the candidate group.
+	candidates, ok := reservedPromLabels[k[0]]
+	if !ok {
+		return false
+	}
+	for _, want := range candidates {
+		if normalizedEquals(k, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizedEquals reports whether NormalizePrometheusLabelName(key) == want
+// without allocating. want must already be in normalized form and must not
+// start with a digit (see IsReservedAttributeKey for why that case is not
+// needed here).
+func normalizedEquals(key, want string) bool {
+	i := 0 // next byte of want to match
+	prevUnderscore := false
+	for _, r := range key {
+		var out byte
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
+			out = byte(r)
+			prevUnderscore = false
+		case prevUnderscore:
+			continue // collapsed into the previous '_'
+		default:
+			out = '_'
+			prevUnderscore = true
+		}
+		if i >= len(want) || want[i] != out {
+			return false
+		}
+		i++
+	}
+	return i == len(want)
 }
 
 // notReserved is the attribute.Filter that keeps every attribute except the
