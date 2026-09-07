@@ -170,11 +170,20 @@ func WithSamplingRatio(ratio float64) Option {
 // TracerProvider. It is an escape hatch for custom samplers not expressible via
 // WithSamplingRatio or the OTEL_TRACES_SAMPLER environment variable.
 //
-// Passing nil leaves sampling unset, preserving the OTel environment/default
-// sampler path. A non-nil sampler overrides OTEL_TRACES_SAMPLER /
-// OTEL_TRACES_SAMPLER_ARG for this SDK instance.
+// Passing nil is a no-op: it leaves whatever sampling configuration is already
+// in place, whether that is an earlier WithSamplingRatio or the OTel
+// environment/default sampler path. A non-nil sampler overrides
+// OTEL_TRACES_SAMPLER / OTEL_TRACES_SAMPLER_ARG and any earlier
+// WithSamplingRatio for this SDK instance.
 func WithTraceSampler(sampler sdktrace.Sampler) Option {
 	return func(c *Config) {
+		if sampler == nil {
+			// A wrapper that maps configuration to options often ends up
+			// passing nil for "no custom sampler". That must not erase a
+			// ratio the caller set beside it, or the service silently runs
+			// at 100 % head sampling.
+			return
+		}
 		c.sampler = sampler
 		c.samplingRatioSet = false
 		c.samplingRatio = 0
