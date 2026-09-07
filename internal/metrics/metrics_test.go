@@ -24,6 +24,9 @@ import (
 	"github.com/flywindy/o11y/internal/testutil"
 )
 
+// baseConfig returns the Prometheus-path Config the tests start from: a
+// private registry on addr, exemplars on and a short bucket list so histogram
+// output stays easy to assert on.
 func baseConfig(addr string) metrics.Config {
 	return metrics.Config{
 		ServiceName:      "test-svc",
@@ -186,21 +189,26 @@ func TestInitMeter_ExemplarsStayUnderRuneCap(t *testing.T) {
 	}
 }
 
+// capturingErrorHandler is an otel.ErrorHandler that records every error
+// the SDK reports, so tests can assert nothing was dropped on the floor.
 type capturingErrorHandler struct {
 	mu   sync.Mutex
 	errs []string
 }
 
+// newCapturingErrorHandler returns an empty capturingErrorHandler.
 func newCapturingErrorHandler() *capturingErrorHandler {
 	return &capturingErrorHandler{}
 }
 
+// Handle implements otel.ErrorHandler.
 func (h *capturingErrorHandler) Handle(err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.errs = append(h.errs, err.Error())
 }
 
+// errors returns a copy of the errors recorded so far.
 func (h *capturingErrorHandler) errors() []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -334,6 +342,8 @@ func TestInitMeter_ExemplarsDisabledSuppressesOpenMetrics(t *testing.T) {
 		"plain Prometheus format keeps integer le boundaries; this is the compatibility path WithExemplars(false) preserves")
 }
 
+// scrapeOpenMetrics fetches /metrics from addr negotiating the OpenMetrics
+// exposition format and returns the body.
 func scrapeOpenMetrics(ctx context.Context, t *testing.T, addr string) string {
 	t.Helper()
 	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)

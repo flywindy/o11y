@@ -284,6 +284,10 @@ func InitMeter(ctx context.Context, cfg Config) (*sdkmetric.MeterProvider, Close
 	return initPrometheus(ctx, cfg, res, views)
 }
 
+// defaultViews returns the views the SDK installs unless
+// Config.DisableDefaultViews is set: the HTTP server attribute allow-list and
+// the per-collection cardinality caps. Reserved-key filtering is layered on
+// top by guardReservedKeys on the Prometheus path, not here.
 func defaultViews(cfg Config) []sdkmetric.View {
 	if cfg.DisableDefaultViews {
 		return nil
@@ -327,12 +331,15 @@ func defaultViews(cfg Config) []sdkmetric.View {
 	}
 }
 
-// initPrometheus sets up the Prometheus pull path.
 // runtimeStart is a seam over runtime.Start so tests can exercise the
 // init-failure branches, which otherwise only trigger on instrument-creation
 // errors. It mirrors internal/profiling's pyroscopeStart.
 var runtimeStart = runtime.Start
 
+// initPrometheus sets up the Prometheus pull path: a private registry, the
+// otelprom exporter with the resource constants promoted to labels, the
+// reserved-key guard on every stream (see guardReservedKeys) and the
+// ContinueOnError /metrics handler bound to cfg.MetricsAddr.
 func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, views []sdkmetric.View) (*sdkmetric.MeterProvider, Closer, error) {
 	reg := prometheus.NewRegistry()
 
@@ -462,6 +469,9 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []s
 	return provider, func(_ context.Context) error { return nil }, nil
 }
 
+// meterProviderOptions assembles the sdkmetric options shared by both export
+// paths: the reader, the resource, the views and the SDK-level cardinality
+// limit derived from the per-collection caps.
 func meterProviderOptions(reader sdkmetric.Reader, res *resource.Resource, views []sdkmetric.View, maxUniqueRoutes, maxUniqueCollections int) []sdkmetric.Option {
 	opts := []sdkmetric.Option{
 		sdkmetric.WithReader(reader),

@@ -22,6 +22,7 @@ import (
 // the shape client_golang produces when one family fails validation.
 type partialGatherer struct{}
 
+// Gather implements prometheus.Gatherer.
 func (partialGatherer) Gather() ([]*dto.MetricFamily, error) {
 	fam := &dto.MetricFamily{
 		Name: proto.String("healthy_total"),

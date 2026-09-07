@@ -51,6 +51,9 @@ const scopeLabelPrefix = "otel_scope_"
 // call into a permanent HTTP 500 on /metrics for the whole pod.
 var reservedPromLabels = buildReservedPromLabels()
 
+// buildReservedPromLabels normalizes resourceConstantLabelKeys and
+// exposedFormatLabels into their Prometheus label form and groups them by
+// first byte; see reservedPromLabels for why.
 func buildReservedPromLabels() map[byte][]string {
 	out := make(map[byte][]string)
 	add := func(label string) {
@@ -248,6 +251,9 @@ func guardReservedKeys(configured []sdkmetric.View) []sdkmetric.View {
 	return out
 }
 
+// withReservedKeyFilter wraps a configured view so every stream it returns
+// also drops reserved attribute keys, composed with the view's own filter.
+// Instruments the view does not match are left untouched.
 func withReservedKeyFilter(v sdkmetric.View) sdkmetric.View {
 	return func(inst sdkmetric.Instrument) (sdkmetric.Stream, bool) {
 		stream, ok := v(inst)
@@ -259,6 +265,10 @@ func withReservedKeyFilter(v sdkmetric.View) sdkmetric.View {
 	}
 }
 
+// catchAllReservedKeyFilter returns the view that covers instruments no
+// configured view matches. It declines any instrument a configured view
+// already claims, and for the rest reproduces the SDK's implicit default
+// stream with the reserved-key filter attached.
 func catchAllReservedKeyFilter(configured []sdkmetric.View) sdkmetric.View {
 	return func(inst sdkmetric.Instrument) (sdkmetric.Stream, bool) {
 		for _, v := range configured {
