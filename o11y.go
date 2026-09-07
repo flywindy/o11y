@@ -289,10 +289,15 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 			_ = tpShutdown(ctx)
 			return nil, initErr
 		}
-		// The public provider sanitizes instrumentation-scope attributes so a
-		// meter created with one that collides with otelprom's own scope
-		// labels cannot poison its families; see metrics.GuardScopeAttributes.
-		mpInternal, meterProviderPublic = mp, metrics.GuardScopeAttributes(mp, slog.New(stdoutHandler))
+		mpInternal, meterProviderPublic = mp, mp
+		if cfg.metricsOTLPEndpoint == "" {
+			// On the Prometheus pull path the public provider sanitizes
+			// instrumentation-scope attributes so a meter created with one
+			// that collides with otelprom's own scope labels cannot poison
+			// its families; see metrics.GuardScopeAttributes. OTLP carries
+			// scope attributes separately and needs no such guard.
+			meterProviderPublic = metrics.GuardScopeAttributes(mp, slog.New(stdoutHandler))
+		}
 		metricsCloser, mpShutdown = closer, mp.Shutdown
 	}
 

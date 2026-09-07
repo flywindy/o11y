@@ -134,6 +134,10 @@ func TestIsReservedAttributeKey(t *testing.T) {
 		"otel.scope.foo", "otel_scope_deployment", "otel.scope.x.y",
 		// exposition-format labels
 		"le", "quantile",
+		// the translator keeps "__x__" intact and client_golang rejects it;
+		// a key with no alphanumerics normalizes to underscores only, which
+		// the translator refuses
+		"__name__", "__meta_kubernetes_pod__", "__", "...", "-", "_.-",
 	}
 	for _, k := range reserved {
 		assert.Truef(t, IsReservedAttributeKey(attribute.Key(k)), "%q should be reserved", k)
@@ -142,6 +146,7 @@ func TestIsReservedAttributeKey(t *testing.T) {
 		"http.route", "service.instance.id", "chat.room.id", "servicename", "",
 		"otel.scope", "otel.scopes.name", "otel.library.name", "otelscope.name",
 		"level", "le.gacy", "quantiles",
+		"_name", "name__", "_name__x", "x__",
 	}
 	for _, k := range notReserved {
 		assert.Falsef(t, IsReservedAttributeKey(attribute.Key(k)), "%q should not be reserved", k)
@@ -171,9 +176,12 @@ func TestNormalizedEqualsMatchesNormalizer(t *testing.T) {
 		"service.name", "service_name", "service-name", "service..name", "service__name",
 		"service.name.", ".service.name", "service.nam", "service.names", "servicename",
 		"Service.Name", "otel.scope.schema_url", "otel/scope/schema/url", "deployment.environment.name",
-		"1service.name", "", "s", "_",
+		"1service.name", "", "s", "_", "_name_", "name__",
 	}
-	targets := []string{"service_name", "otel_scope_schema_url", "deployment_environment_name"}
+	// The "__x__" reserved shape is handled before the walker runs (see
+	// IsReservedAttributeKey), so it is deliberately absent here and covered
+	// by TestNormalizePrometheusLabelName_ReservedShape instead.
+	targets := []string{"service_name", "otel_scope_schema_url", "deployment_environment_name", "_name_", "name_"}
 	for _, k := range keys {
 		for _, want := range targets {
 			assert.Equalf(t, NormalizePrometheusLabelName(k) == want, normalizedEquals(k, want),
@@ -220,4 +228,22 @@ func TestSanitizeScopeAttributes(t *testing.T) {
 	// attribute.NewSet sorts by key, so app.tier precedes app_tier.
 	assert.ElementsMatch(t, []string{"app.tier", "region"}, keys(kept))
 	assert.ElementsMatch(t, []string{"name", "version", "schema.url", "app_tier", "..."}, keys(dropped))
+}
+
+// TestNormalizePrometheusLabelName_ReservedShape pins the translator's
+// reserved-name rule: "__x__" keeps its surrounding double underscores while
+// the inside is normalized as usual.
+func TestNormalizePrometheusLabelName_ReservedShape(t *testing.T) {
+	cases := map[string]string{
+		"__name__":          "__name__",
+		"__meta.kube.pod__": "__meta_kube_pod__",
+		"__a__b__":          "__a_b__",
+		"_name_":            "_name_",
+		"__":                "_",
+		"name__":            "name_",
+		"1__x__":            "key_1_x_",
+	}
+	for in, want := range cases {
+		assert.Equalf(t, want, NormalizePrometheusLabelName(in), "NormalizePrometheusLabelName(%q)", in)
+	}
 }

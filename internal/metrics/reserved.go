@@ -83,6 +83,16 @@ func IsReservedAttributeKey(key attribute.Key) bool {
 	if k == "" {
 		return false
 	}
+	// Two shapes the translator never turns into an exportable label:
+	//   - "__x__": the translator keeps the surrounding double underscores
+	//     (Prometheus' reserved-name convention) and client_golang then
+	//     rejects the label as internal;
+	//   - a key with no alphanumeric rune at all normalizes to underscores
+	//     only, which the translator refuses outright.
+	// Either fails the whole family at gather time, so both are reserved.
+	if isTranslatorReservedShape(k) || !hasAlphanumeric(k) {
+		return true
+	}
 	// A key whose normalized form starts with a digit is prefixed "key_",
 	// which no reserved label starts with; any other first byte survives
 	// normalization as itself or as '_', so it selects the candidate group.
@@ -97,10 +107,30 @@ func IsReservedAttributeKey(key attribute.Key) bool {
 	return false
 }
 
+// isTranslatorReservedShape mirrors otlptranslator's isReservedLabel: a key of
+// at least four bytes that both starts and ends with "__" is treated as a
+// Prometheus reserved name and exported with those underscores intact.
+func isTranslatorReservedShape(k string) bool {
+	return len(k) >= 4 && k[0] == '_' && k[1] == '_' && k[len(k)-1] == '_' && k[len(k)-2] == '_'
+}
+
+// hasAlphanumeric reports whether k contains at least one rune that survives
+// label normalization unchanged. Without one the normalized label would be
+// underscores only, which the translator rejects.
+func hasAlphanumeric(k string) bool {
+	for i := 0; i < len(k); i++ {
+		c := k[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			return true
+		}
+	}
+	return false
+}
+
 // normalizedEquals reports whether NormalizePrometheusLabelName(key) == want
 // without allocating. want must already be in normalized form and must not
-// start with a digit (see IsReservedAttributeKey for why that case is not
-// needed here).
+// start with a digit, and key must not be of the "__x__" reserved shape;
+// IsReservedAttributeKey settles both cases before calling it.
 func normalizedEquals(key, want string) bool {
 	n, complete := normalizedMatchLen(key, want)
 	return complete && n == len(want)
@@ -150,8 +180,10 @@ func notReserved(kv attribute.KeyValue) bool {
 // NormalizePrometheusLabelName mirrors the classic non-UTF8 Prometheus label
 // normalization that otelprom (via github.com/prometheus/otlptranslator)
 // applies on export: any rune outside [a-zA-Z0-9] becomes '_', adjacent
-// underscores collapse to a single one, and a leading digit is prefixed with
-// "key_" so the result is a syntactically valid Prometheus label.
+// underscores collapse to a single one, a leading digit is prefixed with
+// "key_", and a key shaped "__x__" keeps its surrounding double underscores
+// (the translator's reserved-name rule) so the result is a syntactically
+// valid Prometheus label.
 //
 // Reproducing the same rules inside the SDK is what lets it detect collisions
 // before they reach the exporter, where two distinct attribute keys would
@@ -159,6 +191,9 @@ func notReserved(kv attribute.KeyValue) bool {
 func NormalizePrometheusLabelName(key string) string {
 	if key == "" {
 		return ""
+	}
+	if isTranslatorReservedShape(key) {
+		return "__" + NormalizePrometheusLabelName(key[2:len(key)-2]) + "__"
 	}
 	var b strings.Builder
 	b.Grow(len(key))
