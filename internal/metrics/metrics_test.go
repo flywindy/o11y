@@ -452,7 +452,8 @@ func TestInitMeter_MaxUniqueRoutesAppliesSDKOverflow(t *testing.T) {
 
 	hist, err := mp.Meter("test").Float64Histogram("http.server.request.duration", metric.WithUnit("s"))
 	require.NoError(t, err)
-	for i := 0; i < 1100; i++ {
+	// MaxUniqueRoutes=1 leaves the derived limit at its 2,000 floor; exceed it.
+	for i := 0; i < metrics.DefaultCardinalityLimit+100; i++ {
 		hist.Record(context.Background(), 0.01, metric.WithAttributes(
 			semconv.HTTPRequestMethodKey.String("GET"),
 			semconv.HTTPRoute("/route-"+strconv.Itoa(i)),
@@ -461,6 +462,85 @@ func TestInitMeter_MaxUniqueRoutesAppliesSDKOverflow(t *testing.T) {
 	}
 
 	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	assert.Contains(t, body, `otel_metric_overflow="true"`)
+}
+
+// countSeries returns how many exposition lines belong to family.
+func countSeries(body, family string) int {
+	n := 0
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, family+"{") || line == family || strings.HasPrefix(line, family+" ") {
+			n++
+		}
+	}
+	return n
+}
+
+// TestInitMeter_CardinalityLimitBoundsApplicationInstruments is the SDK-7
+// reproduction: an application counter labelled by room id. Before, the
+// derived limit was 1,024,000 and every room became a series; now the
+// stream stops at the derived limit and folds the rest into one
+// otel_metric_overflow="true" series.
+func TestInitMeter_CardinalityLimitBoundsApplicationInstruments(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.RuntimeMetrics = false
+	cfg.MaxUniqueRoutes = 1000 // the shipped default → derived limit 4,000
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	counter, err := mp.Meter("chat").Int64Counter("fanout.errors")
+	require.NoError(t, err)
+	const rooms = 5000
+	for i := 0; i < rooms; i++ {
+		counter.Add(context.Background(), 1, metric.WithAttributes(attribute.String("chat.room.id", "room-"+strconv.Itoa(i))))
+	}
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	// The OTel SDK counts the overflow set against the limit: a stream holds
+	// at most limit series, limit-1 attribute sets plus the overflow.
+	assert.Equal(t, 4000, countSeries(body, "fanout_errors_total"),
+		"the derived limit bounds the stream at 4,000 series: 3,999 attribute sets plus one overflow series")
+	assert.Contains(t, body, `fanout_errors_total{chat_room_id="room-0"`)
+	assert.Contains(t, body, `chat_room_id="room-3998"`)
+	assert.NotContains(t, body, `chat_room_id="room-3999"`)
+	assert.NotContains(t, body, `chat_room_id="room-4999"`)
+	assert.Contains(t, body, `otel_metric_overflow="true"`)
+}
+
+// TestInitMeter_CardinalityLimitOverride: an explicit limit replaces the
+// derived one for every stream.
+func TestInitMeter_CardinalityLimitOverride(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.RuntimeMetrics = false
+	cfg.MaxUniqueRoutes = 1000
+	cfg.CardinalityLimit = 100
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	counter, err := mp.Meter("chat").Int64Counter("fanout.errors")
+	require.NoError(t, err)
+	for i := 0; i < 300; i++ {
+		counter.Add(context.Background(), 1, metric.WithAttributes(attribute.String("chat.room.id", "room-"+strconv.Itoa(i))))
+	}
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	assert.Equal(t, 100, countSeries(body, "fanout_errors_total"), "99 attribute sets plus the overflow series")
 	assert.Contains(t, body, `otel_metric_overflow="true"`)
 }
 

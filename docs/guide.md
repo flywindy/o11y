@@ -423,6 +423,22 @@ in-process aggregators from attacker-controlled attribute sets. If the separate
 SDK guard trips, metrics are preserved under `otel_metric_overflow="true"`
 with route detail intentionally dropped.
 
+That SDK guard applies to every instrument, the application's own included,
+and is the only bound on an instrument someone labels by room id, user id or
+another open-ended value. It is derived as
+`max(2000, 4 × MaxUniqueRoutes, 4 × MaxUniqueCollections)`, so at most 4,000
+series per stream at the defaults: the stream keeps its first 3,999 attribute
+sets and folds every further one into a single `otel_metric_overflow="true"`
+series, which bounds memory and is worth an alert:
+
+```promql
+sum by (service_name, __name__) ({otel_metric_overflow="true"}) > 0
+```
+
+`WithCardinalityLimit(n)` replaces the derived value for a service whose
+`http.server.request.duration` legitimately needs more method × route × status
+combinations; keep the decision in code where a reviewer sees it.
+
 For outbound calls over the standard library client, wrap any
 `http.RoundTripper` with `o11yhttp.NewTransport`. It emits one client span per
 request, records `http.client.request.duration`, and injects `traceparent` so

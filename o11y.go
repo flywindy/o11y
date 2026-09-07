@@ -281,6 +281,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 			),
 			MaxUniqueRoutes:         cfg.maxUniqueRoutes,
 			MaxUniqueCollections:    cfg.maxUniqueCollections,
+			CardinalityLimit:        cfg.cardinalityLimit,
 			ExtraHTTPServerAttrKeys: cfg.extraHTTPServerAttrKeys,
 			Exemplars:               cfg.exemplars,
 			Logger:                  slog.New(stdoutHandler),
