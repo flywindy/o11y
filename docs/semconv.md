@@ -54,7 +54,7 @@ every signal so that service identity is identical across backends.
 | `process.runtime.name` | string | `resource.WithProcessRuntimeName()` | detected |
 | `process.runtime.version` | string | `resource.WithProcessRuntimeVersion()` | detected |
 | `telemetry.sdk.name` / `.language` / `.version` | string | `resource.WithTelemetrySDK()` | detected |
-| (caller-provided) | various | `WithResourceAttributes(...)`; `service.name`, `service.version`, `service.namespace` and `deployment.environment.name` are rejected | optional |
+| (caller-provided) | various | `WithResourceAttributes(...)`; rejected: `service.name`, `service.version`, `service.namespace`, `deployment.environment.name`, `telemetry.sdk.*`, and any key whose Prometheus label would collide with those or be invalid (`service_name`, `__meta__`) | optional |
 | (env-provided) | various | `resource.WithFromEnv()` / `OTEL_RESOURCE_ATTRIBUTES` | optional |
 
 `process.command_args`, `process.owner`, `process.executable.path` and

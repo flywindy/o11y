@@ -451,19 +451,31 @@ func TestWithResourceAttributes(t *testing.T) {
 		attribute.String("service.version", "9.9.9"),
 		attribute.String("service.namespace", "elsewhere"),
 		attribute.String("deployment.environment.name", "production"),
+		attribute.String("telemetry.sdk.name", "not-opentelemetry"),
+		attribute.String("service_name", "alias-of-service.name"), // same Prometheus label as service.name
+		attribute.String("Service-Version", "alias"),              // normalizes to Service_Version, distinct from service_version
+		attribute.String("__meta__", "reserved shape"),
+		attribute.String("...", "punctuation only"),
 		attribute.Int("app.shard", 3),
 	)(cfg)
 
 	assert.Equal(t, []attribute.KeyValue{
 		attribute.String("k8s.pod.name", "room-service-7d9f-x2kq"),
+		attribute.String("Service-Version", "alias"),
 		attribute.Int("app.shard", 3),
 	}, cfg.resourceAttrs, "only caller-owned keys are kept, in order")
 
-	require.Len(t, cfg.initWarnings, 5, "one warning per dropped attribute")
+	require.Len(t, cfg.initWarnings, 9, "one warning per dropped attribute")
 	assert.Contains(t, cfg.initWarnings[0], "empty key")
 	for i, key := range []string{"service.name", "service.version", "service.namespace", "deployment.environment.name"} {
 		assert.Contains(t, cfg.initWarnings[i+1], strconv.Quote(key))
+		assert.Contains(t, cfg.initWarnings[i+1], "identity options")
 	}
+	assert.Contains(t, cfg.initWarnings[5], `"telemetry.sdk.name"`)
+	assert.Contains(t, cfg.initWarnings[6], `"service_name"`)
+	assert.Contains(t, cfg.initWarnings[6], "target_info")
+	assert.Contains(t, cfg.initWarnings[7], `"__meta__"`)
+	assert.Contains(t, cfg.initWarnings[8], `"..."`)
 }
 
 func TestWithResourceAttributesAppendsAcrossCalls(t *testing.T) {
