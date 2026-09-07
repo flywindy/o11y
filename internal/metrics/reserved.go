@@ -5,25 +5,42 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 )
 
 // resourceConstantLabelKeys are the resource attributes the Prometheus path
 // promotes to a constant label on every exported series
-// (initPrometheus → otelprom.WithResourceAsConstantLabels).
-var resourceConstantLabelKeys = []string{
-	"service.namespace",
-	"service.name",
-	"service.version",
-	"deployment.environment.name",
+// (initPrometheus → otelprom.WithResourceAsConstantLabels). They come from
+// the pinned semconv package so a semconv upgrade that renames one surfaces
+// here through the compiler rather than leaving a stale literal behind.
+var resourceConstantLabelKeys = []attribute.Key{
+	semconv.ServiceNamespaceKey,
+	semconv.ServiceNameKey,
+	semconv.ServiceVersionKey,
+	semconv.DeploymentEnvironmentNameKey,
 }
 
-// reservedPromLabels lists, in their post-normalization Prometheus form, the
-// label names the exporter already owns on every series: the four resource
-// constants above. otelprom additionally owns every label under the
-// scopeLabelPrefix — otel_scope_name / _version / _schema_url on every
-// series, plus otel_scope_<attr> for each instrumentation-scope attribute a
-// meter was created with — so that prefix is reserved as a whole rather than
-// enumerated.
+// exposedFormatLabels are label names the Prometheus exposition format itself
+// synthesizes: `le` on every histogram bucket and `quantile` on summaries.
+// otelprom never emits summaries, but reserving both costs nothing. A
+// datapoint attribute rendering as `le` would not fail gathering — the
+// duplicate only appears in the rendered text (`_bucket{le="x",le="1"}`), so
+// ContinueOnError cannot catch it — and Prometheus then rejects the whole
+// scrape, healthy families included.
+var exposedFormatLabels = []string{"le", "quantile"}
+
+// scopeLabelPrefix is the prefix otelprom puts on every label it derives from
+// the instrumentation scope: otel_scope_name / _version / _schema_url on
+// every series, plus otel_scope_<attr> for each instrumentation-scope
+// attribute a meter was created with. The prefix is reserved as a whole
+// rather than enumerated.
+const scopeLabelPrefix = "otel_scope_"
+
+// reservedPromLabels holds, in their post-normalization Prometheus form, the
+// exact label names the exporter or the exposition format already owns on a
+// series: the resource constants above and exposedFormatLabels. It is built
+// once from those sources so the two never drift, and grouped by first byte
+// so IsReservedAttributeKey can reject most keys after one comparison.
 //
 // A datapoint attribute that normalizes to one of these names cannot be
 // exported: otelprom appends the constant labels after the datapoint's own
@@ -32,22 +49,30 @@ var resourceConstantLabelKeys = []string{
 // aggregation is cumulative the bad series lives until the process restarts.
 // With promhttp's default error handling that turned one mislabeled Record
 // call into a permanent HTTP 500 on /metrics for the whole pod.
-//
-// Grouped by first byte so IsReservedAttributeKey can reject most keys after
-// one comparison; every entry is lowercase ASCII, as normalization produces.
-var reservedPromLabels = map[byte][]string{
-	's': {"service_namespace", "service_name", "service_version"},
-	'd': {"deployment_environment_name"},
+var reservedPromLabels = buildReservedPromLabels()
+
+func buildReservedPromLabels() map[byte][]string {
+	out := make(map[byte][]string)
+	add := func(label string) {
+		if label == "" {
+			return
+		}
+		out[label[0]] = append(out[label[0]], label)
+	}
+	for _, k := range resourceConstantLabelKeys {
+		add(NormalizePrometheusLabelName(string(k)))
+	}
+	for _, l := range exposedFormatLabels {
+		add(l)
+	}
+	return out
 }
 
-// scopeLabelPrefix is the prefix otelprom puts on every label it derives from
-// the instrumentation scope (name, version, schema URL and scope attributes).
-const scopeLabelPrefix = "otel_scope_"
-
 // IsReservedAttributeKey reports whether key would render as a Prometheus
-// label the exporter already owns (see reservedPromLabels). The check runs
-// on the normalized form, so "service.name", "service_name" and
-// "service-name" are all reserved.
+// label the exporter or the exposition format already owns (see
+// reservedPromLabels and scopeLabelPrefix). The check runs on the normalized
+// form, so "service.name", "service_name" and "service-name" are all
+// reserved.
 //
 // It is installed as an AttributeFilter on every stream, which the OTel SDK
 // evaluates for every attribute of every measurement, so it must not
@@ -61,14 +86,12 @@ func IsReservedAttributeKey(key attribute.Key) bool {
 	// A key whose normalized form starts with a digit is prefixed "key_",
 	// which no reserved label starts with; any other first byte survives
 	// normalization as itself or as '_', so it selects the candidate group.
-	switch k[0] {
-	case 'o':
-		return normalizedHasPrefix(k, scopeLabelPrefix)
-	case 's', 'd':
-		for _, want := range reservedPromLabels[k[0]] {
-			if normalizedEquals(k, want) {
-				return true
-			}
+	if k[0] == scopeLabelPrefix[0] && normalizedHasPrefix(k, scopeLabelPrefix) {
+		return true
+	}
+	for _, want := range reservedPromLabels[k[0]] {
+		if normalizedEquals(k, want) {
+			return true
 		}
 	}
 	return false

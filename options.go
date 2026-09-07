@@ -8,6 +8,7 @@ import (
 
 	"github.com/flywindy/o11y/internal/baggageattrs"
 	"github.com/flywindy/o11y/internal/metrics"
+	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
@@ -454,8 +455,9 @@ func WithDisableDefaultViews() Option {
 // normalization:
 //
 //   - matches a built-in label the SDK already exports (the view-allowed
-//     HTTP semconv keys, the four resource constants, and the three
-//     otelprom scope labels otel_scope_name / _version / _schema_url), or
+//     HTTP semconv keys, the four resource constants, every otelprom
+//     otel_scope_* label, and the exposition-format labels le / quantile —
+//     the same reserved set the metric views drop at record time), or
 //   - matches another caller-supplied key from this or a prior
 //     WithExtraHTTPServerAttributeKeys call (e.g. "app.name" and "app_name"
 //     both normalize to "app_name"), or
@@ -488,6 +490,12 @@ func WithExtraHTTPServerAttributeKeys(keys ...string) Option {
 				))
 				continue
 			}
+			// The same predicate the metric views apply at record time, so a
+			// key the view would drop anyway is rejected here with a warning
+			// instead of silently vanishing from the series.
+			if metrics.IsReservedAttributeKey(attribute.Key(k)) {
+				seen[norm] = "<built-in SDK label>"
+			}
 			if existing, ok := seen[norm]; ok {
 				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
 					"WithExtraHTTPServerAttributeKeys: key %q collides with %s (both normalize to Prometheus label %q); dropping to prevent silent label-value merging",
@@ -501,29 +509,16 @@ func WithExtraHTTPServerAttributeKeys(keys ...string) Option {
 	}
 }
 
-// reservedHTTPServerPromLabels lists the Prometheus label names the SDK
-// already exports on http_server_request_duration_* series:
-//
-//   - three from the view allow-list: http_request_method, http_route,
-//     http_response_status_code;
-//   - four resource attributes promoted to constant labels by
-//     internal/metrics.initPrometheus (service_*, deployment_*);
-//   - three scope labels otelprom adds to every series unless WithoutScopeInfo
-//     is set: otel_scope_name, otel_scope_version, otel_scope_schema_url.
-//
-// They are stored in their post-normalization form so the equality check is
-// just a map lookup.
+// reservedHTTPServerPromLabels lists the Prometheus label names the SDK's
+// own http.server.request.duration view already exports, in their
+// post-normalization form: the three view-allowed HTTP semconv keys. The
+// labels the exporter owns on every series (resource constants, otel_scope_*,
+// le / quantile) are covered by metrics.IsReservedAttributeKey instead, so
+// this option and the record-time views agree on one reserved set.
 var reservedHTTPServerPromLabels = []string{
 	"http_request_method",
 	"http_route",
 	"http_response_status_code",
-	"service_name",
-	"service_namespace",
-	"service_version",
-	"deployment_environment_name",
-	"otel_scope_name",
-	"otel_scope_version",
-	"otel_scope_schema_url",
 }
 
 // normalizePrometheusLabelName mirrors the Prometheus label normalization

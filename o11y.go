@@ -289,7 +289,10 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 			_ = tpShutdown(ctx)
 			return nil, initErr
 		}
-		mpInternal, meterProviderPublic = mp, mp
+		// The public provider sanitizes instrumentation-scope attributes so a
+		// meter created with one that collides with otelprom's own scope
+		// labels cannot poison its families; see metrics.GuardScopeAttributes.
+		mpInternal, meterProviderPublic = mp, metrics.GuardScopeAttributes(mp, slog.New(stdoutHandler))
 		metricsCloser, mpShutdown = closer, mp.Shutdown
 	}
 

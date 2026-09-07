@@ -290,6 +290,11 @@ func TestWithExtraHTTPServerAttributeKeys_RejectsReservedCollisions(t *testing.T
 		{"otel.scope.name", "otel_scope_name"},
 		{"otel_scope_version", "otel_scope_version"},
 		{"otel.scope.schema_url", "otel_scope_schema_url"},
+		// otelprom renders scope attributes as otel_scope_<attr>, so the whole
+		// prefix is reserved; and the exposition format owns le / quantile.
+		{"otel.scope.tier", "otel_scope_tier"},
+		{"le", "le"},
+		{"quantile", "quantile"},
 	}
 	for _, c := range colliders {
 		cfg := &Config{}

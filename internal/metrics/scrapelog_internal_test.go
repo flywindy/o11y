@@ -132,6 +132,8 @@ func TestIsReservedAttributeKey(t *testing.T) {
 		// otelprom renders every instrumentation-scope attribute as
 		// otel_scope_<attr>, so the whole prefix is reserved.
 		"otel.scope.foo", "otel_scope_deployment", "otel.scope.x.y",
+		// exposition-format labels
+		"le", "quantile",
 	}
 	for _, k := range reserved {
 		assert.Truef(t, IsReservedAttributeKey(attribute.Key(k)), "%q should be reserved", k)
@@ -139,6 +141,7 @@ func TestIsReservedAttributeKey(t *testing.T) {
 	notReserved := []string{
 		"http.route", "service.instance.id", "chat.room.id", "servicename", "",
 		"otel.scope", "otel.scopes.name", "otel.library.name", "otelscope.name",
+		"level", "le.gacy", "quantiles",
 	}
 	for _, k := range notReserved {
 		assert.Falsef(t, IsReservedAttributeKey(attribute.Key(k)), "%q should not be reserved", k)
@@ -181,4 +184,40 @@ func TestNormalizedEqualsMatchesNormalizer(t *testing.T) {
 		assert.Equalf(t, strings.HasPrefix(NormalizePrometheusLabelName(k), scopeLabelPrefix),
 			normalizedHasPrefix(k, scopeLabelPrefix), "normalizedHasPrefix(%q)", k)
 	}
+}
+
+// TestReservedPromLabelsDerivedFromSemconv pins that the reserved set is
+// built from the pinned semconv keys rather than literals, so a semconv
+// rename cannot leave a stale name behind.
+func TestReservedPromLabelsDerivedFromSemconv(t *testing.T) {
+	for _, k := range resourceConstantLabelKeys {
+		label := NormalizePrometheusLabelName(string(k))
+		assert.Containsf(t, reservedPromLabels[label[0]], label, "resource key %q must be reserved", k)
+		assert.Truef(t, IsReservedAttributeKey(k), "resource key %q must be reserved", k)
+	}
+	for _, l := range exposedFormatLabels {
+		assert.Contains(t, reservedPromLabels[l[0]], l)
+	}
+}
+
+func TestSanitizeScopeAttributes(t *testing.T) {
+	kept, dropped := sanitizeScopeAttributes(attribute.NewSet(
+		attribute.String("name", "x"),
+		attribute.String("version", "x"),
+		attribute.String("schema.url", "x"),
+		attribute.String("app.tier", "gold"),
+		attribute.String("app_tier", "dup"),
+		attribute.String("...", "empty"),
+		attribute.String("region", "eu"),
+	))
+	keys := func(kvs []attribute.KeyValue) []string {
+		out := make([]string, 0, len(kvs))
+		for _, kv := range kvs {
+			out = append(out, string(kv.Key))
+		}
+		return out
+	}
+	// attribute.NewSet sorts by key, so app.tier precedes app_tier.
+	assert.ElementsMatch(t, []string{"app.tier", "region"}, keys(kept))
+	assert.ElementsMatch(t, []string{"name", "version", "schema.url", "app_tier", "..."}, keys(dropped))
 }

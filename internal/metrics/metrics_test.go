@@ -959,3 +959,83 @@ func TestInitMeter_ReservedKeyGuardKeepsViewedInstrumentsSingle(t *testing.T) {
 	assert.NotContains(t, body, "evil")
 	assert.Contains(t, body, `http_route="/orders/{id}"`)
 }
+
+// TestInitMeter_LeAttributeIsDropped pins that a histogram attribute rendering
+// as `le` is dropped: gathering would not catch it (the duplicate only appears
+// in the exposition text), and Prometheus rejects the whole scrape on it.
+func TestInitMeter_LeAttributeIsDropped(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	hist, err := mp.Meter("app").Float64Histogram("app_latency", metric.WithUnit("s"))
+	require.NoError(t, err)
+	hist.Record(context.Background(), 0.5, metric.WithAttributes(
+		attribute.String("le", "custom"),
+		attribute.String("outcome", "ok"),
+	))
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	assert.Contains(t, body, "app_latency_seconds_bucket{")
+	assert.Contains(t, body, `outcome="ok"`)
+	assert.NotContains(t, body, `le="custom"`)
+}
+
+// TestGuardScopeAttributes_DropsCollidingScopeAttributes pins the provider
+// wrapper: a scope attribute named "name" (which otelprom would render as a
+// second otel_scope_name) and a scope attribute whose label duplicates an
+// earlier one are dropped, the rest survive, and the meter's families export.
+func TestGuardScopeAttributes_DropsCollidingScopeAttributes(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	guarded := metrics.GuardScopeAttributes(mp, nil)
+	counter, err := guarded.Meter("app",
+		metric.WithInstrumentationVersion("1.2.3"),
+		metric.WithInstrumentationAttributes(
+			attribute.String("name", "evil"),
+			attribute.String("app.tier", "gold"),
+			attribute.String("app_tier", "evil"),
+		),
+	).Int64Counter("app_scoped")
+	require.NoError(t, err)
+	counter.Add(context.Background(), 1)
+
+	plain, err := guarded.Meter("plain").Int64Counter("app_plain")
+	require.NoError(t, err)
+	plain.Add(context.Background(), 1)
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	var found bool
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "app_scoped_total{") {
+			continue
+		}
+		found = true
+		assert.Contains(t, line, `otel_scope_name="app"`, "the scope name label comes from the meter name")
+		assert.Contains(t, line, `otel_scope_version="1.2.3"`, "the version option survives the rebuild")
+		assert.Contains(t, line, `otel_scope_app_tier="gold"`, "the first non-colliding attribute is kept")
+		assert.NotContains(t, line, "evil")
+	}
+	assert.True(t, found, "the scoped family must still be exported: %s", body)
+	assert.Contains(t, body, "app_plain_total{", "a meter without scope attributes passes through")
+}

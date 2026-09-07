@@ -294,10 +294,11 @@ By default the SDK exposes a `/metrics` endpoint on `:2112` for Prometheus to sc
 curl http://localhost:2112/metrics   # inspect raw output
 ```
 
-**Reserved attribute keys.** Those four labels, and every `otel_scope_*`
+**Reserved attribute keys.** Those four labels, every `otel_scope_*`
 label the exporter adds (`otel_scope_name` / `_version` / `_schema_url`, plus
 `otel_scope_<attr>` for each instrumentation-scope attribute a meter was
-created with), are owned by the SDK. An attribute recorded on any instrument whose key
+created with), and the exposition-format labels `le` and `quantile` are
+owned by the SDK. An attribute recorded on any instrument whose key
 normalizes to one of them (`service.name`, `service_name`, `service-name`,
 ...) is dropped from the exported series rather than exported: the
 Prometheus client rejects a series that carries the same label twice, and
@@ -305,7 +306,12 @@ because aggregation is cumulative that rejection would otherwise follow the
 process until restart. Should a family still fail to gather for any other
 reason, `/metrics` keeps serving the healthy families with HTTP 200 and the
 SDK logs one `WARN` (repeats of the same error are suppressed for five
-minutes) naming the family to fix.
+minutes) naming the family to fix. The same rule applies one level up: an
+instrumentation-scope attribute passed to `Meter(name, WithInstrumentationAttributes(...))`
+whose key normalizes to `name`, `version` or `schema_url`, or to the same
+label as another scope attribute, is dropped at meter creation with a `WARN`,
+because the exporter would otherwise emit that `otel_scope_*` label twice on
+every family of the meter.
 
 Set `WithMetricsAddr(":9090")` to move the listener, or `WithMetricsOTLPEndpoint(url)`
 to switch from the Prometheus pull model to OTLP push (useful for serverless

@@ -19,8 +19,9 @@ adopters can plan their upgrades.
   `/metrics` endpoint down. An attribute whose key normalizes to a label the
   Prometheus exporter already owns — the four resource constants
   (`service_name`, `service_namespace`, `service_version`,
-  `deployment_environment_name`) and the `otel_scope_*` labels (name, version,
-  schema URL, and one per instrumentation-scope attribute) —
+  `deployment_environment_name`), the `otel_scope_*` labels (name, version,
+  schema URL, and one per instrumentation-scope attribute), and the
+  exposition-format labels `le` / `quantile` —
   made client_golang reject that family with "duplicate label names in
   constant and variable labels", and because aggregation is cumulative the
   rejection followed the process until restart; with promhttp's default error
@@ -31,7 +32,14 @@ adopters can plan their upgrades.
   the Prometheus and OTLP paths), so the collision cannot form; and the
   Prometheus handler serves with `ContinueOnError`, so any remaining gather
   error costs the affected family only and is logged once per five minutes
-  through the SDK's stdout logger rather than failing the scrape.
+  through the SDK's stdout logger rather than failing the scrape. The public
+  `MeterProvider` additionally drops instrumentation-scope attributes whose
+  label would duplicate `otel_scope_name` / `_version` / `_schema_url` or
+  another scope attribute (with a `WARN`), the one collision a stream filter
+  cannot see. `WithExtraHTTPServerAttributeKeys` rejects the same reserved set
+  at option time, with the usual startup warning, instead of accepting a key
+  the view would then silently drop. `SDK.MeterProvider()` still satisfies
+  `metric.MeterProvider`; it is no longer the concrete `*sdkmetric.MeterProvider`.
 - `WithTraceSampler(nil)` is now a no-op. It previously cleared an earlier
   `WithSamplingRatio`, so a wrapper that appended `WithTraceSampler(nil)` for
   "no custom sampler" silently put the service back at 100 % head sampling.

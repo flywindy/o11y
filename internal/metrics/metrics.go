@@ -339,13 +339,9 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 	// Resource attributes in the allow filter become constant labels on every
 	// series, so service_namespace="..." is guaranteed on every instrument including runtime.
 	// The key "deployment.environment.name" matches the pinned semconv version.
-	constKeys := make([]attribute.Key, 0, len(resourceConstantLabelKeys))
-	for _, k := range resourceConstantLabelKeys {
-		constKeys = append(constKeys, attribute.Key(k))
-	}
 	exporter, err := otelprom.New(
 		otelprom.WithRegisterer(reg),
-		otelprom.WithResourceAsConstantLabels(attribute.NewAllowKeysFilter(constKeys...)),
+		otelprom.WithResourceAsConstantLabels(attribute.NewAllowKeysFilter(resourceConstantLabelKeys...)),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("metrics: create prometheus exporter: %w", err)
