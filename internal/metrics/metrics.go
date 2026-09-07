@@ -84,8 +84,9 @@ type Config struct {
 
 	// CardinalityLimit overrides the OTel SDK's per-stream cardinality limit,
 	// the in-process guard that folds attribute sets beyond the limit into a
-	// single otel.metric.overflow="true" series. Zero derives it from the
-	// export caps: see cardinalityLimitBudget.
+	// single overflow series (otel_metric_overflow="true" on Prometheus).
+	// Only a positive value overrides; zero derives the limit from the
+	// export caps, see cardinalityLimitBudget.
 	CardinalityLimit int
 
 	// ExtraHTTPServerAttrKeys augments the SDK-managed attribute allow-list
@@ -115,8 +116,9 @@ type Closer func(context.Context) error
 
 // The SDK cardinality limit is an in-process memory guard applied to every
 // stream of every instrument, application instruments included: a stream
-// holds at most this many series — limit-1 attribute sets plus one
-// otel.metric.overflow="true" series that absorbs every further set. The export caps (MaxUniqueRoutes,
+// holds at most this many series — limit-1 attribute sets plus one overflow
+// series (the otel.metric.overflow attribute, otel_metric_overflow="true" on
+// Prometheus) that absorbs every further set. The export caps (MaxUniqueRoutes,
 // MaxUniqueCollections) bound one key each and only on the SDK's own
 // instruments; this limit is the only thing standing between an instrument
 // labelled by room id or user id and an unbounded aggregator.

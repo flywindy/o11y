@@ -651,13 +651,15 @@ func WithMaxUniqueRoutes(n int) Option {
 
 // WithCardinalityLimit sets the OTel SDK's per-stream cardinality limit: the
 // most series one instrument may hold in process — n-1 distinct attribute
-// sets plus a single otel.metric.overflow="true" series that absorbs every
+// sets plus a single overflow series (the otel.metric.overflow attribute,
+// rendered as otel_metric_overflow="true" on Prometheus) that absorbs every
 // further set.
 // It is the memory guard for every instrument, application instruments
 // included — the one thing that bounds a counter someone labels by room id
 // or user id — and the overflow series is the signal to alert on.
 //
-// Values <= 0 derive the limit from the export caps:
+// Only n > 0 overrides the derived limit; zero or a negative value returns
+// to it. The derived limit is
 // max(DefaultCardinalityLimit, 4 × MaxUniqueRoutes, 4 × MaxUniqueCollections),
 // which is 4,000 at the defaults. Set it explicitly only for a service whose
 // http.server.request.duration legitimately carries more method × route ×
