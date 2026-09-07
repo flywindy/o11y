@@ -11,23 +11,25 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 )
 
-// IdentityResourceKeys are the resource attributes the SDK's identity options
+// identityResourceKeys are the resource attributes the SDK's identity options
 // own (WithServiceName / WithServiceVersion / WithServiceNamespace /
 // WithEnvironment). They are always set last when the Resource is built, so
 // nothing else can override them by the exact key; the guards below make sure
-// nothing shadows them through an alias either.
-var IdentityResourceKeys = []attribute.Key{
+// nothing shadows them through an alias either. Both tables are package
+// private and never written after initialization, so no caller can change
+// the ownership policy or race with it.
+var identityResourceKeys = []attribute.Key{
 	semconv.ServiceNameKey,
 	semconv.ServiceVersionKey,
 	semconv.ServiceNamespaceKey,
 	semconv.DeploymentEnvironmentNameKey,
 }
 
-// DetectedResourceKeys are the resource attributes the SDK's own detectors set
+// detectedResourceKeys are the resource attributes the SDK's own detectors set
 // (resource.WithTelemetrySDK, the narrow process detectors, resource.WithHost).
 // Listed so a caller or the environment cannot shadow one, by the exact key or
 // by an alias that renders as the same Prometheus label.
-var DetectedResourceKeys = []attribute.Key{
+var detectedResourceKeys = []attribute.Key{
 	semconv.TelemetrySDKNameKey,
 	semconv.TelemetrySDKLanguageKey,
 	semconv.TelemetrySDKVersionKey,
@@ -38,9 +40,16 @@ var DetectedResourceKeys = []attribute.Key{
 	semconv.HostNameKey,
 }
 
-// telemetrySDKLabelPrefix is the Prometheus form of the telemetry.sdk.*
-// namespace, which identifies the OpenTelemetry SDK rather than the service.
-const telemetrySDKLabelPrefix = "telemetry_sdk_"
+// telemetrySDKLabelPrefix and processLabelPrefix are the Prometheus forms of
+// the two namespaces the SDK reserves as a whole: telemetry.sdk.* identifies
+// the OpenTelemetry SDK rather than the service, and process.* is what the
+// SDK's own detectors describe — process.command_args and process.owner are
+// left out of them on purpose (see o11y.buildResource), so nothing may add a
+// process.* attribute back from the outside.
+const (
+	telemetrySDKLabelPrefix = "telemetry_sdk_"
+	processLabelPrefix      = "process_"
+)
 
 // SameLabel reports whether two attribute keys render as the same Prometheus
 // label. That is where resource-attribute collisions happen: otelprom joins
@@ -55,12 +64,12 @@ func SameLabel(a, b attribute.Key) bool {
 // as the same Prometheus label as, and whether that owner is one of the
 // identity keys. It returns "" when no SDK-owned key matches.
 func ResourceKeyOwner(key attribute.Key) (owner attribute.Key, identity bool) {
-	for _, k := range IdentityResourceKeys {
+	for _, k := range identityResourceKeys {
 		if SameLabel(key, k) {
 			return k, true
 		}
 	}
-	for _, k := range DetectedResourceKeys {
+	for _, k := range detectedResourceKeys {
 		if SameLabel(key, k) {
 			return k, false
 		}
@@ -74,6 +83,15 @@ func IsTelemetrySDKKey(key attribute.Key) bool {
 	return strings.HasPrefix(NormalizePrometheusLabelName(string(key)), telemetrySDKLabelPrefix)
 }
 
+// IsProcessKey reports whether key falls in the process.* namespace once
+// rendered as a Prometheus label. The SDK collects the process attributes it
+// is willing to export itself and deliberately leaves process.command_args
+// and process.owner out, so the whole namespace is closed to callers and the
+// environment.
+func IsProcessKey(key attribute.Key) bool {
+	return strings.HasPrefix(NormalizePrometheusLabelName(string(key)), processLabelPrefix)
+}
+
 // EnvResourceAttributes reads OTEL_RESOURCE_ATTRIBUTES and OTEL_SERVICE_NAME
 // the way resource.WithFromEnv does and returns the attributes that may go
 // into the Resource, with one warning per attribute it drops. It is used in
@@ -84,12 +102,13 @@ func IsTelemetrySDKKey(key attribute.Key) bool {
 // Dropped, because otelprom would join the two values into one target_info
 // label or refuse the label outright:
 //
-//   - an alias of an SDK-owned key (IdentityResourceKeys,
-//     DetectedResourceKeys): "telemetry_sdk_name" next to the detected
+//   - an alias of an SDK-owned key (identityResourceKeys,
+//     detectedResourceKeys): "telemetry_sdk_name" next to the detected
 //     telemetry.sdk.name. The exact SDK-owned key is kept: the SDK sets it
 //     again later in the merge, so it is overridden cleanly, and
 //     OTEL_SERVICE_NAME is the documented way to seed service.name;
-//   - any other key in the telemetry.sdk.* namespace;
+//   - any other key in the telemetry.sdk.* or process.* namespaces: the
+//     latter would let process.command_args back in through the environment;
 //   - a key the Prometheus exporter reserves or cannot translate
 //     (IsReservedAttributeKey);
 //   - an alias of a key in callerAttrs, which WithResourceAttributes already
@@ -133,6 +152,10 @@ func EnvResourceAttributes(ctx context.Context, callerAttrs []attribute.KeyValue
 		case owner == "" && IsTelemetrySDKKey(kv.Key):
 			warnings = append(warnings, fmt.Sprintf(
 				"OTEL_RESOURCE_ATTRIBUTES: ignoring %q; telemetry.sdk.* identifies the OpenTelemetry SDK, not the service",
+				string(kv.Key)))
+		case owner == "" && IsProcessKey(kv.Key):
+			warnings = append(warnings, fmt.Sprintf(
+				"OTEL_RESOURCE_ATTRIBUTES: ignoring %q; process.* is collected by the SDK itself, and process.command_args / process.owner are deliberately not exported",
 				string(kv.Key)))
 		case IsReservedAttributeKey(kv.Key):
 			warnings = append(warnings, fmt.Sprintf(

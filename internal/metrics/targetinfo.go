@@ -67,7 +67,11 @@ func targetInfoLabels(res *resource.Resource) (keys, values []string) {
 		}
 		seen[label] = struct{}{}
 		keys = append(keys, label)
-		values = append(values, kv.Value.String())
+		// Emit, not String: otelprom's getAttrs renders label values with
+		// Emit, and the two differ for slices ("[true false]" vs
+		// "[true,false]") and non-finite floats ("+Inf" vs "Infinity"). The
+		// collector exists to keep target_info identical to the exporter's.
+		values = append(values, kv.Value.Emit()) //nolint:staticcheck // deliberate: match otelprom
 	}
 	return keys, values
 }

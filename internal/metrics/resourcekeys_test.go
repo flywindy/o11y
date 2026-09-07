@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -38,6 +39,10 @@ func TestResourceKeyOwner(t *testing.T) {
 	assert.True(t, IsTelemetrySDKKey("telemetry.sdk.extra"))
 	assert.True(t, IsTelemetrySDKKey("telemetry_sdk_name"))
 	assert.False(t, IsTelemetrySDKKey("telemetry.other"))
+	assert.True(t, IsProcessKey("process.command_args"))
+	assert.True(t, IsProcessKey("process_owner"))
+	assert.True(t, IsProcessKey("process.pid"))
+	assert.False(t, IsProcessKey("processor.count"))
 }
 
 // warningFor returns the single warning that quotes key, failing the test
@@ -61,6 +66,8 @@ func TestEnvResourceAttributes(t *testing.T) {
 		"telemetry.sdk.name=mine", // exact detected key: kept, the detector overrides it later
 		"telemetry_sdk_name=evil", // alias of a detected key: dropped
 		"telemetry.sdk.extra=x",   // SDK namespace: dropped
+		"process.pid=7",           // exact detected key: kept, the detector overrides it later
+		"process.command_args=x",  // process.* namespace: dropped, the detectors leave it out on purpose
 		"__meta__=x",              // untranslatable label: dropped
 		"app_foo=env",             // alias of a caller key: dropped
 		"app.bar=env",             // same key as a caller key: kept, the merge overrides it
@@ -77,11 +84,13 @@ func TestEnvResourceAttributes(t *testing.T) {
 	assert.ElementsMatch(t, []attribute.KeyValue{
 		attribute.String("service.name", "from-env"),
 		attribute.String("telemetry.sdk.name", "mine"),
+		attribute.String("process.pid", "7"),
 		attribute.String("app.bar", "env"),
 		attribute.String("env.x", "1"),
 	}, kept)
 
-	require.Len(t, warnings, 6)
+	require.Len(t, warnings, 7)
+	assert.Contains(t, warningFor(t, warnings, "process.command_args"), "deliberately not exported")
 	assert.Contains(t, warningFor(t, warnings, "service_name"), `"service.name"`)
 	assert.Contains(t, warningFor(t, warnings, "telemetry_sdk_name"), `"telemetry.sdk.name"`)
 	assert.Contains(t, warningFor(t, warnings, "telemetry.sdk.extra"), "telemetry.sdk.*")
@@ -113,6 +122,8 @@ func TestTargetInfoCollector(t *testing.T) {
 		attribute.String("__meta__", "dropped"),
 		attribute.String("...", "dropped"),
 		attribute.Int("process.pid", 42),
+		attribute.BoolSlice("app.flags", []bool{true, false}), // otelprom renders slices with Emit
+		attribute.Float64("app.ratio", math.Inf(1)),           // and non-finite floats as +Inf
 	)
 	c, err := newTargetInfoCollector(res)
 	require.NoError(t, err)
@@ -137,5 +148,7 @@ func TestTargetInfoCollector(t *testing.T) {
 		"telemetry_sdk_name": "opentelemetry",
 		"app_x":              "first",
 		"process_pid":        "42",
+		"app_flags":          "[true false]",
+		"app_ratio":          "+Inf",
 	}, labels)
 }
