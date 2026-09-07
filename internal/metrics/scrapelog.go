@@ -56,6 +56,8 @@ type scrapeErrorLogger struct {
 	lastSeen map[string]time.Time
 }
 
+// newScrapeErrorLogger returns a scrapeErrorLogger writing to logger. A nil
+// logger discards everything, so the handler never dereferences nil.
 func newScrapeErrorLogger(logger *slog.Logger) *scrapeErrorLogger {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)

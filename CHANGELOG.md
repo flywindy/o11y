@@ -39,10 +39,14 @@ adopters can plan their upgrades.
   `MeterProvider` additionally drops, on the Prometheus path only,
   instrumentation-scope attributes whose label would duplicate
   `otel_scope_name` / `_version` / `_schema_url` or another scope attribute
-  (with a `WARN`), the one collision a stream filter cannot see. `WithExtraHTTPServerAttributeKeys` rejects the same reserved set
-  at option time, with the usual startup warning, instead of accepting a key
-  the view would then silently drop. `SDK.MeterProvider()` still satisfies
-  `metric.MeterProvider`; it is no longer the concrete `*sdkmetric.MeterProvider`.
+  (with a `WARN`), the one collision a stream filter cannot see.
+  `WithExtraHTTPServerAttributeKeys` rejects the same reserved set at option
+  time, with the usual startup warning, instead of accepting a key the view
+  would then silently drop. The `SDK.MeterProvider()` signature is unchanged
+  (it has returned the `metric.MeterProvider` interface since 0.1.0); only the
+  value behind it changed, from the SDK provider itself to a thin wrapper
+  around it on the Prometheus path, so a caller that type-asserts to
+  `*sdkmetric.MeterProvider` will now see the assertion fail.
 - `WithTraceSampler(nil)` is now a no-op. It previously cleared an earlier
   `WithSamplingRatio`, so a wrapper that appended `WithTraceSampler(nil)` for
   "no custom sampler" silently put the service back at 100 % head sampling.
