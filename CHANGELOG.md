@@ -60,9 +60,11 @@ adopters can plan their upgrades.
   into that label's `target_info` value (`"evil;opentelemetry"`). The OTel
   providers merge the raw environment back into their own Resource, so the
   SDK renders `target_info` itself on the Prometheus pull path and ships
-  the guarded Resource from the OTLP metrics exporter; spans and log
-  records still carry such an alias as a separate attribute, which no
-  Prometheus label is derived from. Exact keys are unaffected:
+  the guarded Resource from the OTLP metrics exporter; the trace and log
+  providers receive the guarded Resource plus every dropped key with an
+  empty value, which wins their merge, so a span or log record from a
+  misconfigured environment carries `process.command_args=""` rather than
+  the command line. Exact keys are unaffected:
   `OTEL_SERVICE_NAME` still seeds `service.name` and the identity options
   still override it.
 

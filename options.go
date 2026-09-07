@@ -362,7 +362,11 @@ func WithServiceNamespace(namespace string) Option {
 // override the same key from OTEL_RESOURCE_ATTRIBUTES, and an environment
 // key that is only an alias of one given here is dropped with a warning;
 // the environment goes through the same guard as this option when the
-// Resource is built (see buildResource).
+// Resource is built (see buildResource). A dropped environment key never
+// reaches target_info or the OTLP metrics Resource; on spans and log
+// records it appears with an empty value, because the OTel providers merge
+// the raw environment back in and the SDK overrides the value rather than
+// mutate the process environment.
 func WithResourceAttributes(attrs ...attribute.KeyValue) Option {
 	return func(c *Config) {
 		for _, kv := range attrs {

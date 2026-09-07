@@ -545,7 +545,7 @@ func resolveResource(ctx context.Context, cfg Config) (*resource.Resource, error
 	// process.command_args and process.owner do not reach target_info; and
 	// the environment filtered so an alias of an SDK-owned key cannot be
 	// joined into its target_info label.
-	envAttrs, envWarnings := EnvResourceAttributes(ctx, nil)
+	envAttrs, _, envWarnings := EnvResourceAttributes(ctx, nil)
 	if cfg.Logger != nil {
 		for _, w := range envWarnings {
 			cfg.Logger.WarnContext(ctx, w)

@@ -117,23 +117,23 @@ func IsProcessKey(key attribute.Key) bool {
 //   - an alias of an environment key kept earlier (keys are visited in
 //     sorted order, so the choice is deterministic).
 //
-// The OTel providers merge resource.Environment() back into the Resource
-// they are given, so the provider-side Resource still carries a dropped
-// alias. The metrics paths correct for that where the Resource is
-// exported: target_info is rendered by targetInfoCollector from the guarded
-// Resource on the Prometheus pull path, and guardedResourceExporter ships
-// the guarded Resource on the OTLP push path, so no Prometheus translation
-// on either path sees the alias. Spans and log records still carry it as
-// its own, distinct attribute: those providers offer no seam short of
-// mutating the process environment, and no Prometheus label is derived
-// from them; the startup warning names the key to remove.
-func EnvResourceAttributes(ctx context.Context, callerAttrs []attribute.KeyValue) (kept []attribute.KeyValue, warnings []string) {
+// The OTel providers merge resource.Environment() back underneath the
+// Resource they are given, so a dropped key would come back on the provider
+// side with its environment value. The metrics paths export the guarded
+// Resource directly (targetInfoCollector on the Prometheus pull path,
+// guardedResourceExporter on the OTLP push path). The trace and log
+// providers offer no such seam, so o11y.buildResource hands them the
+// guarded Resource plus NeutralizeEnvKeys(dropped): the same keys with an
+// empty value, which win the merge by exact key. A span or log record from
+// a misconfigured environment therefore carries process_command_args=""
+// rather than the command line; the warning names the key to remove.
+func EnvResourceAttributes(ctx context.Context, callerAttrs []attribute.KeyValue) (kept []attribute.KeyValue, dropped []attribute.Key, warnings []string) {
 	envRes, err := resource.New(ctx, resource.WithFromEnv())
 	if err != nil && !errors.Is(err, resource.ErrPartialResource) {
-		return nil, []string{fmt.Sprintf("OTEL_RESOURCE_ATTRIBUTES: ignored: %v", err)}
+		return nil, nil, []string{fmt.Sprintf("OTEL_RESOURCE_ATTRIBUTES: ignored: %v", err)}
 	}
 	if envRes == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	seen := make(map[string]attribute.Key)   // normalized label → env key already kept
 	for _, kv := range envRes.Attributes() { // sorted by key
@@ -146,27 +146,33 @@ func EnvResourceAttributes(ctx context.Context, callerAttrs []attribute.KeyValue
 			seen[label] = kv.Key
 			kept = append(kept, kv)
 		case owner != "":
+			dropped = append(dropped, kv.Key)
 			warnings = append(warnings, fmt.Sprintf(
 				"OTEL_RESOURCE_ATTRIBUTES: ignoring %q; it would render as the same Prometheus label as %q, which the SDK sets itself",
 				string(kv.Key), string(owner)))
 		case owner == "" && IsTelemetrySDKKey(kv.Key):
+			dropped = append(dropped, kv.Key)
 			warnings = append(warnings, fmt.Sprintf(
 				"OTEL_RESOURCE_ATTRIBUTES: ignoring %q; telemetry.sdk.* identifies the OpenTelemetry SDK, not the service",
 				string(kv.Key)))
 		case owner == "" && IsProcessKey(kv.Key):
+			dropped = append(dropped, kv.Key)
 			warnings = append(warnings, fmt.Sprintf(
 				"OTEL_RESOURCE_ATTRIBUTES: ignoring %q; process.* is collected by the SDK itself, and process.command_args / process.owner are deliberately not exported",
 				string(kv.Key)))
 		case IsReservedAttributeKey(kv.Key):
+			dropped = append(dropped, kv.Key)
 			warnings = append(warnings, fmt.Sprintf(
 				"OTEL_RESOURCE_ATTRIBUTES: ignoring %q; as the Prometheus label %q it is reserved by the exporter or not a valid label name, and otelprom would disable target_info for the whole process",
 				string(kv.Key), NormalizePrometheusLabelName(string(kv.Key))))
 		case aliasOf(kv.Key, callerAttrs) != "":
+			dropped = append(dropped, kv.Key)
 			warnings = append(warnings, fmt.Sprintf(
 				"OTEL_RESOURCE_ATTRIBUTES: ignoring %q; it would render as the same Prometheus label as %q, which WithResourceAttributes already sets",
 				string(kv.Key), string(aliasOf(kv.Key, callerAttrs))))
 		default:
 			if prev, dup := seen[label]; dup {
+				dropped = append(dropped, kv.Key)
 				warnings = append(warnings, fmt.Sprintf(
 					"OTEL_RESOURCE_ATTRIBUTES: ignoring %q; it would render as the same Prometheus label as %q, given earlier in OTEL_RESOURCE_ATTRIBUTES",
 					string(kv.Key), string(prev)))
@@ -176,7 +182,24 @@ func EnvResourceAttributes(ctx context.Context, callerAttrs []attribute.KeyValue
 			kept = append(kept, kv)
 		}
 	}
-	return kept, warnings
+	return kept, dropped, warnings
+}
+
+// NeutralizeEnvKeys returns dropped as attributes with an empty string value.
+// Merged on top of the guarded Resource before it is handed to a provider,
+// they override the environment's values by exact key when the provider
+// merges resource.Environment() back in, without touching the process
+// environment itself. The environment parses every value as a string, so
+// the type matches.
+func NeutralizeEnvKeys(dropped []attribute.Key) []attribute.KeyValue {
+	if len(dropped) == 0 {
+		return nil
+	}
+	out := make([]attribute.KeyValue, 0, len(dropped))
+	for _, k := range dropped {
+		out = append(out, attribute.String(string(k), ""))
+	}
+	return out
 }
 
 // aliasOf returns the key in attrs that key renders as the same Prometheus

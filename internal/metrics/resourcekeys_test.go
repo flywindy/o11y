@@ -76,7 +76,7 @@ func TestEnvResourceAttributes(t *testing.T) {
 	}, ","))
 	t.Setenv("OTEL_SERVICE_NAME", "from-env") // overrides service.name from the list, still the exact key
 
-	kept, warnings := EnvResourceAttributes(t.Context(), []attribute.KeyValue{
+	kept, dropped, warnings := EnvResourceAttributes(t.Context(), []attribute.KeyValue{
 		attribute.String("app.foo", "code"),
 		attribute.String("app.bar", "code"),
 	})
@@ -88,6 +88,17 @@ func TestEnvResourceAttributes(t *testing.T) {
 		attribute.String("app.bar", "env"),
 		attribute.String("env.x", "1"),
 	}, kept)
+
+	assert.ElementsMatch(t, []attribute.Key{
+		"service_name", "telemetry_sdk_name", "telemetry.sdk.extra", "process.command_args", "__meta__", "app_foo", "env_x",
+	}, dropped, "every dropped key is reported so the provider Resource can neutralize it")
+	neutralized := NeutralizeEnvKeys(dropped)
+	require.Len(t, neutralized, len(dropped))
+	for i, kv := range neutralized {
+		assert.Equal(t, dropped[i], kv.Key)
+		assert.Equal(t, "", kv.Value.AsString())
+	}
+	assert.Nil(t, NeutralizeEnvKeys(nil))
 
 	require.Len(t, warnings, 7)
 	assert.Contains(t, warningFor(t, warnings, "process.command_args"), "deliberately not exported")
@@ -105,8 +116,9 @@ func TestEnvResourceAttributes(t *testing.T) {
 func TestEnvResourceAttributes_Unset(t *testing.T) {
 	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "")
 	t.Setenv("OTEL_SERVICE_NAME", "")
-	kept, warnings := EnvResourceAttributes(t.Context(), nil)
+	kept, dropped, warnings := EnvResourceAttributes(t.Context(), nil)
 	assert.Empty(t, kept)
+	assert.Empty(t, dropped)
 	assert.Empty(t, warnings)
 }
 
