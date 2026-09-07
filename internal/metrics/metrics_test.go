@@ -24,6 +24,9 @@ import (
 	"github.com/flywindy/o11y/internal/testutil"
 )
 
+// baseConfig returns the Prometheus-path Config the tests start from: a
+// private registry on addr, exemplars on and a short bucket list so histogram
+// output stays easy to assert on.
 func baseConfig(addr string) metrics.Config {
 	return metrics.Config{
 		ServiceName:      "test-svc",
@@ -186,21 +189,26 @@ func TestInitMeter_ExemplarsStayUnderRuneCap(t *testing.T) {
 	}
 }
 
+// capturingErrorHandler is an otel.ErrorHandler that records every error
+// the SDK reports, so tests can assert nothing was dropped on the floor.
 type capturingErrorHandler struct {
 	mu   sync.Mutex
 	errs []string
 }
 
+// newCapturingErrorHandler returns an empty capturingErrorHandler.
 func newCapturingErrorHandler() *capturingErrorHandler {
 	return &capturingErrorHandler{}
 }
 
+// Handle implements otel.ErrorHandler.
 func (h *capturingErrorHandler) Handle(err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.errs = append(h.errs, err.Error())
 }
 
+// errors returns a copy of the errors recorded so far.
 func (h *capturingErrorHandler) errors() []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -334,6 +342,8 @@ func TestInitMeter_ExemplarsDisabledSuppressesOpenMetrics(t *testing.T) {
 		"plain Prometheus format keeps integer le boundaries; this is the compatibility path WithExemplars(false) preserves")
 }
 
+// scrapeOpenMetrics fetches /metrics from addr negotiating the OpenMetrics
+// exposition format and returns the body.
 func scrapeOpenMetrics(ctx context.Context, t *testing.T, addr string) string {
 	t.Helper()
 	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -873,4 +883,171 @@ func TestInitMeter_MaxUniqueCollectionsCapsElasticsearchIndices(t *testing.T) {
 		}
 	}
 	assert.True(t, esOther, "overflow indices should merge to one Elasticsearch duration series with count 2")
+}
+
+// TestInitMeter_ReservedAttributeKeysAreDropped pins that an attribute whose
+// Prometheus label name collides with one the exporter already owns
+// (service_name, otel_scope_name, ...) is dropped from the series instead of
+// failing the whole scrape. Before this guard, one such Record call made
+// /metrics answer HTTP 500 until the process restarted.
+func TestInitMeter_ReservedAttributeKeysAreDropped(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	// A meter created with instrumentation-scope attributes makes otelprom add
+	// otel_scope_<attr> labels too, so those keys are reserved as well.
+	counter, err := mp.Meter("app", metric.WithInstrumentationAttributes(
+		attribute.String("tier", "scope"),
+	)).Int64Counter("app_collision")
+	require.NoError(t, err)
+	counter.Add(context.Background(), 1, metric.WithAttributes(
+		attribute.String("service.name", "evil"),
+		attribute.String("service_namespace", "evil"),
+		attribute.String("otel.scope.name", "evil"),
+		attribute.String("otel.scope.tier", "evil"),
+		attribute.String("__name__", "evil"),
+		attribute.String("...", "evil"),
+		attribute.String("outcome", "ok"),
+	))
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	var found bool
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "app_collision_total{") {
+			continue
+		}
+		found = true
+		assert.Contains(t, line, `outcome="ok"`, "non-reserved attributes survive")
+		assert.Contains(t, line, `service_name="test-svc"`, "the resource constant label wins")
+		assert.Contains(t, line, `service_namespace="platform"`)
+		assert.Contains(t, line, `otel_scope_tier="scope"`, "the scope attribute label wins")
+		assert.NotContains(t, line, "evil")
+	}
+	assert.True(t, found, "the family must still be exported: %s", body)
+}
+
+// TestInitMeter_ReservedKeyGuardKeepsViewedInstrumentsSingle pins that the
+// catch-all reserved-key view declines instruments an SDK view already
+// matched. A second stream on those would carry the reader-default
+// aggregation and export as a duplicate family with the wrong buckets.
+func TestInitMeter_ReservedKeyGuardKeepsViewedInstrumentsSingle(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	hist, err := mp.Meter("test").Float64Histogram("http.server.request.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	hist.Record(context.Background(), 0.01, metric.WithAttributes(
+		semconv.HTTPRequestMethodKey.String("GET"),
+		semconv.HTTPRoute("/orders/{id}"),
+		semconv.HTTPResponseStatusCode(http.StatusOK),
+		attribute.String("service.name", "evil"),
+	))
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	assert.Equal(t, 1, strings.Count(body, "# TYPE http_server_request_duration_seconds histogram"),
+		"exactly one family for the viewed instrument: %s", body)
+	assert.Contains(t, body, `le="0.1"`, "the SDK view's buckets apply")
+	assert.NotContains(t, body, `le="25"`, "no second stream with OTel default buckets")
+	assert.NotContains(t, body, "evil")
+	assert.Contains(t, body, `http_route="/orders/{id}"`)
+}
+
+// TestInitMeter_LeAttributeIsDropped pins that a histogram attribute rendering
+// as `le` is dropped: gathering would not catch it (the duplicate only appears
+// in the exposition text), and Prometheus rejects the whole scrape on it.
+func TestInitMeter_LeAttributeIsDropped(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	hist, err := mp.Meter("app").Float64Histogram("app_latency", metric.WithUnit("s"))
+	require.NoError(t, err)
+	hist.Record(context.Background(), 0.5, metric.WithAttributes(
+		attribute.String("le", "custom"),
+		attribute.String("outcome", "ok"),
+	))
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	assert.Contains(t, body, "app_latency_seconds_bucket{")
+	assert.Contains(t, body, `outcome="ok"`)
+	assert.NotContains(t, body, `le="custom"`)
+}
+
+// TestGuardScopeAttributes_DropsCollidingScopeAttributes pins the provider
+// wrapper: a scope attribute named "name" (which otelprom would render as a
+// second otel_scope_name) and a scope attribute whose label duplicates an
+// earlier one are dropped, the rest survive, and the meter's families export.
+func TestGuardScopeAttributes_DropsCollidingScopeAttributes(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	guarded := metrics.GuardScopeAttributes(mp, nil)
+	counter, err := guarded.Meter("app",
+		metric.WithInstrumentationVersion("1.2.3"),
+		metric.WithInstrumentationAttributes(
+			attribute.String("name", "evil"),
+			attribute.String("app.tier", "gold"),
+			attribute.String("app_tier", "evil"),
+		),
+	).Int64Counter("app_scoped")
+	require.NoError(t, err)
+	counter.Add(context.Background(), 1)
+
+	plain, err := guarded.Meter("plain").Int64Counter("app_plain")
+	require.NoError(t, err)
+	plain.Add(context.Background(), 1)
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	var found bool
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "app_scoped_total{") {
+			continue
+		}
+		found = true
+		assert.Contains(t, line, `otel_scope_name="app"`, "the scope name label comes from the meter name")
+		assert.Contains(t, line, `otel_scope_version="1.2.3"`, "the version option survives the rebuild")
+		assert.Contains(t, line, `otel_scope_app_tier="gold"`, "the first non-colliding attribute is kept")
+		assert.NotContains(t, line, "evil")
+	}
+	assert.True(t, found, "the scoped family must still be exported: %s", body)
+	assert.Contains(t, body, "app_plain_total{", "a meter without scope attributes passes through")
 }

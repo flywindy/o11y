@@ -15,6 +15,38 @@ adopters can plan their upgrades.
 
 ### Fixed
 
+- `metrics`: a single mislabeled datapoint can no longer take the whole
+  `/metrics` endpoint down. An attribute whose key normalizes to a label the
+  Prometheus exporter already owns — the four resource constants
+  (`service_name`, `service_namespace`, `service_version`,
+  `deployment_environment_name`), the `otel_scope_*` labels (name, version,
+  schema URL, and one per instrumentation-scope attribute), the
+  exposition-format labels `le` / `quantile`, and the `__x__` reserved-name
+  shape the translator keeps intact —
+  made client_golang reject that family with "duplicate label names in
+  constant and variable labels", and because aggregation is cumulative the
+  rejection followed the process until restart; with promhttp's default error
+  handling the scrape answered HTTP 500 from then on, so runtime, HTTP and
+  database series disappeared along with the bad one. Two changes: on the
+  Prometheus pull path every stream now drops attributes with a reserved key
+  (composed into the SDK's own views, and via a catch-all view for
+  instruments no view matches), so the collision cannot form — the OTLP push
+  path carries resource and scope attributes separately and exports
+  attributes untouched; and the
+  Prometheus handler serves with `ContinueOnError`, so any remaining gather
+  error costs the affected family only and is logged once per five minutes
+  through the SDK's stdout logger rather than failing the scrape. The public
+  `MeterProvider` additionally drops, on the Prometheus path only,
+  instrumentation-scope attributes whose label would duplicate
+  `otel_scope_name` / `_version` / `_schema_url` or another scope attribute
+  (with a `WARN`), the one collision a stream filter cannot see.
+  `WithExtraHTTPServerAttributeKeys` rejects the same reserved set at option
+  time, with the usual startup warning, instead of accepting a key the view
+  would then silently drop. The `SDK.MeterProvider()` signature is unchanged
+  (it has returned the `metric.MeterProvider` interface since 0.1.0); only the
+  value behind it changed, from the SDK provider itself to a thin wrapper
+  around it on the Prometheus path, so a caller that type-asserts to
+  `*sdkmetric.MeterProvider` will now see the assertion fail.
 - `WithTraceSampler(nil)` is now a no-op. It previously cleared an earlier
   `WithSamplingRatio`, so a wrapper that appended `WithTraceSampler(nil)` for
   "no custom sampler" silently put the service back at 100 % head sampling.

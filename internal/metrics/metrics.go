@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"time"
@@ -21,7 +22,6 @@ import (
 	"github.com/flywindy/o11y/internal/metricscap"
 	"github.com/flywindy/o11y/internal/views"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/contrib/instrumentation/runtime"
 	"go.opentelemetry.io/otel/attribute"
 	otlpmetrichttp "go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
@@ -96,6 +96,10 @@ type Config struct {
 	// `le="1"` → `le="1.0"` bucket-boundary format change that OpenMetrics
 	// introduces, at the cost of disabling trace-to-metric linkage.
 	Exemplars bool
+
+	// Logger receives the Prometheus handler's gather errors (rate-limited).
+	// Optional; nil discards them.
+	Logger *slog.Logger
 }
 
 // Closer is a function that shuts down a component. For the Prometheus path it
@@ -280,6 +284,10 @@ func InitMeter(ctx context.Context, cfg Config) (*sdkmetric.MeterProvider, Close
 	return initPrometheus(ctx, cfg, res, views)
 }
 
+// defaultViews returns the views the SDK installs unless
+// Config.DisableDefaultViews is set: the HTTP server attribute allow-list and
+// the per-collection cardinality caps. Reserved-key filtering is layered on
+// top by guardReservedKeys on the Prometheus path, not here.
 func defaultViews(cfg Config) []sdkmetric.View {
 	if cfg.DisableDefaultViews {
 		return nil
@@ -323,12 +331,15 @@ func defaultViews(cfg Config) []sdkmetric.View {
 	}
 }
 
-// initPrometheus sets up the Prometheus pull path.
 // runtimeStart is a seam over runtime.Start so tests can exercise the
 // init-failure branches, which otherwise only trigger on instrument-creation
 // errors. It mirrors internal/profiling's pyroscopeStart.
 var runtimeStart = runtime.Start
 
+// initPrometheus sets up the Prometheus pull path: a private registry, the
+// otelprom exporter with the resource constants promoted to labels, the
+// reserved-key guard on every stream (see guardReservedKeys) and the
+// ContinueOnError /metrics handler bound to cfg.MetricsAddr.
 func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, views []sdkmetric.View) (*sdkmetric.MeterProvider, Closer, error) {
 	reg := prometheus.NewRegistry()
 
@@ -337,12 +348,7 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 	// The key "deployment.environment.name" matches the pinned semconv version.
 	exporter, err := otelprom.New(
 		otelprom.WithRegisterer(reg),
-		otelprom.WithResourceAsConstantLabels(attribute.NewAllowKeysFilter(
-			"service.namespace",
-			"service.name",
-			"service.version",
-			"deployment.environment.name",
-		)),
+		otelprom.WithResourceAsConstantLabels(attribute.NewAllowKeysFilter(resourceConstantLabelKeys...)),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("metrics: create prometheus exporter: %w", err)
@@ -365,8 +371,12 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 		}
 	}()
 
+	// Every stream, on every instrument, drops attribute keys that would
+	// collide with a label otelprom synthesizes or the exposition format
+	// owns (see reserved.go). This is a property of the Prometheus rendering,
+	// so the OTLP path below exports attributes untouched.
 	provider = sdkmetric.NewMeterProvider(
-		meterProviderOptions(exporter, res, views, cfg.MaxUniqueRoutes, cfg.MaxUniqueCollections)...,
+		meterProviderOptions(exporter, res, guardReservedKeys(views), cfg.MaxUniqueRoutes, cfg.MaxUniqueCollections)...,
 	)
 
 	if cfg.RuntimeMetrics {
@@ -395,9 +405,7 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 	// `le` label (e.g. `le="1"` → `le="1.0"`); callers whose dashboards or
 	// recording rules cannot tolerate that one-time series-identity change
 	// can suppress the renegotiation via WithExemplars(false).
-	mux.Handle("/metrics", promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{
-		EnableOpenMetrics: cfg.Exemplars,
-	}))
+	mux.Handle("/metrics", newMetricsHandler(gatherer, cfg.Exemplars, cfg.Logger))
 	server := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -461,6 +469,9 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []s
 	return provider, func(_ context.Context) error { return nil }, nil
 }
 
+// meterProviderOptions assembles the sdkmetric options shared by both export
+// paths: the reader, the resource, the views and the SDK-level cardinality
+// limit derived from the per-collection caps.
 func meterProviderOptions(reader sdkmetric.Reader, res *resource.Resource, views []sdkmetric.View, maxUniqueRoutes, maxUniqueCollections int) []sdkmetric.Option {
 	opts := []sdkmetric.Option{
 		sdkmetric.WithReader(reader),
