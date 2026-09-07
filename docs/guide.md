@@ -435,9 +435,11 @@ series, which bounds memory and is worth an alert:
 sum by (service_name, __name__) ({otel_metric_overflow="true"}) > 0
 ```
 
-`WithCardinalityLimit(n)` replaces the derived value for a service whose
-`http.server.request.duration` legitimately needs more method × route × status
-combinations; keep the decision in code where a reviewer sees it.
+`WithCardinalityLimit(n)` replaces the derived value when `n > 0`; zero or a
+negative value returns to the derived sizing. Use a positive limit for a
+service whose `http.server.request.duration` legitimately needs more method ×
+route × status combinations, and keep the decision in code where a reviewer
+sees it.
 
 For outbound calls over the standard library client, wrap any
 `http.RoundTripper` with `o11yhttp.NewTransport`. It emits one client span per
