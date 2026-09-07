@@ -13,6 +13,61 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+### Added
+
+- `WithResourceAttributes(attrs ...attribute.KeyValue)` adds caller-owned
+  attributes to the Resource shared by traces, metrics and logs (for example
+  `k8s.pod.name` when it is not supplied through `OTEL_RESOURCE_ATTRIBUTES`).
+  Rejected with the usual startup warning: the four identity keys
+  (`service.name`, `service.version`, `service.namespace`,
+  `deployment.environment.name`) so the identity options stay authoritative;
+  the keys the SDK detects itself (`telemetry.sdk.*`, `process.pid`,
+  `process.executable.name`, `process.runtime.name` / `.version`,
+  `host.name`) and the rest of the `telemetry.sdk.*` and `process.*`
+  namespaces, so `process.command_args` cannot be added back from the
+  outside; any alias that renders as the same Prometheus label as one of
+  those (`service_name`, `process_pid`, `host-name` — otelprom would join the
+  two values into one `target_info` label); and any key that would render as
+  an invalid label name (`__meta__` would make otelprom disable `target_info`
+  for the process); and an alias of a key given earlier to the option
+  (`app.foo` then `app_foo`), for the same reason. A key set here overrides
+  the same key from `OTEL_RESOURCE_ATTRIBUTES`.
+
+### Changed
+
+- resource: the SDK no longer uses `resource.WithProcess()`. That detector
+  also collects `process.command_args` and `process.owner`, and the Resource
+  is exported unfiltered — as `target_info` labels on the Prometheus path and
+  on every span and log record over OTLP — so any credential passed as a
+  command-line flag landed in Prometheus, Tempo and Loki. The process is now
+  identified by `process.pid`, `process.executable.name`,
+  `process.runtime.name` and `process.runtime.version` only;
+  `process.executable.path` and `process.runtime.description` are dropped
+  with the other two. `resource.WithTelemetrySDK()` is added at the same
+  time, so `telemetry.sdk.name` / `.language` / `.version` — required by the
+  semantic conventions and assumed by Grafana's service graph — now appear
+  on `target_info`. Dashboards or joins that read `process_command_args`,
+  `process_owner`, `process_executable_path` or
+  `process_runtime_description` from `target_info` will find those labels
+  gone; no series name changes.
+- resource: `OTEL_RESOURCE_ATTRIBUTES` now goes through the same guard as
+  `WithResourceAttributes` when the Resource is built. An environment key
+  that is only an alias of an SDK-owned key (`telemetry_sdk_name` next to the
+  detected `telemetry.sdk.name`, `service-name` next to `service.name`), of
+  a key given to `WithResourceAttributes`, that falls in `telemetry.sdk.*`
+  or `process.*`, or that the Prometheus exporter cannot translate, is
+  dropped with a startup warning instead of being joined
+  into that label's `target_info` value (`"evil;opentelemetry"`). The OTel
+  providers merge the raw environment back into their own Resource, so the
+  SDK renders `target_info` itself on the Prometheus pull path and ships
+  the guarded Resource from the OTLP metrics exporter; the trace and log
+  providers receive the guarded Resource plus every dropped key with an
+  empty value, which wins their merge, so a span or log record from a
+  misconfigured environment carries `process.command_args=""` rather than
+  the command line. Exact keys are unaffected:
+  `OTEL_SERVICE_NAME` still seeds `service.name` and the identity options
+  still override it.
+
 ### Fixed
 
 - `metrics`: a single mislabeled datapoint can no longer take the whole

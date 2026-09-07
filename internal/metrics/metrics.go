@@ -346,12 +346,24 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 	// Resource attributes in the allow filter become constant labels on every
 	// series, so service_namespace="..." is guaranteed on every instrument including runtime.
 	// The key "deployment.environment.name" matches the pinned semconv version.
+	// target_info is rendered by the SDK from res, not by the exporter from
+	// the provider's Resource: the provider merges the raw environment back
+	// in, which would let an environment alias of an SDK-owned key be joined
+	// into that key's label. See targetInfoCollector.
 	exporter, err := otelprom.New(
 		otelprom.WithRegisterer(reg),
 		otelprom.WithResourceAsConstantLabels(attribute.NewAllowKeysFilter(resourceConstantLabelKeys...)),
+		otelprom.WithoutTargetInfo(),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("metrics: create prometheus exporter: %w", err)
+	}
+	targetInfo, err := newTargetInfoCollector(res)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := reg.Register(targetInfo); err != nil {
+		return nil, nil, fmt.Errorf("metrics: register target_info: %w", err)
 	}
 
 	var (
@@ -432,6 +444,10 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []s
 	if rules := otlpCapRules(cfg); len(rules) > 0 {
 		cappedExporter = metricscap.NewExporter(exporter, rules...)
 	}
+	// Ship res, not the provider's Resource: the provider merges the raw
+	// environment back in, which would resurrect an alias
+	// EnvResourceAttributes dropped. See guardedResourceExporter.
+	cappedExporter = withGuardedResource(cappedExporter, res)
 
 	var initSucceeded bool
 	var provider *sdkmetric.MeterProvider
@@ -524,9 +540,24 @@ func resolveResource(ctx context.Context, cfg Config) (*resource.Resource, error
 		return nil, errors.New("metrics: Namespace is required")
 	}
 
+	// Same detector set and environment guard as o11y.buildResource: the
+	// narrow process detectors, never resource.WithProcess(), so
+	// process.command_args and process.owner do not reach target_info; and
+	// the environment filtered so an alias of an SDK-owned key cannot be
+	// joined into its target_info label.
+	envAttrs, _, envWarnings := EnvResourceAttributes(ctx, nil)
+	if cfg.Logger != nil {
+		for _, w := range envWarnings {
+			cfg.Logger.WarnContext(ctx, w)
+		}
+	}
 	resOpts := []resource.Option{
-		resource.WithFromEnv(),
-		resource.WithProcess(),
+		resource.WithAttributes(envAttrs...),
+		resource.WithTelemetrySDK(),
+		resource.WithProcessPID(),
+		resource.WithProcessExecutableName(),
+		resource.WithProcessRuntimeName(),
+		resource.WithProcessRuntimeVersion(),
 		resource.WithHost(),
 		resource.WithAttributes(
 			semconv.ServiceNameKey.String(cfg.ServiceName),

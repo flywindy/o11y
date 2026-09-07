@@ -49,8 +49,20 @@ every signal so that service identity is identical across backends.
 | `service.namespace` | string | `WithServiceNamespace` | yes |
 | `deployment.environment.name` | string | `WithEnvironment` (canonicalized: `production` / `staging` / `development` / `testing`) | yes |
 | `host.*` | various | `resource.WithHost()` | detected |
-| `process.*` | various | `resource.WithProcess()` | detected |
-| (env-provided) | various | `resource.WithFromEnv()` / `OTEL_RESOURCE_ATTRIBUTES` | optional |
+| `process.pid` | int | `resource.WithProcessPID()` | detected |
+| `process.executable.name` | string | `resource.WithProcessExecutableName()` | detected |
+| `process.runtime.name` | string | `resource.WithProcessRuntimeName()` | detected |
+| `process.runtime.version` | string | `resource.WithProcessRuntimeVersion()` | detected |
+| `telemetry.sdk.name` / `.language` / `.version` | string | `resource.WithTelemetrySDK()` | detected |
+| (caller-provided) | various | `WithResourceAttributes(...)`; rejected: the four identity keys above, every detected key above (`telemetry.sdk.*`, `process.*`, `host.name`) and the rest of the `telemetry.sdk.*` and `process.*` namespaces (`process.command_args` cannot be added back), any alias that renders as the same Prometheus label as one of those (`service_name`, `process_pid`, `host-name`), and any key that would render as an invalid label (`__meta__`) | optional |
+| (env-provided) | various | `OTEL_RESOURCE_ATTRIBUTES` / `OTEL_SERVICE_NAME`, read as `resource.WithFromEnv()` does and passed through the same guard as `WithResourceAttributes` (an alias of an SDK-owned or caller-given key is dropped with a warning) | optional |
+
+`process.command_args`, `process.owner`, `process.executable.path` and
+`process.runtime.description` are deliberately not collected, because the
+Resource is exported unfiltered (`target_info`, every span, every log record):
+`process.command_args` can carry credentials passed on the command line;
+`process.owner` reveals which account runs the service, which no backend
+needs; the other two add only label bloat.
 
 ---
 

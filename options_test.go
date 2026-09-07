@@ -13,6 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 func TestParseBoolEnv_Absent(t *testing.T) {
@@ -438,4 +440,209 @@ func TestNormalizeEnvironment(t *testing.T) {
 		_, err := normalizeEnvironment(in)
 		require.Errorf(t, err, "normalizeEnvironment(%q) should be rejected", in)
 	}
+}
+
+func TestWithResourceAttributes(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.initWarnings = nil
+
+	WithResourceAttributes(
+		attribute.String("k8s.pod.name", "room-service-7d9f-x2kq"),
+		attribute.String("", "no key"),
+		attribute.String("service.name", "impostor"),
+		attribute.String("service.version", "9.9.9"),
+		attribute.String("service.namespace", "elsewhere"),
+		attribute.String("deployment.environment.name", "production"),
+		attribute.String("telemetry.sdk.name", "not-opentelemetry"),
+		attribute.String("service_name", "alias-of-service.name"), // same Prometheus label as service.name
+		attribute.String("Service-Version", "alias"),              // normalizes to Service_Version, distinct from service_version
+		attribute.String("telemetry_sdk_name", "alias"),           // same label as the detected telemetry.sdk.name
+		attribute.String("process_pid", "alias"),                  // same label as the detected process.pid
+		attribute.String("host-name", "alias"),                    // same label as the detected host.name
+		attribute.String("telemetry.sdk.extra", "namespace"),      // not detected, but the SDK's namespace
+		attribute.String("process.command_args", "--db-password"), // the namespace the detectors deliberately narrow
+		attribute.String("process_owner", "root"),                 // same namespace, alias spelling
+		attribute.String("__meta__", "reserved shape"),
+		attribute.String("...", "punctuation only"),
+		attribute.Int("app.shard", 3),
+		attribute.String("app.foo", "a"),
+		attribute.String("app_foo", "b"),                      // alias of app.foo given just before
+		attribute.String("k8s.pod.name", "replaced-in-place"), // same exact key: last value wins
+	)(cfg)
+
+	assert.Equal(t, []attribute.KeyValue{
+		attribute.String("k8s.pod.name", "replaced-in-place"),
+		attribute.String("Service-Version", "alias"),
+		attribute.Int("app.shard", 3),
+		attribute.String("app.foo", "a"),
+	}, cfg.resourceAttrs, "only caller-owned keys are kept, in order, one per Prometheus label")
+
+	require.Len(t, cfg.initWarnings, 16, "one warning per dropped attribute")
+	assert.Contains(t, cfg.initWarnings[0], "empty key")
+	for i, key := range []string{"service.name", "service.version", "service.namespace", "deployment.environment.name"} {
+		assert.Contains(t, cfg.initWarnings[i+1], strconv.Quote(key))
+		assert.Contains(t, cfg.initWarnings[i+1], "identity options")
+	}
+	assert.Contains(t, cfg.initWarnings[5], `"telemetry.sdk.name"`)
+	assert.Contains(t, cfg.initWarnings[5], "detects itself")
+	assert.Contains(t, cfg.initWarnings[6], `"service_name"`)
+	assert.Contains(t, cfg.initWarnings[6], `"service.name"`, "the alias names the key it collides with")
+	assert.Contains(t, cfg.initWarnings[6], "identity options")
+	for i, want := range []struct{ key, owner string }{
+		{"telemetry_sdk_name", "telemetry.sdk.name"},
+		{"process_pid", "process.pid"},
+		{"host-name", "host.name"},
+	} {
+		assert.Contains(t, cfg.initWarnings[7+i], strconv.Quote(want.key))
+		assert.Contains(t, cfg.initWarnings[7+i], strconv.Quote(want.owner))
+		assert.Contains(t, cfg.initWarnings[7+i], "detects itself")
+	}
+	assert.Contains(t, cfg.initWarnings[10], `"telemetry.sdk.extra"`)
+	assert.Contains(t, cfg.initWarnings[11], `"process.command_args"`)
+	assert.Contains(t, cfg.initWarnings[11], "deliberately not exported")
+	assert.Contains(t, cfg.initWarnings[12], `"process_owner"`)
+	assert.Contains(t, cfg.initWarnings[13], `"__meta__"`)
+	assert.Contains(t, cfg.initWarnings[13], "target_info")
+	assert.Contains(t, cfg.initWarnings[14], `"..."`)
+	assert.Contains(t, cfg.initWarnings[15], `"app_foo"`)
+	assert.Contains(t, cfg.initWarnings[15], `"app.foo"`, "the alias names the earlier key it collides with")
+}
+
+func TestWithResourceAttributesAppendsAcrossCalls(t *testing.T) {
+	cfg := defaultConfig()
+	WithResourceAttributes(attribute.String("a", "1"))(cfg)
+	WithResourceAttributes(attribute.String("b", "2"))(cfg)
+	assert.Equal(t, []attribute.KeyValue{attribute.String("a", "1"), attribute.String("b", "2")}, cfg.resourceAttrs)
+}
+
+// TestBuildResource_ProcessDetectorsAreNarrow pins the detector set: the
+// resource identifies the process by pid, executable name and runtime, and
+// never carries process.command_args or process.owner, which would otherwise
+// be exported unfiltered on target_info, every span and every log record.
+func TestBuildResource_ProcessDetectorsAreNarrow(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.serviceName, cfg.serviceVersion, cfg.namespace, cfg.environment = "svc", "1.0.0", "platform", "development"
+
+	res, _, err := buildResource(context.Background(), cfg)
+	require.NoError(t, err)
+	attrs := res.Set()
+
+	for _, key := range []attribute.Key{
+		"process.pid", "process.executable.name",
+		"process.runtime.name", "process.runtime.version",
+		"telemetry.sdk.name", "telemetry.sdk.language", "telemetry.sdk.version",
+		"host.name",
+	} {
+		_, ok := attrs.Value(key)
+		assert.True(t, ok, "%s should be detected", key)
+	}
+	for _, key := range []attribute.Key{
+		"process.command_args", "process.owner",
+		"process.executable.path", "process.runtime.description",
+	} {
+		_, ok := attrs.Value(key)
+		assert.False(t, ok, "%s must not be collected", key)
+	}
+	v, _ := attrs.Value("telemetry.sdk.language")
+	assert.Equal(t, "go", v.AsString())
+}
+
+// TestBuildResource_MergeOrder checks the documented precedence: identity
+// options beat WithResourceAttributes, which beats OTEL_RESOURCE_ATTRIBUTES.
+func TestBuildResource_MergeOrder(t *testing.T) {
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", strings.Join([]string{
+		"app.shard=env",                              // exact key also given in code: code wins
+		"app_shard=env-alias",                        // alias of the code key: dropped, would be joined into app_shard
+		"k8s.pod.name=from-env",                      // only in env: kept
+		"only.env=1",                                 // only in env: kept
+		"telemetry_sdk_name=evil",                    // alias of a detected key: dropped
+		"service-name=evil",                          // alias of an identity key: dropped
+		"telemetry.sdk.extra=x",                      // SDK namespace: dropped
+		"__meta__=x",                                 // untranslatable label: dropped
+		"process.command_args=--db-password=hunter2", // process.* namespace: dropped, and neutralized for spans and logs
+	}, ","))
+	t.Setenv("OTEL_SERVICE_NAME", "from-env") // exact identity key: overridden, no warning
+
+	cfg := defaultConfig()
+	cfg.initWarnings = nil
+	cfg.serviceName, cfg.serviceVersion, cfg.namespace, cfg.environment = "svc", "1.0.0", "platform", "development"
+	WithResourceAttributes(attribute.String("app.shard", "code"))(cfg)
+
+	res, providerRes, err := buildResource(context.Background(), cfg)
+	require.NoError(t, err)
+	attrs := res.Set()
+
+	want := map[attribute.Key]string{
+		"service.name":       "svc",      // identity beats OTEL_SERVICE_NAME
+		"app.shard":          "code",     // code beats env
+		"k8s.pod.name":       "from-env", // env still contributes keys code did not set
+		"only.env":           "1",
+		"telemetry.sdk.name": "opentelemetry", // the detector's value, untouched by the env alias
+	}
+	for key, val := range want {
+		v, ok := attrs.Value(key)
+		require.True(t, ok, "%s missing", key)
+		assert.Equal(t, val, v.AsString(), key)
+	}
+	droppedKeys := []attribute.Key{"app_shard", "telemetry_sdk_name", "service-name", "telemetry.sdk.extra", "__meta__", "process.command_args"}
+	for _, key := range droppedKeys {
+		_, ok := attrs.Value(key)
+		assert.False(t, ok, "%s must not reach the guarded Resource", key)
+		v, ok := providerRes.Set().Value(key)
+		require.True(t, ok, "%s must be neutralized on the provider Resource", key)
+		assert.Equal(t, "", v.AsString(), "%s must carry an empty value on the provider Resource", key)
+	}
+	for key, val := range want {
+		v, ok := providerRes.Set().Value(key)
+		require.True(t, ok, "%s missing from the provider Resource", key)
+		assert.Equal(t, val, v.AsString(), key)
+	}
+
+	require.Len(t, cfg.initWarnings, 6, "one warning per dropped environment attribute")
+	for _, want := range []struct{ key, names string }{
+		{"app_shard", `"app.shard"`},
+		{"telemetry_sdk_name", `"telemetry.sdk.name"`},
+		{"service-name", `"service.name"`},
+		{"telemetry.sdk.extra", "telemetry.sdk.*"},
+		{"__meta__", "target_info"},
+		{"process.command_args", "deliberately not exported"},
+	} {
+		w := assertWarningFor(t, cfg.initWarnings, "OTEL_RESOURCE_ATTRIBUTES", want.key, want.names)
+		assert.NotContains(t, w, "hunter2", "a warning names the key, never the value")
+	}
+
+	// The real provider merges resource.Environment() back underneath
+	// providerRes; the neutralized keys must win that merge so the span
+	// never carries the environment's value.
+	exp := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithResource(providerRes), sdktrace.WithSyncer(exp))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	_, span := tp.Tracer("test").Start(context.Background(), "op")
+	span.End()
+	spans := exp.GetSpans()
+	require.Len(t, spans, 1)
+	spanAttrs := spans[0].Resource.Set()
+	for _, key := range droppedKeys {
+		v, ok := spanAttrs.Value(key)
+		require.True(t, ok, "%s should be present, neutralized, on the span resource", key)
+		assert.Equal(t, "", v.AsString(), key)
+	}
+	v, _ := spanAttrs.Value("telemetry.sdk.name")
+	assert.Equal(t, "opentelemetry", v.AsString())
+}
+
+// assertWarningFor asserts that exactly one warning mentions key (quoted) and
+// that it carries prefix and detail. Environment attributes are visited in
+// sorted key order, so tests match by content rather than by index.
+func assertWarningFor(t *testing.T, warnings []string, prefix, key, detail string) string {
+	t.Helper()
+	var matches []string
+	for _, w := range warnings {
+		if strings.Contains(w, strconv.Quote(key)) && strings.HasPrefix(w, prefix) {
+			matches = append(matches, w)
+		}
+	}
+	require.Len(t, matches, 1, "expected one warning for %q, got %v", key, warnings)
+	assert.Contains(t, matches[0], detail)
+	return matches[0]
 }

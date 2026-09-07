@@ -61,6 +61,10 @@ type Config struct {
 	otlpHeaders    map[string]string
 	logLevel       slog.Level
 
+	// Resource attributes added by WithResourceAttributes, on top of the
+	// service identity above and the detected host / process / SDK set.
+	resourceAttrs []attribute.KeyValue
+
 	// Tracing
 	sampler          sdktrace.Sampler
 	samplingRatio    float64
@@ -322,6 +326,101 @@ func WithServiceNamespace(namespace string) Option {
 	return func(c *Config) {
 		c.namespace = namespace
 	}
+}
+
+// WithResourceAttributes adds attributes to the OTel Resource shared by the
+// trace, metrics and log providers, next to the service identity and the
+// detected host, process and SDK attributes. On the Prometheus path they
+// appear on `target_info`; on OTLP they travel with every span, metric data
+// point and log record, so keep them to values that are true for the whole
+// process lifetime and are safe to store in every backend.
+//
+// These keys are not accepted and are dropped with a startup warning, so
+// the identity options and the SDK's own detectors stay the single source
+// of truth and target_info stays exportable:
+//
+//   - the identity keys service.name, service.version, service.namespace and
+//     deployment.environment.name, and any alias that renders as the same
+//     Prometheus label (service_name, service-name): otelprom would join the
+//     two values into one target_info label, "evil;svc";
+//   - the detected keys — telemetry.sdk.name / .language / .version,
+//     process.pid, process.executable.name, process.runtime.name / .version,
+//     host.name — and their aliases (telemetry_sdk_name, process_pid,
+//     host-name), for the same reason; the rest of the telemetry.sdk.* and
+//     process.* namespaces are refused too — the former identifies the
+//     OpenTelemetry SDK, not the service, and the latter would reopen the
+//     door to process.command_args, which the SDK's own detectors leave out
+//     on purpose;
+//   - any key that renders as a label name Prometheus rejects ("__meta__",
+//     punctuation-only keys) or one the exporter reserves elsewhere: the
+//     exporter would then disable target_info for the process;
+//   - an alias of a key given earlier to this option (app.foo, then app_foo):
+//     the two would be joined into one label the same way;
+//   - an empty key.
+//
+// The same exact key given twice keeps the last value. Values given here
+// override the same key from OTEL_RESOURCE_ATTRIBUTES, and an environment
+// key that is only an alias of one given here is dropped with a warning;
+// the environment goes through the same guard as this option when the
+// Resource is built (see buildResource). A dropped environment key never
+// reaches target_info or the OTLP metrics Resource; on spans and log
+// records it appears with an empty value, because the OTel providers merge
+// the raw environment back in and the SDK overrides the value rather than
+// mutate the process environment.
+func WithResourceAttributes(attrs ...attribute.KeyValue) Option {
+	return func(c *Config) {
+		for _, kv := range attrs {
+			owner, identity := metrics.ResourceKeyOwner(kv.Key)
+			switch {
+			case kv.Key == "":
+				c.initWarnings = append(c.initWarnings,
+					"WithResourceAttributes: ignoring an attribute with an empty key")
+			case owner != "" && identity:
+				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
+					"WithResourceAttributes: ignoring %q; it would collide with %q, which is set by the SDK's identity options (WithServiceName / WithServiceVersion / WithServiceNamespace / WithEnvironment)",
+					string(kv.Key), string(owner)))
+			case owner != "":
+				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
+					"WithResourceAttributes: ignoring %q; it would collide with %q, which the SDK detects itself",
+					string(kv.Key), string(owner)))
+			case metrics.IsTelemetrySDKKey(kv.Key):
+				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
+					"WithResourceAttributes: ignoring %q; telemetry.sdk.* identifies the OpenTelemetry SDK, not the service",
+					string(kv.Key)))
+			case metrics.IsProcessKey(kv.Key):
+				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
+					"WithResourceAttributes: ignoring %q; process.* is collected by the SDK itself, and process.command_args / process.owner are deliberately not exported",
+					string(kv.Key)))
+			case metrics.IsReservedAttributeKey(kv.Key):
+				c.initWarnings = append(c.initWarnings, fmt.Sprintf(
+					"WithResourceAttributes: ignoring %q; as the Prometheus label %q it is reserved by the exporter or not a valid label name, and otelprom would disable target_info for the whole process",
+					string(kv.Key), metrics.NormalizePrometheusLabelName(string(kv.Key))))
+			default:
+				c.resourceAttrs = appendResourceAttribute(c, kv)
+			}
+		}
+	}
+}
+
+// appendResourceAttribute adds kv to c.resourceAttrs unless an earlier
+// attribute would render as the same Prometheus label: the same exact key is
+// replaced in place (last value wins, as documented), a different key with
+// the same label is dropped with a warning, because otelprom would join the
+// two values into one target_info label instead of keeping either.
+func appendResourceAttribute(c *Config, kv attribute.KeyValue) []attribute.KeyValue {
+	for i, prev := range c.resourceAttrs {
+		if prev.Key == kv.Key {
+			c.resourceAttrs[i] = kv
+			return c.resourceAttrs
+		}
+		if metrics.SameLabel(prev.Key, kv.Key) {
+			c.initWarnings = append(c.initWarnings, fmt.Sprintf(
+				"WithResourceAttributes: ignoring %q; it would render as the same Prometheus label as %q, given earlier",
+				string(kv.Key), string(prev.Key)))
+			return c.resourceAttrs
+		}
+	}
+	return append(c.resourceAttrs, kv)
 }
 
 // WithMetricsOTLPEndpoint switches the metrics exporter from Prometheus pull

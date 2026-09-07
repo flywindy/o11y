@@ -1051,3 +1051,28 @@ func TestGuardScopeAttributes_DropsCollidingScopeAttributes(t *testing.T) {
 	assert.True(t, found, "the scoped family must still be exported: %s", body)
 	assert.Contains(t, body, "app_plain_total{", "a meter without scope attributes passes through")
 }
+
+// TestInitMeter_StandaloneResourceOmitsCommandArgs covers the resource the
+// package builds itself when Config.Resource is nil: it must use the same
+// narrow process detector set as o11y.buildResource.
+func TestInitMeter_StandaloneResourceOmitsCommandArgs(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	mp, closer, err := metrics.InitMeter(t.Context(), baseConfig(addr))
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	assert.Contains(t, body, `telemetry_sdk_name="opentelemetry"`)
+	assert.Contains(t, body, `process_runtime_name="go"`)
+	for _, unwanted := range []string{
+		"process_command_args", "process_owner",
+		"process_executable_path", "process_runtime_description",
+	} {
+		assert.NotContains(t, body, unwanted)
+	}
+}
