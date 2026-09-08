@@ -15,6 +15,9 @@ adopters can plan their upgrades.
 
 ### Added
 
+- `WithCardinalityLimit(n)` sets the OTel SDK's per-stream cardinality
+  limit explicitly, and `DefaultCardinalityLimit` (2,000) exposes the floor
+  of the derived value. See the Changed entry below for the new derivation.
 - `WithResourceAttributes(attrs ...attribute.KeyValue)` adds caller-owned
   attributes to the Resource shared by traces, metrics and logs (for example
   `k8s.pod.name` when it is not supplied through `OTEL_RESOURCE_ATTRIBUTES`).
@@ -35,6 +38,20 @@ adopters can plan their upgrades.
 
 ### Changed
 
+- metrics: the in-process cardinality limit is a real guard again. It was
+  derived as `MaxUniqueRoutes × 16 × 64` — 1,024,000 attribute sets per
+  stream at the shipped defaults, against OTel's default of 2,000 — so an
+  application counter labelled by room id or user id could hold a million
+  series per pod before the SDK folded anything into
+  `otel_metric_overflow`, and ship them all on every scrape. The limit is
+  now `max(2000, 4 × MaxUniqueRoutes, 4 × MaxUniqueCollections)`, 4,000 at
+  the defaults: the SDK's own `http.server.request.duration` and
+  `db.client.operation.duration` streams stay well inside it, and every
+  other instrument is bounded at 4,000 series per stream — its first 3,999
+  attribute sets plus one `otel_metric_overflow="true"` series that absorbs
+  the rest. A service whose HTTP histogram genuinely needs more method ×
+  route × status combinations sets `WithCardinalityLimit(n)`; raising
+  `WithMaxUniqueRoutes` raises the derived limit with it.
 - resource: the SDK no longer uses `resource.WithProcess()`. That detector
   also collects `process.command_args` and `process.owner`, and the Resource
   is exported unfiltered — as `target_info` labels on the Prometheus path and

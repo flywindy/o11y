@@ -82,6 +82,13 @@ type Config struct {
 	// index names.
 	MaxUniqueCollections int
 
+	// CardinalityLimit overrides the OTel SDK's per-stream cardinality limit,
+	// the in-process guard that folds attribute sets beyond the limit into a
+	// single overflow series (otel_metric_overflow="true" on Prometheus).
+	// Only a positive value overrides; zero derives the limit from the
+	// export caps, see cardinalityLimitBudget.
+	CardinalityLimit int
+
 	// ExtraHTTPServerAttrKeys augments the SDK-managed attribute allow-list
 	// for the http.server.request.duration view. Promoting caller-controlled
 	// keys onto the exported series (rather than letting them fall through to
@@ -107,22 +114,28 @@ type Config struct {
 // It is always safe to call even if the component was never started.
 type Closer func(context.Context) error
 
-// The SDK cardinality limit is an in-process memory guard, not the exported
-// route presentation cap. Derive it from the bounded HTTP keyspace so
-// WithMaxUniqueRoutes(n) can preserve route detail across normal method/status
-// combinations before the SDK overflow guard intentionally drops labels.
+// The SDK cardinality limit is an in-process memory guard applied to every
+// stream of every instrument, application instruments included: a stream
+// holds at most this many series — limit-1 attribute sets plus one overflow
+// series (the otel.metric.overflow attribute, otel_metric_overflow="true" on
+// Prometheus) that absorbs every further set. The export caps (MaxUniqueRoutes,
+// MaxUniqueCollections) bound one key each and only on the SDK's own
+// instruments; this limit is the only thing standing between an instrument
+// labelled by room id or user id and an unbounded aggregator.
 const (
-	sdkCardinalityMethodBudget = 16
-	sdkCardinalityStatusBudget = 64
+	// DefaultCardinalityLimit is the floor of the derived limit and the OTel
+	// SDK's own default. It is what an application instrument gets when the
+	// export caps are left at their defaults or lowered.
+	DefaultCardinalityLimit = 2000
 
-	// sdkCardinalityCollectionBudget is the per-collection envelope for the
-	// Cassandra and Elasticsearch query metrics: db.operation.name ×
-	// server.address/port × error.type (× db.response.status_code for ES, which
-	// shares error.type's values), the other bounded dimensions a
-	// db.collection.name series is multiplied by. Elasticsearch has more endpoint
-	// ids than Cassandra has statement verbs, but a service exercises a handful
-	// per index; the route budget dominates at the shipped defaults anyway.
-	sdkCardinalityCollectionBudget = 128
+	// sdkCardinalityCapMultiplier sizes the derived limit against the export
+	// caps: a route or collection still needs a few attribute-set variants
+	// (method × status, operation × error) before its cap is reached, and a
+	// stream that exceeds four per capped value is far outside what the SDK's
+	// own instruments produce in practice. It is deliberately not the
+	// theoretical envelope (16 methods × 64 status codes): that made the
+	// limit 1,024,000 at the shipped defaults, which is no guard at all.
+	sdkCardinalityCapMultiplier = 4
 )
 
 // capInstrument pairs an instrument name with the Prometheus family name it is
@@ -388,7 +401,7 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 	// owns (see reserved.go). This is a property of the Prometheus rendering,
 	// so the OTLP path below exports attributes untouched.
 	provider = sdkmetric.NewMeterProvider(
-		meterProviderOptions(exporter, res, guardReservedKeys(views), cfg.MaxUniqueRoutes, cfg.MaxUniqueCollections)...,
+		meterProviderOptions(exporter, res, guardReservedKeys(views), cfg)...,
 	)
 
 	if cfg.RuntimeMetrics {
@@ -468,7 +481,7 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []s
 	}()
 
 	provider = sdkmetric.NewMeterProvider(
-		meterProviderOptions(sdkmetric.NewPeriodicReader(cappedExporter), res, views, cfg.MaxUniqueRoutes, cfg.MaxUniqueCollections)...,
+		meterProviderOptions(sdkmetric.NewPeriodicReader(cappedExporter), res, views, cfg)...,
 	)
 
 	if cfg.RuntimeMetrics {
@@ -487,32 +500,31 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []s
 
 // meterProviderOptions assembles the sdkmetric options shared by both export
 // paths: the reader, the resource, the views and the SDK-level cardinality
-// limit derived from the per-collection caps.
-func meterProviderOptions(reader sdkmetric.Reader, res *resource.Resource, views []sdkmetric.View, maxUniqueRoutes, maxUniqueCollections int) []sdkmetric.Option {
-	opts := []sdkmetric.Option{
+// limit (cfg.CardinalityLimit, or the value derived from the export caps).
+func meterProviderOptions(reader sdkmetric.Reader, res *resource.Resource, views []sdkmetric.View, cfg Config) []sdkmetric.Option {
+	return []sdkmetric.Option{
 		sdkmetric.WithReader(reader),
 		sdkmetric.WithResource(res),
 		sdkmetric.WithView(views...),
+		sdkmetric.WithCardinalityLimit(cardinalityLimitBudget(cfg.MaxUniqueRoutes, cfg.MaxUniqueCollections, cfg.CardinalityLimit)),
 	}
-	if limit := cardinalityLimitBudget(maxUniqueRoutes, maxUniqueCollections); limit > 0 {
-		opts = append(opts, sdkmetric.WithCardinalityLimit(limit))
-	}
-	return opts
 }
 
-// cardinalityLimitBudget derives the in-process SDK cardinality limit, which is
-// a single global per-stream guard rather than a per-instrument one. It must
-// therefore accommodate every capped dimension the SDK exports, not just routes:
-// deriving it from MaxUniqueRoutes alone means a caller who lowers that option
-// (say to 1, giving 1024) can push the Cassandra streams over the limit, and the
-// OTel SDK then collapses the excess into otel.metric.overflow — dropping
-// db.collection.name entirely for data that was well inside MaxUniqueCollections.
-// The limit is the larger of the two budgets so neither dimension can starve the
-// other; at the default settings the route budget dominates and this is a no-op.
-func cardinalityLimitBudget(maxUniqueRoutes, maxUniqueCollections int) int {
-	routes := scaleBudget(maxUniqueRoutes, sdkCardinalityMethodBudget*sdkCardinalityStatusBudget)
-	collections := scaleBudget(maxUniqueCollections, sdkCardinalityCollectionBudget)
-	return max(routes, collections)
+// cardinalityLimitBudget returns the per-stream cardinality limit the
+// MeterProvider is built with. An explicit override wins; otherwise the limit
+// is the largest of DefaultCardinalityLimit and sdkCardinalityCapMultiplier
+// times each export cap, so lowering a cap never pushes the SDK's own streams
+// into overflow while their exported key is still within its cap, and
+// raising a cap raises the guard with it. At the shipped defaults (1000
+// routes, 200 collections) the limit is 4,000. It is one global per-stream
+// value in the OTel SDK, so every instrument gets the same limit.
+func cardinalityLimitBudget(maxUniqueRoutes, maxUniqueCollections, override int) int {
+	if override > 0 {
+		return override
+	}
+	routes := scaleBudget(maxUniqueRoutes, sdkCardinalityCapMultiplier)
+	collections := scaleBudget(maxUniqueCollections, sdkCardinalityCapMultiplier)
+	return max(DefaultCardinalityLimit, routes, collections)
 }
 
 // scaleBudget returns n*per, saturating rather than overflowing.
