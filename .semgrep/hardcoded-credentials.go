@@ -52,6 +52,26 @@ func declarationForms() {
 	_, _ = shortDeclPassword, assignedSecret
 }
 
+// multiValueForms covers Go's multi-value short/plain assignment
+// (`a, b := x, y`), a shape distinct from the single-value patterns above —
+// it's the one place credentials commonly appear paired with an unrelated
+// value (`user, password := "admin", "..."`).
+func multiValueForms(lookup func(string) string) {
+	// ruleid: hardcoded-credential-literal
+	user, password := "admin", "sup3rs3cr3t"
+
+	// ruleid: hardcoded-credential-literal
+	var apiUser, apiSecret = "admin", "sup3rs3cr3t"
+
+	// The credential-named half of the pair is negative here: password comes
+	// from lookup(), not a literal, so only requestID's assignment is a
+	// string literal and it carries no credential word. No ruleid — a match
+	// on this line means the pair is no longer matched positionally.
+	password, requestID := lookup("APP_PASSWORD"), "abc-request-id"
+
+	_, _, _, _, _, _ = user, password, apiUser, apiSecret, password, requestID
+}
+
 // --- positives: one line per alternative of the name regex ---
 
 // nameAlternatives gives each alternative of the rule's name regex its own

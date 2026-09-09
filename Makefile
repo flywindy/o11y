@@ -17,9 +17,12 @@ COVERAGE := coverage.out
 # `go install` writes to $GOBIN when it is set, and only falls back to
 # $GOPATH/bin when it is empty — honor that here too, or `make sast-gosec`'s
 # executable check looks in the wrong place on any machine with GOBIN set.
+# GOPATH itself can be a colon-separated list (`go help gopath`); `go install`
+# then uses the first entry's bin dir, so appending /bin to the raw value
+# would build a bogus path like "/a:/b/bin" on a multi-entry GOPATH.
 GOBIN_DIR := $(shell $(GO) env GOBIN)
 ifeq ($(strip $(GOBIN_DIR)),)
-GOBIN_DIR := $(shell $(GO) env GOPATH)/bin
+GOBIN_DIR := $(firstword $(subst :, ,$(shell $(GO) env GOPATH)))/bin
 endif
 TOOLS_GO_TOOLCHAIN := go1.25.13
 GOSEC_VERSION      := v2.26.1
