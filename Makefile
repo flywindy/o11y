@@ -27,6 +27,24 @@ SEMGREP_VERSION    := 1.163.0
 
 GOSEC := $(GOBIN_DIR)/gosec
 
+# pipx installs semgrep into its own venv and exposes the entry point via
+# PIPX_BIN_DIR (default ~/.local/bin), which `make tools` does not add to
+# PATH — `pipx ensurepath` only edits shell rc files, so a fresh shell (or a
+# CI job, before its own PATH tweak) may not have it yet. Resolve semgrep's
+# location explicitly instead of assuming PATH: prefer whatever is already on
+# PATH, else pipx's own reported bin dir, else the bare name (so the "not
+# installed" message below still has something sensible to name).
+SEMGREP := $(shell command -v semgrep 2>/dev/null)
+ifeq ($(strip $(SEMGREP)),)
+PIPX_BIN_DIR := $(shell command -v pipx >/dev/null 2>&1 && pipx environment --value PIPX_BIN_DIR 2>/dev/null)
+ifneq ($(strip $(PIPX_BIN_DIR)),)
+SEMGREP := $(PIPX_BIN_DIR)/semgrep
+endif
+endif
+ifeq ($(strip $(SEMGREP)),)
+SEMGREP := semgrep
+endif
+
 # gosec: -tests=true so it also catches issues planted in test code (mirrors
 # sast-semgrep below — a fixture credential test asserts a value is absent
 # from redacted output, it is not itself a live credential, but the shape is
@@ -96,8 +114,8 @@ sast-gosec: ## gosec: Go security static analysis (injection, weak crypto, unsaf
 	$(GOSEC) $(GOSEC_FLAGS) ./...
 
 sast-semgrep: ## semgrep: repo-owned rules under .semgrep/
-	@command -v semgrep >/dev/null 2>&1 || { echo "semgrep not installed — run 'make tools' (needs pipx), or: pipx install semgrep==$(SEMGREP_VERSION)"; exit 1; }
-	semgrep scan $(SEMGREP_FLAGS) .
+	@command -v "$(SEMGREP)" >/dev/null 2>&1 || { echo "semgrep not installed — run 'make tools' (needs pipx), or: pipx install semgrep==$(SEMGREP_VERSION)"; exit 1; }
+	$(SEMGREP) scan $(SEMGREP_FLAGS) .
 
 # Test the repo-owned rules against their fixtures, so a pattern edit that
 # disables a rule fails here instead of silently passing every later scan.
@@ -108,14 +126,14 @@ sast-semgrep: ## semgrep: repo-owned rules under .semgrep/
 # basename and does not support a separate tests directory. Fixtures contain
 # deliberate violations, which is why SEMGREP_FLAGS excludes .semgrep above.
 sast-semgrep-test: ## Run the repo-owned semgrep rules against their fixtures
-	@command -v semgrep >/dev/null 2>&1 || { echo "semgrep not installed — run 'make tools' (needs pipx), or: pipx install semgrep==$(SEMGREP_VERSION)"; exit 1; }
+	@command -v "$(SEMGREP)" >/dev/null 2>&1 || { echo "semgrep not installed — run 'make tools' (needs pipx), or: pipx install semgrep==$(SEMGREP_VERSION)"; exit 1; }
 	@rc=0; n=0; \
 	for rule in .semgrep/*.yml; do \
 	  fixture="$${rule%.yml}.go"; \
 	  [ -f "$$fixture" ] || continue; \
 	  n=$$((n+1)); \
 	  echo "==> semgrep rule tests: $$rule"; \
-	  ( cd .semgrep && semgrep scan --test --metrics=off \
+	  ( cd .semgrep && $(SEMGREP) scan --test --metrics=off \
 	      --config "$$(basename "$$rule")" "$$(basename "$$fixture")" ) || rc=1; \
 	done; \
 	if [ "$$n" -eq 0 ]; then echo "no semgrep rule fixtures found — expected at least one" >&2; exit 1; fi; \
