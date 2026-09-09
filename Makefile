@@ -118,7 +118,7 @@ sast-gosec: ## gosec: Go security static analysis (injection, weak crypto, unsaf
 
 sast-semgrep: ## semgrep: repo-owned rules under .semgrep/
 	@command -v "$(SEMGREP)" >/dev/null 2>&1 || { echo "semgrep not installed — run 'make tools' (needs pipx), or: pipx install semgrep==$(SEMGREP_VERSION)"; exit 1; }
-	$(SEMGREP) scan $(SEMGREP_FLAGS) .
+	"$(SEMGREP)" scan $(SEMGREP_FLAGS) .
 
 # Test the repo-owned rules against their fixtures, so a pattern edit that
 # disables a rule fails here instead of silently passing every later scan.
@@ -136,7 +136,7 @@ sast-semgrep-test: ## Run the repo-owned semgrep rules against their fixtures
 	  [ -f "$$fixture" ] || continue; \
 	  n=$$((n+1)); \
 	  echo "==> semgrep rule tests: $$rule"; \
-	  ( cd .semgrep && $(SEMGREP) scan --test --metrics=off \
+	  ( cd .semgrep && "$(SEMGREP)" scan --test --metrics=off \
 	      --config "$$(basename "$$rule")" "$$(basename "$$fixture")" ) || rc=1; \
 	done; \
 	if [ "$$n" -eq 0 ]; then echo "no semgrep rule fixtures found — expected at least one" >&2; exit 1; fi; \

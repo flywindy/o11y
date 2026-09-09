@@ -126,6 +126,24 @@ func valueForms() {
 	_, _ = escapedPassword, rawSecret
 }
 
+// concatenatedValueForms covers a credential split across "+" — every piece
+// is still a literal, so the whole expression is exactly as hard-coded as
+// one string, just shaped to dodge a naive single-literal check.
+func concatenatedValueForms() {
+	// ruleid: hardcoded-credential-literal
+	concatenatedSecret := "sup3r-" + "secret"
+
+	_ = concatenatedSecret
+}
+
+// concatenationWithADynamicPartIsNotCovered is the negative twin: as soon as
+// one piece is not a literal, the expression is no longer "assembled
+// entirely from literals" and must stay silent — the value could be
+// anything, including something read from the environment.
+func concatenationWithADynamicPartIsNotCovered(suffix string) string {
+	return "sup3r-" + suffix
+}
+
 // --- negatives: shapes the rule must not flag ---
 
 // A struct-literal field is deliberately out of scope: it is not a
