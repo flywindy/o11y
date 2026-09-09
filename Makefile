@@ -14,7 +14,13 @@ COVERAGE := coverage.out
 # $(GOBIN_DIR) (no go.mod impact). TOOLS_GO_TOOLCHAIN pins the toolchain used
 # to *source-build* gosec so the install is reproducible regardless of the
 # local Go: gosec < v2.26 fails to compile under Go 1.25.x.
-GOBIN_DIR          := $(shell $(GO) env GOPATH)/bin
+# `go install` writes to $GOBIN when it is set, and only falls back to
+# $GOPATH/bin when it is empty — honor that here too, or `make sast-gosec`'s
+# executable check looks in the wrong place on any machine with GOBIN set.
+GOBIN_DIR := $(shell $(GO) env GOBIN)
+ifeq ($(strip $(GOBIN_DIR)),)
+GOBIN_DIR := $(shell $(GO) env GOPATH)/bin
+endif
 TOOLS_GO_TOOLCHAIN := go1.25.13
 GOSEC_VERSION      := v2.26.1
 SEMGREP_VERSION    := 1.163.0

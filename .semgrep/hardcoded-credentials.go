@@ -28,6 +28,17 @@ const constFormPassword = "sup3rs3cr3t"
 // ruleid: hardcoded-credential-literal
 var varFormSecret = "sup3rs3cr3t"
 
+// An explicit type between the name and "=" is still a declaration, not a
+// different pattern shape — Go credential declarations commonly spell out the
+// type (`const apiToken string = "..."`), and a rule that only matched the
+// untyped form would miss most of them.
+//
+// ruleid: hardcoded-credential-literal
+const typedConstFormToken string = "sup3rs3cr3t"
+
+// ruleid: hardcoded-credential-literal
+var typedVarFormApiKey string = "sup3rs3cr3t"
+
 // declarationForms covers the two patterns that only appear inside a function
 // body. The package-level const and var above complete the set of four.
 func declarationForms() {
