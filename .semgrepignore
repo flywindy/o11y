@@ -1,0 +1,37 @@
+# Semgrep ignore list.
+#
+# NOTE: the presence of this file REPLACES semgrep's built-in defaults, which
+# skip *_test.go. That default is exactly the gap this file closes: the two
+# credentials this repo's SAST gate was added to catch
+# (internal/redact/redact_test.go:46,97) live in a _test.go file, and without
+# an explicit override here they are silently skipped rather than scanned.
+# The usual excludes (vendor, node_modules, VCS dirs) are restated below
+# rather than inherited, since the built-in list no longer applies once this
+# file exists.
+
+# --- Go tests ---------------------------------------------------------------
+# Deliberately NOT excluded. Test fixtures are fabricated credentials by
+# nature, which the credential rule (.semgrep/hardcoded-credentials.yml)
+# flags — that is the finding this gate exists to surface, not noise to
+# silence. Annotate a genuine fixture in place with
+# `// nosemgrep: hardcoded-credential-literal` instead of excluding its file.
+
+# --- Dependencies and build output ------------------------------------------
+vendor/
+node_modules/
+build/
+dist/
+
+# --- Virtualenvs -------------------------------------------------------------
+.venv/
+venv/
+.env/
+
+# --- VCS and tooling ---------------------------------------------------------
+.git/
+.svn/
+.hg/
+# Rule fixtures whose whole purpose is to contain deliberate violations;
+# GOSEC_FLAGS / SEMGREP_FLAGS in the Makefile also exclude this directory
+# explicitly, this is belt-and-suspenders for any scan invoked without them.
+.semgrep/
