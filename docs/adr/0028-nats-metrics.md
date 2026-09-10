@@ -173,6 +173,19 @@ identity; observation does not detach, cancel, or replace its lifetime.
 The returned application error is returned unchanged. The SDK never chooses
 Ack, Nak, Term, a retry, or a business result based on that error.
 
+That inertness is the callback signature's one ergonomic trap, and it must be
+closed in the API rather than left to the migration. A handler that returns
+`error` reads, to every Go programmer, as a handler whose error the caller
+acts on — and here the caller records a label and nothing else. Fifteen
+services convert to this signature at once; each conversion is one plausible
+misreading away from a message that is silently never settled because its
+author assumed a returned error would Nak. Name the parameter for what it is
+in the doc comment and the examples (the observed error, used only to derive
+`error.type`), and state on the type that returning non-nil settles nothing.
+An `Observe` callback that returns non-nil without having called a terminal
+method is recorded `left_pending` under section 4 — the disposition that
+proves the trap was hit, so the guard is a query, not only a convention.
+
 For an existing callback with no error result, an adapter can call it and
 return nil. That reports only the errors the adapter exposes; it does not
 discover swallowed failures. `MarkTerminalFailure` is the explicit way for
@@ -292,12 +305,35 @@ The histogram carries the event type and error class, **not disposition**.
 The disposition counter answers a different breakdown and remains useful;
 it is not a second copy of the histogram's count with identical labels.
 
-Use the messaging convention's recommended boundaries by default:
-`[0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10]`
-seconds [S1]. Set them as an instrument advisory and in the scope-specific
-view. An explicit operator `WithHistogramBuckets` override takes precedence.
-The implementation must distinguish an explicit override from the SDK's
-existing default slice. Keep one definition in the driver-free view package.
+Use the SDK's shared boundaries by default — `o11y.DefaultLatencyBuckets()`,
+currently `[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]` seconds —
+not the messaging convention's fourteen [S1]. Set them as an instrument
+advisory and in the scope-specific view. An explicit operator
+`WithHistogramBuckets` override takes precedence. The implementation must
+distinguish an explicit override from the SDK's existing default slice. Keep
+one definition in the driver-free view package.
+
+This is the one place this profile deliberately departs from the convention,
+and it is the same call the SDK has already made five times. Every existing
+integration view — Elasticsearch, MongoDB, Redis, MinIO, Cassandra — passes
+the SDK's `histogramBuckets` rather than its convention's own set, for the
+reason recorded at the boundary definition itself: *"Standardizing these
+boundaries across the company keeps P99 calculations directly comparable
+between services"* (`options.go`). Taking the messaging set here would leave
+JetStream processing and HTTP with different bucket layouts, so their
+percentiles could not be compared and no single recording rule would fit both.
+A latency SLO's bound must therefore be chosen from this set.
+
+Two facts bound how much is given up. The deviation is confined to
+boundaries: the instrument name, the `s` unit, the description,
+`messaging.operation.name`/`.type` and the conditional `error.type` all still
+conform, which is where interoperability actually lives — a generic messaging
+dashboard still finds and groups the series, and only `histogram_quantile`'s
+interpolation points differ. And the pinned generated instrument carries no
+advisory to depart from: `newProcessDurationOpts` in
+`semconv/v1.39.0/messagingconv/metric.go` sets only description and unit, so
+the fourteen boundaries exist in the specification document alone. Adopting
+the SDK set contradicts no pinned code.
 
 Using this instrument does not claim a complete implementation of the
 messaging metric suite. Automatic consumed/sent message counts and client
@@ -357,15 +393,27 @@ Required bounds:
 4. Proposed defaults are 16 configured event values per identity and 16
    distinct identities per connection. Including `unknown`, the largest
    instrument then has at most `16 * 17 * 6 = 1,632` label combinations per
-   connection. These defaults are acceptance item Q3, not measured optima.
+   connection. These defaults are acceptance item Q3, not measured optima —
+   but they are no longer unanchored. Counted at the evidence baseline,
+   newchat declares **14 named event types plus `unknown`** and registers
+   **5 consumer identities** across its services, so the identity default has
+   ample headroom while the event default leaves two spare slots for a
+   service that registers the whole vocabulary. That is the intended shape
+   rather than a near-miss: an identity's allowlist is meant to carry the
+   event types that consumer actually sees, not the application's full
+   taxonomy, and a service approaching the limit is evidence of over-
+   registration before it is evidence of a low limit. Raising the default is
+   not the first response — recalculate item 6 and the fleet budget first.
 5. Multiple connections sharing a MeterProvider and multiple process replicas
    multiply the budget. The per-connection cap does not establish a global
    series bound. Retain the OTel aggregation cap, account for all connections
    in deployment budgets, and treat overflow as a loss of breakdown coverage.
-6. With 14 finite boundaries, a classic histogram can expose 17 series per
-   attribute set (finite buckets, `+Inf`, sum, count). Its five success/error
-   states allow up to `16 * 17 * 5 * 17 = 23,120` such series per connection
-   before replicas. The theoretical bound is a review ceiling, not a target;
+6. With the SDK's 11 finite boundaries (section 5), a classic histogram can
+   expose 14 series per attribute set (finite buckets, `+Inf`, sum, count).
+   Its five success/error states allow up to `16 * 17 * 5 * 14 = 19,040` such
+   series per connection before replicas. Re-derive this number if the
+   boundary set changes; it is a function of section 5's decision, not an
+   independent constant. The theoretical bound is a review ceiling, not a target;
    applications should register only the vocabulary used by each consumer.
 
 An OTel aggregation cap cannot bound an earlier `optTable`, and an export
@@ -429,6 +477,16 @@ View definitions live in `internal/views/nats.go`, importing only OTel;
 with per-instrument allow-keys filters and the exact meter scope. Standalone
 MeterProvider users register `nats.MetricViews` and aggregation limits.
 
+Scoping the `messaging.process.duration` view to this integration's meter
+scope is load-bearing, not tidiness, and for a reason the SDK has already
+written down: `mongo/views.go` scopes its `db.client.operation.duration` view
+so it "never matches another integration's `db.client.operation.duration`
+instrument (e.g. the Redis wrapper's), which would otherwise produce a
+duplicate, conflicting stream when both wrappers are active in the same
+process." Borrowing a standard instrument name is what creates that exposure,
+and a second messaging integration in one process is the case that would hit
+it. The same scoping discipline applies here for the same reason.
+
 This applies Option A locally, as accepted ADR 0027 did. ADR 0026 itself is
 still Proposed at the evidence baseline; do not mark its broader refactor
 accepted as a side effect. Extend the root forbidden dependency prefixes to
@@ -471,7 +529,7 @@ global-state verification is claimed before the implementation exists.
 |---|---|---|
 | `chat.nats.consumer.loop.up` | `o11y.nats.consumer.loops` | Application-reported loop count; not connectivity or handler cancellation |
 | `chat.nats.consumer.messages` | `o11y.nats.consumer.dispositions` | Completed invocation; failed settlement calls do not freeze a later successful disposition |
-| `chat.nats.consumer.processing.duration` | `messaging.process.duration` | Full callback duration, changed default buckets, and error breakdown instead of disposition labels |
+| `chat.nats.consumer.processing.duration` | `messaging.process.duration` | Full callback duration and an error breakdown instead of disposition labels. Boundaries are unchanged: newchat already builds this histogram with `o11y.DefaultLatencyBuckets()`, which section 5 keeps, so existing bucket-bound SLO queries stay valid across the rename |
 | `chat.nats.terminal.failures` | `o11y.nats.consumer.processing.failures` | Explicit per-invocation failure declarations only; loop failures are excluded |
 | `chat.nats.publish.failures` and the two RPC histograms | Keep in newchat | No phase-1 ownership/name change |
 
@@ -484,6 +542,26 @@ Implement SDK behavior first with characterization tests, then migrate AP
 call sites in a separate change. Keep scheduling, retry policy, panic guards,
 and any required delivery-metadata context bridge in the AP. A newchat handler
 that swallows a terminal failure must explicitly preserve that declaration.
+
+### What phase 1 leaves behind in the application
+
+Deferring the publisher and RPC recorders means `pkg/natsmetrics` does not
+shrink to nothing, and the residue is worth naming so a reviewer does not read
+it as an oversight. After phase 1 newchat still owns its subject conventions
+and event/operation vocabulary (`subject.go`, the `Operation` and `EventType`
+constants), its consume loop and worker scheduling (`loop.go`), the publish
+and RPC recorders, and — because those recorders keep their own bounded label
+sets — **a second copy of the copy-on-write measurement-option cache**
+alongside the SDK's.
+
+That duplication is an accepted cost of splitting the migration, not a
+condition to fix inside phase 1. Consolidating it early would mean either
+exporting the cache as SDK API for the application's own instruments, which
+commits the SDK to a public shape before the publisher contract exists, or
+holding the consumer migration until the publisher vocabulary settles behind
+newchat's route-declared method change. The duplication ends when the
+publisher work lands and the application's cache has no remaining caller;
+until then the two must not be partially merged.
 
 The existing [instrument registry guard](https://github.com/hmchangw/newchat/blob/28b97da1eb1554ecdfe12ea76121f23bce446c8c/pkg/obs/instrument_registry_test.go#L50)
 scans application source and will no longer see declarations moved into a
@@ -590,6 +668,32 @@ of `pkg/natsmetrics`.
 | Q2 | Preserve newchat's first-disposition timing or adopt full processing timing and completion-time disposition? | Adopt the definitions above; treat the migration as a semantic change. If preservation wins, use a custom duration name and revise the table before acceptance. |
 | Q3 | Are the consumer-only scope, 16-event/16-identity default limits, stream/subscription mapping, and endpoint-label omission acceptable for the first release? | Start with this bounded profile, validate it against real consumer inventories, and explicitly record the limitations. Do not raise limits without recalculating fleet/histogram cost. |
 | Q4 | Is a four-instrument consumer migration acceptable while publisher/RPC stay in newchat? | Yes. Keep their vocabulary and cost decisions together in later work. |
+
+### Q2 in detail: what each answer costs
+
+Q2 is the only one of the four that cannot be answered from this document as
+first drafted, because it asks an owner to accept a cost the draft describes
+but never totals. It bundles three independent changes, and the bundle — not
+any single element — is what makes the migration unmechanical:
+
+| | Preserve newchat's semantics | Adopt the definitions in sections 3-5 |
+|---|---|---|
+| Timing boundary | Starts after semaphore admission, ends at first disposition | Starts at callback entry, ends at callback return; includes work after an early Ack, excludes queue wait |
+| Disposition | First terminal call wins (`sync.Once`); an Ack that failed is frozen as `left_pending` | Completion-time; an Ack failure followed by a successful retry records `ack` |
+| Duration instrument | Custom name; the standard `messaging.process.duration` is unusable, because its convention *is* full processing timing | `messaging.process.duration`, standard name and unit |
+| Dashboard migration | Names change, shapes do not; panels port by substitution | Every duration and failure panel must be re-reasoned; no prefix rewrite is valid |
+| Rolling deploy | Old and new series are comparable | Old and new series are **not** interchangeable and must not be summed; needs version-scoped queries for the duration of the rollout |
+| What it buys | A cheaper cutover, once | Timing that matches what the histogram's own convention says it measures, and a disposition that stops reporting a recovered Ack as unsettled |
+
+The asymmetry is that preservation is cheap exactly once and then permanent:
+keeping first-disposition timing forecloses the standard instrument name for
+the life of the integration, because the convention defines that instrument as
+the full processing operation. Adopting costs one reviewed migration of four
+families across fifteen services, four documents and one dashboard.
+
+This draft recommends adopting. The recommendation is not free and should not
+be accepted as though it were: whoever accepts Q2 is accepting that the
+newchat migration PR is a re-reasoning of every consumer query, not a rename.
 
 API names and the exact consumer-binding option layout should be reviewed
 with the first implementation, while preserving the contracts in sections
