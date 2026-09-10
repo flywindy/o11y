@@ -145,9 +145,13 @@ func (c *Conn) ConsumerObserver(ctx context.Context, consumer Consumer, cfg Cons
 type ConsumerMetricsConfig struct {
     Site       string
     EventTypes []string
+    // OnConsumeError receives what a jetstream.ConsumeErrHandler would; see
+    // the Consume wiring in section 5 for why it is a field, not an option.
+    OnConsumeError func(jetstream.ConsumeContext, error)
 }
 
 func (o *ConsumerObserver) Observe(ctx context.Context, msg jetstream.Msg, eventType string, handle func(context.Context, jetstream.Msg) error) error
+func (o *ConsumerObserver) Consume(ctx context.Context, handler JetStreamMsgHandler, opts ...jetstream.PullConsumeOpt) (ConsumeContext, error)
 func (o *ConsumerObserver) LoopStarted(ctx context.Context)
 func (o *ConsumerObserver) LoopStopped(ctx context.Context)
 func (o *ConsumerObserver) LoopFailed(ctx context.Context, err error)
@@ -383,29 +387,71 @@ would guarantee they are classified differently. Anything unrecognised becomes
 failures, where only the application knows whether work was abandoned and so
 the application declares the reason.
 
-**`Consume` needs a different wiring, and the facade owns it.** In the pull
-modes the returned error *is* the loop ending, so handing it to `LoopFailed`
-is exact. `Consume` does not work that way: its return value covers setup
-only, and everything after the loop starts arrives at a
-`jetstream.ConsumeErrHandler` instead. Following the pull-mode instruction
-there would mean a consumer deletion or stream outage minutes later is never
-recorded, while calling `LoopFailed` from that handler unconditionally would
-stop the loop gauge on a missing-heartbeat report that stopped nothing.
+**Where the loop-ending error actually appears differs by mode**, and the
+instruction above is only exact for one of the three shapes.
+
+For `Next`, the returned error is the loop ending, so handing it to
+`LoopFailed` is precise.
+
+The batch modes are not the same, despite the same `(value, error)` shape.
+`Fetch`, `FetchBytes` and `FetchNoWait` return once the subscribe and the pull
+request succeed; their direct error covers only that setup. The receive
+goroutine runs on, and a consumer deletion, status error, connection loss or
+context expiry after that point is written to the batch's own field and
+surfaces through `MessageBatch.Error()` — the direct return stays nil. Reading
+only the returned error therefore misses exactly the post-setup outages this
+section exists to catch. **A batch loop must inspect `batch.Error()` after the
+messages channel closes and pass that to `LoopFailed` when it is non-nil.**
+The facade's wrapper is the right thing to read: `messageBatch.Error()`
+already suppresses the `context.Canceled` that an explicit `Stop` produces, so
+what it returns is a real terminal condition rather than expected teardown.
+
+`Consume` differs again: its return value also covers setup only, but there
+is no batch to interrogate — everything after the loop starts arrives at a
+`jetstream.ConsumeErrHandler`. Reading only the return value would miss a
+consumer deletion minutes later, while calling `LoopFailed` from that handler
+unconditionally would stop the loop gauge on a missing-heartbeat report that
+stopped nothing.
 
 The pinned client already draws the line this needs. In
 `jetstream/pull.go`, only `ErrConsumerDeleted` and `ErrBadRequest` reach the
 error handler and are then followed by `sub.Stop()`; missing-heartbeat reports
 (delivered only under `ReportMissingHeartbeats`) and other conditions are
-reported without ending the subscription. So for `Consume` the facade injects
-its own `ConsumeErrHandler` wrapper around the caller's, and:
+reported without ending the subscription.
+
+**That handler cannot be composed through the options, so the observer owns
+the call.** `PullConsumeOpt` declares one unexported method,
+`configureConsume(*consumeOpts) error`, so an opaque option cannot be
+inspected; and `ConsumeErrHandler.configureConsume` is a plain assignment
+(`opts.ErrHandler = c`), so options do not merge — the last one applied wins.
+A facade that appended its own would silently discard the caller's handler,
+and one that prepended it would be discarded by the caller's. There is no
+ordering that preserves both.
+
+So `Consume` is driven through the observer, with the caller's handler passed
+as a typed field rather than an opaque option:
+
+```go
+// ConsumerMetricsConfig gains:
+//   OnConsumeError func(jetstream.ConsumeContext, error)
+func (o *ConsumerObserver) Consume(ctx context.Context, handler JetStreamMsgHandler, opts ...jetstream.PullConsumeOpt) (ConsumeContext, error)
+```
+
+The observer builds the one `ConsumeErrHandler` and applies it last, so:
 
 - an error the pinned client treats as loop-ending is recorded as a receive
   error and applies the stop transition, exactly as `LoopFailed` would;
 - every other error reaching the handler — heartbeat reports included —
   records nothing on this instrument and leaves the loop marked up, because in
   this mode it did not end the loop;
-- the caller's own `ConsumeErrHandler`, if any, is invoked unchanged either
-  way.
+- `OnConsumeError` is then invoked with the same arguments either way, so the
+  caller sees everything it would have seen.
+
+Because the observer's handler is applied last and options cannot be read, a
+`jetstream.ConsumeErrHandler` passed in `opts` to *this* `Consume` is silently
+overwritten. That is a footgun the API cannot detect, so it is a documented
+rule with a lint rule behind it rather than a runtime check: use
+`OnConsumeError`.
 
 The default therefore inverts between the two modes: an unrecognised error is
 `internal` and stops the loop in pull mode, and is ignored in `Consume` mode.
