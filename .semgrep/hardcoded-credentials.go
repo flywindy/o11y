@@ -116,9 +116,10 @@ func qualifiedNames() {
 	proxyPassword := "value-that-is-long-enough" // nosemgrep: gosec.G101-1
 	// ruleid: hardcoded-credential-literal
 	clientSecretValue := "value-that-is-long-enough" // nosemgrep: gosec.G101-1
-	// usernamePassword is the case that made the name exclusions anchored. An
-	// unanchored "name" matches the middle of this identifier and would veto a
-	// real credential.
+	// usernamePassword embeds "name" mid-identifier. It is here because an
+	// earlier version of the rule exempted identifiers by name and had to be
+	// careful not to veto this one; the exemptions are gone, but the case is
+	// worth keeping — a credential word anywhere in the identifier counts.
 	// ruleid: hardcoded-credential-literal
 	usernamePassword := "value-that-is-long-enough" // nosemgrep: gosec.G101-1
 
@@ -174,16 +175,50 @@ func structLiteralFieldIsNotCovered() config {
 	return config{ProxyPassword: "proxypass", ClientSecret: "s"} // nosemgrep: gosec.G101-1
 }
 
+// --- positives: protocol constants are flagged too, and annotated ---
+
 // An identifier that names a header, cookie, collection or env var holds a
-// protocol constant, not a credential.
+// protocol constant rather than a credential, but the rule flags it anyway.
+// It has to: `headerAuthToken = "x-auth-token"` and
+// `headerPassword = "production-secret"` are indistinguishable by name, and
+// their values share every lexical shape, so any silent exemption wide enough
+// to clear the first also clears the second.
+//
+// Real code would settle one of these with
+// `// nosemgrep: gosec.G101-1, hardcoded-credential-literal` plus a reason,
+// putting the judgement in the diff where a reviewer sees it. Here the
+// directive names gosec only: `ruleid:` asserts that our own rule fires, so
+// suppressing it would assert the opposite.
 const (
-	headerAuthToken     = "x-auth-token" // nosemgrep: gosec.G101-1
-	ssoTokenName        = "ssoToken"     // nosemgrep: gosec.G101-1
-	ssoTokenHeader      = "ssoToken"     // nosemgrep: gosec.G101-1
-	ssoTokensCollection = "sso_tokens"   // nosemgrep: gosec.G101-1
-	passwordFieldName   = "password"     // nosemgrep: gosec.G101-1
-	tokenEnvVar         = "SSO_TOKEN"    // nosemgrep: gosec.G101-1
+	// ruleid: hardcoded-credential-literal
+	headerAuthToken = "x-auth-token" // nosemgrep: gosec.G101-1
+	// ruleid: hardcoded-credential-literal
+	ssoTokenName = "ssoToken" // nosemgrep: gosec.G101-1
+	// ruleid: hardcoded-credential-literal
+	ssoTokenHeader = "ssoToken" // nosemgrep: gosec.G101-1
+	// ruleid: hardcoded-credential-literal
+	ssoTokensCollection = "sso_tokens" // nosemgrep: gosec.G101-1
+	// ruleid: hardcoded-credential-literal
+	passwordFieldName = "password" // nosemgrep: gosec.G101-1
+	// ruleid: hardcoded-credential-literal
+	tokenEnvVar = "SSO_TOKEN" // nosemgrep: gosec.G101-1
 )
+
+// The shapes the earlier name-based exemption let through silently: a real
+// credential under an identifier that merely looks like it names something.
+// Each must fire.
+func credentialUnderAQualifierName() {
+	// ruleid: hardcoded-credential-literal
+	apiKeyHeader := "sk-live-abc123realkey" // nosemgrep: gosec.G101-1
+	// ruleid: hardcoded-credential-literal
+	headerPassword := "production-secret" // nosemgrep: gosec.G101-1
+	// ruleid: hardcoded-credential-literal
+	passwordEnvVar := "hunter2-real-password" // nosemgrep: gosec.G101-1
+
+	_, _, _ = apiKeyHeader, headerPassword, passwordEnvVar
+}
+
+// --- negatives: shapes the rule must not flag ---
 
 // An empty string cannot be a credential; table-driven tests use it to assert
 // that a required setting was left unset.
