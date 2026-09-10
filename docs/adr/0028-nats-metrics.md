@@ -150,7 +150,8 @@ type ConsumerMetricsConfig struct {
 func (o *ConsumerObserver) Observe(ctx context.Context, msg jetstream.Msg, eventType string, handle func(context.Context, jetstream.Msg) error) error
 func (o *ConsumerObserver) LoopStarted(ctx context.Context)
 func (o *ConsumerObserver) LoopStopped(ctx context.Context)
-func (o *ConsumerObserver) LoopFailed(ctx context.Context, reason ReceiveErrorReason)
+func (o *ConsumerObserver) LoopFailed(ctx context.Context, err error)
+func (o *ConsumerObserver) Close() error
 func MarkTerminalFailure(ctx context.Context, reason TerminalReason)
 ```
 
@@ -160,6 +161,17 @@ consumer's setup metadata, not message subjects or payloads: `Consumer`
 already exposes `Info(ctx)` and `CachedInfo()`, and `jetstream.ConsumerInfo`
 carries all three. Any necessary metadata lookup occurs at setup with the
 supplied context, never once per delivery.
+
+`Close` is the release point section 6 requires. Without it the per-connection
+registry has no deterministic moment to drop an observer's identity tuple and
+frozen vocabulary, so replacing an observer on a still-open connection would
+leave the old entry retained — and a replacement carrying different event
+types would keep failing setup as incompatible vocabulary for a tuple nothing
+ever released. It is idempotent, applies `LoopStopped` if the loop is still
+marked up (so a released observer cannot strand a `+1` in the loop count), and
+after it returns the observer records nothing. Closing is not required for
+correctness of an observer that lives as long as its connection, which is the
+common case; it is required for any observer that does not.
 
 **Why a free function and not a `Consumer` method.** `Consumer` is an exported
 interface, so adding a method to it is a breaking change for every external
@@ -323,10 +335,18 @@ telemetry, not a guaranteed final zero.
 `LoopFailed` records one receive-error sample and then applies `LoopStopped`,
 because a loop that failed is a loop that is no longer receiving; reporting
 the failure without the transition would leave the loop counted as active.
-Its bounded reasons are `consumer_deleted`, `stream_unavailable` and
-`internal`, classified by the SDK from the iterator error rather than declared
-by the application — unlike processing failures, where only the application
-knows whether work was abandoned. These two families answer different
+
+It takes the **iterator error itself**, not a reason: the application passes
+what `Next`, `Consume` or `Fetch` returned, and the SDK maps it onto the
+bounded set `consumer_deleted`, `stream_unavailable`, `internal`. Centralising
+that mapping is the point — the sentinels involved (`jetstream.ErrConsumerDeleted`,
+`ErrConsumerNotFound`, `ErrStreamNotFound`, `ErrNoStreamResponse`,
+`ErrConnectionClosed`, `nats.ErrDisconnected`, `nats.ErrNoResponders`) are the
+SDK's own dependency surface, and asking every consume loop to classify them
+would guarantee they are classified differently. Anything unrecognised becomes
+`internal` rather than a new label value. This is the opposite of processing
+failures, where only the application knows whether work was abandoned and so
+the application declares the reason. These two families answer different
 questions and must never be added together: one counts work that will get no
 further attempt, the other counts times a loop stopped being able to receive,
 with the number of affected messages unknown by construction.
@@ -443,8 +463,9 @@ Required bounds:
    dispositions, error classes, and failure reasons.
 3. Bound admitted `(site, stream, durable)` tuples per connection and reuse
    their immutable label configuration. Do not intern arbitrary names from
-   message metadata into a process-global map. Define configuration lifetime
-   and release references when the owning connection/observer is released.
+   message metadata into a process-global map. Configuration lifetime is the
+   observer's, and `ConsumerObserver.Close` (section 3) is the release point;
+   an observer that is never closed holds its entry until the connection goes.
    Repeated setup for the same tuple reuses its frozen vocabulary; incompatible
    vocabulary for that tuple is a setup error, not a growing union of values.
 4. Proposed defaults are 16 configured event values per identity and 16
@@ -587,8 +608,29 @@ global-state verification is claimed before the implementation exists.
 | `chat.nats.consumer.loop.up` | `o11y.nats.consumer.loops` | Application-reported loop count; not connectivity or handler cancellation |
 | `chat.nats.consumer.messages` | `o11y.nats.consumer.dispositions` | Completed invocation; failed settlement calls do not freeze a later successful disposition |
 | `chat.nats.consumer.processing.duration` | `messaging.process.duration` | Full callback duration and an error breakdown instead of disposition labels. Boundaries are unchanged: newchat already builds this histogram with `o11y.DefaultLatencyBuckets()`, which section 5 keeps, so existing bucket-bound SLO queries stay valid across the rename |
-| `chat.nats.terminal.failures` | `o11y.nats.consumer.processing.failures` **and** `o11y.nats.consumer.receive.errors` | The one family splits in two. Per-invocation declarations keep the first four reasons; `consumer_deleted` and `stream_unavailable` move to the receive counter, which counts events rather than messages. A panel that today breaks the single family down `by (reason)` must query both and must not sum them |
+| `chat.nats.terminal.failures` | `o11y.nats.consumer.processing.failures` **and** `o11y.nats.consumer.receive.errors` | The one family splits in two — see the reason-by-reason mapping below. A panel that today breaks the single family down `by (reason)` must query both and must not sum them |
 | `chat.nats.publish.failures` and the two RPC histograms | Keep in newchat | No phase-1 ownership/name change |
+
+Where each `reason` value goes, because the split is not a clean partition:
+
+| `chat.nats.terminal.failures{reason=…}` | Lands on | As |
+|---|---|---|
+| `permanent`, `invalid_payload`, `publish_exhausted`, `max_deliver` | `…processing.failures` | `o11y.nats.failure.reason`, same values |
+| `consumer_deleted`, `stream_unavailable` | `…receive.errors` | `o11y.nats.receive.reason`, same values |
+| `internal` | **both** | `o11y.nats.failure.reason="internal"` *and* `o11y.nats.receive.reason="internal"` |
+
+`internal` is the row that will bite a mechanical migration, and it is worth
+being precise about why: it is already two things today. `MarkTerminal` records
+it when a handler declares an unclassified terminal failure, and `LoopFailed`
+records it as the default arm for a receive error matching none of its
+sentinels — both onto the same metric under the same label value. The split
+separates them, which is the improvement; the cost is that a dashboard that
+merely renames the metric keeps one source and silently drops the other, and
+one that queries both and adds them double-counts nothing today but will
+conflate a handler bug with a broker outage tomorrow. Point each existing
+`internal` panel at whichever source it was actually watching. The two
+instruments carry different attribute *keys*, so a query can always tell them
+apart even though the value spelling is shared.
 
 Inline `site`, `stream`, `consumer`, `event_type`, `outcome`, and `reason`
 map to the scoped/standard attributes in section 6. The processing histogram
@@ -634,27 +676,45 @@ labels, because two things change at once and the second is not a rename.
 newchat's dashboard already documents the trap in the *existing* metric: a
 hard process crash cannot emit a zero — the series goes stale and then
 disappears — so `chat_nats_consumer_loop_up` alone reports a crashed consumer
-as green, and catching it needs a label-scoped
-`absent(chat_nats_consumer_loop_up{service_name,site,stream,consumer})` per
-expected durable, backed by a maintained inventory of what should be running.
+as green. Catching it needs one `absent()` per expected durable, fully
+qualified, backed by a maintained inventory of what should be running:
 
-`o11y.nats.consumer.loops` keeps that trap and adds one. The label set moves
-(`consumer` becomes `messaging.destination.subscription.name`, `stream`
-becomes `messaging.destination.name`), so every such `absent()` expression has
-to be rewritten rather than retargeted. And the value is no longer a
-per-durable boolean: section 5 makes it a count to which every observer with
-the same labels contributes, so a process running two observers over one
-durable reads 2, and an expression testing `== 1` silently stops firing.
-Section 5's own sentence — "Multiple observers with the same labels contribute
-an active-loop count, not a process-wide Boolean" — is the part alerting has
-to absorb.
+```promql
+absent(chat_nats_consumer_loop_up{
+  service_name="broadcast-worker", site="site-a",
+  stream="MESSAGES-CANONICAL-site-a", consumer="broadcast-worker"})
+```
+
+`o11y.nats.consumer.loops` keeps that trap and adds two changes, neither of
+which is a relabel.
+
+First, the label *names* move, and the names an alert must use are the
+**Prometheus-rendered** ones, not the OTLP attribute keys in section 6. This
+repo's default metrics path is Prometheus pull (AGENTS.md), and the exporter
+renders dots as underscores, so the selector above becomes:
+
+```promql
+absent(o11y_nats_consumer_loops{
+  service_name="broadcast-worker", o11y_nats_site="site-a",
+  messaging_destination_name="MESSAGES-CANONICAL-site-a",
+  messaging_destination_subscription_name="broadcast-worker"})
+```
+
+Writing `messaging.destination.subscription.name` in a PromQL selector matches
+nothing and fails open — the alert simply never fires. Section 6's table is the
+OTLP contract; this is its exposition rendering, and alerting needs the second.
+
+Second, the value is no longer a per-durable boolean. Section 5 makes it a
+count to which every observer with the same labels contributes, so a process
+running two observers over one durable reads 2 and an expression testing `== 1`
+silently stops firing. Compare `< 1` instead.
 
 Treat this as its own migration task with the inventory owner, ahead of the
-cutover: rewrite the per-durable `absent()` set against the new label names,
-replace boolean comparisons with `< 1` (a durable with no live loop) rather
-than equality, and keep the crash-detection companion (`up == 0`, plus
-`absent()`) that the gauge cannot supply on its own. None of this is derivable
-from the label mapping table above, which is why it is called out separately.
+cutover: regenerate the per-durable `absent()` set against the rendered names,
+replace equality comparisons with `< 1`, and keep the crash-detection
+companion (`up == 0` alongside `absent()`) that the gauge cannot supply on its
+own. None of it is derivable from the label mapping table above, which is why
+it is called out separately.
 
 During rolling deployment, old and new duration/failure families are not
 interchangeable. Keep version-specific queries or explicit compatibility

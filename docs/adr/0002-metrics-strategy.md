@@ -143,10 +143,17 @@ and `7.5` — but **only in its specification prose**: the pinned generated Go c
 bucket advisory at all (`ExplicitBucketBoundaries` appears nowhere under
 `semconv/v1.39.0`), so there is nothing in code to conform to, and §5's semconv
 requirement covers instrument names, attribute keys and types rather than boundaries. And
-an instrument with no advisory and no View falls back to the metrics SDK's own default,
-`{0, 5, 10, 25, 50, 75, 100, 250, 500, 1000}` — shaped for milliseconds, so every
-sub-5-second sample of a seconds-unit histogram lands in the first bucket. That fallback
-is why an SDK-owned latency histogram must set boundaries explicitly whichever set wins.
+an instrument with no advisory and no View falls back to the metrics SDK's own default —
+`{0, 5, 10, 25, 50, 75, 100, 250, 500, 750, 1000, 2500, 5000, 7500, 10000}`, from
+`DefaultAggregationSelector` in `sdk/metric/reader.go`. That set is shaped for
+milliseconds, so a seconds-unit histogram collapses into it: every duration from 0 to 5
+seconds shares one bucket, which is the whole range most latency SLOs live in. That
+fallback is why an SDK-owned latency histogram must set boundaries explicitly whichever
+set wins.
+
+(Read that list off `reader.go`, not the ten-number list in `aggregation.go`'s doc
+comment — the latter is an illustrative example of how boundaries work, not the default,
+and is easy to mistake for one.)
 
 ---
 
