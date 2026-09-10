@@ -173,9 +173,12 @@ would drop the caller's trace and exemplar, and every other method here
 propagates one.
 
 **`Close` releases memory, not admission.** It drops the observer's cached
-measurement options and its vocabulary entry, but the identity tuple stays
-admitted for the life of the connection, and a replacement observer for a
-tuple already admitted must present compatible vocabulary. Returning the
+measurement options — nothing else. The per-connection registry keeps both the
+admitted identity tuple *and* its canonical vocabulary for the life of the
+connection, which it has to: section 6 makes a replacement observer for an
+already-admitted tuple reuse that frozen vocabulary and rejects an
+incompatible one, and a registry that forgot the vocabulary on close would
+have nothing left to compare against. Returning the
 budget on close would be unsound rather than merely generous: the
 MeterProvider's cumulative sum and histogram aggregators keep every attribute
 set ever recorded, and nothing in `Close` can retract them. A connection that
@@ -236,9 +239,13 @@ misreading away from a message that is silently never settled because its
 author assumed a returned error would Nak. Name the parameter for what it is
 in the doc comment and the examples (the observed error, used only to derive
 `error.type`), and state on the type that returning non-nil settles nothing.
-An `Observe` callback that returns non-nil without having called a terminal
-method is recorded `left_pending` under section 4 — the disposition that
-proves the trap was hit, so the guard is a query, not only a convention.
+A callback that returns without a successful terminal method still records a
+disposition under section 4's precedence — `handler_aborted` if it unwound
+abnormally, `handler_cancelled` if its context was already done, and
+`left_pending` in the ordinary case of a normal return on a live context.
+`left_pending` is therefore the arm the trap lands on, and querying it is what
+proves the trap was hit, so the guard is a signal rather than only a
+convention.
 
 For an existing callback with no error result, an adapter can call it and
 return nil. That reports only the errors the adapter exposes; it does not
@@ -665,7 +672,7 @@ global-state verification is claimed before the implementation exists.
 |---|---|---|
 | `chat.nats.consumer.loop.up` | `o11y.nats.consumer.loops` | Application-reported loop count; not connectivity or handler cancellation |
 | `chat.nats.consumer.messages` | `o11y.nats.consumer.dispositions` | Completed invocation; failed settlement calls do not freeze a later successful disposition |
-| `chat.nats.consumer.processing.duration` | `messaging.process.duration` | Full callback duration and an error breakdown instead of disposition labels. Boundaries are unchanged: newchat already builds this histogram with `o11y.DefaultLatencyBuckets()`, which section 5 keeps, so existing bucket-bound SLO queries stay valid across the rename |
+| `chat.nats.consumer.processing.duration` | `messaging.process.duration` | Full callback duration and an error breakdown instead of disposition labels. Boundaries are unchanged — newchat already builds this histogram with `o11y.DefaultLatencyBuckets()`, which section 5 keeps — so a bucket-bound query keeps *parsing*, and that is the trap: what lands in those buckets now measures a different span of time (Q2). Re-evaluate every SLO over this family rather than porting it, and scope queries by version through the rollout |
 | `chat.nats.terminal.failures` | `o11y.nats.consumer.processing.failures` **and** `o11y.nats.consumer.receive.errors` | The one family splits in two — see the reason-by-reason mapping below. A panel that today breaks the single family down `by (reason)` must query both and must not sum them |
 | `chat.nats.publish.failures` and the two RPC histograms | Keep in newchat | No phase-1 ownership/name change |
 
@@ -764,15 +771,27 @@ OTLP contract; this is its exposition rendering, and alerting needs the second.
 
 Second, the value is no longer a per-durable boolean. Section 5 makes it a
 count to which every observer with the same labels contributes, so a process
-running two observers over one durable reads 2 and an expression testing `== 1`
-silently stops firing. Compare `< 1` instead.
+running two observers over one durable reads 2 and an expression testing
+`== 1` silently stops firing. The live-but-idle case needs its own expression
+beside the `absent()` one, because a reachable process whose loop has stopped
+still exports the series — at zero:
+
+```promql
+o11y_nats_consumer_loops{
+  service_name="broadcast-worker", o11y_nats_site="site-a",
+  messaging_destination_name="MESSAGES-CANONICAL-site-a",
+  messaging_destination_subscription_name="broadcast-worker"} < 1
+```
+
+Three conditions, three different failures: `absent()` catches the durable
+whose series vanished, `< 1` catches the one still scraped with no live loop,
+and `up == 0` catches the whole target going away. None substitutes for
+another, and only the third is unchanged by this migration.
 
 Treat this as its own migration task with the inventory owner, ahead of the
-cutover: regenerate the per-durable `absent()` set against the rendered names,
-replace equality comparisons with `< 1`, and keep the crash-detection
-companion (`up == 0` alongside `absent()`) that the gauge cannot supply on its
-own. None of it is derivable from the label mapping table above, which is why
-it is called out separately.
+cutover: regenerate all three per durable against the rendered names. None of
+it is derivable from the label mapping table above, which is why it is called
+out separately.
 
 During rolling deployment, old and new duration/failure families are not
 interchangeable. Keep version-specific queries or explicit compatibility
