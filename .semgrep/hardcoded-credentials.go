@@ -108,10 +108,10 @@ func nameAlternatives() {
 	_, _, _, _, _, _, _ = password, passwd, pwd, secret, token, apiKey, credential
 }
 
-// separatedNameAlternatives covers the two terms whose halves carry no
-// meaning apart — "api key" and "access key". Split spellings are what code
-// ported from JSON, env files or another language brings in, and a
-// contiguous-only match walks straight past them.
+// separatedNameAlternatives covers the three terms whose halves carry no
+// meaning apart — "api key", "access key" and "private key". Split spellings
+// are what code ported from JSON, env files or another language brings in,
+// and a contiguous-only match walks straight past them.
 func separatedNameAlternatives() {
 	// ruleid: hardcoded-credential-literal
 	api_key := "live-secret-value" // nosemgrep: gosec.G101-1
@@ -119,8 +119,15 @@ func separatedNameAlternatives() {
 	accessKey := "AKIAIOSFODNN7EXAMPLE" // nosemgrep: gosec.G101-1
 	// ruleid: hardcoded-credential-literal
 	access_key := "AKIAIOSFODNN7EXAMPLE" // nosemgrep: gosec.G101-1
+	// A pasted PEM block is the highest-impact shape in this whole file, and
+	// "key" alone is excluded, so the qualified spellings have to be listed
+	// or the gate never sees it.
+	// ruleid: hardcoded-credential-literal
+	privateKey := "-----BEGIN PRIVATE KEY-----MIIEvQIBADAN" // nosemgrep: gosec.G101-1
+	// ruleid: hardcoded-credential-literal
+	private_key := "-----BEGIN PRIVATE KEY-----MIIEvQIBADAN" // nosemgrep: gosec.G101-1
 
-	_, _, _ = api_key, accessKey, access_key
+	_, _, _, _, _ = api_key, accessKey, access_key, privateKey, private_key
 }
 
 // A bare "key" is not a credential word. This library names attribute,
