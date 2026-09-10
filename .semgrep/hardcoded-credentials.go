@@ -108,6 +108,31 @@ func nameAlternatives() {
 	_, _, _, _, _, _, _ = password, passwd, pwd, secret, token, apiKey, credential
 }
 
+// separatedNameAlternatives covers the two terms whose halves carry no
+// meaning apart — "api key" and "access key". Split spellings are what code
+// ported from JSON, env files or another language brings in, and a
+// contiguous-only match walks straight past them.
+func separatedNameAlternatives() {
+	// ruleid: hardcoded-credential-literal
+	api_key := "live-secret-value" // nosemgrep: gosec.G101-1
+	// ruleid: hardcoded-credential-literal
+	accessKey := "AKIAIOSFODNN7EXAMPLE" // nosemgrep: gosec.G101-1
+	// ruleid: hardcoded-credential-literal
+	access_key := "AKIAIOSFODNN7EXAMPLE" // nosemgrep: gosec.G101-1
+
+	_, _, _ = api_key, accessKey, access_key
+}
+
+// A bare "key" is not a credential word. This library names attribute,
+// metric and object keys constantly, and every one of them holds a literal —
+// widening the qualifier to plain "key" would flag the lot.
+func aBareKeyIsNotACredential() {
+	objectKey := "videos/2026/clip.bin"
+	traceIDKey := "traceId"
+
+	_, _ = objectKey, traceIDKey
+}
+
 // The match is on a substring of the identifier, not the whole of it, so a
 // qualified name still trips the rule — the shape internal/redact's own test
 // fixtures actually take (`const secret = "..."`).
