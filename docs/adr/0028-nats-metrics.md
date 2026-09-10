@@ -137,9 +137,9 @@ synchronous `Observe` operation. The names below are proposed API, not APIs
 already provided by the SDK:
 
 ```go
-// NewConsumerObserver binds an observer to an existing consumer. It is a free
-// function, NOT a method added to the Consumer interface — see below.
-func NewConsumerObserver(ctx context.Context, c Consumer, cfg ConsumerMetricsConfig) (*ConsumerObserver, error)
+// ConsumerObserver binds an observer to an existing consumer. It hangs off
+// Conn — a concrete struct — NOT off the Consumer interface; see below.
+func (c *Conn) ConsumerObserver(ctx context.Context, consumer Consumer, cfg ConsumerMetricsConfig) (*ConsumerObserver, error)
 
 // ConsumerMetricsConfig supplies application-owned, bounded vocabulary.
 type ConsumerMetricsConfig struct {
@@ -151,7 +151,7 @@ func (o *ConsumerObserver) Observe(ctx context.Context, msg jetstream.Msg, event
 func (o *ConsumerObserver) LoopStarted(ctx context.Context)
 func (o *ConsumerObserver) LoopStopped(ctx context.Context)
 func (o *ConsumerObserver) LoopFailed(ctx context.Context, err error)
-func (o *ConsumerObserver) Close() error
+func (o *ConsumerObserver) Close(ctx context.Context) error
 func MarkTerminalFailure(ctx context.Context, reason TerminalReason)
 ```
 
@@ -163,29 +163,57 @@ carries all three. Any necessary metadata lookup occurs at setup with the
 supplied context, never once per delivery.
 
 `Close` is the release point section 6 requires. Without it the per-connection
-registry has no deterministic moment to drop an observer's identity tuple and
-frozen vocabulary, so replacing an observer on a still-open connection would
-leave the old entry retained — and a replacement carrying different event
-types would keep failing setup as incompatible vocabulary for a tuple nothing
-ever released. It is idempotent, applies `LoopStopped` if the loop is still
-marked up (so a released observer cannot strand a `+1` in the loop count), and
-after it returns the observer records nothing. Closing is not required for
-correctness of an observer that lives as long as its connection, which is the
-common case; it is required for any observer that does not.
+registry has no deterministic moment to drop an observer's frozen vocabulary,
+so replacing an observer on a still-open connection would leave the old entry
+retained. It is idempotent, applies `LoopStopped` if the loop is still marked
+up (so a released observer cannot strand a `+1` in the loop count), and after
+it returns the observer records nothing. It takes a context because it
+records: manufacturing a `context.Background()` inside a lifecycle method
+would drop the caller's trace and exemplar, and every other method here
+propagates one.
 
-**Why a free function and not a `Consumer` method.** `Consumer` is an exported
-interface, so adding a method to it is a breaking change for every external
-implementor — and a silent one for the implementors most likely to exist.
-An implementor that *embeds* the interface keeps compiling and gains a nil
-method that panics when the new one is called; newchat already has exactly
-that shape today (`search-sync-worker/consumer_source_test.go`, a
-`fakeO11yConsumer` embedding a nil `o11ynats.Consumer` and overriding only
-`Fetch`). This is the same hazard the test requirements below already guard
-for on `jetstream.Msg` — "embedding can silently inherit a new method" — and
-it applies to this ADR's own change. A free function takes the interface as a
-parameter, needs nothing added to it, and so is not a breaking change at all.
-The alternative, adding the method and listing it among section 7's breaking
-changes, buys nothing in exchange for that cost.
+**`Close` releases memory, not admission.** It drops the observer's cached
+measurement options and its vocabulary entry, but the identity tuple stays
+admitted for the life of the connection, and a replacement observer for a
+tuple already admitted must present compatible vocabulary. Returning the
+budget on close would be unsound rather than merely generous: the
+MeterProvider's cumulative sum and histogram aggregators keep every attribute
+set ever recorded, and nothing in `Close` can retract them. A connection that
+cycled observers across changing stream or durable names would then admit far
+more than the section 6 ceiling over its lifetime, retain and export all of
+those series, and eventually push the identities still in use into
+`otel.metric.overflow` — the stated per-connection bound quietly stops being a
+bound. Admission is therefore a property of the connection; `Close` only stops
+the observer growing the recorder's own caches.
+
+**Why it hangs off `Conn` and not off `Consumer`.** Two constraints meet here
+and only one shape satisfies both.
+
+`Consumer` is an exported interface, so adding a method to it is a breaking
+change for every external implementor — and a silent one for the implementors
+most likely to exist. An implementor that *embeds* the interface keeps
+compiling and gains a nil method that panics when the new one is called;
+newchat already has exactly that shape today
+(`search-sync-worker/consumer_source_test.go`, a `fakeO11yConsumer` embedding
+a nil `o11ynats.Consumer` and overriding only `Fetch`). This is the same
+hazard the test requirements below already guard for on `jetstream.Msg` —
+"embedding can silently inherit a new method" — and it applies to this ADR's
+own change.
+
+But a plain free function taking only the interface cannot work either,
+because construction needs state the interface does not carry: the
+MeterProvider, the resolved metrics toggle, and the per-connection identity
+registry section 6 requires. Reaching them by asserting the argument to the
+concrete facade type would fail for exactly the external and decorator
+implementors the free function was meant to protect, and a package-global
+registry is barred by ADR 0003.
+
+A method on `Conn` satisfies both. `Conn` is a concrete struct, so a new
+method on it breaks no one; it already holds the providers and the toggle; and
+it is the natural owner of a registry whose bound section 6 states *per
+connection*, which until now had no owner at all. The consumer arrives as an
+ordinary interface parameter, so any implementation — SDK, decorator or fake —
+can be observed.
 
 `Observe` invokes the application callback exactly once on the calling
 goroutine. Timing starts immediately before invocation and ends on return
@@ -337,8 +365,8 @@ because a loop that failed is a loop that is no longer receiving; reporting
 the failure without the transition would leave the loop counted as active.
 
 It takes the **iterator error itself**, not a reason: the application passes
-what `Next`, `Consume` or `Fetch` returned, and the SDK maps it onto the
-bounded set `consumer_deleted`, `stream_unavailable`, `internal`. Centralising
+what `Next`, `Fetch`, `FetchBytes` or `FetchNoWait` returned, and the SDK maps
+it onto the bounded set `consumer_deleted`, `stream_unavailable`, `internal`. Centralising
 that mapping is the point — the sentinels involved (`jetstream.ErrConsumerDeleted`,
 `ErrConsumerNotFound`, `ErrStreamNotFound`, `ErrNoStreamResponse`,
 `ErrConnectionClosed`, `nats.ErrDisconnected`, `nats.ErrNoResponders`) are the
@@ -346,7 +374,37 @@ SDK's own dependency surface, and asking every consume loop to classify them
 would guarantee they are classified differently. Anything unrecognised becomes
 `internal` rather than a new label value. This is the opposite of processing
 failures, where only the application knows whether work was abandoned and so
-the application declares the reason. These two families answer different
+the application declares the reason.
+
+**`Consume` needs a different wiring, and the facade owns it.** In the pull
+modes the returned error *is* the loop ending, so handing it to `LoopFailed`
+is exact. `Consume` does not work that way: its return value covers setup
+only, and everything after the loop starts arrives at a
+`jetstream.ConsumeErrHandler` instead. Following the pull-mode instruction
+there would mean a consumer deletion or stream outage minutes later is never
+recorded, while calling `LoopFailed` from that handler unconditionally would
+stop the loop gauge on a missing-heartbeat report that stopped nothing.
+
+The pinned client already draws the line this needs. In
+`jetstream/pull.go`, only `ErrConsumerDeleted` and `ErrBadRequest` reach the
+error handler and are then followed by `sub.Stop()`; missing-heartbeat reports
+(delivered only under `ReportMissingHeartbeats`) and other conditions are
+reported without ending the subscription. So for `Consume` the facade injects
+its own `ConsumeErrHandler` wrapper around the caller's, and:
+
+- an error the pinned client treats as loop-ending is recorded as a receive
+  error and applies the stop transition, exactly as `LoopFailed` would;
+- every other error reaching the handler — heartbeat reports included —
+  records nothing on this instrument and leaves the loop marked up, because in
+  this mode it did not end the loop;
+- the caller's own `ConsumeErrHandler`, if any, is invoked unchanged either
+  way.
+
+The default therefore inverts between the two modes: an unrecognised error is
+`internal` and stops the loop in pull mode, and is ignored in `Consume` mode.
+That is not an inconsistency to tidy away — it follows from what an error
+means in each, and pinning it here is the point, because it is not derivable
+from the instrument's description. These two families answer different
 questions and must never be added together: one counts work that will get no
 further attempt, the other counts times a loop stopped being able to receive,
 with the number of affected messages unknown by construction.
