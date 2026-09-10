@@ -153,9 +153,8 @@ type ConsumerMetricsConfig struct {
 
 func (o *ConsumerObserver) Observe(ctx context.Context, msg jetstream.Msg, eventType string, handle func(context.Context, jetstream.Msg) error) error
 func (o *ConsumerObserver) Consume(ctx context.Context, handler JetStreamMsgHandler, opts ...jetstream.PullConsumeOpt) (ConsumeContext, error)
-func (o *ConsumerObserver) LoopStarted(ctx context.Context)
-func (o *ConsumerObserver) LoopStopped(ctx context.Context)
-func (o *ConsumerObserver) LoopFailed(ctx context.Context, err error)
+func (o *ConsumerObserver) StartLoop(ctx context.Context) *Loop
+func (l *Loop) End(ctx context.Context, err error)
 func (o *ConsumerObserver) Close(ctx context.Context) error
 func MarkTerminalFailure(ctx context.Context, reason TerminalReason)
 ```
@@ -170,7 +169,8 @@ supplied context, never once per delivery.
 `Close` is the release point section 6 requires. Without it an observer
 replaced on a still-open connection keeps its measurement-option cache alive
 for the life of that connection, with nothing left to record into it. It is
-idempotent, applies `LoopStopped` if the loop is still marked up (so a released observer cannot strand a `+1` in the loop count), and after
+idempotent, ends any loop the observer still has open (so a released
+observer cannot strand a `+1` in the loop count), and after
 it returns the observer records nothing. It takes a context because it
 records: manufacturing a `context.Background()` inside a lifecycle method
 would drop the caller's trace and exemplar, and every other method here
@@ -256,20 +256,23 @@ return nil. That reports only the errors the adapter exposes; it does not
 discover swallowed failures. `MarkTerminalFailure` is the explicit way for
 such code to report the narrower fact that it has abandoned work.
 
-`LoopStarted` and `LoopStopped` bracket the loop, and the application owns
-both because it owns the loop. Call `LoopStarted` once the delivery API has
-returned successfully — after the iterator, batch or consume handle exists,
-not before, because a loop that failed to start never received anything and
-must not read as up. Call `LoopStopped` when the loop stops accepting work.
-Both are idempotent, so a shutdown path that also unwinds through `Close` is
-safe.
+**Liveness is carried by a loop handle, not by the observer**, because a loop
+is what starts and stops. `StartLoop` returns one and adds 1 to the active
+count; `End` is idempotent, subtracts it, and records a receive error when the
+error it is handed is not a normal ending (section 5). An observer running two
+delivery loops therefore reads 2, and one of them ending does not zero the
+other.
+
+`End` is the only way the SDK learns a loop is over. It never infers that from
+an error, which is what keeps section 5's classification out of the business
+of deciding whether consumption stopped — and removes the ordering hazard of
+an asynchronous failure arriving before a separate "started" call.
 
 All six facade delivery paths use the same **observation** contract:
 `Consume`, `Messages`, `Next`, `Fetch`, `FetchBytes`, and `FetchNoWait`. That
-uniformity is about `Observe` and the disposition semantics below; it does
-*not* extend to how a loop-ending error reaches the observer, which differs by
-mode and is specified in section 5. Applications invoke `Observe` inside their
-actual worker. A synchronous
+uniformity is about `Observe` and the disposition semantics below; where each
+mode's ending comes from is section 5. Applications invoke `Observe` inside
+their actual worker. A synchronous
 `Consume` callback can invoke it directly. A callback that dispatches work
 must put it inside the dispatched worker, after admission. Examples must
 show both cases without wrapping the same invocation twice.
@@ -368,7 +371,7 @@ instrumentation is deferred as a whole, including its vocabulary.
 
 | Name | OTel instrument / unit | Proposed description and recording boundary |
 |---|---|---|
-| `o11y.nats.consumer.loops` | Int64UpDownCounter / `{loop}` | Number of application-reported active consumer loops. Record idempotent start/stop transitions per observer; publish an initial zero. |
+| `o11y.nats.consumer.loops` | Int64UpDownCounter / `{loop}` | Active delivery loops, one `+1` per open loop handle (section 3). Publish an initial zero. |
 | `o11y.nats.consumer.dispositions` | Int64Counter / `{message}` | Completed observed delivery attempts by local disposition. Record once at callback completion under section 4. |
 | `messaging.process.duration` | Float64Histogram / `s` | Duration of processing operation. Record the complete observed callback invocation, including failures. |
 | `o11y.nats.consumer.processing.failures` | Int64Counter / `{failure}` | Observed processing invocations explicitly declared terminally unsuccessful by the application. At most one per invocation. |
@@ -382,87 +385,45 @@ Multiple observers with the same labels contribute an active-loop count,
 not a process-wide Boolean. A disappeared process produces missing/stale
 telemetry, not a guaranteed final zero.
 
-`LoopFailed` records one receive-error sample and then applies `LoopStopped`,
-because a loop that failed is a loop that is no longer receiving; reporting
-the failure without the transition would leave the loop counted as active.
+`End` records at most one receive-error sample and always returns the loop's
+`+1`. The caller knows the loop is over; the SDK only labels why.
 
-It takes the **iterator error itself**, not a reason, and the SDK maps it.
-Centralising that mapping is the point: these sentinels are the SDK's own
-dependency surface, and asking every consume loop to classify them would
-guarantee they are classified differently. The mapping is total:
+**The reason is best effort, and deliberately not a contract.** A nil error,
+`context.Canceled` or `context.DeadlineExceeded` is a normal ending and
+records nothing — a shutdown, or a bounded fetch reaching its deadline, is how
+a loop is *supposed* to end, and counting it would put a fleet-wide spike on
+the one instrument whose purpose is to show that consumption broke. Otherwise
+the SDK recognises what it can:
 
-| Error | Result |
+| Recognised error | Reason |
 |---|---|
 | `jetstream.ErrConsumerDeleted`, `ErrConsumerNotFound` | `consumer_deleted` |
-| `jetstream.ErrStreamNotFound`, `ErrNoStreamResponse`, `jetstream.ErrConnectionClosed`, `nats.ErrConnectionClosed`, `nats.ErrDisconnected`, `nats.ErrNoResponders` | `stream_unavailable` |
-| `context.Canceled`, `context.DeadlineExceeded` | **no sample**; the stop transition only |
-| anything else — `jetstream.ErrBadRequest` included | `internal` |
+| `jetstream.ErrStreamNotFound`, `ErrNoStreamResponse`, `ErrServerShutdown`, `ErrConnectionClosed`, `nats.ErrConnectionClosed`, `nats.ErrDisconnected`, `nats.ErrNoResponders` | `stream_unavailable` |
+| everything else | `internal` |
 
-The context row is not a gap in the classification, it is why the SDK does
-this rather than each caller. A caller cancelling its own context, or a
-bounded fetch reaching its deadline, is how a loop is *supposed* to end;
-recording that as a receive error would turn every routine shutdown into a
-fleet-wide spike on the one instrument whose purpose is to show that
-consumption broke. The loop still stops — `LoopFailed` applies the stop
-transition either way — it simply stops without a failure sample. Anything
-unrecognised becomes `internal` rather than a new label value. This is the opposite of processing
-failures, where only the application knows whether work was abandoned and so
-the application declares the reason.
+**This is a refinement, not an enumeration.** An earlier draft promised a total
+mapping over the client's error surface; that promise cannot be kept, because
+the surface is not enumerable from outside and moves with every `nats.go`
+release. `internal` is the honest default, adding a row is not a breaking
+change, and nothing depends on the table being complete — the loop already
+ended, because the caller said so. Classification is the opposite of
+processing failures, where only the application knows whether work was
+abandoned and so the application declares the reason.
 
-**Where the loop-ending error actually appears differs by mode**, and the
-instruction above is only exact for one of the three shapes.
+**Where each mode's ending comes from:**
 
-For `Next` — and for `Messages`, whose `MessagesContext.Next` has the same
-shape — the returned error is the loop ending, so handing it to `LoopFailed`
-is precise. Those two are the only modes where that holds.
+| Mode | The ending |
+|---|---|
+| `Next`, `Messages` | the returned error. A routine `nats.ErrTimeout` from an idle poll is not an ending — the loop continues and `End` is not called |
+| `Fetch`, `FetchBytes`, `FetchNoWait` | `batch.Error()` once the messages channel closes; the direct return covers setup only. Read the facade's `messageBatch.Error()`, which already suppresses the `context.Canceled` an explicit `Stop` produces |
+| `Consume` | the observer's own `Consume` ends the loop when `ConsumeContext.Closed()` closes. No sentinel set is involved: the client closing the subscription *is* the ending, however it decided that |
 
-The batch modes are not the same, despite the same `(value, error)` shape.
-`Fetch`, `FetchBytes` and `FetchNoWait` return once the subscribe and the pull
-request succeed; their direct error covers only that setup. The receive
-goroutine runs on, and a consumer deletion, status error, connection loss or
-context expiry after that point is written to the batch's own field and
-surfaces through `MessageBatch.Error()` — the direct return stays nil. Reading
-only the returned error therefore misses exactly the post-setup outages this
-section exists to catch. **A batch loop must inspect `batch.Error()` after the
-messages channel closes and pass that to `LoopFailed` when it is non-nil.**
-The facade's wrapper is the right thing to read: `messageBatch.Error()`
-already suppresses the `context.Canceled` that an explicit `Stop` produces, so
-what it returns is a real terminal condition rather than expected teardown.
-
-`Consume` differs again: its return value also covers setup only, but there
-is no batch to interrogate — everything after the loop starts arrives at a
-`jetstream.ConsumeErrHandler`. Reading only the return value would miss a
-consumer deletion minutes later, while calling `LoopFailed` from that handler
-unconditionally would stop the loop gauge on a missing-heartbeat report that
-stopped nothing.
-
-The pinned client already draws the line this needs, on two paths. In
-`jetstream/pull.go` the message path calls the error handler and then
-`sub.Stop()` for `ErrConsumerDeleted` and `ErrBadRequest`, and the error-channel
-path calls the handler and then `if errors.Is(err, ErrConnectionClosed) {
-sub.Stop() }`. Everything else reaching the handler leaves the subscription
-running: missing-heartbeat reports (delivered only under
-`ReportMissingHeartbeats`) trigger a re-fetch, and the unexported
-connected/disconnected notices are informational. **The terminal set is
-therefore those three**, though they do not all classify alike:
-`ErrBadRequest` ends the loop but is a protocol fault rather than a stream
-being unavailable, so it takes the `internal` catch-all above rather than
-being forced into a reason that would misdescribe it on a dashboard. The rule
-for keeping the set correct is mechanical —
-classify exactly the error paths the pinned client follows with `sub.Stop()`,
-and re-derive the set on every `nats.go` bump rather than trusting this list.
-
-**That handler cannot be composed through the options, so the observer owns
-the call.** `PullConsumeOpt` declares one unexported method,
-`configureConsume(*consumeOpts) error`, so an opaque option cannot be
-inspected; and `ConsumeErrHandler.configureConsume` is a plain assignment
-(`opts.ErrHandler = c`), so options do not merge — the last one applied wins.
-A facade that appended its own would silently discard the caller's handler,
-and one that prepended it would be discarded by the caller's. There is no
-ordering that preserves both.
-
-So `Consume` is driven through the observer, with the caller's handler passed
-as a typed field rather than an opaque option:
+The `Consume` row is why the observer owns that call. `PullConsumeOpt` declares
+one unexported method, so an opaque option cannot be inspected, and
+`ConsumeErrHandler.configureConsume` is a plain assignment — options do not
+merge, and no ordering preserves both the SDK's handler and the caller's. So
+`Consume` runs through the observer, which watches `Closed()` for the ending
+and forwards every error the client reports to `OnConsumeError`:
 
 ```go
 // ConsumerMetricsConfig gains:
@@ -470,39 +431,17 @@ as a typed field rather than an opaque option:
 func (o *ConsumerObserver) Consume(ctx context.Context, handler JetStreamMsgHandler, opts ...jetstream.PullConsumeOpt) (ConsumeContext, error)
 ```
 
-`OnConsumeError` carries its own `context.Context` because it fires
-asynchronously, long after registration. Capturing the registration context
-would be wrong in the common case that it came from a request: that context is
-cancelled when the request ends, and the callback runs after. The observer
-therefore supplies a loop-lifetime context detached from the registration one
-(`obsctx.Detach`, ADR 0024), so the callback keeps the trace identity without
-inheriting a cancellation that has nothing to do with the loop.
+`OnConsumeError` carries its own context because it fires long after
+registration; capturing a request-scoped registration context would be
+cancelled before the callback runs, so the observer supplies one detached from
+it (`obsctx.Detach`, ADR 0024). A `jetstream.ConsumeErrHandler` passed in
+`opts` to this `Consume` is silently overwritten — undetectable by the API, so
+it is a documented rule with a lint rule behind it: use `OnConsumeError`.
 
-The observer builds the one `ConsumeErrHandler` and applies it last, so:
-
-- an error the pinned client treats as loop-ending is recorded as a receive
-  error and applies the stop transition, exactly as `LoopFailed` would;
-- every other error reaching the handler — heartbeat reports included —
-  records nothing on this instrument and leaves the loop marked up, because in
-  this mode it did not end the loop;
-- `OnConsumeError` is then invoked either way, with the loop-lifetime context
-  and the same handle and error, so the caller sees everything a native
-  handler would have seen.
-
-Because the observer's handler is applied last and options cannot be read, a
-`jetstream.ConsumeErrHandler` passed in `opts` to *this* `Consume` is silently
-overwritten. That is a footgun the API cannot detect, so it is a documented
-rule with a lint rule behind it rather than a runtime check: use
-`OnConsumeError`.
-
-The default therefore inverts between the two modes: an unrecognised error is
-`internal` and stops the loop in pull mode, and is ignored in `Consume` mode.
-That is not an inconsistency to tidy away — it follows from what an error
-means in each, and pinning it here is the point, because it is not derivable
-from the instrument's description. These two families answer different
-questions and must never be added together: one counts work that will get no
-further attempt, the other counts times a loop stopped being able to receive,
-with the number of affected messages unknown by construction.
+Receive errors and processing failures answer different questions and must
+never be summed: one counts work that will get no further attempt, the other
+counts times a loop stopped being able to receive, with the number of affected
+messages unknown by construction.
 
 The processing histogram uses the standard name because its proposed timing
 matches the standard processing operation. Its error class is absent when
@@ -898,8 +837,9 @@ At acceptance/implementation, update:
 - `docs/semconv.md`: instruments, custom keys, stream/subscription mapping,
   and the endpoint-label limitation. Do not list these as emitted before code lands.
 - Driver-free views, root wiring, dependency-prefix gate, provider/toggle tests.
-- `docs/guide.md`, `examples/README.md`, JetStream examples, and CHANGELOG:
-  API migration and the explicit processing-boundary requirement.
+- `README.md`, `docs/guide.md`, `examples/README.md`, JetStream examples, and
+  CHANGELOG: the breaking `Connect` signature, `WithMetricsEnabled`, and the
+  explicit processing-boundary requirement.
 
 Required behavior tests, with a ManualReader and native-message fakes:
 
@@ -928,20 +868,21 @@ Required behavior tests, with a ManualReader and native-message fakes:
    NATS drivers out. AP scrape/registry migration has explicit coverage.
 9. The receive-error classifier is total and pinned: each sentinel in section
    5's table maps to its stated reason, an unrecognised error is `internal`,
-   and `context.Canceled`/`context.DeadlineExceeded` apply the stop transition
-   while recording no sample. Re-derive the terminal set against the pinned
-   client on every `nats.go` bump rather than asserting a copied list.
-10. Every delivery mode reaches `LoopFailed` by its own route: `Next` and
-    `Messages` from the returned error; `Fetch`/`FetchBytes`/`FetchNoWait`
-    from `batch.Error()` after the channel closes, with a `Stop`-induced
-    `context.Canceled` producing no sample; `Consume` from the observer's own
-    handler for the terminal set and from nothing else, with heartbeat
-    reports leaving the loop up.
+   and `context.Canceled`/`context.DeadlineExceeded` end the loop while
+   recording no sample. An unrecognised error must not change any behaviour
+   beyond its label, so the suite proves the table is refinement rather than
+   contract.
+10. Every delivery mode reaches `End` by its own route: `Next`/`Messages`
+    from the returned error, with a routine `nats.ErrTimeout` leaving the
+    loop open; the batch modes from `batch.Error()` after the channel closes,
+    with a `Stop`-induced `context.Canceled` producing no sample; `Consume`
+    from `ConsumeContext.Closed()`. Two loops on one observer read 2, and
+    ending one leaves the other counted.
 11. `OnConsumeError` fires for terminal and non-terminal errors alike, with a
     context that outlives a cancelled registration context, and a
     `jetstream.ConsumeErrHandler` passed in `opts` does not suppress the
     observer's own recording.
-12. `Close` is idempotent, applies `LoopStopped` only when the loop is up,
+12. `Close` is idempotent, ends any loop still open,
     records nothing afterwards, and leaves the identity admitted and its
     vocabulary intact — a replacement observer for a closed tuple still gets
     the frozen vocabulary and still rejects an incompatible one, and cycling
