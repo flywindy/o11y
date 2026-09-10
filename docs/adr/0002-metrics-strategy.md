@@ -126,6 +126,28 @@ are applied specifically to `http.server.*` histograms via an OTel View. User-au
 histograms retain their default exponential boundaries. Standardising HTTP boundaries across
 services keeps P99 comparisons directly comparable in Grafana.
 
+**Where the eleven numbers come from.** They are `prometheus.DefBuckets` from
+`client_golang`, copied verbatim — the set that library has shipped as its histogram
+default for a decade, described there as "tailored to broadly measure the response time
+(in seconds) of a network service". Recording the provenance because it bounds the
+authority of the set: `client_golang`'s own doc comment continues "Most likely, however,
+you will be required to define buckets customized to your use case", so this is a
+widely-deployed default rather than a standard anyone has argued for. What justifies it
+here is the standardisation above, not the pedigree — and that reason applies just as well
+to any other agreed set, so a future proposal to change it needs to beat cross-service
+comparability, not merely cite a different authority.
+
+For contrast, the two sets a caller might otherwise land on. OTel semconv recommends
+fourteen boundaries for `http.server.request.duration` — these eleven plus `0.075`, `0.75`
+and `7.5` — but **only in its specification prose**: the pinned generated Go carries no
+bucket advisory at all (`ExplicitBucketBoundaries` appears nowhere under
+`semconv/v1.39.0`), so there is nothing in code to conform to, and §5's semconv
+requirement covers instrument names, attribute keys and types rather than boundaries. And
+an instrument with no advisory and no View falls back to the metrics SDK's own default,
+`{0, 5, 10, 25, 50, 75, 100, 250, 500, 1000}` — shaped for milliseconds, so every
+sub-5-second sample of a seconds-unit histogram lands in the first bucket. That fallback
+is why an SDK-owned latency histogram must set boundaries explicitly whichever set wins.
+
 ---
 
 ## Consequences

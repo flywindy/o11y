@@ -324,16 +324,33 @@ JetStream processing and HTTP with different bucket layouts, so their
 percentiles could not be compared and no single recording rule would fit both.
 A latency SLO's bound must therefore be chosen from this set.
 
-Two facts bound how much is given up. The deviation is confined to
-boundaries: the instrument name, the `s` unit, the description,
+Neither set carries the authority the argument might seem to rest on, so the
+provenance of both is worth stating rather than implying. The SDK's eleven are
+`prometheus.DefBuckets` from `client_golang`, copied verbatim (ADR 0002 §9);
+that library's own doc comment calls them a broad starting point and says most
+users will need to customise. They are a widely-deployed default, not a
+standard. The convention's fourteen are those eleven plus `0.075`, `0.75` and
+`7.5`, and they live **only in the specification prose**: `ExplicitBucketBoundaries`
+appears nowhere under the pinned `semconv/v1.39.0` — not in `messagingconv`, not
+anywhere — so `newProcessDurationOpts` sets description and unit and nothing
+else. There is no pinned code to contradict, and ADR 0008's semconv requirement
+covers instrument names, attribute keys and types rather than boundaries.
+
+With neither set winning on authority, internal consistency decides, and it
+points one way. What is given up is also bounded: the deviation is confined to
+boundaries, while the instrument name, the `s` unit, the description,
 `messaging.operation.name`/`.type` and the conditional `error.type` all still
-conform, which is where interoperability actually lives — a generic messaging
-dashboard still finds and groups the series, and only `histogram_quantile`'s
-interpolation points differ. And the pinned generated instrument carries no
-advisory to depart from: `newProcessDurationOpts` in
-`semconv/v1.39.0/messagingconv/metric.go` sets only description and unit, so
-the fourteen boundaries exist in the specification document alone. Adopting
-the SDK set contradicts no pinned code.
+conform — which is where interoperability actually lives. A generic messaging
+dashboard still finds and groups the series; only `histogram_quantile`'s
+interpolation points differ.
+
+The concrete thing the fourteen would buy is three more legal SLO bounds — 75 ms,
+750 ms and 7.5 s — since a bound between boundaries cannot be read without
+interpolating. No current SLO wants one: SLO-4 and SLO-5 already sit on `0.5`
+and `0.25`, and the 300 ms that was once drafted falls between boundaries in
+**both** sets, so the fourteen would not have rescued it. Should a future SLO
+need one of those three, that is an argument to revisit ADR 0002 §9 for every
+family at once — never to give this one family a different layout.
 
 Using this instrument does not claim a complete implementation of the
 messaging metric suite. Automatic consumed/sent message counts and client
