@@ -137,11 +137,9 @@ synchronous `Observe` operation. The names below are proposed API, not APIs
 already provided by the SDK:
 
 ```go
-// Consumer retains its existing methods and gains observer construction.
-type Consumer interface {
-    // Existing methods omitted.
-    Observer(ctx context.Context, cfg ConsumerMetricsConfig) (*ConsumerObserver, error)
-}
+// NewConsumerObserver binds an observer to an existing consumer. It is a free
+// function, NOT a method added to the Consumer interface — see below.
+func NewConsumerObserver(ctx context.Context, c Consumer, cfg ConsumerMetricsConfig) (*ConsumerObserver, error)
 
 // ConsumerMetricsConfig supplies application-owned, bounded vocabulary.
 type ConsumerMetricsConfig struct {
@@ -152,14 +150,30 @@ type ConsumerMetricsConfig struct {
 func (o *ConsumerObserver) Observe(ctx context.Context, msg jetstream.Msg, eventType string, handle func(context.Context, jetstream.Msg) error) error
 func (o *ConsumerObserver) LoopStarted(ctx context.Context)
 func (o *ConsumerObserver) LoopStopped(ctx context.Context)
+func (o *ConsumerObserver) LoopFailed(ctx context.Context, reason ReceiveErrorReason)
 func MarkTerminalFailure(ctx context.Context, reason TerminalReason)
 ```
 
-`Observer` would be implemented on the existing concrete facade. Its
-configuration contains the optional site label and event-type allowlist. Stream, durable
-consumer name, and acknowledgment policy come from the bound consumer's
-setup metadata, not message subjects or payloads. Any necessary metadata
-lookup occurs at setup with the supplied context, never once per delivery.
+Its configuration contains the optional site label and event-type allowlist.
+Stream, durable consumer name, and acknowledgment policy come from the bound
+consumer's setup metadata, not message subjects or payloads: `Consumer`
+already exposes `Info(ctx)` and `CachedInfo()`, and `jetstream.ConsumerInfo`
+carries all three. Any necessary metadata lookup occurs at setup with the
+supplied context, never once per delivery.
+
+**Why a free function and not a `Consumer` method.** `Consumer` is an exported
+interface, so adding a method to it is a breaking change for every external
+implementor — and a silent one for the implementors most likely to exist.
+An implementor that *embeds* the interface keeps compiling and gains a nil
+method that panics when the new one is called; newchat already has exactly
+that shape today (`search-sync-worker/consumer_source_test.go`, a
+`fakeO11yConsumer` embedding a nil `o11ynats.Consumer` and overriding only
+`Fetch`). This is the same hazard the test requirements below already guard
+for on `jetstream.Msg` — "embedding can silently inherit a new method" — and
+it applies to this ADR's own change. A free function takes the interface as a
+parameter, needs nothing added to it, and so is not a breaking change at all.
+The alternative, adding the method and listing it among section 7's breaking
+changes, buys nothing in exchange for that cost.
 
 `Observe` invokes the application callback exactly once on the calling
 goroutine. Timing starts immediately before invocation and ends on return
@@ -266,16 +280,29 @@ business failure. The application must supply the classification.
 
 `consumer_deleted` and `stream_unavailable` are excluded from this per-work
 counter. They describe receive-loop failures with an unknown number of
-affected messages. Keep their logs and application recovery handling; add a
-separate bounded receive-error instrument only with a named reader and an
-explicit event-count contract. Broker MaxDeliver and Term advisories remain
-independent evidence [S4]. Never sum these sources as a count of lost work.
+affected messages, so counting them as work would put a number on the metric
+that nothing in the process knows.
+
+They are not dropped, though — they move to their own instrument in the same
+phase (section 5). An earlier draft deferred that instrument until it had "a
+named reader and an explicit event-count contract"; both already exist and the
+draft simply did not check. The reader is newchat's live dashboard panel
+`sum by (reason) (rate(chat_nats_terminal_failures_total[$__rate_interval]))`,
+whose description enumerates `stream_unavailable` among the reasons it exists
+to show, and the producer is `LoopFailed` in `pkg/natsmetrics`. The
+event-count contract is what excluding them from the per-work counter already
+implies: **one sample per loop-failure event, never per affected message.**
+Deferring would therefore not have postponed a speculative instrument; it
+would have deleted a signal that is wired end to end today, and replaced it
+with logs — which is a downgrade for alerting, not an equivalent.
+
+Broker MaxDeliver and Term advisories remain independent evidence [S4]. Never
+sum these sources, or the receive-error counter, as a count of lost work.
 
 ### 5. Instruments and names
 
-The recommended phase-1 set is **four consumer instruments**, replacing the
-initial proposal's five-family migration. Publisher instrumentation is
-deferred as a whole, including its vocabulary.
+The recommended phase-1 set is **five consumer instruments**. Publisher
+instrumentation is deferred as a whole, including its vocabulary.
 
 | Name | OTel instrument / unit | Proposed description and recording boundary |
 |---|---|---|
@@ -283,6 +310,7 @@ deferred as a whole, including its vocabulary.
 | `o11y.nats.consumer.dispositions` | Int64Counter / `{message}` | Completed observed delivery attempts by local disposition. Record once at callback completion under section 4. |
 | `messaging.process.duration` | Float64Histogram / `s` | Duration of processing operation. Record the complete observed callback invocation, including failures. |
 | `o11y.nats.consumer.processing.failures` | Int64Counter / `{failure}` | Observed processing invocations explicitly declared terminally unsuccessful by the application. At most one per invocation. |
+| `o11y.nats.consumer.receive.errors` | Int64Counter / `{error}` | Receive-loop failures reported by the application, by bounded cause. One sample per event, never per affected message (section 4). |
 
 Loop state is reported by the application because the application owns the
 loop. It means neither broker connectivity nor end-to-end readiness. The
@@ -291,6 +319,17 @@ finish afterwards. That stop does not classify those workers as canceled.
 Multiple observers with the same labels contribute an active-loop count,
 not a process-wide Boolean. A disappeared process produces missing/stale
 telemetry, not a guaranteed final zero.
+
+`LoopFailed` records one receive-error sample and then applies `LoopStopped`,
+because a loop that failed is a loop that is no longer receiving; reporting
+the failure without the transition would leave the loop counted as active.
+Its bounded reasons are `consumer_deleted`, `stream_unavailable` and
+`internal`, classified by the SDK from the iterator error rather than declared
+by the application — unlike processing failures, where only the application
+knows whether work was abandoned. These two families answer different
+questions and must never be added together: one counts work that will get no
+further attempt, the other counts times a loop stopped being able to receive,
+with the number of affected messages unknown by construction.
 
 The processing histogram uses the standard name because its proposed timing
 matches the standard processing operation. Its error class is absent when
@@ -370,16 +409,17 @@ equality join between the metric destination and the span destination.
 
 | Attribute | Applies to | Source and bound |
 |---|---|---|
-| `messaging.system` | All four | Constant `nats`; a documented custom system value already used upstream |
-| `messaging.destination.name` | All four | Stream from consumer setup; admitted identity tuple only |
-| `messaging.destination.subscription.name` | All four | Durable consumer from setup; ephemeral identities excluded from this phase |
-| `o11y.nats.site` | All four, optional | Immutable deployment/site alias supplied at setup; never extracted from payloads |
+| `messaging.system` | All five | Constant `nats`; a documented custom system value already used upstream |
+| `messaging.destination.name` | All five | Stream from consumer setup; admitted identity tuple only |
+| `messaging.destination.subscription.name` | All five | Durable consumer from setup; ephemeral identities excluded from this phase |
+| `o11y.nats.site` | All five, optional | Immutable deployment/site alias supplied at setup; never extracted from payloads |
 | `messaging.operation.name` | Processing duration | Constant `process` |
 | `messaging.operation.type` | Processing duration | Constant `process` |
 | `error.type` | Processing duration, failures only | Four failure classes defined in section 5 |
 | `o11y.nats.event.type` | Dispositions, processing duration, processing failures | Application allowlist plus reserved `unknown` |
 | `o11y.nats.disposition` | Dispositions | Six values defined in section 4 |
 | `o11y.nats.failure.reason` | Processing failures | Five values defined in section 4 |
+| `o11y.nats.receive.reason` | Receive errors | Three values defined in section 5; SDK-classified, not application-declared |
 
 Server endpoint labels are intentionally omitted in this processing profile:
 the observation context describes application work, potentially after a
@@ -547,7 +587,7 @@ global-state verification is claimed before the implementation exists.
 | `chat.nats.consumer.loop.up` | `o11y.nats.consumer.loops` | Application-reported loop count; not connectivity or handler cancellation |
 | `chat.nats.consumer.messages` | `o11y.nats.consumer.dispositions` | Completed invocation; failed settlement calls do not freeze a later successful disposition |
 | `chat.nats.consumer.processing.duration` | `messaging.process.duration` | Full callback duration and an error breakdown instead of disposition labels. Boundaries are unchanged: newchat already builds this histogram with `o11y.DefaultLatencyBuckets()`, which section 5 keeps, so existing bucket-bound SLO queries stay valid across the rename |
-| `chat.nats.terminal.failures` | `o11y.nats.consumer.processing.failures` | Explicit per-invocation failure declarations only; loop failures are excluded |
+| `chat.nats.terminal.failures` | `o11y.nats.consumer.processing.failures` **and** `o11y.nats.consumer.receive.errors` | The one family splits in two. Per-invocation declarations keep the first four reasons; `consumer_deleted` and `stream_unavailable` move to the receive counter, which counts events rather than messages. A panel that today breaks the single family down `by (reason)` must query both and must not sum them |
 | `chat.nats.publish.failures` and the two RPC histograms | Keep in newchat | No phase-1 ownership/name change |
 
 Inline `site`, `stream`, `consumer`, `event_type`, `outcome`, and `reason`
@@ -585,6 +625,36 @@ scans application source and will no longer see declarations moved into a
 dependency. Add SDK instrument contract tests and an AP collect/scrape test;
 keep the source guard for remaining AP-owned instruments. Update the AP
 contract with a named dashboard, alert, or investigation for each family.
+
+### Per-durable liveness alerting has to be redesigned, not relabelled
+
+The loop family is the one migration item that cannot be handled by mapping
+labels, because two things change at once and the second is not a rename.
+
+newchat's dashboard already documents the trap in the *existing* metric: a
+hard process crash cannot emit a zero — the series goes stale and then
+disappears — so `chat_nats_consumer_loop_up` alone reports a crashed consumer
+as green, and catching it needs a label-scoped
+`absent(chat_nats_consumer_loop_up{service_name,site,stream,consumer})` per
+expected durable, backed by a maintained inventory of what should be running.
+
+`o11y.nats.consumer.loops` keeps that trap and adds one. The label set moves
+(`consumer` becomes `messaging.destination.subscription.name`, `stream`
+becomes `messaging.destination.name`), so every such `absent()` expression has
+to be rewritten rather than retargeted. And the value is no longer a
+per-durable boolean: section 5 makes it a count to which every observer with
+the same labels contributes, so a process running two observers over one
+durable reads 2, and an expression testing `== 1` silently stops firing.
+Section 5's own sentence — "Multiple observers with the same labels contribute
+an active-loop count, not a process-wide Boolean" — is the part alerting has
+to absorb.
+
+Treat this as its own migration task with the inventory owner, ahead of the
+cutover: rewrite the per-durable `absent()` set against the new label names,
+replace boolean comparisons with `< 1` (a durable with no live loop) rather
+than equality, and keep the crash-detection companion (`up == 0`, plus
+`absent()`) that the gauge cannot supply on its own. None of this is derivable
+from the label mapping table above, which is why it is called out separately.
 
 During rolling deployment, old and new duration/failure families are not
 interchangeable. Keep version-specific queries or explicit compatibility
@@ -654,8 +724,6 @@ it does not claim those implementation gates have passed.
   reader needs them, with handoff/buffer/abandonment boundaries defined for
   all modes. This is where the standard consumed/sent/operation instruments
   belong; it is not a rename of a completion counter.
-- **Receive-loop error metric:** add when an operational reader requires
-  bounded failure counts beyond logs and loop-state transitions.
 - **Worker runner, automatic retry, DLQ, recovery, ordered/push consumers,
   AckNone/AckAll:** separate proposals driven by concrete consumer needs.
 - **Upstream metric adoption:** refresh the ADR 0008 evaluation if a maintained
@@ -684,7 +752,7 @@ of `pkg/natsmetrics`.
 | Q1 | May processing observation require an explicit synchronous wrapper inside the actual worker? | Yes. Keep dispatch/lifetime control in AP code and avoid implicit completion guesses. |
 | Q2 | Preserve newchat's first-disposition timing or adopt full processing timing and completion-time disposition? | Adopt the definitions above; treat the migration as a semantic change. If preservation wins, use a custom duration name and revise the table before acceptance. |
 | Q3 | Are the consumer-only scope, 16-event/16-identity default limits, stream/subscription mapping, and endpoint-label omission acceptable for the first release? | Start with this bounded profile, validate it against real consumer inventories, and explicitly record the limitations. Do not raise limits without recalculating fleet/histogram cost. |
-| Q4 | Is a four-instrument consumer migration acceptable while publisher/RPC stay in newchat? | Yes. Keep their vocabulary and cost decisions together in later work. |
+| Q4 | Is a five-instrument consumer migration acceptable while publisher/RPC stay in newchat? | Yes. The fifth (receive errors) is not scope growth — it preserves a signal newchat emits and reads today, which four would have dropped. Publisher and RPC keep their vocabulary and cost decisions together in later work. |
 
 ### Q2 in detail: what each answer costs
 
