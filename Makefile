@@ -95,7 +95,15 @@ tools: ## Install pinned SAST tooling (gosec, semgrep)
 	  pipx install --force semgrep==$(SEMGREP_VERSION) \
 	    && pipx inject semgrep setuptools; \
 	elif command -v semgrep >/dev/null 2>&1; then \
-	  echo "pipx not found, but semgrep is already on PATH — skipping semgrep install"; \
+	  found="$$(semgrep --version 2>/dev/null | head -n1)"; \
+	  if [ "$$found" = "$(SEMGREP_VERSION)" ]; then \
+	    echo "pipx not found; semgrep $(SEMGREP_VERSION) is already on PATH — skipping install"; \
+	  else \
+	    echo "pipx not found, and the semgrep on PATH is $${found:-unknown}, not the pinned $(SEMGREP_VERSION)." >&2; \
+	    echo "Rule-test and exit-code behaviour differ between releases, so this is not accepted silently." >&2; \
+	    echo "Install pipx, or: pip install --user semgrep==$(SEMGREP_VERSION)" >&2; \
+	    exit 1; \
+	  fi; \
 	else \
 	  echo "pipx not found and semgrep not on PATH — install pipx, or: pip install --user semgrep==$(SEMGREP_VERSION)" >&2; \
 	  exit 1; \
