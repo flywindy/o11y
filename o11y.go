@@ -21,7 +21,6 @@ import (
 	"strings"
 	"sync"
 
-	o11ycassandra "github.com/flywindy/o11y/cassandra"
 	"github.com/flywindy/o11y/internal/baggageattrs"
 	o11ylog "github.com/flywindy/o11y/internal/log"
 	"github.com/flywindy/o11y/internal/metrics"
@@ -271,7 +270,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 						append(views.Redis(cfg.histogramBuckets), o11ymongo.MetricViews(cfg.histogramBuckets)...),
 						o11yminio.MetricViews(cfg.histogramBuckets)...,
 					),
-					o11ycassandra.MetricViews(cfg.histogramBuckets)...,
+					views.Cassandra(cfg.histogramBuckets)...,
 				),
 				// Views come from the driver-free leaf package so the root
 				// package does not link the integration's client

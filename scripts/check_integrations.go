@@ -276,6 +276,7 @@ func shouldSkipDir(name string) bool {
 // there — an unenforced convention is how the original coupling accumulated.
 var rootForbiddenDepPrefixes = []string{
 	"github.com/elastic/",
+	"github.com/gocql/",
 	"github.com/redis/",
 }
 
