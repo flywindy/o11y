@@ -28,7 +28,6 @@ import (
 	"github.com/flywindy/o11y/internal/redact"
 	"github.com/flywindy/o11y/internal/trace"
 	"github.com/flywindy/o11y/internal/views"
-	o11ymongo "github.com/flywindy/o11y/mongo"
 	otelpyroscope "github.com/grafana/otel-profiling-go"
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel/metric"
@@ -266,7 +265,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 			ExtraViews: append(
 				append(
 					append(
-						append(views.Redis(cfg.histogramBuckets), o11ymongo.MetricViews(cfg.histogramBuckets)...),
+						append(views.Redis(cfg.histogramBuckets), views.Mongo(cfg.histogramBuckets)...),
 						views.Minio(cfg.histogramBuckets)...,
 					),
 					views.Cassandra(cfg.histogramBuckets)...,

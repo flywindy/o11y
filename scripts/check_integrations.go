@@ -279,6 +279,7 @@ var rootForbiddenDepPrefixes = []string{
 	"github.com/gocql/",
 	"github.com/minio/",
 	"github.com/redis/",
+	"go.mongodb.org/",
 }
 
 // checkRootDoesNotLinkDrivers asserts, via the build graph rather than source

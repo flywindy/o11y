@@ -14,9 +14,15 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
+
+	"github.com/flywindy/o11y/internal/views"
 )
 
-const instrumentationName = "github.com/flywindy/o11y/mongo"
+// instrumentationName aliases the scope constant in internal/views so the scope
+// this package records its pool metrics under and the scope its pool views
+// match cannot drift; the constant lives there because the root package must
+// name it without linking the mongo driver (ADR 0026 Option A).
+const instrumentationName = views.MongoScope
 
 type poolMetrics struct {
 	count      metric.Int64UpDownCounter
