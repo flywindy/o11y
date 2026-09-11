@@ -38,6 +38,22 @@ adopters can plan their upgrades.
 
 ### Changed
 
+- dependencies: the root `o11y` package no longer links the Cassandra,
+  MinIO, MongoDB or Redis drivers. It imported those four packages for one
+  reason — to collect their `MetricViews` — and because Go links at package
+  granularity, every service that imported the SDK linked all four drivers
+  whether or not it spoke any of those protocols. The view definitions now
+  live in a driver-free internal package; each integration keeps
+  `MetricViews` as a re-export, so **no service changes a line of code**
+  (ADR 0026 Option A). The root package's transitive dependencies drop from
+  590 to 457, and all four drivers to zero linked packages. What a service
+  sees after upgrading and running `go mod tidy`: a smaller binary, the four
+  drivers gone from its `go.mod` and `go.sum` unless it imports them
+  directly, and `govulncheck` — which works from the call graph — no longer
+  reporting advisories for drivers it never calls. Version selection is
+  unchanged: the SDK's `go.mod` still requires the drivers, so a service
+  pinning an older one is still raised to the SDK's version, exactly as
+  before.
 - metrics: the in-process cardinality limit is a real guard again. It was
   derived as `MaxUniqueRoutes × 16 × 64` — 1,024,000 attribute sets per
   stream at the shipped defaults, against OTel's default of 2,000 — so an
