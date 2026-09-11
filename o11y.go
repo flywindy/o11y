@@ -31,7 +31,6 @@ import (
 	"github.com/flywindy/o11y/internal/views"
 	o11yminio "github.com/flywindy/o11y/minio"
 	o11ymongo "github.com/flywindy/o11y/mongo"
-	o11yredis "github.com/flywindy/o11y/redis"
 	otelpyroscope "github.com/grafana/otel-profiling-go"
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel/metric"
@@ -269,13 +268,13 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 			ExtraViews: append(
 				append(
 					append(
-						append(o11yredis.MetricViews(cfg.histogramBuckets), o11ymongo.MetricViews(cfg.histogramBuckets)...),
+						append(views.Redis(cfg.histogramBuckets), o11ymongo.MetricViews(cfg.histogramBuckets)...),
 						o11yminio.MetricViews(cfg.histogramBuckets)...,
 					),
 					o11ycassandra.MetricViews(cfg.histogramBuckets)...,
 				),
-				// Elasticsearch's view comes from the driver-free leaf package so
-				// the root package does not link the go-elasticsearch client
+				// Views come from the driver-free leaf package so the root
+				// package does not link the integration's client
 				// (ADR 0026 Option A, ADR 0027 §5).
 				views.Elasticsearch(cfg.histogramBuckets)...,
 			),
