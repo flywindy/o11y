@@ -1,44 +1,25 @@
 package minio
 
 import (
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/sdk/instrumentation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
-	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
+
+	"github.com/flywindy/o11y/internal/views"
 )
 
-// MetricViews returns the metric.Views that bound the cardinality of
-// minio.client.operation.duration and pin its histogram buckets to the
-// SDK's WithHistogramBuckets policy.
+// MetricViews returns the metric views that bound the cardinality of
+// minio.client.operation.duration and pin its histogram buckets to the SDK's
+// WithHistogramBuckets policy. The view is scoped to this package's
+// instrumentation scope so it never matches another integration's
+// operation-duration instrument.
 //
-// OTel Go Views are fixed at MeterProvider construction and cannot be
-// retro-fitted at instrument creation, so this slice is composed by
-// o11y.Init via the ExtraViews seam (matching the redis/mongo pattern).
-// Services that build their own MeterProvider must register the same
-// views via sdkmetric.WithView(...) at construction; otherwise the
-// allowlist is not in effect.
+// o11y.Init registers these views automatically. Services that build their own
+// MeterProvider must register them via sdkmetric.WithView(MetricViews(...)...)
+// on that provider; a view applies only to the MeterProvider it is registered
+// with, and without it the allowlist is not in effect.
 //
-// The view is scoped to this package's instrumentation scope so it never
-// matches another integration's operation-duration instrument.
+// The definitions live in the driver-free internal/views package so the root
+// o11y package can register them without importing the minio-go client
+// (ADR 0026 Option A); this function is the public re-export.
 func MetricViews(histogramBuckets []float64) []sdkmetric.View {
-	return []sdkmetric.View{
-		sdkmetric.NewView(
-			sdkmetric.Instrument{
-				Name:  "minio.client.operation.duration",
-				Scope: instrumentation.Scope{Name: instrumentationName},
-			},
-			sdkmetric.Stream{
-				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
-					Boundaries: histogramBuckets,
-				},
-				AttributeFilter: attribute.NewAllowKeysFilter(
-					objectStoreOperationNameKey,
-					objectStoreBucketNameKey,
-					semconv.ServerAddressKey,
-					semconv.ServerPortKey,
-					semconv.ErrorTypeKey,
-				),
-			},
-		),
-	}
+	return views.Minio(histogramBuckets)
 }

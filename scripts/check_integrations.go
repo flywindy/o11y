@@ -277,6 +277,7 @@ func shouldSkipDir(name string) bool {
 var rootForbiddenDepPrefixes = []string{
 	"github.com/elastic/",
 	"github.com/gocql/",
+	"github.com/minio/",
 	"github.com/redis/",
 }
 
