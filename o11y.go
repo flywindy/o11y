@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -262,18 +263,19 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 			RuntimeMetrics:      cfg.runtimeMetrics,
 			HistogramBuckets:    cfg.histogramBuckets,
 			DisableDefaultViews: cfg.disableDefaultViews,
-			ExtraViews: append(
-				append(
-					append(
-						append(views.Redis(cfg.histogramBuckets), views.Mongo(cfg.histogramBuckets)...),
-						views.Minio(cfg.histogramBuckets)...,
-					),
-					views.Cassandra(cfg.histogramBuckets)...,
-				),
-				// Views come from the driver-free leaf package so the root
-				// package does not link the integration's client
-				// (ADR 0026 Option A, ADR 0027 §5).
-				views.Elasticsearch(cfg.histogramBuckets)...,
+			// Every integration's views come from the driver-free internal/views
+			// package, so composing them here does not link gocql, minio-go,
+			// the mongo driver, go-redis, or the go-elasticsearch client into
+			// the root package — and so into every consumer of this SDK
+			// (ADR 0026 Option A, ADR 0027 §5). Each integration re-exports its
+			// function as the public MetricViews for services that build their
+			// own MeterProvider.
+			ExtraViews: slices.Concat(
+				views.Cassandra(cfg.histogramBuckets),
+				views.Elasticsearch(cfg.histogramBuckets),
+				views.Minio(cfg.histogramBuckets),
+				views.Mongo(cfg.histogramBuckets),
+				views.Redis(cfg.histogramBuckets),
 			),
 			MaxUniqueRoutes:         cfg.maxUniqueRoutes,
 			MaxUniqueCollections:    cfg.maxUniqueCollections,
