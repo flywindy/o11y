@@ -1,106 +1,27 @@
 package cassandra
 
 import (
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/sdk/instrumentation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
-	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
+
+	"github.com/flywindy/o11y/internal/views"
 )
 
 // MetricViews returns the metric views required to keep Cassandra metric labels
-// aligned with the SDK's semantic-convention and cardinality contract.
+// aligned with the SDK's semantic-convention and cardinality contract: the SDK
+// histogram buckets for db.client.operation.duration and
+// db.client.connection.create_time, and allow-keys filters bounding those and
+// the two SDK-owned attempt counters (ADR 0019 §7). Each view is scoped to this
+// package's instrumentation scope so it never matches another integration's
+// identically named instrument.
 //
-// histogramBuckets are applied to db.client.operation.duration and
-// db.client.connection.create_time so Cassandra latency buckets follow the
-// SDK's configured WithHistogramBuckets policy (matching the HTTP, MongoDB, and
-// Redis duration histograms).
+// o11y.Init registers these views automatically. Services that build their own
+// MeterProvider must register them via sdkmetric.WithView(MetricViews(...)...)
+// on that provider; a view applies only to the MeterProvider it is registered
+// with.
 //
-// The operation-duration view is scoped to this package's instrumentation so it
-// never matches another integration's db.client.operation.duration instrument
-// (e.g. the Redis or MongoDB wrapper's), which would otherwise produce a
-// duplicate, conflicting stream when several wrappers are active in the same
-// process. An allow-keys filter bounds the label set (ADR 0019 §7).
-//
-// The query-path views allow db.collection.name; it reaches the series only when
-// the observer emits it (on by default, see cassandra.WithCollectionMetricLabel)
-// and a single table was resolved. Its distinct-value count is capped separately
-// at the export boundary by o11y.WithMaxUniqueCollections — an allow-keys filter
-// bounds which keys appear, not how many values a key takes.
+// The definitions live in the driver-free internal/views package so the root
+// o11y package can register them without importing gocql (ADR 0026 Option A);
+// this function is the public re-export.
 func MetricViews(histogramBuckets []float64) []sdkmetric.View {
-	return []sdkmetric.View{
-		sdkmetric.NewView(
-			sdkmetric.Instrument{
-				Name:  "db.client.operation.duration",
-				Scope: instrumentation.Scope{Name: instrumentationName},
-			},
-			sdkmetric.Stream{
-				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
-					Boundaries: histogramBuckets,
-				},
-				AttributeFilter: attribute.NewAllowKeysFilter(
-					semconv.DBSystemNameKey,
-					semconv.DBOperationNameKey,
-					semconv.DBNamespaceKey,
-					semconv.DBCollectionNameKey,
-					semconv.ServerAddressKey,
-					semconv.ServerPortKey,
-					semconv.ErrorTypeKey,
-				),
-			},
-		),
-		sdkmetric.NewView(
-			sdkmetric.Instrument{
-				Name:  "db.client.connection.create_time",
-				Scope: instrumentation.Scope{Name: instrumentationName},
-			},
-			sdkmetric.Stream{
-				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
-					Boundaries: histogramBuckets,
-				},
-				AttributeFilter: attribute.NewAllowKeysFilter(
-					semconv.DBSystemNameKey,
-					semconv.DBClientConnectionPoolNameKey,
-					semconv.ServerAddressKey,
-					semconv.ServerPortKey,
-				),
-			},
-		),
-		// The two SDK-owned attempt counters carry the same bounded label set by
-		// construction (metricAttrs / ObserveConnect), but they get the same
-		// allow-keys backstop view as the histograms so a future stray attribute
-		// cannot leak into them either. No bucket/aggregation override: counters
-		// keep their default sum aggregation.
-		sdkmetric.NewView(
-			sdkmetric.Instrument{
-				Name:  "cassandra.query.attempts",
-				Scope: instrumentation.Scope{Name: instrumentationName},
-			},
-			sdkmetric.Stream{
-				AttributeFilter: attribute.NewAllowKeysFilter(
-					semconv.DBSystemNameKey,
-					semconv.DBOperationNameKey,
-					semconv.DBNamespaceKey,
-					semconv.DBCollectionNameKey,
-					semconv.ServerAddressKey,
-					semconv.ServerPortKey,
-					semconv.ErrorTypeKey,
-				),
-			},
-		),
-		sdkmetric.NewView(
-			sdkmetric.Instrument{
-				Name:  "cassandra.connection.attempts",
-				Scope: instrumentation.Scope{Name: instrumentationName},
-			},
-			sdkmetric.Stream{
-				AttributeFilter: attribute.NewAllowKeysFilter(
-					semconv.DBSystemNameKey,
-					semconv.DBClientConnectionPoolNameKey,
-					semconv.ServerAddressKey,
-					semconv.ServerPortKey,
-					semconv.ErrorTypeKey,
-				),
-			},
-		),
-	}
+	return views.Cassandra(histogramBuckets)
 }
