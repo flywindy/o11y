@@ -110,7 +110,9 @@ The phase-1 per-message disposition contract supports **AckExplicit**
 consumers. AckNone and AckAll need separate semantics: one AckAll call can
 acknowledge multiple messages, so one method call does not prove one message
 settlement. Unsupported policies must be reported at observer setup, without
-changing the native consumer configuration or preventing uninstrumented use.
+changing the native consumer configuration or preventing uninstrumented use —
+except with metrics disabled, where that check does not run (Contract:
+Disabled, section 7).
 
 ### 2. Sourcing evaluation under ADR 0008
 
@@ -166,33 +168,6 @@ already exposes `Info(ctx)` and `CachedInfo()`, and `jetstream.ConsumerInfo`
 carries all three. Any necessary metadata lookup occurs at setup with the
 supplied context, never once per delivery.
 
-`Close` is the release point section 6 requires. Without it an observer
-replaced on a still-open connection keeps its measurement-option cache alive
-for the life of that connection, with nothing left to record into it. It is
-idempotent, ends any loop the observer still has open (so a released
-observer cannot strand a `+1` in the loop count), and after
-it returns the observer records nothing. It takes a context because it
-records: manufacturing a `context.Background()` inside a lifecycle method
-would drop the caller's trace and exemplar, and every other method here
-propagates one.
-
-**`Close` releases memory, not admission.** It drops the observer's cached
-measurement options — nothing else. The per-connection registry keeps both the
-admitted identity tuple *and* its canonical vocabulary for the life of the
-connection, which it has to: section 6 makes a replacement observer for an
-already-admitted tuple reuse that frozen vocabulary and rejects an
-incompatible one, and a registry that forgot the vocabulary on close would
-have nothing left to compare against. Returning the
-budget on close would be unsound rather than merely generous: the
-MeterProvider's cumulative sum and histogram aggregators keep every attribute
-set ever recorded, and nothing in `Close` can retract them. A connection that
-cycled observers across changing stream or durable names would then admit far
-more than the section 6 ceiling over its lifetime, retain and export all of
-those series, and eventually push the identities still in use into
-`otel.metric.overflow` — the stated per-connection bound quietly stops being a
-bound. Admission is therefore a property of the connection; `Close` only stops
-the observer growing the recorder's own caches.
-
 **Why it hangs off `Conn` and not off `Consumer`.** Two constraints meet here
 and only one shape satisfies both.
 
@@ -234,59 +209,156 @@ identity; observation does not detach, cancel, or replace its lifetime.
 The returned application error is returned unchanged. The SDK never chooses
 Ack, Nak, Term, a retry, or a business result based on that error.
 
-That inertness is the callback signature's one ergonomic trap, and it must be
-closed in the API rather than left to the migration. A handler that returns
-`error` reads, to every Go programmer, as a handler whose error the caller
-acts on — and here the caller records a label and nothing else. Fifteen
-services convert to this signature at once; each conversion is one plausible
-misreading away from a message that is silently never settled because its
-author assumed a returned error would Nak. Name the parameter for what it is
-in the doc comment and the examples (the observed error, used only to derive
-`error.type`), and state on the type that returning non-nil settles nothing.
-A callback that returns without a successful terminal method still records a
-disposition under section 4's precedence — `handler_aborted` if it unwound
-abnormally, `handler_cancelled` if its context was already done, and
-`left_pending` in the ordinary case of a normal return on a live context.
-`left_pending` is therefore the arm the trap lands on, and querying it is what
-proves the trap was hit, so the guard is a signal rather than only a
-convention.
+That inertness is the signature's one ergonomic trap: a handler returning
+`error` reads as one whose error the caller acts on, and here the caller only
+derives a label from it. The doc comment and the worked example must name it
+for what it is, and the type must state that returning non-nil settles
+nothing — the example settles explicitly before returning for exactly this
+reason. Such a callback records `left_pending` under section 4's precedence,
+which is an **investigation signal, not proof of a defect**: a handler
+deliberately leaving a message to AckWait redelivery is a legitimate pattern
+landing in the same state.
 
 For an existing callback with no error result, an adapter can call it and
 return nil. That reports only the errors the adapter exposes; it does not
 discover swallowed failures. `MarkTerminalFailure` is the explicit way for
 such code to report the narrower fact that it has abandoned work.
 
-**Liveness is carried by a loop handle, not by the observer**, because a loop
-is what starts and stops. `StartLoop` returns one and adds 1 to the active
-count; `End` is idempotent, subtracts it, and records a receive error when the
-error it is handed is not a normal ending (section 5). An observer running two
-delivery loops therefore reads 2, and one of them ending does not zero the
-other.
+#### Contract: Loop
 
-`End` is the only way the SDK learns a loop is over. It never infers that from
-an error, which is what keeps section 5's classification out of the business
-of deciding whether consumption stopped — and removes the ordering hazard of
-an asynchronous failure arriving before a separate "started" call.
+This is the authoritative statement of loop liveness. Other sections reference
+it and must not restate it.
 
-All six facade delivery paths use the same **observation** contract:
-`Consume`, `Messages`, `Next`, `Fetch`, `FetchBytes`, and `FetchNoWait`. That
-uniformity is about `Observe` and the disposition semantics below; where each
-mode's ending comes from is section 5. Applications invoke `Observe` inside
-their actual worker. A synchronous
-`Consume` callback can invoke it directly. A callback that dispatches work
-must put it inside the dispatched worker, after admission. Examples must
-show both cases without wrapping the same invocation twice.
+- **A loop handle is the unit of liveness.** `StartLoop` returns one and adds
+  `+1`; `End` is idempotent and subtracts that `+1`. Two loops on one observer
+  read 2, and ending one leaves the other counted.
+- **Every handle from one observer carries the same labels**, because labels
+  come from the bound consumer. The gauge counts loops, it does not
+  distinguish them.
+- **The handle spans the application's loop, not one delivery call.** A worker
+  that repeatedly calls `Fetch` holds one handle across all of its batches: an
+  ordinary finite batch closing its channel is not an ending. Ending a handle
+  per batch would drop the gauge to zero between pulls and fire the `< 1`
+  liveness alert on a healthy worker.
+- **`End` is the only way the SDK learns a loop is over.** It never infers that
+  from an error, which is what keeps error classification out of the business
+  of deciding whether consumption stopped, and removes any ordering hazard
+  between an asynchronous failure and a separate "started" call.
+- **A handle never ended leaks its `+1` until the observer closes.** `Close`
+  ends every handle the observer still holds, as a normal ending with no
+  failure sample — the observer cannot know why a loop the application forgot
+  was abandoned.
 
-Calling a delivery API alone does not automatically measure application
-processing. The SDK must not finalize a previous message when the next one
-is fetched, a batch channel closes, an iterator stops, or a consume handle
-drains. None of those events proves that the previous worker has returned.
+#### Contract: Observer Close
+
+This is the authoritative statement of `Close`. Section 6 references it.
+
+- Idempotent; after it returns the observer records nothing, and later calls on
+  it are no-ops rather than errors.
+- Ends every loop handle the observer still holds (see the Loop contract).
+- Does **not** wait for in-flight `Observe` calls. An `Observe` already running
+  completes and records normally; the application owns that ordering, which is
+  the same division the rest of this ADR draws.
+- Releases **observer-local measurement-option caches only**. The
+  per-connection registry keeps the admitted identity tuple and its canonical
+  vocabulary for the life of the connection, because section 6 has a
+  replacement observer reuse that frozen vocabulary and reject an incompatible
+  one. Admission is never returned: the MeterProvider's cumulative aggregators
+  retain every attribute set ever recorded and nothing in `Close` can retract
+  them, so returning the budget would let a connection cycling observers admit
+  past the section 6 ceiling while its old series stay exported.
+- Takes a context because it records.
+
+All six delivery paths — `Consume`, `Messages`, `Next`, `Fetch`, `FetchBytes`,
+`FetchNoWait` — share this `Observe` contract; where each mode's *ending* comes
+from is section 5. `Observe` goes inside the actual worker, after admission,
+as the worked example shows.
+
+Calling a delivery API alone measures nothing. The SDK must not finalize a
+previous message when the next one is fetched, a batch channel closes, an
+iterator stops, or a consume handle drains — none of those proves the previous
+worker returned.
 
 An observed callback must finish using the tracked message before returning.
 For work that outlives it, the application places `Observe` around that work
 instead. Process termination can prevent any completion sample from being
 recorded or exported; this is in-process instrumentation, not a durable
 exactly-once ledger.
+
+#### Worked example: the ordering the contracts require
+
+The contracts above are about ordering, so one example is worth more than the
+prose it replaces. This is a bounded-concurrency batch worker — the shape all
+five newchat consumers use — showing admission, `Observe`, the loop boundary
+and shutdown in the order the contracts demand.
+
+```go
+obs, err := conn.ConsumerObserver(ctx, cons, o11ynats.ConsumerMetricsConfig{
+    Site:       cfg.SiteID,
+    EventTypes: []string{"created", "updated", "deleted"},
+})
+if err != nil {
+    return err
+}
+defer obs.Close(context.WithoutCancel(ctx)) // ends any loop still open
+
+loop := obs.StartLoop(ctx) // ONE handle for the whole worker, not per batch
+sem := make(chan struct{}, cfg.MaxWorkers)
+var wg sync.WaitGroup
+
+for {
+    batch, err := cons.Fetch(ctx, cfg.BatchSize)
+    if err != nil { // setup failed: this loop is over
+        loop.End(ctx, err)
+        break
+    }
+
+    for msg := range batch.Messages() {
+        sem <- struct{}{} // admission FIRST — the timer must not include this wait
+        wg.Add(1)
+        go func(msg jetstream.Msg) {
+            defer func() { <-sem; wg.Done() }()
+
+            // Observe wraps the real work, inside the worker, after admission.
+            _ = obs.Observe(ctx, msg, classify(msg),
+                func(ctx context.Context, msg jetstream.Msg) error {
+                    if err := handle(ctx, msg); err != nil {
+                        if permanent(err) {
+                            o11ynats.MarkTerminalFailure(ctx, o11ynats.TerminalPermanent)
+                            return msg.Term() // settle before returning
+                        }
+                        return msg.NakWithDelay(backoff())
+                    }
+                    return msg.Ack()
+                })
+        }(msg)
+    }
+
+    // Read the batch error on the OUTER loop. An ordinary finite batch closing
+    // its channel is not an ending; only a non-nil error is.
+    if err := batch.Error(); err != nil {
+        loop.End(ctx, err)
+        break
+    }
+    if ctx.Err() != nil { // normal shutdown: ends the loop, records no failure
+        loop.End(ctx, ctx.Err())
+        break
+    }
+}
+
+wg.Wait() // in-flight Observe calls finish and record; Close does not wait for them
+```
+
+Four things this pins that prose kept getting wrong:
+
+1. `StartLoop` is outside the `for`. Inside it, the gauge would drop to zero
+   between batches and fire the `< 1` liveness alert on a healthy worker.
+2. `sem <- struct{}{}` precedes `Observe`, so admission wait is outside the
+   timer — the boundary section 4 defines.
+3. `batch.Error()` is read on the outer loop, and only a non-nil value ends
+   the loop.
+4. `wg.Wait()` is the application's, not `Close`'s. `Close` ends loops and
+   releases caches; waiting for in-flight work is the application's ordering.
 
 ### 4. Disposition and failure semantics
 
@@ -377,16 +449,11 @@ instrumentation is deferred as a whole, including its vocabulary.
 | `o11y.nats.consumer.processing.failures` | Int64Counter / `{failure}` | Observed processing invocations explicitly declared terminally unsuccessful by the application. At most one per invocation. |
 | `o11y.nats.consumer.receive.errors` | Int64Counter / `{error}` | Receive-loop failures reported by the application, by bounded cause. One sample per event, never per affected message (section 4). |
 
-Loop state is reported by the application because the application owns the
-loop. It means neither broker connectivity nor end-to-end readiness. The
-application reports stop when it stops accepting work; existing workers can
-finish afterwards. That stop does not classify those workers as canceled.
-Multiple observers with the same labels contribute an active-loop count,
-not a process-wide Boolean. A disappeared process produces missing/stale
-telemetry, not a guaranteed final zero.
-
-`End` records at most one receive-error sample and always returns the loop's
-`+1`. The caller knows the loop is over; the SDK only labels why.
+Loop boundaries are the Loop contract's (section 3); this section covers only
+what `End` records. It emits at most one receive-error sample. The `loops`
+gauge means neither broker connectivity nor end-to-end readiness, and a
+disappeared process produces stale telemetry rather than a guaranteed final
+zero.
 
 **The reason is best effort, and deliberately not a contract.** A nil error,
 `context.Canceled` or `context.DeadlineExceeded` is a normal ending and
@@ -412,18 +479,49 @@ abandoned and so the application declares the reason.
 
 **Where each mode's ending comes from:**
 
-| Mode | The ending |
-|---|---|
-| `Next`, `Messages` | the returned error. A routine `nats.ErrTimeout` from an idle poll is not an ending — the loop continues and `End` is not called |
-| `Fetch`, `FetchBytes`, `FetchNoWait` | `batch.Error()` once the messages channel closes; the direct return covers setup only. Read the facade's `messageBatch.Error()`, which already suppresses the `context.Canceled` an explicit `Stop` produces |
-| `Consume` | the observer's own `Consume` ends the loop when `ConsumeContext.Closed()` closes. No sentinel set is involved: the client closing the subscription *is* the ending, however it decided that |
+| Mode | The ending | Cause available? |
+|---|---|---|
+| `Next`, `Messages` | the returned error; a routine `nats.ErrTimeout` from an idle poll is not an ending, so the loop continues and `End` is not called | yes — the error *is* the ending |
+| `Fetch`, `FetchBytes`, `FetchNoWait` | `batch.Error()` once the messages channel closes, read on the **application's outer loop**, not per batch; the direct return covers setup only. Read the facade's `messageBatch.Error()`, which already suppresses the `context.Canceled` an explicit `Stop` produces | yes |
+| `Consume` | `ConsumeContext.Closed()` | **usually no** — see the contract below |
 
-The `Consume` row is why the observer owns that call. `PullConsumeOpt` declares
-one unexported method, so an opaque option cannot be inspected, and
+#### Contract: Consume ending
+
+This is the authoritative statement for `Consume`. It is deliberately weaker
+than the other two modes, and the weakness is the contract rather than a gap
+to be closed later.
+
+1. **`Closed()` proves this `Consume` ended. It does not prove it failed.**
+   The pinned channel is a bare `<-chan struct{}` and carries no cause.
+2. **The observer retains evidence of an application-initiated stop.** It owns
+   the `ConsumeContext` it returns, so `Stop`/`Drain` called by the
+   application is known. The handle handed to `OnConsumeError` must be the
+   same wrapper — the native `ConsumeErrHandlerFunc` receives a full
+   `ConsumeContext`, so an unwrapped one would let a stop from inside the
+   callback bypass this evidence.
+3. **The last observed error is diagnostic only.** It is never automatically
+   the cause of the closure. The client reports non-terminal errors through
+   the same callback, and stops itself on paths that carry no error at all —
+   `StopAfter` reaching its limit is a normal ending with no application call
+   and no error. Pairing a close with whatever error came before it would
+   report that as a failure.
+4. **An ending without sufficient evidence is unknown, not a failure.** It
+   records no `receive.errors` sample. Unknown endings are not stuffed into a
+   failure count to make the instrument look complete in every mode.
+
+The operational consequence, which Q4 must be decided on: in `Consume` mode
+`o11y.nats.consumer.receive.errors` will usually record **nothing**, even when
+consumption genuinely broke. The authoritative signal that consumption stopped
+in that mode is the `loops` gauge falling without an application-initiated
+stop — which the liveness expressions in the migration section already cover.
+Do not read the absence of receive-error samples as evidence that a `Consume`
+loop is healthy.
+
+The observer owns the `Consume` call for a second reason too: the handler
+cannot be composed through options. `PullConsumeOpt` declares one unexported
+method, so an opaque option cannot be inspected, and
 `ConsumeErrHandler.configureConsume` is a plain assignment — options do not
-merge, and no ordering preserves both the SDK's handler and the caller's. So
-`Consume` runs through the observer, which watches `Closed()` for the ending
-and forwards every error the client reports to `OnConsumeError`:
+merge, and no ordering preserves both the SDK's handler and the caller's.
 
 ```go
 // ConsumerMetricsConfig gains:
@@ -510,6 +608,29 @@ operation duration are outside this phase. Do not rename dispositions to
 `messaging.client.sent.messages`. No complete delivery-rate or publish-rate
 denominator is provided by this proposal.
 
+#### What this does not measure, and where that evidence lives
+
+These five instruments answer "is processing working". They are half of a
+consumer's operational picture, and the ADR states the other half rather than
+leaving an operator to discover it during an incident. Nothing here proposes
+moving broker monitoring into the SDK.
+
+| Question | Evidence | Blind spot |
+|---|---|---|
+| Is the loop alive? | `o11y.nats.consumer.loops` (+ `absent()` / `up == 0`) | A `Consume` loop that ended without an application stop shows here and usually *only* here |
+| Are messages being settled, and how? | `o11y.nats.consumer.dispositions` by disposition | Counts attempts, not distinct messages |
+| How long does processing take? | `messaging.process.duration` | Excludes queue and admission wait, by design |
+| Did the application abandon work? | `o11y.nats.consumer.processing.failures` | Only what the application declares |
+| Did receiving break? | `o11y.nats.consumer.receive.errors` | Usually silent under `Consume` (Contract: Consume ending) |
+| **Am I falling behind?** | **Broker exporter** — JetStream consumer pending and redelivered gauges | Not emitted by this layer at all |
+| **Is a message stuck in redelivery?** | **Broker exporter**, cross-checked with `dispositions{disposition="nak"}` | The disposition counter counts attempts; it cannot say how many distinct messages are stuck |
+| **Is the worker pool saturated?** | **Not measured.** Scheduling belongs to the application (section 1), so neither this layer nor the broker sees it | Inferable from rising duration against a flat disposition rate, which is an inference, not a signal |
+
+The first five rows are this ADR. The last three are why an operator must not
+read this set as the whole picture: a falling `dispositions` rate means
+"nothing arriving" or "50k pending", and only the broker exporter can tell
+those apart.
+
 ### 6. Attributes, cardinality, and cache limits
 
 The following mapping is an **SDK-proposed JetStream mapping**, not a claim
@@ -555,10 +676,9 @@ Required bounds:
    dispositions, error classes, and failure reasons.
 3. Bound admitted `(site, stream, durable)` tuples per connection and reuse
    their immutable label configuration. Do not intern arbitrary names from
-   message metadata into a process-global map. Configuration lifetime is the
-   observer's, and `ConsumerObserver.Close` (section 3) is the release point;
-   an observer that is never closed holds its entry until the connection goes.
-   Repeated setup for the same tuple reuses its frozen vocabulary; incompatible
+   message metadata into a process-global map. Admission and the frozen
+   vocabulary last for the connection; `Close` releases observer-local caches
+   only (Contract: Observer Close, section 3). Repeated setup for the same tuple reuses its frozen vocabulary; incompatible
    vocabulary for that tuple is a setup error, not a growing union of values.
 4. Proposed defaults are 16 configured event values per identity and 16
    distinct identities per connection. Including `unknown`, the largest
@@ -622,12 +742,28 @@ give a leaf integration access to an SDK instance's FeatureToggles. Do not
 discover enablement through globals, another environment-variable precedence
 chain, or type assertions against a particular no-op provider.
 
-When disabled, keep a valid observer whose loop-state contract still works
-but skip metric registration, measurement option caches, timers, and
-metrics-only message wrapping. Invoke the handler with the original message
-and context. Do not remove application metadata used for retry decisions,
-change context lifetime, or change native method behavior. Moving any
-retry-related context helper must be tested independently of enablement.
+#### Contract: Disabled
+
+This is the authoritative statement of disabled mode. Section 1 references it.
+
+- **Still runs:** configuration validation that would be wrong under any
+  setting — a malformed event allowlist, an oversized configuration, an
+  identity that cannot be resolved from the consumer. These are programming
+  errors, and hiding them behind a toggle would make the toggle change which
+  bugs are reachable.
+- **Skipped:** metric registration, measurement-option caches, timers, and
+  metrics-only message wrapping.
+- **Skipped, and this is the precedence rule:** validation that exists only
+  because metrics exist. **Unsupported acknowledgment policies are the case
+  this decides** — section 1 requires `AckNone`/`AckAll` to be rejected at
+  observer setup, but that rejection exists solely because per-message
+  disposition cannot be recorded for them. With metrics disabled there is
+  nothing to record, so turning observability off must not fail a startup that
+  would otherwise succeed. Disabled mode therefore skips it.
+- **Guaranteed either way:** the handler is invoked with the original message
+  and context; application metadata used for retry decisions stays available;
+  context lifetime and native method behavior are unchanged. Moving any
+  retry-related context helper must be tested independently of enablement.
 
 The benefit is avoiding the whole recorder path. Do not state that every
 no-op `Add` inherently allocates: pinned OTel no-op method bodies are empty;
@@ -728,6 +864,27 @@ Inline `site`, `stream`, `consumer`, `event_type`, `outcome`, and `reason`
 map to the scoped/standard attributes in section 6. The processing histogram
 does not retain an outcome label. Operator queries must be reviewed against
 these mappings, not transformed by a prefix replacement alone.
+
+**Phase-1 inventory, counted at the evidence baseline.** Three numbers, because
+they are different sizes and the ADR previously quoted only the largest:
+
+| | Count |
+|---|---|
+| Services with a consumer to migrate | **5** — `message-gatekeeper`, `broadcast-worker`, `message-worker`, `notification-worker`, `room-worker` |
+| Consumer registrations (`ConsumerConfig` sites) | **5** |
+| Shared entry points to modify | **1** — `pkg/natsmetrics/loop.go`, which all five already go through |
+
+The "fifteen services" figure quoted elsewhere in earlier drafts is the whole
+`pkg/natsmetrics` import surface, which includes the publish and RPC recorders
+this phase defers. The shared loop is what makes the migration small: the
+observer calls land in one helper rather than in five hand-written loops.
+
+That lowers the **cost**; it is not what makes the SDK/application split
+correct. The split rests on which side can see what — the SDK holds the
+`jetstream.Msg` interface and its own pinned error surface, the application
+holds business failure, event vocabulary and scheduling — and that argument
+does not change with the number of call sites. A larger N would make this
+migration more expensive without making the boundary wrong.
 
 Implement SDK behavior first with characterization tests, then migrate AP
 call sites in a separate change. Keep scheduling, retry policy, panic guards,
@@ -851,8 +1008,14 @@ Required behavior tests, with a ManualReader and native-message fakes:
 3. Ack/DoubleAck failure followed by success; repeated terminal calls; Term
    failure; handler error without disposition; cancellation; abnormal unwind;
    Ack followed by panic; concurrent state access under `-race`.
-4. Drain stops admission while already admitted handlers finish successfully;
-   iterator/batch closure does not finalize those handlers. An abandoned
+4. Shutdown ordering, stated per mode because `Drain` means different things.
+   Native `ConsumeContext.Drain` (the `Consume` mode only) stops admission
+   while already-admitted deliveries finish; it does **not** wait for
+   goroutines the callback dispatched, which is the application's `wg.Wait()`
+   in the worked example. For `Messages`, `Next` and the batch modes there is
+   no native drain at all — the application stops fetching. In every mode,
+   iterator or batch closure does not finalize handlers, `Close` does not wait
+   for in-flight `Observe` calls (Contract: Observer Close), and an abandoned
    unobserved message produces no fabricated completion sample.
 5. Terminal declarations deduplicate; classifications are not inferred from
    Ack-drop, Term, delivery count alone, or a loop failure. AckNone/AckAll are
@@ -882,11 +1045,23 @@ Required behavior tests, with a ManualReader and native-message fakes:
     context that outlives a cancelled registration context, and a
     `jetstream.ConsumeErrHandler` passed in `opts` does not suppress the
     observer's own recording.
-12. `Close` is idempotent, ends any loop still open,
-    records nothing afterwards, and leaves the identity admitted and its
-    vocabulary intact — a replacement observer for a closed tuple still gets
-    the frozen vocabulary and still rejects an incompatible one, and cycling
-    observers does not raise the admitted-identity count.
+12. The Loop and Observer Close contracts, with their counter-examples: one
+    handle survives many batches and the gauge does not dip between them; two
+    loops on one observer read 2; a handle never ended is closed by `Close` as
+    a normal ending with no failure sample; `Close` is idempotent, records
+    nothing afterwards, leaves the identity admitted and its vocabulary intact
+    so a replacement still gets the frozen vocabulary and still rejects an
+    incompatible one, and cycling observers does not raise the
+    admitted-identity count.
+13. The Consume ending contract's four rules, each with its counter-example:
+    an application `Stop` records no failure; a `StopAfter` limit reached
+    after an earlier recoverable error records **no** failure, and in
+    particular not that error; a stop called from inside `OnConsumeError`
+    still counts as application-initiated; and a close with no evidence
+    records nothing rather than a synthetic reason.
+14. The Disabled contract: an `AckNone` consumer constructs successfully with
+    metrics off and fails setup with metrics on, while a malformed event
+    allowlist fails in both.
 
 Before an implementation commit, run repository-required formatting/tidy,
 ADR gate, lint/vet, normal tests, and race tests. Benchmark raw handling,
@@ -899,7 +1074,9 @@ it does not claim those implementation gates have passed.
 ## Deferred work and triggers
 
 - **Publish failures and publisher vocabulary:** migrate together when the
-  bounded destination/operation contract and readers are agreed. A failures-
+  bounded destination/operation contract and readers are agreed. That trigger
+  needs a named owner at acceptance; without one the phase-1 duplication below
+  has no one to end it. A failures-
   only counter has no acceptance denominator. Stream depth is not cumulative
   accepted publishes; Core NATS local publish success is not delivery. Keep
   newchat's documented blind spots explicit [S6].
@@ -938,7 +1115,7 @@ of `pkg/natsmetrics`.
 | Q1 | May processing observation require an explicit synchronous wrapper inside the actual worker? | Yes. Keep dispatch/lifetime control in AP code and avoid implicit completion guesses. |
 | Q2 | Preserve newchat's first-disposition timing or adopt full processing timing and completion-time disposition? | Adopt the definitions above; treat the migration as a semantic change. If preservation wins, use a custom duration name and revise the table before acceptance. |
 | Q3 | Are the consumer-only scope, 16-event/16-identity default limits, stream/subscription mapping, and endpoint-label omission acceptable for the first release? | Start with this bounded profile, validate it against real consumer inventories, and explicitly record the limitations. Do not raise limits without recalculating fleet/histogram cost. |
-| Q4 | Is a five-instrument consumer migration acceptable while publisher/RPC stay in newchat? | Yes. The fifth (receive errors) is not scope growth — it preserves a signal newchat emits and reads today, which four would have dropped. Publisher and RPC keep their vocabulary and cost decisions together in later work. |
+| Q4 | Is the consumer migration acceptable given the failure signal it actually preserves, while publisher/RPC stay in newchat? | Qualified yes. Five instruments, but decide on what they carry, not that they exist: `receive.errors` is strong for `Next`/`Messages`/batch and **usually records nothing under `Consume`**, where the ending is authoritative but its cause is not (Contract: Consume ending, section 5). If that degradation is unacceptable, the honest alternative is to declare `receive.errors` unsupported for `Consume` rather than to fill it with unknown endings. |
 
 ### Q2 in detail: what each answer costs
 
@@ -959,8 +1136,9 @@ any single element — is what makes the migration unmechanical:
 The asymmetry is that preservation is cheap exactly once and then permanent:
 keeping first-disposition timing forecloses the standard instrument name for
 the life of the integration, because the convention defines that instrument as
-the full processing operation. Adopting costs one reviewed migration of four
-families across fifteen services, four documents and one dashboard.
+the full processing operation. Adopting costs one reviewed migration, whose
+real size is in the inventory below rather than the whole `pkg/natsmetrics`
+surface.
 
 This draft recommends adopting. The recommendation is not free and should not
 be accepted as though it were: whoever accepts Q2 is accepting that the
