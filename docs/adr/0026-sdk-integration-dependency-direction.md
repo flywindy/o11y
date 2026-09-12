@@ -1,7 +1,8 @@
 # ADR 0026 — SDK ↔ Integration Dependency Direction
 
-**Status**: Proposed (decision required — see §Open decision)
-**Date**: 2026-08-15
+**Status**: Accepted (Option A) — 2026-09-11. Option B is **not** adopted and
+remains open; see §Decision.
+**Date**: 2026-08-15 (proposed), 2026-09-11 (accepted)
 **Relates to**: ADR 0002 (metrics strategy — the views this ADR is about exist
 to enforce its cardinality contract), ADR 0003 (global-state policy — why the
 SDK composes providers explicitly rather than reading globals), ADR 0008
@@ -12,6 +13,9 @@ integrations whose `MetricViews` the root package imports)
 ---
 
 ## Context
+
+*Describes the state at the time this ADR was proposed. The coupling below has
+since been removed — see §Decision.*
 
 `o11y.Init` imports four integration packages — `cassandra`, `minio`, `mongo`,
 `redis` — for one purpose: to collect their `MetricViews(...)` and pass them
@@ -236,18 +240,65 @@ must put their view definitions in the leaf package; this belongs in the ADR
 
 ---
 
-## Open decision
+## Decision
 
-1. **A or B?** This turns on whether consumer-controlled driver versions matter.
-   A does not provide them; only B does. If they do not matter, A is the cheap
-   and reversible answer. If they do — or if the team already intends to split
-   modules for release-cadence reasons — the disruption is better spent once, on B.
-2. **Where do the leaf packages live?** `internal/views` (one package, four
-   functions — simplest, but "internal" understates that these definitions are
-   the substance of a public API) or `<integration>/views` per package (more
-   files, keeps each integration's views beside it). Leaning `internal/views`;
-   the public surface stays the existing `MetricViews` re-exports either way.
-3. **Should the ADR 0008 checklist gain a "view definitions live in the leaf
-   package" item**, enforced by `scripts/check_integrations.go`? Leaning yes —
-   the gate already parses integration packages, and an unenforced convention
-   is how the current edge accumulated.
+**Option A, adopted 2026-09-11.** Every integration's view definitions live in
+the driver-free `internal/views` package; each integration keeps `MetricViews`
+as a one-line re-export, so no consumer changes a line. `scripts/check_integrations.go`
+enforces it via `go list -deps` on the root package, which asserts against the
+build graph rather than against source imports and so cannot be worked around by
+an indirect import.
+
+Measured on the root package after the migration: transitive dependencies
+**590 → 457**, and gocql, minio-go, mongo-driver and go-redis all at **0**
+linked packages (they were 4, 14, 49 and 9).
+
+**Option B is not adopted and is not foreclosed.** It remains the only way to
+give consumers control of their own driver versions, and the only way to
+decouple release cadence. Two things bound how urgent it is:
+
+- MVS only raises versions, never lowers them. A service that needs a driver
+  *newer* than the SDK's already gets it today. B changes only the case where a
+  service needs an *older* one — which no service has yet asked for.
+- The leaf packages A creates are exactly what B needs, so A is a strict prefix
+  of B rather than a detour. An earlier draft of this ADR warned that taking A
+  first would "pay the disruption twice"; that was wrong and is withdrawn. A is
+  non-breaking, so consumers pay nothing for it, and B's own consumer cost is one
+  `require` line that `go mod tidy` adds automatically. B's real cost is
+  maintainer-side release engineering, and that cost is the same whenever it is
+  paid.
+
+**Revisit B when** a service is actually blocked by the SDK's driver version, or
+when releasing everything together to ship one integration's fix becomes a real
+drag on cadence. Neither has happened yet.
+
+### How the two subsidiary questions were settled
+
+They were answered in practice before this ADR was formally accepted, by
+ADR 0027's elasticsearch work:
+
+1. **Where do the leaf packages live?** `internal/views` — one package, one file
+   per integration. The public surface stays each integration's existing
+   `MetricViews` re-export, so "internal" describes where the definitions sit,
+   not how reachable they are.
+2. **Should the convention be enforced?** Yes, and it already is:
+   `checkRootDoesNotLinkDrivers` in `scripts/check_integrations.go` fails the
+   build if a driver module prefix appears in the root package's dependency
+   graph. Elasticsearch was the first integration held to it; the other four
+   joined on adoption of this ADR. An unenforced convention is how the original
+   edge accumulated, which is the argument for the gate.
+
+### Notes for the next integration
+
+- Put the view definition in `internal/views/<integration>.go` and make
+  `<integration>/views.go` a one-line re-export.
+- Define the instrumentation scope as `views.<Integration>Scope` and alias the
+  integration package's `instrumentationName` to it, so the scope recorded under
+  and the scope matched against are one constant.
+- Add the driver's module prefix to `rootForbiddenDepPrefixes`.
+- If a view must name a constant owned by an upstream instrumentation package
+  whose import would link the driver, copy the literal into `internal/views` and
+  add an equality assertion test in the integration package, which already
+  imports it — see `mongo.TestMongoContribScopeMatchesUpstream`. A silently
+  detached view is the failure mode being guarded against: the instrument keeps
+  emitting, just with default boundaries and an unbounded label set.

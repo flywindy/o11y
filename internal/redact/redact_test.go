@@ -43,6 +43,11 @@ func TestURL(t *testing.T) {
 // TestURLNeverLeaksThePassword is the property that matters for URL: whatever
 // shape the endpoint takes, the secret must not survive into the logged string.
 func TestURLNeverLeaksThePassword(t *testing.T) {
+	// Fixture credential asserted absent from redact.URL's output below, not a
+	// live credential. Both ids are named because each scanner matches only
+	// its own: gosec.G101-1 is the registry rule an external scan reports,
+	// hardcoded-credential-literal is this repo's own.
+	// nosemgrep: gosec.G101-1, hardcoded-credential-literal
 	const secret = "sup3r-s3cret-token"
 	for _, raw := range []string{
 		"http://user:" + secret + "@pyroscope:4040",
@@ -64,6 +69,12 @@ func TestURLNeverLeaksThePassword(t *testing.T) {
 // net/url renders a parse failure as `parse "<raw>": …`, and Pyroscope's client
 // returns that error verbatim.
 func TestInText(t *testing.T) {
+	// Fixture credential embedded in a malformed URL, not a live one. gosec
+	// reports this shape (password-in-URL) even though its entropy filter
+	// misses the bare `const secret` above, so this line needs the gosec
+	// directive the other does not.
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: gosec.G101-1
 	const endpoint = "http://user:s3cret%zz@pyroscope:4040"
 	// The shape net/url actually produces, confirmed against the stdlib.
 	text := `parse "` + endpoint + `": invalid URL escape "%zz"`
@@ -80,6 +91,8 @@ func TestInText(t *testing.T) {
 // endpoint quoted in the error can be one the SDK never configured.
 func TestInTextRedactsEndpointsItWasNotToldAbout(t *testing.T) {
 	const configured = "http://alloy.infra.svc.cluster.local:4040"
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: gosec.G101-1
 	const override = "http://user:s3cret%zz@adhoc-host:4040"
 	text := `parse "` + override + `": invalid URL escape "%zz"`
 
@@ -94,6 +107,9 @@ func TestInTextRedactsEndpointsItWasNotToldAbout(t *testing.T) {
 // rounds found slipping past pattern matching. None of them is handled by a
 // dedicated pattern; all are caught by the closing rule that no "@" may survive.
 func TestInTextClosesTheShapesPatternsMiss(t *testing.T) {
+	// Fixture credential asserted absent from redact.InText's output below, not
+	// a live credential.
+	// nosemgrep: gosec.G101-1, hardcoded-credential-literal
 	const secret = "s3cret"
 	tests := []struct {
 		name string

@@ -1,112 +1,27 @@
 package mongo
 
 import (
-	otelmongo "go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/v2/mongo/otelmongo"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/sdk/instrumentation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
-	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
+
+	"github.com/flywindy/o11y/internal/views"
 )
 
 // MetricViews returns the metric views required to keep MongoDB metric labels
-// aligned with the SDK's semantic-convention and cardinality contract.
+// aligned with the SDK's semantic-convention and cardinality contract: the SDK
+// histogram buckets for otelmongo's db.client.operation.duration and this
+// package's db.client.connection.create_time, allow-keys filters bounding the
+// pool label sets, and drop views for the pool instruments the SDK does not
+// publish. Each view is scoped to the instrumentation that emits the
+// instrument, so it never matches another integration's identically named one.
 //
-// histogramBuckets are applied to db.client.operation.duration so MongoDB
-// latency buckets follow the SDK's configured WithHistogramBuckets policy
-// (matching the HTTP and Redis duration histograms) instead of the contrib
-// instrument's baked-in boundaries.
+// o11y.Init registers these views automatically. Services that build their own
+// MeterProvider must register them via sdkmetric.WithView(MetricViews(...)...)
+// on that provider; a view applies only to the MeterProvider it is registered
+// with.
 //
-// The view is scoped to the otelmongo instrumentation that emits the metric so
-// it never matches another integration's db.client.operation.duration
-// instrument (e.g. the Redis wrapper's), which would otherwise produce a
-// duplicate, conflicting stream when both wrappers are active in the same
-// process.
+// The definitions live in the driver-free internal/views package so the root
+// o11y package can register them without importing the mongo driver
+// (ADR 0026 Option A); this function is the public re-export.
 func MetricViews(histogramBuckets []float64) []sdkmetric.View {
-	views := []sdkmetric.View{
-		sdkmetric.NewView(
-			sdkmetric.Instrument{
-				Name:  "db.client.operation.duration",
-				Scope: instrumentation.Scope{Name: otelmongo.ScopeName},
-			},
-			sdkmetric.Stream{
-				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
-					Boundaries: histogramBuckets,
-				},
-				AttributeFilter: attribute.NewAllowKeysFilter(
-					semconv.DBSystemNameKey,
-					semconv.DBOperationNameKey,
-					semconv.NetworkPeerAddressKey,
-					semconv.NetworkPeerPortKey,
-					semconv.ErrorTypeKey,
-				),
-			},
-		),
-	}
-
-	poolAttrs := attribute.NewAllowKeysFilter(
-		semconv.DBSystemNameKey,
-		semconv.DBClientConnectionPoolNameKey,
-		semconv.ServerAddressKey,
-		semconv.ServerPortKey,
-	)
-	views = append(views,
-		sdkmetric.NewView(
-			sdkmetric.Instrument{
-				Name:  "db.client.connection.count",
-				Scope: instrumentation.Scope{Name: instrumentationName},
-			},
-			sdkmetric.Stream{
-				AttributeFilter: attribute.NewAllowKeysFilter(
-					semconv.DBSystemNameKey,
-					semconv.DBClientConnectionPoolNameKey,
-					semconv.DBClientConnectionStateKey,
-					semconv.ServerAddressKey,
-					semconv.ServerPortKey,
-				),
-			},
-		),
-		sdkmetric.NewView(
-			sdkmetric.Instrument{
-				Name:  "db.client.connection.create_time",
-				Scope: instrumentation.Scope{Name: instrumentationName},
-			},
-			sdkmetric.Stream{
-				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
-					Boundaries: histogramBuckets,
-				},
-				AttributeFilter: poolAttrs,
-			},
-		),
-	)
-
-	for _, name := range []string{
-		"db.client.connection.idle.min",
-		"db.client.connection.max",
-		"db.client.connection.pending_requests",
-		"db.client.connection.timeouts",
-	} {
-		views = append(views, sdkmetric.NewView(
-			sdkmetric.Instrument{
-				Name:  name,
-				Scope: instrumentation.Scope{Name: instrumentationName},
-			},
-			sdkmetric.Stream{AttributeFilter: poolAttrs},
-		))
-	}
-
-	for _, name := range []string{
-		"db.client.connection.idle.max",
-		"db.client.connection.use_time",
-		"db.client.connection.wait_time",
-	} {
-		views = append(views, sdkmetric.NewView(
-			sdkmetric.Instrument{
-				Name:  name,
-				Scope: instrumentation.Scope{Name: instrumentationName},
-			},
-			sdkmetric.Stream{Aggregation: sdkmetric.AggregationDrop{}},
-		))
-	}
-
-	return views
+	return views.Mongo(histogramBuckets)
 }

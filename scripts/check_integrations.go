@@ -271,11 +271,15 @@ func shouldSkipDir(name string) bool {
 // link. The root package composes every integration's metric views into
 // o11y.Init; a view that lives beside its driver would make that driver a
 // compile-time dependency of every consumer of the root package, even one that
-// never uses the integration (ADR 0026 Option A). Elasticsearch is the first
-// integration held to this: its view lives in the driver-free internal/views
-// package (ADR 0027 §5), and this check keeps it that way.
+// never uses the integration (ADR 0026 Option A). Every integration's views
+// live in the driver-free internal/views package, and this check keeps them
+// there — an unenforced convention is how the original coupling accumulated.
 var rootForbiddenDepPrefixes = []string{
 	"github.com/elastic/",
+	"github.com/gocql/",
+	"github.com/minio/",
+	"github.com/redis/",
+	"go.mongodb.org/",
 }
 
 // checkRootDoesNotLinkDrivers asserts, via the build graph rather than source

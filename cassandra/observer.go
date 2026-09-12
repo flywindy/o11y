@@ -12,9 +12,15 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/flywindy/o11y/internal/views"
 )
 
-const instrumentationName = "github.com/flywindy/o11y/cassandra"
+// instrumentationName aliases the scope constant in internal/views so the scope
+// this package records under and the scope its views match cannot drift; the
+// constant lives there because the root package must name it without linking
+// gocql (ADR 0026 Option A).
+const instrumentationName = views.CassandraScope
 
 // attemptKey records the driver-side attempt index on a per-attempt span. gocql
 // fires ObserveQuery once per attempt (and per page), so sibling spans carry an

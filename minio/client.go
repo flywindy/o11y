@@ -19,16 +19,24 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/flywindy/o11y/internal/views"
 )
 
-const instrumentationName = "github.com/flywindy/o11y/minio"
+// instrumentationName aliases the scope constant in internal/views so the scope
+// this package records under and the scope its views match cannot drift; the
+// constant lives there because the root package must name it without linking
+// the minio-go client (ADR 0026 Option A).
+const instrumentationName = views.MinioScope
 
 // ADR 0018 §4 attribute keys. The object_store.* namespace is package-local;
-// see References in ADR 0018 for the OTel patterns it mirrors.
+// see References in ADR 0018 for the OTel patterns it mirrors. The two keys the
+// metric view has to name are defined in internal/views and aliased here, for
+// the same reason as instrumentationName.
 const (
 	objectStoreSystemNameKey    = attribute.Key("object_store.system.name")
-	objectStoreOperationNameKey = attribute.Key("object_store.operation.name")
-	objectStoreBucketNameKey    = attribute.Key("object_store.bucket.name")
+	objectStoreOperationNameKey = views.ObjectStoreOperationNameKey
+	objectStoreBucketNameKey    = views.ObjectStoreBucketNameKey
 	objectStoreObjectKeyKey     = attribute.Key("object_store.object.key")
 	objectStoreObjectSizeKey    = attribute.Key("object_store.object.size")
 	minioErrorKindKey           = attribute.Key("minio.error.kind")

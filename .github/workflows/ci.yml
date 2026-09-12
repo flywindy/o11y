@@ -115,3 +115,37 @@ jobs:
           go version
           go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
           govulncheck ./...
+
+  sast:
+    # gosec is intentionally not run here yet — see the note on GOSEC_FLAGS in
+    # the Makefile. It surfaced 12 pre-existing findings unrelated to the
+    # credential-literal gap this job exists to catch; wiring it in as a
+    # blocking gate needs a human triage pass first (fix vs justified
+    # #nosec), tracked separately. `make sast-gosec` stays runnable locally.
+    name: sast (repo-owned semgrep rules)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # This job never pushes or re-authenticates as itself, so the checkout
+      # token doesn't need to persist in the local git config afterward.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Installs the pinned SAST toolchain (gosec, semgrep) via the Makefile
+      # so CI and local `make sast` stay in lockstep. pipx is preinstalled on
+      # ubuntu-latest; add its bin dir to PATH for the semgrep scan step.
+      # gosec installs here too even though `make sast` below does not run it
+      # yet, so `make sast-gosec` works out of the box for anyone triaging it.
+      - name: Install SAST tools
+        run: |
+          make tools
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: SAST (repo-owned semgrep rules, fail on medium+)
+        run: make sast
