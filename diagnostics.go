@@ -26,7 +26,9 @@ const otelDiagnosticRepeatWindow = time.Minute
 const maxTrackedOTelDiagnostics = 32
 
 // otelErrorHandler turns the errors OTel components hand to otel.Handle into
-// structured WARN records, one per distinct error per repeat window.
+// structured ERROR records, one per distinct error per repeat window. ERROR,
+// not WARN: a service running WithLogLevel(slog.LevelError) would otherwise
+// filter out the very export failures the handler exists to surface.
 type otelErrorHandler struct {
 	logger    *slog.Logger
 	suppress  *repeat.Suppressor
@@ -58,7 +60,7 @@ func (h *otelErrorHandler) Handle(err error) {
 	if h.suppress.SuppressedAt(msg, h.now()) {
 		return
 	}
-	h.logger.WarnContext(context.Background(), "otel internal error",
+	h.logger.ErrorContext(context.Background(), "otel internal error",
 		slog.String("error", msg),
 		slog.String("repeat_suppressed_for", otelDiagnosticRepeatWindow.String()),
 	)
@@ -66,7 +68,7 @@ func (h *otelErrorHandler) Handle(err error) {
 
 // ErrorHandler returns a handler that writes the errors OpenTelemetry
 // components report internally — a failed OTLP export, an instrument the
-// SDK could not register — as structured WARN records on the SDK's stdout
+// SDK could not register — as structured ERROR records on the SDK's stdout
 // log, one per distinct error per minute. Without it those errors go to
 // the OTel default handler, which prints plain text to stderr on every
 // occurrence: during a collector outage that is one unparseable line every
@@ -81,7 +83,7 @@ func (h *otelErrorHandler) Handle(err error) {
 // Records go to stdout only, not through the OTLP log pipeline: an export
 // failure logged through the pipeline that is failing would queue another
 // record behind it. The number of failed batches is available regardless
-// of the handler as the o11y_export_failures_total{signal} metric.
+// of the handler as the o11y_export_failures_total metric.
 func (s *SDK) ErrorHandler() otel.ErrorHandler {
 	return s.errorHandler
 }

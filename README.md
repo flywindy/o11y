@@ -351,13 +351,16 @@ import "go.opentelemetry.io/otel"
 
 otel.SetTracerProvider(obs.TracerProvider())
 otel.SetTextMapPropagator(obs.Propagator)
-otel.SetErrorHandler(obs.ErrorHandler()) // OTel-internal errors as structured WARN, once per minute
+otel.SetErrorHandler(obs.ErrorHandler()) // OTel-internal errors as structured ERROR records, once per minute
 otel.SetLogger(obs.Logr())               // OTel-internal messages likewise, instead of plain text on stderr
 ```
 
-The SDK never installs these itself (ADR 0003). Failed OTLP exports are
-also counted as `o11y_export_failures_total{signal}` on `/metrics` whether or
-not the handlers are installed; see
+The SDK never installs these itself (ADR 0003). Independently of the
+handlers, every batch an OTLP exporter fails to deliver is counted as
+`o11y_export_failures_total{otel_component_type}` among the SDK's own
+metrics: on `/metrics` on the default Prometheus pull path, through the OTLP
+metrics pipeline with `WithMetricsOTLPEndpoint`, and not at all when the
+metrics pillar is off. See
 [Export failures & OTel diagnostics](docs/guide.md#export-failures--otel-diagnostics).
 
 For everything else — structured logging with trace correlation, user identity

@@ -387,24 +387,28 @@ into nothing every few seconds, the default handler prints one plain-text
 line to stderr per attempt, and afterward nobody can say how much was lost.
 Two things make that visible.
 
-**`o11y_export_failures_total{signal}`** counts every batch the OTLP
-exporters failed to deliver, labeled `traces`, `logs` or `metrics`. It is an
-SDK-owned instrument on the same `/metrics` endpoint, present after upgrading
-with no code change; a service with a healthy collector shows three zero
-series. Alert on it:
+**`o11y_export_failures_total{otel_component_type}`** counts every batch
+the OTLP exporters failed to deliver, one series per exporter: the label is
+semconv's `otel.component.type`, with the values `otlp_http_span_exporter`,
+`otlp_http_log_exporter` and `otlp_http_metric_exporter`. It is an SDK-owned
+instrument among the SDK's own metrics, present after upgrading with no code
+change; a service with a healthy collector shows three zero series. Alert on
+it:
 
 ```promql
-sum by (service_name, signal) (rate(o11y_export_failures_total[5m])) > 0
+sum by (service_name, otel_component_type) (rate(o11y_export_failures_total[5m])) > 0
 ```
 
 The unit is a batch, not a span: the span batcher sends up to 512 spans per
 batch and the log batcher up to 512 records (`OTEL_BSP_MAX_EXPORT_BATCH_SIZE`
 / `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE`), so the count is a lower bound on the
-items lost. On the default Prometheus pull path the counter is scraped
-directly. On the OTLP metrics push path (`WithMetricsOTLPEndpoint`) the
-`metrics` count travels through the pipeline that is failing and lands once
-an export succeeds again; it still answers "how many collections were lost"
-after the outage.
+items lost. Where the counter lands follows the metrics pillar: on the
+default Prometheus pull path it is scraped from `/metrics`; on the OTLP
+metrics push path (`WithMetricsOTLPEndpoint`) the metric exporter's own
+count travels through the pipeline that is failing and lands once an export
+succeeds again, which still answers "how many collections were lost" after
+the outage; with the metrics pillar off (`WithMetricsEnabled(false)`) the
+counter is not registered anywhere.
 
 **Structured diagnostics.** The SDK builds replacements for the OTel
 default error handler and logger but does not install them — ADR 0003, the
@@ -420,9 +424,10 @@ otel.SetLogger(sdk.Logr())               // OTel-internal messages → structure
 ```
 
 `ErrorHandler()` writes each distinct OTel-internal error once per minute as
-a WARN record with the error text under `error` and the suppression window
-under `repeat_suppressed_for`; a collector outage becomes one line per
-minute per signal instead of one per attempt. `Logr()` does the same for the
+an ERROR record (so it survives an error-only log level) with the error text
+under `error` and the suppression window under `repeat_suppressed_for`; a
+collector outage becomes one line per minute per exporter instead of one per
+attempt. `Logr()` does the same for the
 messages the SDK logs on its own ("dropped log records", an invalid
 instrument name), mapping OTel's verbosity convention onto the SDK's log
 level: V(1) is WARN, V(4) is INFO, V(8) is DEBUG. Both write to the stdout
@@ -430,7 +435,7 @@ JSON log only, not through the OTLP log pipeline: an error about the log
 pipeline must not queue another record behind the batch that is failing.
 
 ```json
-{"time":"2026-09-13T06:07:40Z","level":"WARN","msg":"otel internal error",
+{"time":"2026-09-13T06:07:40Z","level":"ERROR","msg":"otel internal error",
  "service.name":"room-service","environment":"production",
  "error":"traces export: Post \"http://otel-collector:4318/v1/traces\": dial tcp 10.0.0.5:4318: connect: connection refused",
  "repeat_suppressed_for":"1m0s"}

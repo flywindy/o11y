@@ -483,7 +483,7 @@ func TestInit_TargetInfoCarriesNarrowProcessAndSDKAttributes(t *testing.T) {
 
 // TestInit_ExportFailuresCounted points the OTLP exporters at a server that
 // rejects everything and checks the failures show up on the Prometheus
-// endpoint as o11y_export_failures_total, one series per signal. The
+// endpoint as o11y_export_failures_total, one series per exporter. The
 // batchers are told to flush quickly so the test does not wait for their
 // default schedules.
 func TestInit_ExportFailuresCounted(t *testing.T) {
@@ -512,13 +512,13 @@ func TestInit_ExportFailuresCounted(t *testing.T) {
 			return false
 		}
 		body = b
-		return seriesValue(b, "o11y_export_failures_total", `signal="traces"`) >= 1 &&
-			seriesValue(b, "o11y_export_failures_total", `signal="logs"`) >= 1
-	}, 5*time.Second, 50*time.Millisecond, "export failures should be counted per signal; last scrape:\n%s", body)
+		return seriesValue(b, "o11y_export_failures_total", `otel_component_type="otlp_http_span_exporter"`) >= 1 &&
+			seriesValue(b, "o11y_export_failures_total", `otel_component_type="otlp_http_log_exporter"`) >= 1
+	}, 5*time.Second, 50*time.Millisecond, "export failures should be counted per exporter; last scrape:\n%s", body)
 
-	// Every signal is reported, so a dashboard sees a zero rather than no
+	// Every exporter is reported, so a dashboard sees a zero rather than no
 	// series, and the SDK's own scope names the instrument.
-	assert.Equal(t, float64(0), seriesValue(body, "o11y_export_failures_total", `signal="metrics"`))
+	assert.Equal(t, float64(0), seriesValue(body, "o11y_export_failures_total", `otel_component_type="otlp_http_metric_exporter"`))
 	assert.GreaterOrEqual(t, seriesValue(body, "o11y_export_failures_total", `otel_scope_name="github.com/flywindy/o11y"`), float64(0),
 		"the counter is registered under the SDK's own instrumentation scope")
 }

@@ -20,10 +20,12 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 )
 
-// Signal names the pipeline a failure belongs to. The values are the label
-// values of o11y_export_failures_total.
+// Signal names the pipeline a failure belongs to. Each maps to the semconv
+// otel.component.type of the OTLP/HTTP exporter that serves it, which is the
+// attribute the counter carries (see ComponentType).
 type Signal string
 
 // The three OTLP pipelines the SDK exports on.
@@ -35,15 +37,33 @@ const (
 
 // InstrumentName is the OTel name of the failure counter. otelprom renders it
 // as o11y_export_failures_total; the unit is a braces annotation and adds no
-// suffix.
+// suffix. The name is SDK-owned: semconv v1.39.0's exporter self-metrics
+// (otel.sdk.exporter.span.exported and siblings) count exported items with
+// error.type on failure, are at status Development, and are the names the
+// OTel Go SDK will emit itself once it ships self-observability; a
+// package-local name keeps this batch-level failure counter from colliding
+// with those when they land. See docs/semconv.md.
 const InstrumentName = "o11y.export.failures"
 
 // ScopeName is the instrumentation scope the SDK registers its own
 // instruments under. otelprom renders it as the otel_scope_name label.
 const ScopeName = "github.com/flywindy/o11y"
 
-// signalKey is the attribute (Prometheus label) carrying the Signal.
-const signalKey = attribute.Key("signal")
+// ComponentType returns the semconv otel.component.type attribute for the
+// exporter that serves signal (otelprom renders the key as the
+// otel_component_type label), or an empty KeyValue for an unknown signal.
+func ComponentType(signal Signal) attribute.KeyValue {
+	switch signal {
+	case SignalTraces:
+		return semconv.OTelComponentTypeOtlpHTTPSpanExporter
+	case SignalLogs:
+		return semconv.OTelComponentTypeOtlpHTTPLogExporter
+	case SignalMetrics:
+		return semconv.OTelComponentTypeOtlpHTTPMetricExporter
+	default:
+		return attribute.KeyValue{}
+	}
+}
 
 // Recorder holds one failure count per signal. The zero value is ready to
 // use; Fail is safe for concurrent use and never blocks, so it can run inside
@@ -85,7 +105,8 @@ func (r *Recorder) counter(signal Signal) *atomic.Int64 {
 }
 
 // Register creates the o11y.export.failures observable counter on meter,
-// reporting one data point per signal from the Recorder's counts. It is
+// reporting one data point per signal, attributed by otel.component.type,
+// from the Recorder's counts. It is
 // observable rather than synchronous so the counts can start accumulating
 // before the MeterProvider exists (the tracer is built first) and so the
 // metric pipeline's own failures can be counted without re-entering it.
@@ -95,7 +116,7 @@ func (r *Recorder) Register(meter metric.Meter) error {
 		metric.WithUnit("{batch}"),
 		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
 			for _, signal := range []Signal{SignalTraces, SignalLogs, SignalMetrics} {
-				o.Observe(r.Failures(signal), metric.WithAttributes(signalKey.String(string(signal))))
+				o.Observe(r.Failures(signal), metric.WithAttributes(ComponentType(signal)))
 			}
 			return nil
 		}),

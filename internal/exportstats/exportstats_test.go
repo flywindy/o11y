@@ -132,9 +132,23 @@ func TestRegister_ObservesOnePointPerSignal(t *testing.T) {
 
 	got := map[string]int64{}
 	for _, dp := range sum.DataPoints {
-		v, ok := dp.Attributes.Value(attribute.Key("signal"))
-		require.True(t, ok, "every data point carries the signal attribute")
+		require.Equal(t, 1, dp.Attributes.Len(), "exactly one attribute per data point")
+		v, ok := dp.Attributes.Value(attribute.Key("otel.component.type"))
+		require.True(t, ok, "every data point carries the semconv otel.component.type attribute")
 		got[v.AsString()] = dp.Value
 	}
-	assert.Equal(t, map[string]int64{"traces": 2, "logs": 1, "metrics": 0}, got)
+	assert.Equal(t, map[string]int64{
+		"otlp_http_span_exporter":   2,
+		"otlp_http_log_exporter":    1,
+		"otlp_http_metric_exporter": 0,
+	}, got)
+}
+
+// TestComponentType pins the signal to semconv component-type mapping and the
+// empty value for an unknown signal.
+func TestComponentType(t *testing.T) {
+	assert.Equal(t, "otlp_http_span_exporter", exportstats.ComponentType(exportstats.SignalTraces).Value.AsString())
+	assert.Equal(t, "otlp_http_log_exporter", exportstats.ComponentType(exportstats.SignalLogs).Value.AsString())
+	assert.Equal(t, "otlp_http_metric_exporter", exportstats.ComponentType(exportstats.SignalMetrics).Value.AsString())
+	assert.False(t, exportstats.ComponentType(exportstats.Signal("profiles")).Valid())
 }
