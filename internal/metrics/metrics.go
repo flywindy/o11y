@@ -282,13 +282,16 @@ func prometheusCapRules(cfg Config) []metricscap.PrometheusRule {
 }
 
 // InitMeter initializes an OTel MeterProvider and returns it together with a
-// Closer that must be called during SDK shutdown.
+// Closer for the resources the MeterProvider's own Shutdown does not cover.
+// The Closer is nil when there are none; a caller must nil-check it before
+// calling it, and must call MeterProvider.Shutdown on either path.
 //
 // Exporter strategy:
 //   - cfg.MetricsOTLPEndpoint == "" → Prometheus pull: private registry +
-//     HTTP server on cfg.MetricsAddr; Closer shuts down the HTTP server.
+//     HTTP server on cfg.MetricsAddr; the Closer shuts down the HTTP server.
 //   - cfg.MetricsOTLPEndpoint != "" → OTLP push: otlpmetrichttp exporter;
-//     Closer shuts down the exporter. MetricsAddr is ignored.
+//     the Closer is nil, since MeterProvider.Shutdown drains the
+//     PeriodicReader and shuts the exporter down. MetricsAddr is ignored.
 //
 // Bind errors (Prometheus path) are surfaced synchronously.
 func InitMeter(ctx context.Context, cfg Config) (*sdkmetric.MeterProvider, Closer, error) {
