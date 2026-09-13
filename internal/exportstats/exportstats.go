@@ -1,13 +1,22 @@
-// Package exportstats counts OTLP export failures per signal and exposes the
-// count as an SDK-owned instrument, so "the collector was unreachable" has a
-// number attached instead of a line on stderr.
+// Package exportstats counts OTLP export calls that returned an error, per
+// signal, and exposes the count as an SDK-owned instrument, so "the
+// collector was unreachable" has a number attached instead of a line on
+// stderr.
 //
 // The OTel SDK's batchers (BatchSpanProcessor, the log BatchProcessor and the
 // metric PeriodicReader) hand each failed batch to otel.Handle and move on;
 // the spans, records or data points in that batch are gone. Nothing in the
 // SDK counts them. The wrappers here sit between the batcher and the OTLP
-// exporter, count every batch the exporter rejects, and leave the error
-// untouched so the batcher's own reporting still runs.
+// exporter, count every Export call the exporter returns an error for, and
+// leave the error untouched so the batcher's own reporting still runs.
+//
+// "Returned an error" is wider than "dropped the batch". The pinned OTLP/HTTP
+// exporters also return an error for a partial-success response: the
+// collector accepted the request but rejected some items, or accepted every
+// item and attached a warning message. Both count here, so the counter is an
+// upper bound on failed batches and a lower bound on lost items; the
+// rejected-item count and the message are in the error text the batcher
+// hands to otel.Handle, which the SDK's ErrorHandler logs.
 package exportstats
 
 import (
@@ -39,10 +48,12 @@ const (
 // as o11y_export_failures_total; the unit is a braces annotation and adds no
 // suffix. The name is SDK-owned: semconv v1.39.0's exporter self-metrics
 // (otel.sdk.exporter.span.exported and siblings) count exported items with
-// error.type on failure, are at status Development, and are the names the
-// OTel Go SDK will emit itself once it ships self-observability; a
-// package-local name keeps this batch-level failure counter from colliding
-// with those when they land. See docs/semconv.md.
+// error.type on failure and are at status Development. The pinned OTLP/HTTP
+// exporters already emit them behind the experimental
+// OTEL_GO_X_OBSERVABILITY=true opt-in, on the global MeterProvider (which
+// this SDK never sets; an application that wires the global gets them on
+// the same provider). A package-local name keeps this batch-level counter,
+// which needs no opt-in, from colliding with those. See docs/semconv.md.
 const InstrumentName = "o11y.export.failures"
 
 // ScopeName is the instrumentation scope the SDK registers its own
@@ -74,15 +85,15 @@ type Recorder struct {
 	metrics atomic.Int64
 }
 
-// Fail records one failed export batch for signal. Unknown signals are
-// ignored rather than counted under a wrong label.
+// Fail records one export call that returned an error for signal. Unknown
+// signals are ignored rather than counted under a wrong label.
 func (r *Recorder) Fail(signal Signal) {
 	if c := r.counter(signal); c != nil {
 		c.Add(1)
 	}
 }
 
-// Failures returns the number of failed batches recorded for signal.
+// Failures returns the number of erroring export calls recorded for signal.
 func (r *Recorder) Failures(signal Signal) int64 {
 	if c := r.counter(signal); c != nil {
 		return c.Load()
@@ -112,7 +123,7 @@ func (r *Recorder) counter(signal Signal) *atomic.Int64 {
 // metric pipeline's own failures can be counted without re-entering it.
 func (r *Recorder) Register(meter metric.Meter) error {
 	_, err := meter.Int64ObservableCounter(InstrumentName,
-		metric.WithDescription("Export batches the OTLP exporters failed to deliver; the spans, log records or data points in a failed batch are dropped."),
+		metric.WithDescription("Export calls the OTLP exporters returned an error for: a batch the collector rejected or could not be reached for (its spans, log records or data points are dropped), or a partial-success response that rejected some items or carried a warning."),
 		metric.WithUnit("{batch}"),
 		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
 			for _, signal := range []Signal{SignalTraces, SignalLogs, SignalMetrics} {
