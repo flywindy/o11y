@@ -15,6 +15,23 @@ adopters can plan their upgrades.
 
 ### Added
 
+- `o11y_export_failures_total{signal}` counts every batch the OTLP exporters
+  failed to deliver, per signal (`traces`, `logs`, `metrics`). The OTel
+  batchers drop a rejected batch after handing the error to `otel.Handle`, so
+  until now a collector outage left no number behind; the counter is an
+  SDK-owned instrument on the same `/metrics` endpoint, reported for every
+  signal (zero when healthy), and needs no code change. See the guide's
+  "Export failures & OTel diagnostics" section for the alert.
+- `SDK.ErrorHandler()` and `SDK.Logr()` return replacements for OTel's
+  default error handler and internal logger, which print plain text to
+  stderr on every occurrence. The replacements write structured records to
+  the SDK's stdout log, one per distinct error or message per minute, with
+  the suppression window under `repeat_suppressed_for`; `Logr()` maps OTel's
+  verbosity convention (V(1) warn, V(4) info, V(8) debug) onto the SDK's
+  log level. The SDK does not install them (ADR 0003); the application does
+  with `otel.SetErrorHandler` / `otel.SetLogger`. The scrape-error log line
+  introduced by #93 renders its `repeat_suppressed_for` field the same way
+  (`"5m0s"` rather than a nanosecond count).
 - `WithCardinalityLimit(n)` sets the OTel SDK's per-stream cardinality
   limit explicitly, and `DefaultCardinalityLimit` (2,000) exposes the floor
   of the derived value. See the Changed entry below for the new derivation.

@@ -351,7 +351,14 @@ import "go.opentelemetry.io/otel"
 
 otel.SetTracerProvider(obs.TracerProvider())
 otel.SetTextMapPropagator(obs.Propagator)
+otel.SetErrorHandler(obs.ErrorHandler()) // OTel-internal errors as structured WARN, once per minute
+otel.SetLogger(obs.Logr())               // OTel-internal messages likewise, instead of plain text on stderr
 ```
+
+The SDK never installs these itself (ADR 0003). Failed OTLP exports are
+also counted as `o11y_export_failures_total{signal}` on `/metrics` whether or
+not the handlers are installed; see
+[Export failures & OTel diagnostics](docs/guide.md#export-failures--otel-diagnostics).
 
 For everything else — structured logging with trace correlation, user identity
 attributes, trace sampling, continuous profiling, and the NATS / MongoDB /

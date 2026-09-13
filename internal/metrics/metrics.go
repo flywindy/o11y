@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/flywindy/o11y/internal/exportstats"
 	"github.com/flywindy/o11y/internal/metricscap"
 	"github.com/flywindy/o11y/internal/views"
 	"github.com/prometheus/client_golang/prometheus"
@@ -107,6 +108,12 @@ type Config struct {
 	// Logger receives the Prometheus handler's gather errors (rate-limited).
 	// Optional; nil discards them.
 	Logger *slog.Logger
+
+	// ExportFailures, when set, is registered on the provider as the
+	// o11y.export.failures observable counter and counts every batch the
+	// OTLP metrics exporter fails to deliver. The trace and log exporters
+	// share the same Recorder, so one instrument reports all three signals.
+	ExportFailures *exportstats.Recorder
 }
 
 // Closer is a function that shuts down a component. For the Prometheus path it
@@ -291,10 +298,24 @@ func InitMeter(ctx context.Context, cfg Config) (*sdkmetric.MeterProvider, Close
 	views := defaultViews(cfg)
 	views = append(views, cfg.ExtraViews...)
 
+	var provider *sdkmetric.MeterProvider
+	var closer Closer
 	if cfg.MetricsOTLPEndpoint != "" {
-		return initOTLP(ctx, cfg, res, views)
+		provider, closer, err = initOTLP(ctx, cfg, res, views)
+	} else {
+		provider, closer, err = initPrometheus(ctx, cfg, res, views)
 	}
-	return initPrometheus(ctx, cfg, res, views)
+	if err != nil {
+		return nil, nil, err
+	}
+	if cfg.ExportFailures != nil {
+		if err := cfg.ExportFailures.Register(provider.Meter(exportstats.ScopeName)); err != nil {
+			_ = closer(ctx)
+			_ = provider.Shutdown(ctx)
+			return nil, nil, fmt.Errorf("metrics: register export failure counter: %w", err)
+		}
+	}
+	return provider, closer, nil
 }
 
 // defaultViews returns the views the SDK installs unless
@@ -454,8 +475,13 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []s
 		return nil, nil, fmt.Errorf("metrics: create OTLP exporter: %w", err)
 	}
 	cappedExporter := sdkmetric.Exporter(exporter)
+	if cfg.ExportFailures != nil {
+		// Innermost wrapper: it counts the upload itself failing, before any
+		// rewriting layer sits between the reader and the wire.
+		cappedExporter = exportstats.MetricExporter(exporter, cfg.ExportFailures)
+	}
 	if rules := otlpCapRules(cfg); len(rules) > 0 {
-		cappedExporter = metricscap.NewExporter(exporter, rules...)
+		cappedExporter = metricscap.NewExporter(cappedExporter, rules...)
 	}
 	// Ship res, not the provider's Resource: the provider merges the raw
 	// environment back in, which would resurrect an alias

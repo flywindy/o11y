@@ -25,6 +25,7 @@ For project setup, the `Init` options reference, and feature toggles, see the
     - [Logging Guidelines](#logging-guidelines)
   - [Metrics](#metrics)
   - [Profiling](#profiling)
+  - [Export failures & OTel diagnostics](#export-failures--otel-diagnostics)
 - [Integrations](#integrations)
   - [HTTP](#http)
     - [net/http server & client](#nethttp-server--client)
@@ -376,6 +377,68 @@ Important caveats:
 - Go `pprof` labels apply to the current goroutine. Work started in a new
   goroutine is captured in the service-level profile, but it is not linked to
   the span unless the application propagates pprof labels explicitly.
+
+## Export failures & OTel diagnostics
+
+The OTel SDK's batchers — the `BatchSpanProcessor`, the log `BatchProcessor`
+and the metric `PeriodicReader` — hand every batch the OTLP exporter rejects
+to `otel.Handle` and drop it. With the collector unreachable each queue drains
+into nothing every few seconds, the default handler prints one plain-text
+line to stderr per attempt, and afterwards nobody can say how much was lost.
+Two things make that visible.
+
+**`o11y_export_failures_total{signal}`** counts every batch the OTLP
+exporters failed to deliver, labelled `traces`, `logs` or `metrics`. It is an
+SDK-owned instrument on the same `/metrics` endpoint, present after upgrading
+with no code change; a service with a healthy collector shows three zero
+series. Alert on it:
+
+```promql
+sum by (service_name, signal) (rate(o11y_export_failures_total[5m])) > 0
+```
+
+The unit is a batch, not a span: the span batcher sends up to 512 spans per
+batch and the log batcher up to 512 records (`OTEL_BSP_MAX_EXPORT_BATCH_SIZE`
+/ `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE`), so the count is a lower bound on the
+items lost. On the default Prometheus pull path the counter is scraped
+directly. On the OTLP metrics push path (`WithMetricsOTLPEndpoint`) the
+`metrics` count travels through the pipeline that is failing and lands once
+an export succeeds again; it still answers "how many collections were lost"
+after the outage.
+
+**Structured diagnostics.** The SDK builds replacements for the OTel
+default error handler and logger but does not install them — ADR 0003, the
+SDK never touches OTel globals. The application installs them next to the
+providers it already wires:
+
+```go
+otel.SetTracerProvider(sdk.TracerProvider())
+otel.SetMeterProvider(sdk.MeterProvider())
+otel.SetTextMapPropagator(sdk.Propagator)
+otel.SetErrorHandler(sdk.ErrorHandler()) // OTel-internal errors → structured WARN
+otel.SetLogger(sdk.Logr())               // OTel-internal messages → structured records
+```
+
+`ErrorHandler()` writes each distinct OTel-internal error once per minute as
+a WARN record with the error text under `error` and the suppression window
+under `repeat_suppressed_for`; a collector outage becomes one line per
+minute per signal instead of one per attempt. `Logr()` does the same for the
+messages the SDK logs on its own ("dropped log records", an invalid
+instrument name), mapping OTel's verbosity convention onto the SDK's log
+level: V(1) is WARN, V(4) is INFO, V(8) is DEBUG. Both write to the stdout
+JSON log only, not through the OTLP log pipeline: an error about the log
+pipeline must not queue another record behind the batch that is failing.
+
+```json
+{"time":"2026-09-13T06:07:40Z","level":"WARN","msg":"otel internal error",
+ "service.name":"room-service","environment":"production",
+ "error":"traces export: Post \"http://otel-collector:4318/v1/traces\": dial tcp 10.0.0.5:4318: connect: connection refused",
+ "repeat_suppressed_for":"1m0s"}
+```
+
+An endpoint that carries credentials in its URL is redacted in the error
+text before it is logged, the same way the profiling and scrape diagnostics
+redact theirs.
 
 ---
 

@@ -2,9 +2,13 @@ package o11y_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -475,4 +479,89 @@ func TestInit_TargetInfoCarriesNarrowProcessAndSDKAttributes(t *testing.T) {
 	} {
 		assert.NotContains(t, line, unwanted)
 	}
+}
+
+// TestInit_ExportFailuresCounted points the OTLP exporters at a server that
+// rejects everything and checks the failures show up on the Prometheus
+// endpoint as o11y_export_failures_total, one series per signal. The
+// batchers are told to flush quickly so the test does not wait for their
+// default schedules.
+func TestInit_ExportFailuresCounted(t *testing.T) {
+	t.Setenv("OTEL_BSP_SCHEDULE_DELAY", "50")
+	t.Setenv("OTEL_BLRP_SCHEDULE_DELAY", "50")
+	// 400 is not retried by the OTLP/HTTP exporters, so each batch fails once
+	// and immediately.
+	rejecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	t.Cleanup(rejecting.Close)
+	addr := testutil.FreeAddr(t)
+
+	sdk, err := o11y.Init(t.Context(), append(commonOpts(rejecting.URL), o11y.WithMetricsAddr(addr))...)
+	require.NoError(t, err)
+	defer testutil.MustShutdown(t.Context(), t, sdk)
+
+	_, span := sdk.Tracer("export-test").Start(t.Context(), "probe")
+	span.End()
+	sdk.Logger.InfoContext(t.Context(), "probe record")
+
+	var body string
+	require.Eventually(t, func() bool {
+		b, err := testutil.TryScrapeMetrics(t.Context(), addr)
+		if err != nil {
+			return false
+		}
+		body = b
+		return seriesValue(b, "o11y_export_failures_total", `signal="traces"`) >= 1 &&
+			seriesValue(b, "o11y_export_failures_total", `signal="logs"`) >= 1
+	}, 5*time.Second, 50*time.Millisecond, "export failures should be counted per signal; last scrape:\n%s", body)
+
+	// Every signal is reported, so a dashboard sees a zero rather than no
+	// series, and the SDK's own scope names the instrument.
+	assert.Equal(t, float64(0), seriesValue(body, "o11y_export_failures_total", `signal="metrics"`))
+	assert.GreaterOrEqual(t, seriesValue(body, "o11y_export_failures_total", `otel_scope_name="github.com/flywindy/o11y"`), float64(0),
+		"the counter is registered under the SDK's own instrumentation scope")
+}
+
+// seriesValue returns the value of the first series of family whose label set
+// contains match, or -1 when there is none.
+func seriesValue(body, family, match string) float64 {
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, family+"{") || !strings.Contains(line, match) {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		v, err := strconv.ParseFloat(fields[1], 64)
+		if err != nil {
+			continue
+		}
+		return v
+	}
+	return -1
+}
+
+// TestInit_DiagnosticsAccessors checks the ErrorHandler and Logr accessors
+// are usable straight after Init: non-nil, safe on nil errors, and
+// installable through the otel globals by a caller (the SDK itself never
+// installs them).
+func TestInit_DiagnosticsAccessors(t *testing.T) {
+	srv := testutil.FakeOTLPServer(t)
+	sdk, err := o11y.Init(t.Context(), commonOpts(srv.URL)...)
+	require.NoError(t, err)
+	defer testutil.MustShutdown(t.Context(), t, sdk)
+
+	h := sdk.ErrorHandler()
+	require.NotNil(t, h)
+	assert.NotPanics(t, func() {
+		h.Handle(nil)
+		h.Handle(errors.New("traces export: probe"))
+	})
+
+	l := sdk.Logr()
+	assert.True(t, l.V(1).Enabled(), "OTel warnings pass the default INFO level")
+	assert.False(t, l.V(8).Enabled(), "OTel debug messages are gated by the SDK log level")
+	assert.NotPanics(t, func() { l.V(1).Info("dropped log records", "dropped", 3) })
 }
