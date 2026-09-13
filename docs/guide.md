@@ -513,7 +513,10 @@ only where `Init` passes no explicit option, so its endpoint is never read,
 its headers only without `WithOTLPHeaders`, and its timeout, compression
 and certificate files always, taking the `LOGS_` variable first and the
 generic one only when the `LOGS_` variable is unset (for the client
-certificate, when the `LOGS_` pair is incomplete). The endpoints given to `WithOTLPEndpoint` and
+certificate, when the `LOGS_` pair is incomplete). Each value is checked
+as the exporter reading it will see it: the trace and metric exporters
+trim surrounding whitespace, the log exporter parses the value verbatim.
+The endpoints given to `WithOTLPEndpoint` and
 `WithMetricsOTLPEndpoint` get the same check, since the trace and metric
 exporters echo a URL they cannot parse the same way and then fall back to
 their default endpoint. The error names the variable or option and the

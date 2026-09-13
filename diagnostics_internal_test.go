@@ -231,6 +231,30 @@ func TestValidateOTLPExporterEnv(t *testing.T) {
 			require.Error(t, validateOTLPExporterEnv(all), "the trace exporter still reads the generic CA file")
 		})
 	})
+
+	t.Run("log exporter reads values verbatim", func(t *testing.T) {
+		certPath, _ := writeTestKeyPair(t, t.TempDir())
+		tracesOnly := &Config{traceEnabled: true}
+		logsOnly := &Config{logEnabled: true}
+
+		t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", " 10000 ")
+		require.NoError(t, validateOTLPExporterEnv(tracesOnly), "the trace exporter trims the value before parsing it")
+		err := validateOTLPExporterEnv(logsOnly)
+		require.Error(t, err, "the log exporter parses the value with its whitespace and echoes it")
+		assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_TIMEOUT cannot be used")
+
+		t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", " ")
+		require.NoError(t, validateOTLPExporterEnv(tracesOnly), "a blank value is unset for the trace exporter")
+		require.Error(t, validateOTLPExporterEnv(logsOnly), "a blank value is set, and unparseable, for the log exporter")
+
+		t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "")
+		t.Setenv("OTEL_EXPORTER_OTLP_CERTIFICATE", " "+certPath+" ")
+		require.NoError(t, validateOTLPExporterEnv(tracesOnly), "the trace exporter trims the path")
+		err = validateOTLPExporterEnv(logsOnly)
+		require.Error(t, err, "the log exporter opens the path with its whitespace")
+		assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_CERTIFICATE cannot be used")
+		assert.NotContains(t, err.Error(), certPath)
+	})
 }
 
 // writeTestKeyPair writes a self-signed certificate and its private key as

@@ -142,6 +142,11 @@ var otlpHeaderEnvVars = []string{
 type otlpEnvCheck struct {
 	name  string
 	check func(string) (reason string, bad bool)
+	// verbatim marks a variable the exporter reads as os.Getenv returns
+	// it: the pinned log exporter never trims a value, so one wrapped in
+	// whitespace is set, and is parsed with the whitespace. The trace and
+	// metric exporters trim first and treat a blank value as unset.
+	verbatim bool
 	// pair, when set, is a second variable the exporter requires alongside
 	// name before it reads either: a client certificate is loaded only
 	// when both the CLIENT_CERTIFICATE and the CLIENT_KEY variable are set.
@@ -155,22 +160,26 @@ type otlpEnvCheck struct {
 }
 
 // set reports whether the exporter will read the variable: name is set and
-// non-empty, and so is pair when the check has one.
+// non-empty as the exporter sees it, and so is pair when the check has one.
 func (c otlpEnvCheck) set() bool {
-	return envSet(c.name) && (c.pair == "" || envSet(c.pair))
+	return envValue(c.name, c.verbatim) != "" && (c.pair == "" || envValue(c.pair, c.verbatim) != "")
 }
 
-// envSet reports whether the variable name is set to a non-blank value,
-// which is how the pinned exporters decide whether to read it.
-func envSet(name string) bool {
-	return strings.TrimSpace(os.Getenv(name)) != ""
+// envValue returns the variable name as the exporter that reads it will
+// see it: verbatim, or trimmed of surrounding whitespace.
+func envValue(name string, verbatim bool) string {
+	v := os.Getenv(name)
+	if verbatim {
+		return v
+	}
+	return strings.TrimSpace(v)
 }
 
 // clientCertCheck builds the check for the CLIENT_CERTIFICATE / CLIENT_KEY
 // pair under prefix, which the exporters read only when both are set.
-func clientCertCheck(prefix string) otlpEnvCheck {
+func clientCertCheck(prefix string, verbatim bool) otlpEnvCheck {
 	key := prefix + "CLIENT_KEY"
-	return otlpEnvCheck{name: prefix + "CLIENT_CERTIFICATE", pair: key, check: checkClientKeyPair(key)}
+	return otlpEnvCheck{name: prefix + "CLIENT_CERTIFICATE", pair: key, verbatim: verbatim, check: checkClientKeyPair(key, verbatim)}
 }
 
 // otlpExporterEnvChecks lists the variables the enabled OTLP exporters will
@@ -190,7 +199,9 @@ func clientCertCheck(prefix string) otlpEnvCheck {
 // the signal variable first and reads the generic one only when the signal
 // variable is unset (a signal value that fails to parse is echoed before
 // it falls through, so it is still rejected); for the client certificate
-// the signal pair counts as set only when both its variables are. A
+// the signal pair counts as set only when both its variables are. The log
+// exporter also reads every value verbatim, where the trace and metric
+// exporters trim it, so its checks parse what os.Getenv returns. A
 // variable no enabled exporter reads is left alone.
 func otlpExporterEnvChecks(cfg *Config) []otlpEnvCheck {
 	var checks []otlpEnvCheck
@@ -201,7 +212,7 @@ func otlpExporterEnvChecks(cfg *Config) []otlpEnvCheck {
 				otlpEnvCheck{name: prefix + "TIMEOUT", check: checkMilliseconds},
 				otlpEnvCheck{name: prefix + "HEADERS", check: malformedHeaderList},
 				otlpEnvCheck{name: prefix + "CERTIFICATE", check: checkCertificateFile},
-				clientCertCheck(prefix),
+				clientCertCheck(prefix, false),
 			)
 		}
 	}
@@ -217,11 +228,12 @@ func otlpExporterEnvChecks(cfg *Config) []otlpEnvCheck {
 			return otlpEnvCheck{
 				name:     logs + setting,
 				check:    check,
-				fallback: &otlpEnvCheck{name: generic + setting, check: check},
+				verbatim: true,
+				fallback: &otlpEnvCheck{name: generic + setting, check: check, verbatim: true},
 			}
 		}
-		clientCert := clientCertCheck(logs)
-		genericClientCert := clientCertCheck(generic)
+		clientCert := clientCertCheck(logs, true)
+		genericClientCert := clientCertCheck(generic, true)
 		clientCert.fallback = &genericClientCert
 		checks = append(checks,
 			signalFirst("TIMEOUT", checkMilliseconds),
@@ -257,7 +269,8 @@ func otlpExporterEnvChecks(cfg *Config) []otlpEnvCheck {
 // CLIENT_KEY (read only when both are set) must name readable files that
 // form a key pair: the exporters echo the path of a file they cannot read,
 // both as a field and inside the os.ReadFile error. An empty variable is
-// skipped, as the exporters skip it.
+// skipped, as the exporters skip it; each value is checked as the exporter
+// that reads it will see it, trimmed or verbatim.
 func validateOTLPExporterEnv(cfg *Config) error {
 	for _, c := range otlpExporterEnvChecks(cfg) {
 		for c.fallback != nil && !c.set() {
@@ -266,7 +279,7 @@ func validateOTLPExporterEnv(cfg *Config) error {
 		if !c.set() {
 			continue
 		}
-		if err := validateOTLPEnvVar(c.name, c.check); err != nil {
+		if err := validateOTLPEnvVar(c.name, envValue(c.name, c.verbatim), c.check); err != nil {
 			return err
 		}
 	}
@@ -309,15 +322,16 @@ func checkCertificateFile(path string) (string, bool) {
 }
 
 // checkClientKeyPair returns the exporters' client certificate rule for a
-// CLIENT_CERTIFICATE value paired with the variable keyVar: both files
-// must be readable and together form a valid key pair.
-func checkClientKeyPair(keyVar string) func(string) (string, bool) {
+// CLIENT_CERTIFICATE value paired with the variable keyVar, read verbatim
+// or trimmed as the exporter reads it: both files must be readable and
+// together form a valid key pair.
+func checkClientKeyPair(keyVar string, verbatim bool) func(string) (string, bool) {
 	return func(certPath string) (string, bool) {
 		cert, err := os.ReadFile(certPath)
 		if err != nil {
 			return "the file it names cannot be read", true
 		}
-		key, err := os.ReadFile(strings.TrimSpace(os.Getenv(keyVar)))
+		key, err := os.ReadFile(envValue(keyVar, verbatim))
 		if err != nil {
 			return "the file named by " + keyVar + " cannot be read", true
 		}
@@ -363,15 +377,14 @@ func urlParseReason(err error) error {
 	return err
 }
 
-// validateOTLPEnvVar applies check to the trimmed value of the variable
-// name when it is set and non-empty, and returns the Init error for the
-// reason check reports.
-func validateOTLPEnvVar(name string, check func(string) (reason string, bad bool)) error {
-	raw := strings.TrimSpace(os.Getenv(name))
-	if raw == "" {
+// validateOTLPEnvVar applies check to value, the variable name as the
+// exporter reading it will see it, and returns the Init error for the
+// reason check reports. An empty value is skipped.
+func validateOTLPEnvVar(name, value string, check func(string) (reason string, bad bool)) error {
+	if value == "" {
 		return nil
 	}
-	if reason, bad := check(raw); bad {
+	if reason, bad := check(value); bad {
 		return fmt.Errorf("o11y: %s cannot be used (%s); the OTLP exporters would report its raw text through OTel's global logger while Init builds them, before Logr() can be installed, so the variable is rejected instead", name, reason)
 	}
 	return nil

@@ -46,7 +46,8 @@ adopters can plan their upgrades.
   `TIMEOUT`, `COMPRESSION` or `HEADERS` variable, or a `CERTIFICATE`,
   `CLIENT_CERTIFICATE` or `CLIENT_KEY` variable naming a file that cannot
   be read or parsed, that the enabled exporters would actually read (the
-  log exporter reads one only where `Init` passes no explicit option), and
+  log exporter reads one only where `Init` passes no explicit option, and
+  verbatim, where the trace and metric exporters trim it), and
   a malformed endpoint given to `WithOTLPEndpoint`
   or `WithMetricsOTLPEndpoint`, which the trace and metric exporters echo
   the same way, with an error that names the variable or option and the
