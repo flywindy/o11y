@@ -87,8 +87,10 @@ func (h *otelErrorHandler) Handle(err error) {
 //
 // Records go to stdout only, not through the OTLP log pipeline: an export
 // failure logged through the pipeline that is failing would queue another
-// record behind it. The number of failed batches is available regardless
-// of the handler as the o11y_export_failures_total metric.
+// record behind it. The number of export calls that returned an error (a
+// rejected or undeliverable batch, or a partial-success response) is
+// available regardless of the handler as the o11y_export_failures_total
+// metric.
 func (s *SDK) ErrorHandler() otel.ErrorHandler {
 	return s.errorHandler
 }
