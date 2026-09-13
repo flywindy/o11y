@@ -312,13 +312,17 @@ func (s *logrSink) resolveReflected(rv reflect.Value, orig any, depth int) any {
 			out[i] = s.resolveDepth(rv.Index(i).Interface(), depth+1)
 		}
 		return out
-	case reflect.Pointer:
+	case reflect.Pointer, reflect.Interface:
+		// A pointer to a pointer, or to an interface holding a string, is
+		// what a JSON handler dereferences all the way down, so the walk
+		// follows every layer (bounded by depth) before deciding.
 		if rv.IsNil() {
 			return orig
 		}
-		switch rv.Elem().Kind() {
-		case reflect.String, reflect.Map, reflect.Slice, reflect.Array, reflect.Struct:
-			return s.resolveDepth(rv.Elem().Interface(), depth+1)
+		elem := rv.Elem()
+		switch elem.Kind() {
+		case reflect.String, reflect.Map, reflect.Slice, reflect.Array, reflect.Struct, reflect.Pointer, reflect.Interface:
+			return s.resolveDepth(elem.Interface(), depth+1)
 		default:
 			return orig
 		}

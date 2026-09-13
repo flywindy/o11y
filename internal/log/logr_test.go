@@ -167,6 +167,30 @@ func TestLogr_RedactsLoggerName(t *testing.T) {
 	assert.Contains(t, out, "collector:4318", "the host survives")
 }
 
+// TestLogr_RedactsPointerChains checks a pointer to a pointer and a pointer
+// to an interface are followed to the string they hold, which a JSON
+// handler would otherwise dereference and print verbatim.
+func TestLogr_RedactsPointerChains(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	const endpoint = "http://svc:hunter2@collector:4318"
+	l := o11ylog.NewLogrRedacting(logger, nil, o11ylog.Redaction{Endpoints: []string{endpoint}, Secrets: []string{"TopSecretToken"}})
+
+	str := endpoint
+	ptr := &str
+	var iface any = "TopSecretToken"
+	var nilIface any
+	var nilPtr **string
+	l.Info("pointers", "pp", &ptr, "piface", &iface, "pnil", &nilIface, "ppnil", nilPtr)
+
+	out := buf.String()
+	assert.NotContains(t, out, "hunter2")
+	assert.NotContains(t, out, "TopSecretToken")
+	assert.Contains(t, out, "collector:4318", "the host survives")
+	assert.Contains(t, out, `"pnil":null`)
+	assert.Contains(t, out, `"ppnil":null`)
+}
+
 // marshalsToText implements logr.Marshaler the way attribute.Set does, with
 // nothing slog could render on its own.
 type marshalsToText struct{ hidden string }
