@@ -205,6 +205,60 @@ func TestLogr_RedactsTypedNestedContainers(t *testing.T) {
 	assert.Contains(t, out, "not-a-credential", "a []byte is passed through")
 }
 
+// endpointStringer renders an endpoint through String(), the way a type with
+// a custom text form reaches the slog handler.
+type endpointStringer struct{ url string }
+
+// String implements fmt.Stringer.
+func (e endpointStringer) String() string { return "endpoint=" + e.url }
+
+// endpointValuer is a bare slog.LogValuer whose value carries an endpoint.
+type endpointValuer struct{ url string }
+
+// LogValue implements slog.LogValuer.
+func (e endpointValuer) LogValue() slog.Value { return slog.StringValue(e.url) }
+
+// TestLogr_RedactsStructsStringersAndLogValuers covers the value forms the
+// handler would otherwise render itself: a struct with an endpoint in an
+// exported field (and a nested one), a pointer to a struct, a fmt.Stringer
+// whose text carries the endpoint, a bare slog.LogValuer, a struct with no
+// exported field (rendered with %+v), and a time.Duration and time.Time
+// that must stay what they are.
+func TestLogr_RedactsStructsStringersAndLogValuers(t *testing.T) {
+	logger, buf := newRecordingLogger(slog.LevelInfo)
+	const endpoint = "http://svc:hunter2@collector:4318"
+	type inner struct{ Endpoint string }
+	type outer struct {
+		Name  string
+		Inner inner
+		note  string
+	}
+	l := o11ylog.NewLogr(logger, nil, endpoint)
+
+	o := outer{Name: "exporter", Inner: inner{Endpoint: endpoint}, note: "hidden"}
+	l.Info("forms",
+		"struct", o,
+		"ptr", &o,
+		"stringer", endpointStringer{url: endpoint},
+		"valuer", endpointValuer{url: endpoint},
+		"opaque", endpointStringerless{url: endpoint},
+		"dur", 1500*time.Millisecond,
+		"when", time.Date(2026, 9, 13, 10, 0, 0, 0, time.UTC),
+	)
+
+	out := buf.String()
+	assert.NotContains(t, out, "hunter2")
+	assert.Equal(t, 5, strings.Count(out, "collector:4318"), "every redacted copy keeps the host")
+	assert.Contains(t, out, "Inner", "the struct's exported fields survive")
+	assert.NotContains(t, out, "hidden", "unexported fields are not rendered")
+	assert.Contains(t, out, "dur=1.5s", "a Duration keeps its slog rendering")
+	assert.Contains(t, out, "when=2026-09-13T10:00:00.000Z", "a Time keeps its slog rendering")
+}
+
+// endpointStringerless has no exported field and no String method, so the
+// only way to inspect it is the %+v rendering the handler would print.
+type endpointStringerless struct{ url string }
+
 // TestLogr_BoundsGroupNesting checks a slog.Group nested deeper than the
 // resolver follows is cut off with the placeholder rather than descended
 // into forever or passed through unredacted.

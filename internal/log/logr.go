@@ -2,6 +2,7 @@ package log
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"reflect"
 	"strings"
@@ -155,6 +156,21 @@ func (s *logrSink) resolveDepth(v any, depth int) any {
 		return redact.InText(t.Error(), s.endpoints...)
 	case slog.Attr:
 		return s.resolveAttr(t, depth)
+	case slog.Value:
+		return s.resolveDepth(t.Resolve().Any(), depth+1)
+	case slog.LogValuer:
+		// A bare LogValuer (not wrapped in an Attr) would otherwise be
+		// resolved by the handler, after redaction; resolve it here so its
+		// output is what gets inspected.
+		return s.resolveDepth(t.LogValue().Resolve().Any(), depth+1)
+	case time.Time, time.Duration:
+		// Both are Stringers, but carry no text and have slog kinds of
+		// their own; leave them so the handler renders them as usual.
+		return v
+	case fmt.Stringer:
+		// The handler would render it through String() anyway; redact
+		// that rendering rather than let it reach the log unseen.
+		return redact.InText(t.String(), s.endpoints...)
 	}
 	return s.resolveReflected(reflect.ValueOf(v), v, depth)
 }
@@ -162,14 +178,31 @@ func (s *logrSink) resolveDepth(v any, depth int) any {
 // resolveReflected walks v by kind so a container of any static type is
 // covered: a string (named string types included) is redacted, a
 // string-keyed map is rebuilt as map[string]any and a slice or array as
-// []any with every element resolved, a pointer to one of those is
-// followed, and a []byte or anything else (numbers, structs, times) is
-// returned as is. orig is the value v was taken from, returned unchanged
-// for the kinds that are left alone.
+// []any with every element resolved, a struct is rebuilt as a
+// map[string]any of its exported fields (each resolved; one with no
+// exported field is rendered with %+v and redacted, since that is what
+// the handler would print), a pointer to one of those is followed, and a
+// []byte or anything else (numbers, bools) is returned as is. orig is the
+// value v was taken from, returned unchanged for the kinds that are left
+// alone.
 func (s *logrSink) resolveReflected(rv reflect.Value, orig any, depth int) any {
 	switch rv.Kind() {
 	case reflect.String:
 		return redact.InText(rv.String(), s.endpoints...)
+	case reflect.Struct:
+		rt := rv.Type()
+		out := make(map[string]any, rt.NumField())
+		for i := range rt.NumField() {
+			f := rt.Field(i)
+			if !f.IsExported() {
+				continue
+			}
+			out[f.Name] = s.resolveDepth(rv.Field(i).Interface(), depth+1)
+		}
+		if len(out) == 0 {
+			return redact.InText(fmt.Sprintf("%+v", orig), s.endpoints...)
+		}
+		return out
 	case reflect.Map:
 		if rv.Type().Key().Kind() != reflect.String || rv.IsNil() {
 			return orig
@@ -193,7 +226,7 @@ func (s *logrSink) resolveReflected(rv reflect.Value, orig any, depth int) any {
 			return orig
 		}
 		switch rv.Elem().Kind() {
-		case reflect.String, reflect.Map, reflect.Slice, reflect.Array:
+		case reflect.String, reflect.Map, reflect.Slice, reflect.Array, reflect.Struct:
 			return s.resolveDepth(rv.Elem().Interface(), depth+1)
 		default:
 			return orig
