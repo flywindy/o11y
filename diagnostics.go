@@ -2,6 +2,7 @@ package o11y
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -252,6 +253,41 @@ func checkCompression(v string) (string, bool) {
 		return "", false
 	}
 	return `it is neither "gzip" nor "none"`, true
+}
+
+// validateConfiguredEndpoints rejects a malformed endpoint given through
+// WithOTLPEndpoint or WithMetricsOTLPEndpoint before any exporter is built.
+// The pinned trace and metric exporters' WithEndpointURL reports a URL it
+// cannot parse through OTel's global logger with the raw text attached and
+// then keeps their fallback endpoint, so Init would succeed while a
+// credential in the URL's userinfo reached stderr. Only an endpoint an
+// enabled OTLP exporter will use is checked, and the error names the
+// option and the parser's reason, never the value.
+func validateConfiguredEndpoints(cfg *Config) error {
+	type configured struct{ option, value string }
+	var endpoints []configured
+	if cfg.traceEnabled || cfg.logEnabled {
+		endpoints = append(endpoints, configured{"WithOTLPEndpoint", cfg.otlpEndpoint})
+	}
+	if cfg.metricsEnabled && cfg.metricsOTLPEndpoint != "" {
+		endpoints = append(endpoints, configured{"WithMetricsOTLPEndpoint", cfg.metricsOTLPEndpoint})
+	}
+	for _, e := range endpoints {
+		if _, err := url.Parse(e.value); err != nil {
+			return fmt.Errorf("o11y: the endpoint given to %s is not a valid URL (%w); the OTLP exporters would report its raw text through OTel's global logger while Init builds them, so the option is rejected instead and its value is not repeated here", e.option, urlParseReason(err))
+		}
+	}
+	return nil
+}
+
+// urlParseReason returns the parser's reason from a url.Parse error without
+// the URL the *url.Error carries, so a credential in the URL is not echoed.
+func urlParseReason(err error) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) && uerr.Err != nil {
+		return uerr.Err
+	}
+	return err
 }
 
 // validateOTLPEnvVar applies check to the trimmed value of the variable

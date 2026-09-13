@@ -174,6 +174,28 @@ func TestValidateOTLPExporterEnv(t *testing.T) {
 	})
 }
 
+// TestValidateConfiguredEndpoints pins that a malformed WithOTLPEndpoint or
+// WithMetricsOTLPEndpoint value fails before any exporter is built, with an
+// error that names the option and the parser's reason but never the value,
+// and that only an endpoint an enabled OTLP exporter uses is checked.
+func TestValidateConfiguredEndpoints(t *testing.T) {
+	const bad = "http://user:secret%zz@collector:4318"
+
+	err := validateConfiguredEndpoints(&Config{traceEnabled: true, otlpEndpoint: bad})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "WithOTLPEndpoint is not a valid URL")
+	assert.Contains(t, err.Error(), "invalid URL escape")
+	assert.NotContains(t, err.Error(), "secret", "the value stays out of the error")
+
+	err = validateConfiguredEndpoints(&Config{metricsEnabled: true, metricsOTLPEndpoint: bad})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "WithMetricsOTLPEndpoint is not a valid URL")
+	assert.NotContains(t, err.Error(), "secret")
+
+	require.NoError(t, validateConfiguredEndpoints(&Config{metricsEnabled: true, otlpEndpoint: bad}), "no trace or log exporter uses the OTLP endpoint")
+	require.NoError(t, validateConfiguredEndpoints(&Config{traceEnabled: true, logEnabled: true, otlpEndpoint: "http://collector:4318", metricsEnabled: true, metricsOTLPEndpoint: "http://collector:4318"}))
+}
+
 // derefError dereferences its receiver in Error, so a typed nil *derefError
 // panics when rendered the ordinary way.
 type derefError struct{ msg string }
