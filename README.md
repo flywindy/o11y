@@ -356,8 +356,9 @@ otel.SetLogger(obs.Logr())               // OTel-internal messages likewise, ins
 ```
 
 The SDK never installs these itself (ADR 0003). Independently of the
-handlers, every batch an OTLP exporter fails to deliver is counted as
-`o11y_export_failures_total{otel_component_type}` among the SDK's own
+handlers, every export call an OTLP exporter returned an error for (a
+rejected or undeliverable batch, or a partial-success response) is counted
+as `o11y_export_failures_total{otel_component_type}` among the SDK's own
 metrics: on `/metrics` on the default Prometheus pull path, through the OTLP
 metrics pipeline with `WithMetricsOTLPEndpoint`, and not at all when the
 metrics pillar is off. See
