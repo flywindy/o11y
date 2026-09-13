@@ -97,44 +97,81 @@ func TestDiagnosticSecrets(t *testing.T) {
 	assert.Len(t, got, len(slices.Compact(slices.Sorted(slices.Values(got)))), "no duplicates")
 }
 
-// TestValidateOTLPHeaderEnv mirrors the pinned exporters' parser: a pair
-// without "=", a name that is not an HTTP token or a value that is not
-// valid percent-encoding fails Init with an error that names the variable
-// and the pair's position but never its text; an empty variable and a
-// variable no enabled exporter reads are ignored.
-func TestValidateOTLPHeaderEnv(t *testing.T) {
+// TestValidateOTLPExporterEnv mirrors the pinned exporters' parsers: a
+// header pair without "=", with a name that is not an HTTP token or a value
+// that is not valid percent-encoding, an endpoint that is not a URL, or a
+// timeout that is not an integer fails Init with an error that names the
+// variable (and the pair's position) but never its text; an empty variable
+// and a variable no enabled exporter reads are ignored.
+func TestValidateOTLPExporterEnv(t *testing.T) {
 	all := &Config{traceEnabled: true, logEnabled: true, metricsEnabled: true, metricsOTLPEndpoint: "http://collector:4318"}
 
 	t.Run("well-formed", func(t *testing.T) {
 		t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer%20abcdef, x-tenant=acme")
+		t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318")
+		t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "10000")
 		t.Setenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "")
-		require.NoError(t, validateOTLPHeaderEnv(all))
+		require.NoError(t, validateOTLPExporterEnv(all))
 	})
 
-	for _, tc := range []struct{ name, value, reason string }{
-		{"missing equals", "authorization", "missing '='"},
-		{"bad name", "bad name=value", "not a valid HTTP header name"},
-		{"bad value", "authorization=BearerSecret%zz", "not valid percent-encoding"},
+	for _, tc := range []struct{ name, variable, value, reason, secret string }{
+		{"missing equals", "OTEL_EXPORTER_OTLP_HEADERS", "x-ok=1, authorization", "pair 2 is missing '='", "authorization"},
+		{"bad name", "OTEL_EXPORTER_OTLP_LOGS_HEADERS", "x-ok=1, bad name=value", "name of pair 2 is not a valid HTTP header name", "bad name"},
+		{"bad value", "OTEL_EXPORTER_OTLP_TRACES_HEADERS", "x-ok=1, authorization=BearerSecret%zz", "value of pair 2 is not valid percent-encoding", "BearerSecret"},
+		{"bad endpoint", "OTEL_EXPORTER_OTLP_ENDPOINT", "http://user:secret%zz@collector:4318", "not a valid URL", "secret%zz"},
+		{"bad metrics endpoint", "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "http://user:secret%zz@collector:4318", "not a valid URL", "secret%zz"},
+		{"bad timeout", "OTEL_EXPORTER_OTLP_TIMEOUT", "10s", "not an integer count of milliseconds", "10s"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-ok=1, "+tc.value)
-			err := validateOTLPHeaderEnv(all)
+			t.Setenv(tc.variable, tc.value)
+			err := validateOTLPExporterEnv(all)
 			require.Error(t, err)
-			assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_HEADERS: pair 2")
+			assert.Contains(t, err.Error(), tc.variable+" is malformed")
 			assert.Contains(t, err.Error(), tc.reason)
-			assert.NotContains(t, err.Error(), "BearerSecret", "the raw text stays out of the error")
-			assert.NotContains(t, err.Error(), "bad name")
+			assert.NotContains(t, err.Error(), tc.secret, "the raw text stays out of the error")
 		})
 	}
 
 	t.Run("variable no exporter reads is ignored", func(t *testing.T) {
 		t.Setenv("OTEL_EXPORTER_OTLP_METRICS_HEADERS", "authorization=BearerSecret%zz")
+		t.Setenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "http://user:secret%zz@collector:4318")
 		pull := &Config{traceEnabled: true, logEnabled: true, metricsEnabled: true}
-		require.NoError(t, validateOTLPHeaderEnv(pull), "the metrics variable is read only on the OTLP push path")
-		require.Error(t, validateOTLPHeaderEnv(all))
+		require.NoError(t, validateOTLPExporterEnv(pull), "the metrics variables are read only on the OTLP push path")
+		require.Error(t, validateOTLPExporterEnv(all))
 		none := &Config{}
-		require.NoError(t, validateOTLPHeaderEnv(none), "no OTLP exporter, nothing to validate")
+		require.NoError(t, validateOTLPExporterEnv(none), "no OTLP exporter, nothing to validate")
 	})
+}
+
+// derefError dereferences its receiver in Error, so a typed nil *derefError
+// panics when rendered the ordinary way.
+type derefError struct{ msg string }
+
+func (e *derefError) Error() string { return e.msg }
+
+// panicError panics on any receiver.
+type panicError struct{}
+
+func (panicError) Error() string { panic("no") }
+
+// TestOTelErrorHandler_SurvivesBrokenErrors pins that a typed nil error and
+// an Error method that panics are rendered as placeholders rather than
+// taking the process down, and that a live error still renders.
+func TestOTelErrorHandler_SurvivesBrokenErrors(t *testing.T) {
+	var buf bytes.Buffer
+	h := newOTelErrorHandler(slog.New(slog.NewTextHandler(&buf, nil)))
+
+	var typed *derefError
+	assert.NotPanics(t, func() { h.Handle(typed) })
+	assert.Contains(t, buf.String(), "<nil *o11y.derefError>")
+
+	buf.Reset()
+	assert.NotPanics(t, func() { h.Handle(panicError{}) })
+	assert.Contains(t, buf.String(), "[omitted: o11y.panicError panicked while rendering]")
+
+	buf.Reset()
+	h.Handle(&derefError{msg: "still rendered"})
+	assert.Contains(t, buf.String(), "still rendered")
 }
 
 // TestOTelErrorHandler_NilIsIgnored checks nil errors and a nil logger are safe.

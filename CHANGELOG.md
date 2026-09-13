@@ -40,10 +40,13 @@ adopters can plan their upgrades.
   configured endpoints and the header values of `WithOTLPHeaders` and
   `WithProfilingAuthHeaders` and the header names and values in the
   `OTEL_EXPORTER_OTLP_*HEADERS` variables, which the pinned exporters echo
-  verbatim when one fails to parse. The exporters parse those variables
-  while `Init` builds them, before `Logr()` can be installed, so `Init`
-  now rejects a malformed variable up front with an error that names the
-  variable and the pair's position but not its text; `Logr()` maps OTel's
+  verbatim when one fails to parse. The exporters parse their
+  `OTEL_EXPORTER_OTLP_*` variables while `Init` builds them, before
+  `Logr()` can be installed, so `Init` now rejects a malformed `ENDPOINT`,
+  `TIMEOUT` or `HEADERS` variable the enabled exporters would read, with an
+  error that names the variable and the pair's position but not its text.
+  `ErrorHandler()` renders a typed nil error and an `Error` method that
+  panics as placeholders rather than crashing; `Logr()` maps OTel's
   verbosity convention (V(1) warn, V(4) info, V(8) debug) onto the SDK's
   log level, so at the default INFO level the warnings the default logger
   dropped ("dropped log records") now appear. The SDK does not install them

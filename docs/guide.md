@@ -381,9 +381,12 @@ Important caveats:
 ## Export failures & OTel diagnostics
 
 The OTel SDK's batchers — the `BatchSpanProcessor`, the log `BatchProcessor`
-and the metric `PeriodicReader` — hand every export call that returned an
-error to `otel.Handle` and move on; a batch the collector rejected or could
-not be reached for is dropped. With the collector unreachable each queue
+and the metric `PeriodicReader` — hand every scheduled export call that
+returned an error to `otel.Handle` and move on; a batch the collector
+rejected or could not be reached for is dropped. (At shutdown only the trace
+batcher still goes through `otel.Handle`; the log batcher and the metric
+reader return their final export's error from `Shutdown` instead, see the
+shutdown notes below.) With the collector unreachable each queue
 drains into nothing every few seconds, the default handler prints one
 plain-text line to stderr per attempt, and afterward nobody can say how much
 was lost. Two things make that visible.
@@ -489,13 +492,17 @@ otel.SetErrorHandler(sdk.ErrorHandler()) // OTel-internal errors → structured 
 otel.SetLogger(sdk.Logr())               // OTel-internal messages → structured records
 ```
 
-One message cannot wait for that wiring: the OTLP exporters parse the
-`OTEL_EXPORTER_OTLP_*HEADERS` variables while `Init` builds them and report
-a pair they cannot parse through OTel's global logger with its raw text, so
-`Init` rejects a malformed variable (a pair without `=`, a name that is not
-an HTTP token, a value that is not valid percent-encoding) before any
-exporter exists. The error names the variable and the pair's position, not
-its text.
+One message cannot wait for that wiring: the OTLP exporters parse their
+`OTEL_EXPORTER_OTLP_*` variables while `Init` builds them, before the
+explicit options apply, and report a value they cannot parse through OTel's
+global logger with its raw text, so `Init` rejects a malformed variable
+before any exporter exists: an `ENDPOINT` that is not a URL (a credential
+in its userinfo is what makes the echo dangerous), a `TIMEOUT` that is not
+an integer count of milliseconds, or a `HEADERS` pair without `=`, with a
+name that is not an HTTP token or a value that is not valid
+percent-encoding. Only the variables the enabled OTLP exporters read are
+checked, and the error names the variable and the pair's position, not its
+text.
 
 `ErrorHandler()` writes each distinct OTel-internal error once per minute as
 an ERROR record (so it survives an error-only log level) with the error text

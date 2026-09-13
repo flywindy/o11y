@@ -299,11 +299,11 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	}
 	appendBaggageWarnings(cfg, whitelist)
 
-	// The OTLP exporters parse the OTEL_EXPORTER_OTLP_*HEADERS variables as
-	// they are built and report a malformed pair's raw text through OTel's
+	// The OTLP exporters parse their OTEL_EXPORTER_OTLP_* variables as they
+	// are built and report a malformed value's raw text through OTel's
 	// global logger, which nothing installed after Init can redact, so a
 	// malformed variable fails Init before any exporter exists.
-	if err := validateOTLPHeaderEnv(cfg); err != nil {
+	if err := validateOTLPExporterEnv(cfg); err != nil {
 		return nil, err
 	}
 

@@ -83,20 +83,29 @@ func TestInit_UnknownEnvironment(t *testing.T) {
 	assert.Contains(t, err.Error(), "unknown deployment environment")
 }
 
-// TestInit_RejectsMalformedOTLPHeaderEnv pins that a malformed
-// OTEL_EXPORTER_OTLP_*HEADERS value fails Init before any exporter is built,
-// with an error that names the variable and the pair but not its text: the
-// exporters would otherwise print the raw value through OTel's global logger
-// while Init builds them, before sdk.Logr() can be installed.
-func TestInit_RejectsMalformedOTLPHeaderEnv(t *testing.T) {
+// TestInit_RejectsMalformedOTLPExporterEnv pins that a malformed
+// OTEL_EXPORTER_OTLP_* value fails Init before any exporter is built, with
+// an error that names the variable but not its text: the exporters would
+// otherwise print the raw value through OTel's global logger while Init
+// builds them, before sdk.Logr() can be installed.
+func TestInit_RejectsMalformedOTLPExporterEnv(t *testing.T) {
 	srv := testutil.FakeOTLPServer(t)
-	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-ok=1, authorization=BearerSecret%zz")
 
-	_, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
+	t.Run("headers", func(t *testing.T) {
+		t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-ok=1, authorization=BearerSecret%zz")
+		_, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_HEADERS is malformed (the value of pair 2")
+		assert.NotContains(t, err.Error(), "BearerSecret")
+	})
 
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_HEADERS: pair 2 is malformed")
-	assert.NotContains(t, err.Error(), "BearerSecret")
+	t.Run("endpoint", func(t *testing.T) {
+		t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://user:secret%zz@collector:4318")
+		_, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_ENDPOINT is malformed (it is not a valid URL")
+		assert.NotContains(t, err.Error(), "secret%zz")
+	})
 }
 
 // TestInit_EnvironmentAliases verifies that common shorthand values are

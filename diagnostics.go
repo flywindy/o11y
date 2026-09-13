@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"reflect"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -63,7 +65,7 @@ func (h *otelErrorHandler) Handle(err error) {
 	if err == nil {
 		return
 	}
-	msg := redact.Secrets(redact.InText(err.Error(), h.endpoints...), h.secrets...)
+	msg := redact.Secrets(redact.InText(errorText(err), h.endpoints...), h.secrets...)
 	if h.suppress.SuppressedAt(msg, h.now()) {
 		return
 	}
@@ -71,6 +73,23 @@ func (h *otelErrorHandler) Handle(err error) {
 		slog.String("error", msg),
 		slog.String("repeat_suppressed_for", otelDiagnosticRepeatWindow.String()),
 	)
+}
+
+// errorText renders err for the diagnostic record without letting a broken
+// error value take the process down: a typed nil pointer is named rather
+// than dereferenced by its own Error method, and an Error method that
+// panics is recovered into a placeholder naming the type. A diagnostic is
+// never worth a crash.
+func errorText(err error) (text string) {
+	if rv := reflect.ValueOf(err); rv.Kind() == reflect.Pointer && rv.IsNil() {
+		return fmt.Sprintf("<nil %T>", err)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			text = fmt.Sprintf("[omitted: %T panicked while rendering]", err)
+		}
+	}()
+	return err.Error()
 }
 
 // ErrorHandler returns a handler that writes the errors OpenTelemetry
@@ -132,66 +151,103 @@ var otlpHeaderEnvVars = []string{
 	"OTEL_EXPORTER_OTLP_LOGS_HEADERS",
 }
 
-// otlpHeaderEnvVarsFor returns the header variables the OTLP exporters Init
-// is about to build will read: the generic variable when any OTLP exporter
-// is built, and the per-signal variable for each signal exported over OTLP.
-// A variable no exporter reads is left alone.
-func otlpHeaderEnvVarsFor(cfg *Config) []string {
+// otlpExporterEnvPrefixes returns the OTEL_EXPORTER_OTLP_ variable
+// prefixes the OTLP exporters Init is about to build will read: the generic
+// prefix when any OTLP exporter is built, and the per-signal prefix for
+// each signal exported over OTLP. A variable no exporter reads is left
+// alone.
+func otlpExporterEnvPrefixes(cfg *Config) []string {
 	traces := cfg.traceEnabled
 	logs := cfg.logEnabled
 	metrics := cfg.metricsEnabled && cfg.metricsOTLPEndpoint != ""
 	if !traces && !logs && !metrics {
 		return nil
 	}
-	vars := []string{"OTEL_EXPORTER_OTLP_HEADERS"}
+	prefixes := []string{"OTEL_EXPORTER_OTLP_"}
 	if traces {
-		vars = append(vars, "OTEL_EXPORTER_OTLP_TRACES_HEADERS")
+		prefixes = append(prefixes, "OTEL_EXPORTER_OTLP_TRACES_")
 	}
 	if metrics {
-		vars = append(vars, "OTEL_EXPORTER_OTLP_METRICS_HEADERS")
+		prefixes = append(prefixes, "OTEL_EXPORTER_OTLP_METRICS_")
 	}
 	if logs {
-		vars = append(vars, "OTEL_EXPORTER_OTLP_LOGS_HEADERS")
+		prefixes = append(prefixes, "OTEL_EXPORTER_OTLP_LOGS_")
 	}
-	return vars
+	return prefixes
 }
 
-// validateOTLPHeaderEnv rejects a malformed OTLP header variable before any
-// exporter is built. The pinned exporters parse these variables while they
-// are constructed and report a pair they cannot parse through OTel's global
-// logger with the raw text attached ("input", "key" or "value"), and Init
-// builds the exporters before it returns, so nothing the application can
-// install later reaches those messages: Logr's redaction only covers what
-// is logged after otel.SetLogger. Failing Init instead keeps the raw text
-// out of stderr; the error names the variable and the pair's position, not
-// its text. The rules mirror the exporters' parser: a pair without "=", a
-// name that is not an HTTP token, or a value that is not valid
-// percent-encoding. An empty variable is skipped, as the exporters skip it.
-func validateOTLPHeaderEnv(cfg *Config) error {
-	for _, name := range otlpHeaderEnvVarsFor(cfg) {
-		raw := strings.TrimSpace(os.Getenv(name))
-		if raw == "" {
-			continue
+// validateOTLPExporterEnv rejects a malformed OTLP exporter variable before
+// any exporter is built. The pinned exporters parse their environment while
+// they are constructed, before the explicit options apply, and report a
+// value they cannot parse through OTel's global logger with the raw text
+// attached ("input", "key" or "value"); Init builds the exporters before it
+// returns, so nothing the application can install later reaches those
+// messages, and Logr's redaction only covers what is logged after
+// otel.SetLogger. Failing Init instead keeps the raw text out of stderr;
+// the error names the variable and, for a header list, the pair's position,
+// never the text. The rules mirror the exporters' parsers: ENDPOINT must
+// parse as a URL (a credential in its userinfo is what makes the echo
+// dangerous), TIMEOUT must be an integer count of milliseconds, and each
+// HEADERS pair must carry "=", a name that is an HTTP token and a value that
+// is valid percent-encoding. Certificate variables name files, which the
+// exporters echo as paths, and INSECURE and COMPRESSION are never echoed,
+// so they are not checked. An empty variable is skipped, as the exporters
+// skip it.
+func validateOTLPExporterEnv(cfg *Config) error {
+	for _, prefix := range otlpExporterEnvPrefixes(cfg) {
+		if err := validateOTLPEnvVar(prefix+"ENDPOINT", func(v string) (string, bool) {
+			if _, err := url.Parse(v); err != nil {
+				return "it is not a valid URL", true
+			}
+			return "", false
+		}); err != nil {
+			return err
 		}
-		for i, pair := range strings.Split(raw, ",") {
-			k, v, found := strings.Cut(pair, "=")
-			var reason string
-			switch {
-			case !found:
-				reason = "missing '='"
-			case !isHTTPToken(strings.TrimSpace(k)):
-				reason = "the name is not a valid HTTP header name"
-			default:
-				if _, err := url.PathUnescape(v); err != nil {
-					reason = "the value is not valid percent-encoding"
-				}
+		if err := validateOTLPEnvVar(prefix+"TIMEOUT", func(v string) (string, bool) {
+			if _, err := strconv.Atoi(v); err != nil {
+				return "it is not an integer count of milliseconds", true
 			}
-			if reason != "" {
-				return fmt.Errorf("o11y: %s: pair %d is malformed (%s); the OTLP exporters would report its raw text through OTel's global logger while Init builds them, before Logr() can be installed, so the variable is rejected instead", name, i+1, reason)
-			}
+			return "", false
+		}); err != nil {
+			return err
+		}
+		if err := validateOTLPEnvVar(prefix+"HEADERS", malformedHeaderList); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// validateOTLPEnvVar applies check to the trimmed value of the variable
+// name when it is set and non-empty, and returns the Init error for the
+// reason check reports.
+func validateOTLPEnvVar(name string, check func(string) (reason string, bad bool)) error {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return nil
+	}
+	if reason, bad := check(raw); bad {
+		return fmt.Errorf("o11y: %s is malformed (%s); the OTLP exporters would report its raw text through OTel's global logger while Init builds them, before Logr() can be installed, so the variable is rejected instead", name, reason)
+	}
+	return nil
+}
+
+// malformedHeaderList mirrors the exporters' header-list parser on a
+// HEADERS value and names the first malformed pair by position.
+func malformedHeaderList(raw string) (string, bool) {
+	for i, pair := range strings.Split(raw, ",") {
+		k, v, found := strings.Cut(pair, "=")
+		switch {
+		case !found:
+			return fmt.Sprintf("pair %d is missing '='", i+1), true
+		case !isHTTPToken(strings.TrimSpace(k)):
+			return fmt.Sprintf("the name of pair %d is not a valid HTTP header name", i+1), true
+		}
+		if _, err := url.PathUnescape(v); err != nil {
+			return fmt.Sprintf("the value of pair %d is not valid percent-encoding", i+1), true
+		}
+	}
+	return "", false
 }
 
 // isHTTPToken reports whether s is a non-empty RFC 7230 token, the check the
