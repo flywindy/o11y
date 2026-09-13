@@ -387,8 +387,8 @@ into nothing every few seconds, the default handler prints one plain-text
 line to stderr per attempt, and afterward nobody can say how much was lost.
 Two things make that visible.
 
-**`o11y_export_failures_total{otel_component_type}`** counts every batch
-the OTLP exporters failed to deliver, one series per exporter: the label is
+**`o11y_export_failures_total{otel_component_type}`** counts every export
+call the OTLP exporters returned an error for, one series per exporter: the label is
 semconv's `otel.component.type`, with the values `otlp_http_span_exporter`,
 `otlp_http_log_exporter` and `otlp_http_metric_exporter`. It is an SDK-owned
 instrument among the SDK's own metrics, present after upgrading with no code
@@ -399,10 +399,17 @@ it:
 sum by (service_name, otel_component_type) (rate(o11y_export_failures_total[5m])) > 0
 ```
 
-The unit is a batch, not a span: the span batcher sends up to 512 spans per
-batch and the log batcher up to 512 records (`OTEL_BSP_MAX_EXPORT_BATCH_SIZE`
-/ `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE`), so the count is a lower bound on the
-items lost. Where the counter lands follows the metrics pillar: on the
+The unit is an export call, not a span: the span batcher sends up to 512
+spans per batch and the log batcher up to 512 records
+(`OTEL_BSP_MAX_EXPORT_BATCH_SIZE` / `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE`). Most
+counted calls are a batch the collector rejected or could not be reached
+for, whose items are dropped; the pinned exporters also return an error for
+a *partial-success* response, where the collector accepted the request but
+rejected some items, or accepted everything and attached a warning message.
+So the count is an upper bound on dropped batches and a lower bound on lost
+items; the rejected-item count and the collector's message are in the error
+text `ErrorHandler()` logs. Where the counter lands follows the metrics
+pillar: on the
 default Prometheus pull path it is scraped from `/metrics`; on the OTLP
 metrics push path (`WithMetricsOTLPEndpoint`) the metric exporter's own
 count travels through the pipeline that is failing and lands once an export
@@ -417,14 +424,19 @@ still counted and, on the push path, shipped with the last collection.
 
 **Structured diagnostics.** The SDK builds replacements for the OTel
 default error handler and logger but does not install them — ADR 0003, the
-SDK never touches OTel globals. The application installs them next to the
-providers it already wires:
+SDK never touches OTel globals. Out of the box the OTel default handler
+prints every handled error as plain text to stderr, and the default logger
+prints only its error-level messages: its warnings and informational
+messages ("dropped log records", "Tracer created") are dropped, because the
+default `stdr` logger sits at verbosity 0 and OTel logs them at V(1) and
+V(4). The application installs the replacements next to the providers it
+already wires:
 
 ```go
 otel.SetTracerProvider(sdk.TracerProvider())
 otel.SetMeterProvider(sdk.MeterProvider())
 otel.SetTextMapPropagator(sdk.Propagator)
-otel.SetErrorHandler(sdk.ErrorHandler()) // OTel-internal errors → structured WARN
+otel.SetErrorHandler(sdk.ErrorHandler()) // OTel-internal errors → structured ERROR records
 otel.SetLogger(sdk.Logr())               // OTel-internal messages → structured records
 ```
 
@@ -435,7 +447,10 @@ collector outage becomes one line per minute per exporter instead of one per
 attempt. `Logr()` does the same for the
 messages the SDK logs on its own ("dropped log records", an invalid
 instrument name), mapping OTel's verbosity convention onto the SDK's log
-level: V(1) is WARN, V(4) is INFO, V(8) is DEBUG. Both write to the stdout
+level: V(1) is WARN, V(4) is INFO, V(8) is DEBUG. Note that this is more
+than a format change: at the SDK's default INFO level the WARN and INFO
+diagnostics the OTel default logger was dropping now appear, one per
+distinct message per minute. Both write to the stdout
 JSON log only, not through the OTLP log pipeline: an error about the log
 pipeline must not queue another record behind the batch that is failing.
 

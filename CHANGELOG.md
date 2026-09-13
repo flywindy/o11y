@@ -15,8 +15,10 @@ adopters can plan their upgrades.
 
 ### Added
 
-- `o11y_export_failures_total{otel_component_type}` counts every batch the
-  OTLP exporters failed to deliver, one series per exporter (semconv's
+- `o11y_export_failures_total{otel_component_type}` counts every export
+  call the OTLP exporters returned an error for — a batch the collector
+  rejected or could not be reached for, or a partial-success response —
+  one series per exporter (semconv's
   `otel.component.type`: `otlp_http_span_exporter`, `otlp_http_log_exporter`,
   `otlp_http_metric_exporter`). The OTel batchers drop a rejected batch after
   handing the error to `otel.Handle`, so until now a collector outage left no
@@ -27,13 +29,17 @@ adopters can plan their upgrades.
   no code change. See the guide's "Export failures & OTel diagnostics"
   section for the alert and `docs/semconv.md` for the catalog entry.
 - `SDK.ErrorHandler()` and `SDK.Logr()` return replacements for OTel's
-  default error handler and internal logger, which print plain text to
-  stderr on every occurrence. The replacements write structured records to
+  default error handler and internal logger: the default handler prints
+  every handled error as plain text to stderr on every occurrence, and the
+  default logger prints only error-level messages, dropping OTel's warnings
+  and informational messages. The replacements write structured records to
   the SDK's stdout log (handled errors at ERROR, so an error-only log level
   keeps them), one per distinct error or message per minute, with
   the suppression window under `repeat_suppressed_for`; `Logr()` maps OTel's
   verbosity convention (V(1) warn, V(4) info, V(8) debug) onto the SDK's
-  log level. The SDK does not install them (ADR 0003); the application does
+  log level, so at the default INFO level the warnings the default logger
+  dropped ("dropped log records") now appear. The SDK does not install them
+  (ADR 0003); the application does
   with `otel.SetErrorHandler` / `otel.SetLogger`. The scrape-error log line
   introduced by #93 renders its `repeat_suppressed_for` field the same way
   (`"5m0s"` rather than a nanosecond count).

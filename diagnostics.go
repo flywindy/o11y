@@ -92,8 +92,13 @@ func (s *SDK) ErrorHandler() otel.ErrorHandler {
 // messages — "dropped log records", an invalid instrument name — as
 // structured records on the SDK's stdout log, one per distinct message per
 // minute. Verbosity follows the OTel SDK's own convention: V(1) is WARN,
-// V(4) is INFO, V(8) is DEBUG, gated by the SDK's log level. Without it the
-// OTel default prints plain text to stderr.
+// V(4) is INFO, V(8) is DEBUG, gated by the SDK's log level.
+//
+// This surfaces more than the OTel default does, not just in a different
+// format: the default logger is a stdr logger at verbosity 0, so it prints
+// only error-level messages as plain text to stderr and drops the V(1)
+// warnings and V(4) informational messages entirely. With Logr installed
+// at the SDK's default INFO level those warnings and messages appear.
 //
 // The SDK does not install the logger (ADR 0003); the application does
 // with otel.SetLogger(sdk.Logr()). See ErrorHandler for the companion.
