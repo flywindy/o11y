@@ -150,6 +150,23 @@ func TestLogr_RedactsAttrKeys(t *testing.T) {
 	assert.Contains(t, out, "exporter.", "the group structure survives")
 }
 
+// TestLogr_RedactsLoggerName checks a WithName segment is redacted before
+// it is emitted as the "logger" attribute.
+func TestLogr_RedactsLoggerName(t *testing.T) {
+	logger, buf := newRecordingLogger(slog.LevelInfo)
+	const endpoint = "http://svc:hunter2@collector:4318"
+	l := o11ylog.NewLogrRedacting(logger, nil, o11ylog.Redaction{Endpoints: []string{endpoint}, Secrets: []string{"TopSecretToken"}}).
+		WithName(endpoint).WithName("TopSecretToken")
+
+	l.Info("named")
+
+	out := buf.String()
+	assert.NotContains(t, out, "hunter2")
+	assert.NotContains(t, out, "TopSecretToken")
+	assert.Contains(t, out, "logger=", "the attribute is still emitted")
+	assert.Contains(t, out, "collector:4318", "the host survives")
+}
+
 // marshalsToText implements logr.Marshaler the way attribute.Set does, with
 // nothing slog could render on its own.
 type marshalsToText struct{ hidden string }
