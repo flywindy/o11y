@@ -2,6 +2,8 @@ package o11y
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -140,12 +142,35 @@ var otlpHeaderEnvVars = []string{
 type otlpEnvCheck struct {
 	name  string
 	check func(string) (reason string, bad bool)
-	// fallback, when set, is the variable the exporter reads instead when
-	// name is unset: the log exporter resolves a setting from the signal
-	// variable first and consults the generic one only when the signal
-	// variable is empty, so a generic value shadowed by a valid signal
-	// value is never parsed and must not be checked.
-	fallback string
+	// pair, when set, is a second variable the exporter requires alongside
+	// name before it reads either: a client certificate is loaded only
+	// when both the CLIENT_CERTIFICATE and the CLIENT_KEY variable are set.
+	pair string
+	// fallback, when set, is the check the exporter applies instead when
+	// name (and pair) is unset: the log exporter resolves a setting from
+	// the signal variable first and consults the generic one only when the
+	// signal variable is empty, so a generic value shadowed by a valid
+	// signal value is never parsed and must not be checked.
+	fallback *otlpEnvCheck
+}
+
+// set reports whether the exporter will read the variable: name is set and
+// non-empty, and so is pair when the check has one.
+func (c otlpEnvCheck) set() bool {
+	return envSet(c.name) && (c.pair == "" || envSet(c.pair))
+}
+
+// envSet reports whether the variable name is set to a non-blank value,
+// which is how the pinned exporters decide whether to read it.
+func envSet(name string) bool {
+	return strings.TrimSpace(os.Getenv(name)) != ""
+}
+
+// clientCertCheck builds the check for the CLIENT_CERTIFICATE / CLIENT_KEY
+// pair under prefix, which the exporters read only when both are set.
+func clientCertCheck(prefix string) otlpEnvCheck {
+	key := prefix + "CLIENT_KEY"
+	return otlpEnvCheck{name: prefix + "CLIENT_CERTIFICATE", pair: key, check: checkClientKeyPair(key)}
 }
 
 // otlpExporterEnvChecks lists the variables the enabled OTLP exporters will
@@ -153,18 +178,20 @@ type otlpEnvCheck struct {
 // two exporter families differ in when they read the environment. The
 // pinned trace and metric exporters apply the environment before the
 // explicit options, so with traces enabled, or metrics on the push path,
-// every ENDPOINT, TIMEOUT and HEADERS variable under the generic and the
-// signal prefix is parsed whatever Init passes in. The pinned log exporter
-// consults a variable only when the matching explicit option is absent:
-// Init always passes the log endpoint URL, which also pins the path and the
-// insecure flag, so its ENDPOINT and INSECURE variables are never read; it
-// passes headers only when WithOTLPHeaders set some, so the HEADERS
-// variables are read only then; and it never sets a timeout or a
-// compression, so those variables are always read. It also resolves each
-// setting from the signal variable first and reads the generic one only
-// when the signal variable is unset (a signal value that fails to parse is
-// echoed before it falls through, so it is still rejected). A variable no
-// enabled exporter reads is left alone.
+// every ENDPOINT, TIMEOUT, HEADERS, CERTIFICATE and CLIENT_CERTIFICATE /
+// CLIENT_KEY variable under the generic and the signal prefix is read
+// whatever Init passes in. The pinned log exporter consults a variable only
+// when the matching explicit option is absent: Init always passes the log
+// endpoint URL, which also pins the path and the insecure flag, so its
+// ENDPOINT and INSECURE variables are never read; it passes headers only
+// when WithOTLPHeaders set some, so the HEADERS variables are read only
+// then; and it never sets a timeout, a compression or a TLS configuration,
+// so those variables are always read. It also resolves each setting from
+// the signal variable first and reads the generic one only when the signal
+// variable is unset (a signal value that fails to parse is echoed before
+// it falls through, so it is still rejected); for the client certificate
+// the signal pair counts as set only when both its variables are. A
+// variable no enabled exporter reads is left alone.
 func otlpExporterEnvChecks(cfg *Config) []otlpEnvCheck {
 	var checks []otlpEnvCheck
 	envFirst := func(signal string) {
@@ -173,6 +200,8 @@ func otlpExporterEnvChecks(cfg *Config) []otlpEnvCheck {
 				otlpEnvCheck{name: prefix + "ENDPOINT", check: checkURL},
 				otlpEnvCheck{name: prefix + "TIMEOUT", check: checkMilliseconds},
 				otlpEnvCheck{name: prefix + "HEADERS", check: malformedHeaderList},
+				otlpEnvCheck{name: prefix + "CERTIFICATE", check: checkCertificateFile},
+				clientCertCheck(prefix),
 			)
 		}
 	}
@@ -183,16 +212,22 @@ func otlpExporterEnvChecks(cfg *Config) []otlpEnvCheck {
 		envFirst("METRICS")
 	}
 	if cfg.logEnabled {
+		const generic, logs = "OTEL_EXPORTER_OTLP_", "OTEL_EXPORTER_OTLP_LOGS_"
 		signalFirst := func(setting string, check func(string) (string, bool)) otlpEnvCheck {
 			return otlpEnvCheck{
-				name:     "OTEL_EXPORTER_OTLP_LOGS_" + setting,
+				name:     logs + setting,
 				check:    check,
-				fallback: "OTEL_EXPORTER_OTLP_" + setting,
+				fallback: &otlpEnvCheck{name: generic + setting, check: check},
 			}
 		}
+		clientCert := clientCertCheck(logs)
+		genericClientCert := clientCertCheck(generic)
+		clientCert.fallback = &genericClientCert
 		checks = append(checks,
 			signalFirst("TIMEOUT", checkMilliseconds),
 			signalFirst("COMPRESSION", checkCompression),
+			signalFirst("CERTIFICATE", checkCertificateFile),
+			clientCert,
 		)
 		if len(cfg.otlpHeaders) == 0 {
 			checks = append(checks, signalFirst("HEADERS", malformedHeaderList))
@@ -217,16 +252,21 @@ func otlpExporterEnvChecks(cfg *Config) []otlpEnvCheck {
 // credential in its userinfo is what makes the echo dangerous), TIMEOUT
 // must be an integer count of milliseconds, COMPRESSION must be "gzip" or
 // "none", and each HEADERS pair must carry "=", a name that is an HTTP
-// token and a value that is valid percent-encoding. Certificate variables
-// name files, which the exporters echo as paths, and are not checked. An
-// empty variable is skipped, as the exporters skip it.
+// token and a value that is valid percent-encoding. CERTIFICATE must name
+// a readable file holding a PEM certificate, and CLIENT_CERTIFICATE with
+// CLIENT_KEY (read only when both are set) must name readable files that
+// form a key pair: the exporters echo the path of a file they cannot read,
+// both as a field and inside the os.ReadFile error. An empty variable is
+// skipped, as the exporters skip it.
 func validateOTLPExporterEnv(cfg *Config) error {
 	for _, c := range otlpExporterEnvChecks(cfg) {
-		name := c.name
-		if c.fallback != "" && strings.TrimSpace(os.Getenv(c.name)) == "" {
-			name = c.fallback
+		for c.fallback != nil && !c.set() {
+			c = *c.fallback
 		}
-		if err := validateOTLPEnvVar(name, c.check); err != nil {
+		if !c.set() {
+			continue
+		}
+		if err := validateOTLPEnvVar(c.name, c.check); err != nil {
 			return err
 		}
 	}
@@ -253,6 +293,39 @@ func checkCompression(v string) (string, bool) {
 		return "", false
 	}
 	return `it is neither "gzip" nor "none"`, true
+}
+
+// checkCertificateFile applies the exporters' CA certificate rule: the
+// path must be readable and hold at least one PEM certificate.
+func checkCertificateFile(path string) (string, bool) {
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		return "the file it names cannot be read", true
+	}
+	if !x509.NewCertPool().AppendCertsFromPEM(pem) {
+		return "the file it names holds no PEM certificate", true
+	}
+	return "", false
+}
+
+// checkClientKeyPair returns the exporters' client certificate rule for a
+// CLIENT_CERTIFICATE value paired with the variable keyVar: both files
+// must be readable and together form a valid key pair.
+func checkClientKeyPair(keyVar string) func(string) (string, bool) {
+	return func(certPath string) (string, bool) {
+		cert, err := os.ReadFile(certPath)
+		if err != nil {
+			return "the file it names cannot be read", true
+		}
+		key, err := os.ReadFile(strings.TrimSpace(os.Getenv(keyVar)))
+		if err != nil {
+			return "the file named by " + keyVar + " cannot be read", true
+		}
+		if _, err := tls.X509KeyPair(cert, key); err != nil {
+			return "it and " + keyVar + " do not name a valid certificate and key pair", true
+		}
+		return "", false
+	}
 }
 
 // validateConfiguredEndpoints rejects a malformed endpoint given through
@@ -299,7 +372,7 @@ func validateOTLPEnvVar(name string, check func(string) (reason string, bad bool
 		return nil
 	}
 	if reason, bad := check(raw); bad {
-		return fmt.Errorf("o11y: %s is malformed (%s); the OTLP exporters would report its raw text through OTel's global logger while Init builds them, before Logr() can be installed, so the variable is rejected instead", name, reason)
+		return fmt.Errorf("o11y: %s cannot be used (%s); the OTLP exporters would report its raw text through OTel's global logger while Init builds them, before Logr() can be installed, so the variable is rejected instead", name, reason)
 	}
 	return nil
 }

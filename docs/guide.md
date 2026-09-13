@@ -499,16 +499,21 @@ through OTel's global logger, the log exporter through `otel.Handle`), so
 `Init` rejects a malformed variable before any exporter exists: an
 `ENDPOINT` that is not a URL (a credential in its userinfo is what makes
 the echo dangerous), a `TIMEOUT` that is not an integer count of
-milliseconds, a `COMPRESSION` that is neither `gzip` nor `none`, or a
+milliseconds, a `COMPRESSION` that is neither `gzip` nor `none`, a
 `HEADERS` pair without `=`, with a name that is not an HTTP token or a
-value that is not valid percent-encoding. Only the variables the enabled
-exporters actually read are checked: the trace and metric exporters apply
-the environment before the explicit options, so their `ENDPOINT`, `TIMEOUT`
-and `HEADERS` variables are always read; the log exporter reads a variable
+value that is not valid percent-encoding, a `CERTIFICATE` that does not
+name a readable file holding a PEM certificate, or a `CLIENT_CERTIFICATE`
+and `CLIENT_KEY` (read only when both are set) that do not name readable
+files forming a key pair; the exporters echo the path of a file they
+cannot read. Only the variables the enabled exporters actually read are
+checked: the trace and metric exporters apply the environment before the
+explicit options, so their `ENDPOINT`, `TIMEOUT`, `HEADERS` and
+certificate variables are always read; the log exporter reads a variable
 only where `Init` passes no explicit option, so its endpoint is never read,
-its headers only without `WithOTLPHeaders`, and its timeout and compression
-always, taking the `LOGS_` variable first and the generic one only when the
-`LOGS_` variable is unset. The endpoints given to `WithOTLPEndpoint` and
+its headers only without `WithOTLPHeaders`, and its timeout, compression
+and certificate files always, taking the `LOGS_` variable first and the
+generic one only when the `LOGS_` variable is unset (for the client
+certificate, when the `LOGS_` pair is incomplete). The endpoints given to `WithOTLPEndpoint` and
 `WithMetricsOTLPEndpoint` get the same check, since the trace and metric
 exporters echo a URL they cannot parse the same way and then fall back to
 their default endpoint. The error names the variable or option and the

@@ -43,9 +43,11 @@ adopters can plan their upgrades.
   verbatim when one fails to parse. The exporters parse their
   `OTEL_EXPORTER_OTLP_*` variables while `Init` builds them, before
   `Logr()` can be installed, so `Init` now rejects a malformed `ENDPOINT`,
-  `TIMEOUT`, `COMPRESSION` or `HEADERS` variable the enabled exporters
-  would actually read (the log exporter reads one only where `Init` passes
-  no explicit option), and a malformed endpoint given to `WithOTLPEndpoint`
+  `TIMEOUT`, `COMPRESSION` or `HEADERS` variable, or a `CERTIFICATE`,
+  `CLIENT_CERTIFICATE` or `CLIENT_KEY` variable naming a file that cannot
+  be read or parsed, that the enabled exporters would actually read (the
+  log exporter reads one only where `Init` passes no explicit option), and
+  a malformed endpoint given to `WithOTLPEndpoint`
   or `WithMetricsOTLPEndpoint`, which the trace and metric exporters echo
   the same way, with an error that names the variable or option and the
   pair's position but not the text. `ErrorHandler()` and `Logr()` render a typed

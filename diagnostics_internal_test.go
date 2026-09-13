@@ -3,8 +3,16 @@ package o11y
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"log/slog"
+	"math/big"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -132,7 +140,7 @@ func TestValidateOTLPExporterEnv(t *testing.T) {
 			t.Setenv(tc.variable, tc.value)
 			err := validateOTLPExporterEnv(all)
 			require.Error(t, err)
-			assert.Contains(t, err.Error(), tc.variable+" is malformed")
+			assert.Contains(t, err.Error(), tc.variable+" cannot be used")
 			assert.Contains(t, err.Error(), tc.reason)
 			assert.NotContains(t, err.Error(), tc.secret, "the raw text stays out of the error")
 		})
@@ -170,8 +178,81 @@ func TestValidateOTLPExporterEnv(t *testing.T) {
 		t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "10000")
 		err := validateOTLPExporterEnv(withHeaders)
 		require.Error(t, err, "a signal value that fails to parse is echoed before the exporter falls through")
-		assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT is malformed")
+		assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT cannot be used")
 	})
+
+	t.Run("certificate files", func(t *testing.T) {
+		dir := t.TempDir()
+		certPath, keyPath := writeTestKeyPair(t, dir)
+		missing := filepath.Join(dir, "missing.pem")
+		text := filepath.Join(dir, "notes.txt")
+		require.NoError(t, os.WriteFile(text, []byte("not a certificate"), 0o600))
+
+		t.Setenv("OTEL_EXPORTER_OTLP_CERTIFICATE", certPath)
+		t.Setenv("OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", certPath)
+		t.Setenv("OTEL_EXPORTER_OTLP_CLIENT_KEY", keyPath)
+		require.NoError(t, validateOTLPExporterEnv(all), "a readable PEM certificate and a matching key pair pass")
+
+		for _, tc := range []struct{ name, variable, value, named, reason string }{
+			{"unreadable CA file", "OTEL_EXPORTER_OTLP_CERTIFICATE", missing, "OTEL_EXPORTER_OTLP_CERTIFICATE", "the file it names cannot be read"},
+			{"CA file without a certificate", "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE", text, "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE", "holds no PEM certificate"},
+			{"unreadable client certificate", "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", missing, "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", "the file it names cannot be read"},
+			{"unreadable client key", "OTEL_EXPORTER_OTLP_CLIENT_KEY", missing, "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", "the file named by OTEL_EXPORTER_OTLP_CLIENT_KEY cannot be read"},
+			{"mismatched pair", "OTEL_EXPORTER_OTLP_CLIENT_KEY", text, "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", "do not name a valid certificate and key pair"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Setenv(tc.variable, tc.value)
+				err := validateOTLPExporterEnv(all)
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.named+" cannot be used (")
+				assert.Contains(t, err.Error(), tc.reason)
+				assert.NotContains(t, err.Error(), dir, "the path stays out of the error")
+			})
+		}
+
+		t.Run("client pair needs both variables", func(t *testing.T) {
+			t.Setenv("OTEL_EXPORTER_OTLP_CLIENT_KEY", "")
+			t.Setenv("OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", missing)
+			require.NoError(t, validateOTLPExporterEnv(all), "the exporters load a client certificate only when both variables are set")
+		})
+
+		t.Run("log exporter takes the LOGS_ pair only when complete", func(t *testing.T) {
+			logsOnly := &Config{logEnabled: true}
+			t.Setenv("OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", missing)
+			t.Setenv("OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE", certPath)
+			err := validateOTLPExporterEnv(logsOnly)
+			require.Error(t, err, "a LOGS_ certificate without its key leaves the generic pair in use")
+			assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE cannot be used")
+			t.Setenv("OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY", keyPath)
+			require.NoError(t, validateOTLPExporterEnv(logsOnly), "a complete LOGS_ pair shadows the generic one")
+			t.Setenv("OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE", certPath)
+			t.Setenv("OTEL_EXPORTER_OTLP_CERTIFICATE", missing)
+			require.NoError(t, validateOTLPExporterEnv(logsOnly), "a LOGS_ CA file shadows the generic one")
+			require.Error(t, validateOTLPExporterEnv(all), "the trace exporter still reads the generic CA file")
+		})
+	})
+}
+
+// writeTestKeyPair writes a self-signed certificate and its private key as
+// PEM files under dir and returns their paths.
+func writeTestKeyPair(t *testing.T, dir string) (certPath, keyPath string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	require.NoError(t, err)
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	require.NoError(t, err)
+	certPath = filepath.Join(dir, "cert.pem")
+	keyPath = filepath.Join(dir, "key.pem")
+	require.NoError(t, os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600))
+	require.NoError(t, os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600))
+	return certPath, keyPath
 }
 
 // TestValidateConfiguredEndpoints pins that a malformed WithOTLPEndpoint or
