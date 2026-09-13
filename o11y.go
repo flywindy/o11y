@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/flywindy/o11y/internal/baggageattrs"
 	"github.com/flywindy/o11y/internal/exportstats"
@@ -136,6 +137,15 @@ func (s *SDK) Meter(name string) metric.Meter {
 // logged and returned joined. Always call with a context that has a timeout
 // to cap the flush wait.
 //
+// The deadline is shared out: each component runs under an even share of
+// the time left, recomputed as the sequence advances, so a component that
+// finishes early hands its slack to the ones after it, and one that drains
+// slowly (the OTel batchers drain on a background context while the OTLP
+// exporter retries a failing collector for up to a minute) cannot consume
+// the whole deadline and leave the components after it, the meter
+// provider's final collection in particular, with a context that is
+// already done. A context without a deadline is passed through unchanged.
+//
 // Shutdown is idempotent: subsequent calls return the same joined error
 // without rerunning any closer. Callers may safely register Shutdown in
 // multiple defer chains (for example, both in main and in a signal handler)
@@ -143,8 +153,11 @@ func (s *SDK) Meter(name string) metric.Meter {
 func (s *SDK) Shutdown(ctx context.Context) error {
 	s.shutdownOnce.Do(func() {
 		var errs []error
-		for _, fn := range s.shutdowns {
-			if err := fn(ctx); err != nil {
+		for i, fn := range s.shutdowns {
+			closerCtx, cancel := shutdownBudget(ctx, len(s.shutdowns)-i)
+			err := fn(closerCtx)
+			cancel()
+			if err != nil {
 				s.Logger.ErrorContext(ctx, "SDK component shutdown failed", slog.Any("error", err))
 				errs = append(errs, err)
 			}
@@ -152,6 +165,22 @@ func (s *SDK) Shutdown(ctx context.Context) error {
 		s.shutdownErr = errors.Join(errs...)
 	})
 	return s.shutdownErr
+}
+
+// shutdownBudget derives the context one closer runs under: an even share
+// of the time left before ctx's deadline across the closers still to run,
+// this one included. The last closer, and every closer when ctx has no
+// deadline or its deadline has already passed, gets ctx itself.
+func shutdownBudget(ctx context.Context, remaining int) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok || remaining <= 1 {
+		return ctx, func() {}
+	}
+	share := time.Until(deadline) / time.Duration(remaining)
+	if share <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, share)
 }
 
 // shutdownSequence orders the per-pillar closers Shutdown runs. Disabled

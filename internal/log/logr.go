@@ -113,18 +113,36 @@ func (s *logrSink) write(level slog.Level, key, msg string, keysAndValues []any)
 	s.logger.Log(context.Background(), level, msg, args...)
 }
 
+// maxResolveDepth bounds the recursion through nested containers and
+// Marshaler results, so a Marshaler that returns another Marshaler (or
+// itself) cannot recurse without end. Values deeper than this pass through
+// unchanged.
+const maxResolveDepth = 8
+
 // resolve prepares one logr key or value for slog. A logr.Marshaler (OTel
 // passes an attribute.Set as the "attributes" value of its "Tracer created"
 // diagnostic) is replaced by what MarshalLog returns, since slog would
-// otherwise see only unexported fields and render "{}". Strings, errors and
-// string-valued slog.Attrs then go through redact.InText with the
-// configured endpoints: otlptracehttp reports an endpoint that fails to
-// parse as a "url" value beside the error, and the error text alone being
-// redacted would leave the credential in that field. Keys are strings too
-// and pass through unchanged in practice; redacting them is harmless.
+// otherwise see only unexported fields and render "{}"; that result is then
+// resolved like any other value, so the map[string]string an attribute.Set
+// marshals to has its values redacted too. Strings, errors, string-valued
+// slog.Attrs and the strings inside maps and slices go through
+// redact.InText with the configured endpoints: otlptracehttp reports an
+// endpoint that fails to parse as a "url" value beside the error, and the
+// error text alone being redacted would leave the credential in that
+// field. Keys are strings too and pass through unchanged in practice;
+// redacting them is harmless.
 func (s *logrSink) resolve(v any) any {
+	return s.resolveDepth(v, 0)
+}
+
+// resolveDepth is resolve with the recursion depth tracked; see
+// maxResolveDepth.
+func (s *logrSink) resolveDepth(v any, depth int) any {
+	if depth > maxResolveDepth {
+		return v
+	}
 	if m, ok := v.(logr.Marshaler); ok {
-		v = m.MarshalLog()
+		return s.resolveDepth(m.MarshalLog(), depth+1)
 	}
 	switch t := v.(type) {
 	case string:
@@ -132,7 +150,31 @@ func (s *logrSink) resolve(v any) any {
 	case error:
 		return redact.InText(t.Error(), s.endpoints...)
 	case slog.Attr:
-		return s.resolveAttr(t)
+		return s.resolveAttr(t, depth)
+	case map[string]string:
+		out := make(map[string]string, len(t))
+		for k, val := range t {
+			out[k] = redact.InText(val, s.endpoints...)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, val := range t {
+			out[k] = s.resolveDepth(val, depth+1)
+		}
+		return out
+	case []string:
+		out := make([]string, len(t))
+		for i, val := range t {
+			out[i] = redact.InText(val, s.endpoints...)
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, val := range t {
+			out[i] = s.resolveDepth(val, depth+1)
+		}
+		return out
 	default:
 		return v
 	}
@@ -141,8 +183,10 @@ func (s *logrSink) resolve(v any) any {
 // resolveAttr redacts a string-valued attribute and rebuilds a group
 // attribute member by member, so an endpoint nested inside slog.Group is
 // redacted like one at the top level. A LogValuer is resolved first so its
-// output is what gets inspected.
-func (s *logrSink) resolveAttr(a slog.Attr) slog.Attr {
+// output is what gets inspected, and any other kind is unwrapped and
+// resolved as a plain value, which covers a map or slice carried as
+// slog.Any.
+func (s *logrSink) resolveAttr(a slog.Attr, depth int) slog.Attr {
 	val := a.Value.Resolve()
 	switch val.Kind() {
 	case slog.KindString:
@@ -151,11 +195,11 @@ func (s *logrSink) resolveAttr(a slog.Attr) slog.Attr {
 		members := val.Group()
 		args := make([]any, 0, len(members))
 		for _, m := range members {
-			args = append(args, s.resolveAttr(m))
+			args = append(args, s.resolveAttr(m, depth+1))
 		}
 		return slog.Group(a.Key, args...)
 	default:
-		return slog.Attr{Key: a.Key, Value: val}
+		return slog.Any(a.Key, s.resolveDepth(val.Any(), depth+1))
 	}
 }
 
