@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -95,7 +96,7 @@ func TestInit_RejectsMalformedOTLPExporterEnv(t *testing.T) {
 		t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-ok=1, authorization=BearerSecret%zz")
 		_, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_HEADERS is malformed (the value of pair 2")
+		assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_HEADERS cannot be used (the value of pair 2")
 		assert.NotContains(t, err.Error(), "BearerSecret")
 	})
 
@@ -103,8 +104,17 @@ func TestInit_RejectsMalformedOTLPExporterEnv(t *testing.T) {
 		t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://user:secret%zz@collector:4318")
 		_, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_ENDPOINT is malformed (it is not a valid URL")
+		assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_ENDPOINT cannot be used (it is not a valid URL")
 		assert.NotContains(t, err.Error(), "secret%zz")
+	})
+
+	t.Run("certificate", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "ca.pem")
+		t.Setenv("OTEL_EXPORTER_OTLP_CERTIFICATE", missing)
+		_, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_CERTIFICATE cannot be used (the file it names cannot be read")
+		assert.NotContains(t, err.Error(), missing)
 	})
 
 	t.Run("configured endpoint", func(t *testing.T) {
