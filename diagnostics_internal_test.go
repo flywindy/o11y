@@ -155,6 +155,7 @@ func TestValidateOTLPExporterEnv(t *testing.T) {
 		{"bad log record limit", "OTEL_LOGRECORD_ATTRIBUTE_VALUE_LENGTH_LIMIT", "long", "not an integer", "long"},
 		{"bad metric interval", "OTEL_METRIC_EXPORT_INTERVAL", "never", "not a positive integer", "never"},
 		{"non-positive metric timeout", "OTEL_METRIC_EXPORT_TIMEOUT", "-5", "not a positive integer", "-5"},
+		{"bad cardinality limit", "OTEL_GO_X_CARDINALITY_LIMIT", "BearerSecret", "not an integer", "BearerSecret"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(tc.variable, tc.value)
@@ -273,6 +274,14 @@ func TestValidateOTLPExporterEnv(t *testing.T) {
 		require.Error(t, validateOTLPExporterEnv(push))
 		require.NoError(t, validateOTLPExporterEnv(pull), "the periodic reader exists only on the push path")
 		t.Setenv("OTEL_METRIC_EXPORT_TIMEOUT", "")
+
+		t.Setenv("OTEL_GO_X_CARDINALITY_LIMIT", " lots ")
+		require.Error(t, validateOTLPExporterEnv(pull), "the MeterProvider parses the limit on the pull path too")
+		require.Error(t, validateOTLPExporterEnv(push))
+		require.NoError(t, validateOTLPExporterEnv(tracesOnly), "no MeterProvider without the metrics pillar")
+		t.Setenv("OTEL_GO_X_CARDINALITY_LIMIT", " 4000 ")
+		require.NoError(t, validateOTLPExporterEnv(pull), "the SDK trims the value before parsing it")
+		t.Setenv("OTEL_GO_X_CARDINALITY_LIMIT", "")
 
 		t.Setenv("OTEL_ATTRIBUTE_COUNT_LIMIT", "lots")
 		t.Setenv("OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT", "64")

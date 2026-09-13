@@ -268,9 +268,14 @@ func otlpExporterEnvChecks(cfg *Config) []otlpEnvCheck {
 // [0, 1] is reported without the value, so only a non-number is
 // rejected). With logs enabled: the OTEL_BLRP_* batcher settings and the
 // OTEL_LOGRECORD_* limits, verbatim integers, since Init passes no
-// explicit option for them. On the OTLP metrics push path:
-// OTEL_METRIC_EXPORT_INTERVAL and OTEL_METRIC_EXPORT_TIMEOUT, verbatim
-// positive integers (the reader echoes a non-positive one too).
+// explicit option for them. With the metrics pillar on either path:
+// OTEL_GO_X_CARDINALITY_LIMIT, which NewMeterProvider parses (trimmed,
+// as an integer) before the WithCardinalityLimit option applies and hands
+// otel.Handle the strconv error, value included. On the OTLP metrics push
+// path: OTEL_METRIC_EXPORT_INTERVAL and OTEL_METRIC_EXPORT_TIMEOUT,
+// verbatim positive integers (the reader echoes a non-positive one too).
+// OTEL_METRICS_EXEMPLAR_FILTER and OTEL_GO_X_METRIC_EXPORT_BATCH_SIZE are
+// ignored silently by the SDK when unrecognised and are not checked.
 func sdkEnvChecks(cfg *Config) []otlpEnvCheck {
 	var checks []otlpEnvCheck
 	integer := func(name string) otlpEnvCheck {
@@ -302,6 +307,9 @@ func sdkEnvChecks(cfg *Config) []otlpEnvCheck {
 		} {
 			checks = append(checks, integer(name))
 		}
+	}
+	if cfg.metricsEnabled {
+		checks = append(checks, otlpEnvCheck{name: "OTEL_GO_X_CARDINALITY_LIMIT", check: checkInteger})
 	}
 	if cfg.metricsEnabled && cfg.metricsOTLPEndpoint != "" {
 		for _, name := range []string{"OTEL_METRIC_EXPORT_INTERVAL", "OTEL_METRIC_EXPORT_TIMEOUT"} {
