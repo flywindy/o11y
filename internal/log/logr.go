@@ -230,9 +230,11 @@ func (s *logrSink) resolveDepth(v any, depth int) (out any) {
 const redactedUserinfo = "redacted"
 
 // resolveReflected walks v by kind so a container of any static type is
-// covered: a string (named string types included) is redacted, a
-// string-keyed map is rebuilt as map[string]any and a slice or array as
-// []any with every element resolved, a struct is rebuilt as a
+// covered: a string (named string types included) is redacted, a map is
+// rebuilt as map[string]any with every key and value resolved (a key that
+// is not a string is rendered from its resolved form, so a map[int]string
+// cannot carry a value past the rules) and a slice or array as []any with
+// every element resolved, a struct is rebuilt as a
 // map[string]any of its exported fields (each resolved; one with no
 // exported field is replaced by a placeholder naming its type, since its
 // unexported fields cannot be inspected and must not be printed), a
@@ -261,12 +263,18 @@ func (s *logrSink) resolveReflected(rv reflect.Value, orig any, depth int) any {
 		}
 		return out
 	case reflect.Map:
-		if rv.Type().Key().Kind() != reflect.String || rv.IsNil() {
+		if rv.IsNil() {
 			return orig
 		}
 		out := make(map[string]any, rv.Len())
 		for it := rv.MapRange(); it.Next(); {
-			out[it.Key().String()] = s.resolveDepth(it.Value().Interface(), depth+1)
+			var key string
+			if it.Key().Kind() == reflect.String {
+				key = s.redaction.Text(it.Key().String())
+			} else {
+				key = fmt.Sprint(s.resolveDepth(it.Key().Interface(), depth+1))
+			}
+			out[key] = s.resolveDepth(it.Value().Interface(), depth+1)
 		}
 		return out
 	case reflect.Slice, reflect.Array:

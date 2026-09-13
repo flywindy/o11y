@@ -201,7 +201,9 @@ func shutdownBudget(ctx context.Context, remaining int) (context.Context, contex
 // recorded into a counter nothing reads again. On the Prometheus pull path
 // the otelprom reader's shutdown collects nothing, so only a scrape that
 // lands between the drain and the scrape server stopping sees the count;
-// the ErrorHandler record is the durable evidence there. This holds for a
+// the ErrorHandler record is the durable evidence there, provided the
+// application installed SDK.ErrorHandler with otel.SetErrorHandler (OTel's
+// default handler prints the error to stderr instead). This holds for a
 // drain that finishes within its closer's share of the deadline; past it
 // the two batchers differ. The trace BatchSpanProcessor drains on a
 // background context of its own (bounded by the export timeout, 30s by

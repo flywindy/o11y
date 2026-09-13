@@ -78,7 +78,8 @@ adopters can plan their upgrades.
   collection (which is what ships the shutdown-time failures on the OTLP
   push path; on the Prometheus pull path only a scrape landing before the
   scrape server stops sees them, so the ErrorHandler record is the durable
-  evidence there) with a context that is already done. Disabled pillars and the OTLP metrics path
+  evidence there once the application has installed it) with a context that
+  is already done. Disabled pillars and the OTLP metrics path
   (whose exporter the MeterProvider's own shutdown covers) no longer
   contribute a no-op closer, so they neither run nor take a share. A
   context without a deadline is passed through unchanged. A trace drain

@@ -430,7 +430,10 @@ before the meter provider, so a batch that fails in their final flush is
 still counted and, on the push path, shipped with the last collection. On
 the pull path only a scrape that lands between that drain and the scrape
 server stopping sees it, so in practice a shutdown-time failure is not
-observable there; the `ErrorHandler()` record is the durable evidence. The
+observable there; the `ErrorHandler()` record is the durable evidence,
+provided the application installed it with `otel.SetErrorHandler` (the
+wiring block below; without it OTel's default handler prints the error to
+stderr). The
 `Shutdown` deadline is shared out evenly across the enabled components
 still to run, recomputed as each finishes, so a tracer drain that waits on a
 collector that is down cannot use up the whole deadline and leave the meter
