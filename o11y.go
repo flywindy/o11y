@@ -470,7 +470,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		// Both write to stdout only: an OTel-internal error about the OTLP
 		// log pipeline must not be queued behind the batch that is failing.
 		errorHandler: newOTelErrorHandler(slog.New(stdoutHandler), cfg.otlpEndpoint, cfg.metricsOTLPEndpoint, cfg.profilingEndpoint),
-		logr:         newLogr(slog.New(stdoutHandler)),
+		logr:         newLogr(slog.New(stdoutHandler), cfg.otlpEndpoint, cfg.metricsOTLPEndpoint, cfg.profilingEndpoint),
 	}, nil
 }
 

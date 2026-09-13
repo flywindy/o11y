@@ -384,11 +384,11 @@ The OTel SDK's batchers — the `BatchSpanProcessor`, the log `BatchProcessor`
 and the metric `PeriodicReader` — hand every batch the OTLP exporter rejects
 to `otel.Handle` and drop it. With the collector unreachable each queue drains
 into nothing every few seconds, the default handler prints one plain-text
-line to stderr per attempt, and afterwards nobody can say how much was lost.
+line to stderr per attempt, and afterward nobody can say how much was lost.
 Two things make that visible.
 
 **`o11y_export_failures_total{signal}`** counts every batch the OTLP
-exporters failed to deliver, labelled `traces`, `logs` or `metrics`. It is an
+exporters failed to deliver, labeled `traces`, `logs` or `metrics`. It is an
 SDK-owned instrument on the same `/metrics` endpoint, present after upgrading
 with no code change; a service with a healthy collector shows three zero
 series. Alert on it:
