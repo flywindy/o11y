@@ -26,8 +26,8 @@ import (
 // the exporter carries the given headers (used for authentication against
 // managed observability backends). sampler is optional; when nil, OTel's
 // environment/default sampler path remains active. failures counts every
-// batch the exporter fails to deliver; it may be nil when nothing reports the
-// count.
+// Export call the exporter returned an error for; it may be nil when nothing
+// reports the count.
 func InitTracer(ctx context.Context, endpoint string, headers map[string]string, res *resource.Resource, sampler sdktrace.Sampler, failures *exportstats.Recorder, spanProcessors ...sdktrace.SpanProcessor) (*sdktrace.TracerProvider, propagation.TextMapPropagator, error) {
 	// 1. OTLP HTTP trace exporter
 	expOpts := []otlptracehttp.Option{
