@@ -86,8 +86,9 @@ type Config struct {
 	// CardinalityLimit overrides the OTel SDK's per-stream cardinality limit,
 	// the in-process guard that folds attribute sets beyond the limit into a
 	// single overflow series (otel_metric_overflow="true" on Prometheus).
-	// Only a positive value overrides; zero derives the limit from the
-	// export caps, see cardinalityLimitBudget.
+	// Only a positive value overrides, and never below MinCardinalityLimit;
+	// zero derives the limit from the export caps, see
+	// cardinalityLimitBudget.
 	CardinalityLimit int
 
 	// ExtraHTTPServerAttrKeys augments the SDK-managed attribute allow-list
@@ -136,6 +137,13 @@ const (
 	// SDK's own default. It is what an application instrument gets when the
 	// export caps are left at their defaults or lowered.
 	DefaultCardinalityLimit = 2000
+
+	// MinCardinalityLimit is the lowest per-stream limit an override can
+	// set. The SDK's own o11y.export.failures counter carries one series per
+	// OTLP exporter, three at most, and the OTel SDK reserves one slot of
+	// every stream for the overflow series, so a limit below four would fold
+	// the SDK's fixed series into overflow and lose the per-exporter counts.
+	MinCardinalityLimit = 4
 
 	// sdkCardinalityCapMultiplier sizes the derived limit against the export
 	// caps: a route or collection still needs a few attribute-set variants
@@ -546,7 +554,9 @@ func meterProviderOptions(reader sdkmetric.Reader, res *resource.Resource, views
 }
 
 // cardinalityLimitBudget returns the per-stream cardinality limit the
-// MeterProvider is built with. An explicit override wins; otherwise the limit
+// MeterProvider is built with. An explicit override wins, floored at
+// MinCardinalityLimit so the SDK's own fixed-cardinality streams stay out
+// of overflow; otherwise the limit
 // is the largest of DefaultCardinalityLimit and sdkCardinalityCapMultiplier
 // times each export cap, so lowering a cap never pushes the SDK's own streams
 // into overflow while their exported key is still within its cap, and
@@ -555,7 +565,7 @@ func meterProviderOptions(reader sdkmetric.Reader, res *resource.Resource, views
 // value in the OTel SDK, so every instrument gets the same limit.
 func cardinalityLimitBudget(maxUniqueRoutes, maxUniqueCollections, override int) int {
 	if override > 0 {
-		return override
+		return max(override, MinCardinalityLimit)
 	}
 	routes := scaleBudget(maxUniqueRoutes, sdkCardinalityCapMultiplier)
 	collections := scaleBudget(maxUniqueCollections, sdkCardinalityCapMultiplier)
