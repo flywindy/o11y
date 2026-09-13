@@ -210,6 +210,37 @@ func TestLogr_RedactsTypedNestedContainers(t *testing.T) {
 	assert.Contains(t, out, "intkeys=map[7:", "a map with non-string keys is rebuilt, not passed through")
 }
 
+// derefError dereferences its receiver in Error, so a typed nil *derefError
+// panics when rendered the ordinary way.
+type derefError struct{ msg string }
+
+func (e *derefError) Error() string { return e.msg }
+
+// panicError panics on any receiver.
+type panicError struct{}
+
+func (panicError) Error() string { panic("no") }
+
+// TestLogr_SurvivesBrokenErrors pins that Error renders a typed nil error
+// and an Error method that panics as placeholders rather than taking the
+// process down, and that a live error still renders.
+func TestLogr_SurvivesBrokenErrors(t *testing.T) {
+	logger, buf := newRecordingLogger(slog.LevelInfo)
+	l := o11ylog.NewLogr(logger, nil)
+
+	var typed *derefError
+	assert.NotPanics(t, func() { l.Error(typed, "typed nil") })
+	assert.Contains(t, buf.String(), "<nil *log_test.derefError>")
+
+	buf.Reset()
+	assert.NotPanics(t, func() { l.Error(panicError{}, "panicking") })
+	assert.Contains(t, buf.String(), "[omitted: log_test.panicError panicked while rendering]")
+
+	buf.Reset()
+	l.Error(&derefError{msg: "still rendered"}, "live")
+	assert.Contains(t, buf.String(), "still rendered")
+}
+
 // endpointStringer renders an endpoint through String(), the way a type with
 // a custom text form reaches the slog handler.
 type endpointStringer struct{ url string }

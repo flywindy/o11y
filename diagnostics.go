@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
-	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -65,7 +64,7 @@ func (h *otelErrorHandler) Handle(err error) {
 	if err == nil {
 		return
 	}
-	msg := redact.Secrets(redact.InText(errorText(err), h.endpoints...), h.secrets...)
+	msg := redact.Secrets(redact.InText(o11ylog.ErrorText(err), h.endpoints...), h.secrets...)
 	if h.suppress.SuppressedAt(msg, h.now()) {
 		return
 	}
@@ -73,23 +72,6 @@ func (h *otelErrorHandler) Handle(err error) {
 		slog.String("error", msg),
 		slog.String("repeat_suppressed_for", otelDiagnosticRepeatWindow.String()),
 	)
-}
-
-// errorText renders err for the diagnostic record without letting a broken
-// error value take the process down: a typed nil pointer is named rather
-// than dereferenced by its own Error method, and an Error method that
-// panics is recovered into a placeholder naming the type. A diagnostic is
-// never worth a crash.
-func errorText(err error) (text string) {
-	if rv := reflect.ValueOf(err); rv.Kind() == reflect.Pointer && rv.IsNil() {
-		return fmt.Sprintf("<nil %T>", err)
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			text = fmt.Sprintf("[omitted: %T panicked while rendering]", err)
-		}
-	}()
-	return err.Error()
 }
 
 // ErrorHandler returns a handler that writes the errors OpenTelemetry
@@ -151,71 +133,107 @@ var otlpHeaderEnvVars = []string{
 	"OTEL_EXPORTER_OTLP_LOGS_HEADERS",
 }
 
-// otlpExporterEnvPrefixes returns the OTEL_EXPORTER_OTLP_ variable
-// prefixes the OTLP exporters Init is about to build will read: the generic
-// prefix when any OTLP exporter is built, and the per-signal prefix for
-// each signal exported over OTLP. A variable no exporter reads is left
-// alone.
-func otlpExporterEnvPrefixes(cfg *Config) []string {
-	traces := cfg.traceEnabled
-	logs := cfg.logEnabled
-	metrics := cfg.metricsEnabled && cfg.metricsOTLPEndpoint != ""
-	if !traces && !logs && !metrics {
-		return nil
+// otlpEnvCheck names one environment variable an OTLP exporter Init is
+// about to build will read, and the rule that exporter's parser applies to
+// it.
+type otlpEnvCheck struct {
+	name  string
+	check func(string) (reason string, bad bool)
+}
+
+// otlpExporterEnvChecks lists the variables the enabled OTLP exporters will
+// read from the environment, each with its exporter's own parsing rule. The
+// two exporter families differ in when they read the environment. The
+// pinned trace and metric exporters apply the environment before the
+// explicit options, so with traces enabled, or metrics on the push path,
+// every ENDPOINT, TIMEOUT and HEADERS variable under the generic and the
+// signal prefix is parsed whatever Init passes in. The pinned log exporter
+// consults a variable only when the matching explicit option is absent:
+// Init always passes the log endpoint URL, which also pins the path and the
+// insecure flag, so its ENDPOINT and INSECURE variables are never read; it
+// passes headers only when WithOTLPHeaders set some, so the HEADERS
+// variables are read only then; and it never sets a timeout or a
+// compression, so those variables are always read. A variable no enabled
+// exporter reads is left alone.
+func otlpExporterEnvChecks(cfg *Config) []otlpEnvCheck {
+	var checks []otlpEnvCheck
+	envFirst := func(signal string) {
+		for _, prefix := range []string{"OTEL_EXPORTER_OTLP_", "OTEL_EXPORTER_OTLP_" + signal + "_"} {
+			checks = append(checks,
+				otlpEnvCheck{prefix + "ENDPOINT", checkURL},
+				otlpEnvCheck{prefix + "TIMEOUT", checkMilliseconds},
+				otlpEnvCheck{prefix + "HEADERS", malformedHeaderList},
+			)
+		}
 	}
-	prefixes := []string{"OTEL_EXPORTER_OTLP_"}
-	if traces {
-		prefixes = append(prefixes, "OTEL_EXPORTER_OTLP_TRACES_")
+	if cfg.traceEnabled {
+		envFirst("TRACES")
 	}
-	if metrics {
-		prefixes = append(prefixes, "OTEL_EXPORTER_OTLP_METRICS_")
+	if cfg.metricsEnabled && cfg.metricsOTLPEndpoint != "" {
+		envFirst("METRICS")
 	}
-	if logs {
-		prefixes = append(prefixes, "OTEL_EXPORTER_OTLP_LOGS_")
+	if cfg.logEnabled {
+		for _, prefix := range []string{"OTEL_EXPORTER_OTLP_LOGS_", "OTEL_EXPORTER_OTLP_"} {
+			checks = append(checks,
+				otlpEnvCheck{prefix + "TIMEOUT", checkMilliseconds},
+				otlpEnvCheck{prefix + "COMPRESSION", checkCompression},
+			)
+			if len(cfg.otlpHeaders) == 0 {
+				checks = append(checks, otlpEnvCheck{prefix + "HEADERS", malformedHeaderList})
+			}
+		}
 	}
-	return prefixes
+	return checks
 }
 
 // validateOTLPExporterEnv rejects a malformed OTLP exporter variable before
 // any exporter is built. The pinned exporters parse their environment while
-// they are constructed, before the explicit options apply, and report a
-// value they cannot parse through OTel's global logger with the raw text
-// attached ("input", "key" or "value"); Init builds the exporters before it
-// returns, so nothing the application can install later reaches those
-// messages, and Logr's redaction only covers what is logged after
-// otel.SetLogger. Failing Init instead keeps the raw text out of stderr;
-// the error names the variable and, for a header list, the pair's position,
-// never the text. The rules mirror the exporters' parsers: ENDPOINT must
-// parse as a URL (a credential in its userinfo is what makes the echo
-// dangerous), TIMEOUT must be an integer count of milliseconds, and each
-// HEADERS pair must carry "=", a name that is an HTTP token and a value that
-// is valid percent-encoding. Certificate variables name files, which the
-// exporters echo as paths, and INSECURE and COMPRESSION are never echoed,
-// so they are not checked. An empty variable is skipped, as the exporters
-// skip it.
+// they are constructed and report a value they cannot parse with the raw
+// text attached: the trace and metric exporters through OTel's global
+// logger ("input", "key" or "value"), the log exporter through otel.Handle
+// with the value in the error. Init builds the exporters before it returns,
+// so nothing the application can install later reaches those messages,
+// and Logr's and ErrorHandler's redaction only covers what is reported
+// after otel.SetLogger / otel.SetErrorHandler. Failing Init instead keeps
+// the raw text out of stderr; the error names the variable and, for a
+// header list, the pair's position, never the text. Only the variables the
+// enabled exporters actually read are checked (see otlpExporterEnvChecks),
+// with the rules their parsers apply: ENDPOINT must parse as a URL (a
+// credential in its userinfo is what makes the echo dangerous), TIMEOUT
+// must be an integer count of milliseconds, COMPRESSION must be "gzip" or
+// "none", and each HEADERS pair must carry "=", a name that is an HTTP
+// token and a value that is valid percent-encoding. Certificate variables
+// name files, which the exporters echo as paths, and are not checked. An
+// empty variable is skipped, as the exporters skip it.
 func validateOTLPExporterEnv(cfg *Config) error {
-	for _, prefix := range otlpExporterEnvPrefixes(cfg) {
-		if err := validateOTLPEnvVar(prefix+"ENDPOINT", func(v string) (string, bool) {
-			if _, err := url.Parse(v); err != nil {
-				return "it is not a valid URL", true
-			}
-			return "", false
-		}); err != nil {
-			return err
-		}
-		if err := validateOTLPEnvVar(prefix+"TIMEOUT", func(v string) (string, bool) {
-			if _, err := strconv.Atoi(v); err != nil {
-				return "it is not an integer count of milliseconds", true
-			}
-			return "", false
-		}); err != nil {
-			return err
-		}
-		if err := validateOTLPEnvVar(prefix+"HEADERS", malformedHeaderList); err != nil {
+	for _, c := range otlpExporterEnvChecks(cfg) {
+		if err := validateOTLPEnvVar(c.name, c.check); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func checkURL(v string) (string, bool) {
+	if _, err := url.Parse(v); err != nil {
+		return "it is not a valid URL", true
+	}
+	return "", false
+}
+
+func checkMilliseconds(v string) (string, bool) {
+	if _, err := strconv.Atoi(v); err != nil {
+		return "it is not an integer count of milliseconds", true
+	}
+	return "", false
+}
+
+func checkCompression(v string) (string, bool) {
+	switch v {
+	case "gzip", "none":
+		return "", false
+	}
+	return `it is neither "gzip" nor "none"`, true
 }
 
 // validateOTLPEnvVar applies check to the trimmed value of the variable

@@ -43,10 +43,12 @@ adopters can plan their upgrades.
   verbatim when one fails to parse. The exporters parse their
   `OTEL_EXPORTER_OTLP_*` variables while `Init` builds them, before
   `Logr()` can be installed, so `Init` now rejects a malformed `ENDPOINT`,
-  `TIMEOUT` or `HEADERS` variable the enabled exporters would read, with an
-  error that names the variable and the pair's position but not its text.
-  `ErrorHandler()` renders a typed nil error and an `Error` method that
-  panics as placeholders rather than crashing; `Logr()` maps OTel's
+  `TIMEOUT`, `COMPRESSION` or `HEADERS` variable the enabled exporters
+  would actually read (the log exporter reads one only where `Init` passes
+  no explicit option), with an error that names the variable and the pair's
+  position but not its text. `ErrorHandler()` and `Logr()` render a typed
+  nil error and an `Error` method that panics as placeholders rather than
+  crashing; `Logr()` maps OTel's
   verbosity convention (V(1) warn, V(4) info, V(8) debug) onto the SDK's
   log level, so at the default INFO level the warnings the default logger
   dropped ("dropped log records") now appear. The SDK does not install them

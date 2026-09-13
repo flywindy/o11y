@@ -101,14 +101,33 @@ func (s *logrSink) Info(level int, msg string, keysAndValues ...any) {
 	s.write(slogLevel(level), msg, msg, keysAndValues)
 }
 
+// ErrorText renders err for a diagnostic record without letting a broken
+// error value take the process down: a typed nil pointer is named rather
+// than dereferenced by its own Error method, and an Error method that
+// panics is recovered into a placeholder naming the type. A diagnostic is
+// never worth a crash. Both the logr sink and the SDK's ErrorHandler render
+// through it.
+func ErrorText(err error) (text string) {
+	if rv := reflect.ValueOf(err); rv.Kind() == reflect.Pointer && rv.IsNil() {
+		return fmt.Sprintf("<nil %T>", err)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			text = fmt.Sprintf("[omitted: %T panicked while rendering]", err)
+		}
+	}()
+	return err.Error()
+}
+
 // Error implements logr.LogSink. The error text, with any configured
 // endpoint's credentials redacted, is carried as the "error" attribute and
 // takes part in the repeat key, so two different errors under the same
-// message are each logged.
+// message are each logged. The text comes from ErrorText, so a typed nil
+// or a panicking Error method cannot crash the process.
 func (s *logrSink) Error(err error, msg string, keysAndValues ...any) {
 	key := msg
 	if err != nil {
-		text := s.redaction.Text(err.Error())
+		text := s.redaction.Text(ErrorText(err))
 		key = msg + ": " + text
 		keysAndValues = append([]any{slog.String("error", text)}, keysAndValues...)
 	}
