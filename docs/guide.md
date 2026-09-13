@@ -499,7 +499,13 @@ through OTel's global logger, the log exporter through `otel.Handle`), so
 `Init` rejects a malformed variable before any exporter exists: an
 `ENDPOINT` that is not a URL (a credential in its userinfo is what makes
 the echo dangerous), a `TIMEOUT` that is not an integer count of
-milliseconds, a `COMPRESSION` that is neither `gzip` nor `none`, a
+milliseconds, the log exporter's `COMPRESSION` when it is neither `gzip`
+nor `none` (the trace and metric exporters map any other value to no
+compression without a message), the metric exporter's
+`METRICS_TEMPORALITY_PREFERENCE` and `METRICS_DEFAULT_HISTOGRAM_AGGREGATION`
+when they are none of the values it knows (it warns with the value
+through OTel's global logger, which a logger installed before `Init`
+would print), a
 `HEADERS` pair without `=`, with a name that is not an HTTP token or a
 value that is not valid percent-encoding, a `CERTIFICATE` that does not
 name a readable file holding a PEM certificate, or a `CLIENT_CERTIFICATE`
@@ -508,7 +514,8 @@ files forming a key pair; the exporters echo the path of a file they
 cannot read. Only the variables the enabled exporters actually read are
 checked: the trace and metric exporters apply the environment before the
 explicit options, so their `ENDPOINT`, `TIMEOUT`, `HEADERS` and
-certificate variables are always read; the log exporter reads a variable
+certificate variables, and the metric exporter's two preference
+variables, are always read; the log exporter reads a variable
 only where `Init` passes no explicit option, so its endpoint is never read,
 its headers only without `WithOTLPHeaders`, and its timeout, compression
 and certificate files always, taking the `LOGS_` variable first and the

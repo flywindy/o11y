@@ -43,7 +43,9 @@ adopters can plan their upgrades.
   verbatim when one fails to parse. The exporters parse their
   `OTEL_EXPORTER_OTLP_*` variables while `Init` builds them, before
   `Logr()` can be installed, so `Init` now rejects a malformed `ENDPOINT`,
-  `TIMEOUT`, `COMPRESSION` or `HEADERS` variable, or a `CERTIFICATE`,
+  `TIMEOUT` or `HEADERS` variable, the log exporter's `COMPRESSION`, the
+  metric exporter's `TEMPORALITY_PREFERENCE` and
+  `DEFAULT_HISTOGRAM_AGGREGATION`, or a `CERTIFICATE`,
   `CLIENT_CERTIFICATE` or `CLIENT_KEY` variable naming a file that cannot
   be read or parsed, that the enabled exporters would actually read (the
   log exporter reads one only where `Init` passes no explicit option, and

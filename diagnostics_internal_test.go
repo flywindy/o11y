@@ -124,7 +124,10 @@ func TestValidateOTLPExporterEnv(t *testing.T) {
 		t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "10000")
 		t.Setenv("OTEL_EXPORTER_OTLP_COMPRESSION", "gzip")
 		t.Setenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "")
-		require.NoError(t, validateOTLPExporterEnv(all))
+		t.Setenv("OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE", "Delta")
+		t.Setenv("OTEL_EXPORTER_OTLP_METRICS_DEFAULT_HISTOGRAM_AGGREGATION", "base2_exponential_bucket_histogram")
+		t.Setenv("OTEL_EXPORTER_OTLP_TRACES_COMPRESSION", "brotli")
+		require.NoError(t, validateOTLPExporterEnv(all), "the trace exporter maps an unknown compression to none without a message")
 	})
 
 	for _, tc := range []struct{ name, variable, value, reason, secret string }{
@@ -135,6 +138,8 @@ func TestValidateOTLPExporterEnv(t *testing.T) {
 		{"bad metrics endpoint", "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "http://user:secret%zz@collector:4318", "not a valid URL", "secret%zz"},
 		{"bad timeout", "OTEL_EXPORTER_OTLP_TIMEOUT", "10s", "not an integer count of milliseconds", "10s"},
 		{"bad logs compression", "OTEL_EXPORTER_OTLP_LOGS_COMPRESSION", "brotli", `neither "gzip" nor "none"`, "brotli"},
+		{"bad metrics temporality", "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE", "sometimes", `none of "cumulative", "delta" and "lowmemory"`, "sometimes"},
+		{"bad histogram aggregation", "OTEL_EXPORTER_OTLP_METRICS_DEFAULT_HISTOGRAM_AGGREGATION", "sketch", `neither "explicit_bucket_histogram" nor "base2_exponential_bucket_histogram"`, "sketch"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(tc.variable, tc.value)
@@ -149,6 +154,7 @@ func TestValidateOTLPExporterEnv(t *testing.T) {
 	t.Run("variable no exporter reads is ignored", func(t *testing.T) {
 		t.Setenv("OTEL_EXPORTER_OTLP_METRICS_HEADERS", "authorization=BearerSecret%zz")
 		t.Setenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "http://user:secret%zz@collector:4318")
+		t.Setenv("OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE", "sometimes")
 		pull := &Config{traceEnabled: true, logEnabled: true, metricsEnabled: true}
 		require.NoError(t, validateOTLPExporterEnv(pull), "the metrics variables are read only on the OTLP push path")
 		require.Error(t, validateOTLPExporterEnv(all))
