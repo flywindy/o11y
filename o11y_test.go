@@ -117,6 +117,14 @@ func TestInit_RejectsMalformedOTLPExporterEnv(t *testing.T) {
 		assert.NotContains(t, err.Error(), missing)
 	})
 
+	t.Run("configured header name", func(t *testing.T) {
+		opts := append(commonOpts(srv.URL), o11y.WithOTLPHeaders(map[string]string{"Bearer\nSecret": "v"}))
+		_, err := o11y.Init(context.Background(), opts...)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "WithOTLPHeaders is not a valid HTTP header name")
+		assert.NotContains(t, err.Error(), "Secret")
+	})
+
 	t.Run("configured endpoint", func(t *testing.T) {
 		opts := append(commonOpts(srv.URL), o11y.WithOTLPEndpoint("http://user:secret%zz@collector:4318"))
 		_, err := o11y.Init(context.Background(), opts...)

@@ -53,7 +53,10 @@ adopters can plan their upgrades.
   a malformed endpoint given to `WithOTLPEndpoint`
   or `WithMetricsOTLPEndpoint`, which the trace and metric exporters echo
   the same way, with an error that names the variable or option and the
-  pair's position but not the text. `ErrorHandler()` and `Logr()` render a typed
+  pair's position but neither the text nor the parser's message, and a
+  header name given to `WithOTLPHeaders` or `WithProfilingAuthHeaders`
+  that is not an HTTP token, which `net/http` would quote, escaped, in
+  every export error. `ErrorHandler()` and `Logr()` render a typed
   nil error and an `Error` method that panics as placeholders rather than
   crashing; `Logr()` maps OTel's
   verbosity convention (V(1) warn, V(4) info, V(8) debug) onto the SDK's
