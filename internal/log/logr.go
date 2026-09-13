@@ -182,8 +182,8 @@ const tooDeep = "[omitted: nested deeper than the SDK redacts]"
 // redact.InText with the configured endpoints: otlptracehttp reports an
 // endpoint that fails to parse as a "url" value beside the error, and the
 // error text alone being redacted would leave the credential in that
-// field. Keys are strings too and pass through unchanged in practice;
-// redacting them is harmless.
+// field. Keys are redacted the same way, whether passed as a bare string
+// in the key/value list or carried by a slog.Attr and its group members.
 func (s *logrSink) resolve(v any) any {
 	return s.resolveDepth(v, 0)
 }
@@ -333,22 +333,26 @@ func (s *logrSink) resolveReflected(rv reflect.Value, orig any, depth int) any {
 // than maxResolveDepth is replaced by tooDeep rather than descended into
 // or passed through.
 func (s *logrSink) resolveAttr(a slog.Attr, depth int) slog.Attr {
+	// The key is text the caller chose as well: a bare slog.Attr or a
+	// group member keyed by an endpoint or a credential would otherwise
+	// carry it past the value redaction.
+	key := s.redaction.Text(a.Key)
 	if depth > maxResolveDepth {
-		return slog.String(a.Key, tooDeep)
+		return slog.String(key, tooDeep)
 	}
 	val := a.Value.Resolve()
 	switch val.Kind() {
 	case slog.KindString:
-		return slog.String(a.Key, s.redaction.Text(val.String()))
+		return slog.String(key, s.redaction.Text(val.String()))
 	case slog.KindGroup:
 		members := val.Group()
 		args := make([]any, 0, len(members))
 		for _, m := range members {
 			args = append(args, s.resolveAttr(m, depth+1))
 		}
-		return slog.Group(a.Key, args...)
+		return slog.Group(key, args...)
 	default:
-		return slog.Any(a.Key, s.resolveDepth(val.Any(), depth+1))
+		return slog.Any(key, s.resolveDepth(val.Any(), depth+1))
 	}
 }
 

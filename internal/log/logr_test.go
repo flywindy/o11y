@@ -132,6 +132,24 @@ func TestLogr_RedactsEndpointCredentialsInValues(t *testing.T) {
 	assert.Contains(t, out, "configured=")
 }
 
+// TestLogr_RedactsAttrKeys checks the key of a bare slog.Attr and of a
+// group member is redacted like a value, since a caller can put an
+// endpoint or a credential there too.
+func TestLogr_RedactsAttrKeys(t *testing.T) {
+	logger, buf := newRecordingLogger(slog.LevelInfo)
+	const endpoint = "http://svc:hunter2@collector:4318"
+	l := o11ylog.NewLogrRedacting(logger, nil, o11ylog.Redaction{Endpoints: []string{endpoint}, Secrets: []string{"TopSecretToken"}})
+
+	l.Info("keys", slog.String(endpoint, "v"), slog.Group("exporter", slog.Int(endpoint, 1), slog.String("TopSecretToken", "x")),
+		slog.Any("TopSecretToken", []string{"y"}), endpoint, "bare key")
+
+	out := buf.String()
+	assert.NotContains(t, out, "hunter2")
+	assert.NotContains(t, out, "TopSecretToken")
+	assert.Equal(t, 3, strings.Count(out, "collector:4318"), "every redacted key keeps the host")
+	assert.Contains(t, out, "exporter.", "the group structure survives")
+}
+
 // marshalsToText implements logr.Marshaler the way attribute.Set does, with
 // nothing slog could render on its own.
 type marshalsToText struct{ hidden string }
