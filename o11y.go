@@ -292,8 +292,9 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	}
 	appendBaggageWarnings(cfg, whitelist)
 
-	// Every OTLP exporter reports its failed batches here; the MeterProvider
-	// registers the count as o11y_export_failures_total once it exists. The
+	// Every OTLP exporter reports each Export call that returned an error
+	// here; the MeterProvider registers the count as
+	// o11y_export_failures_total once it exists. The
 	// Recorder is created first because the tracer is built before the meter.
 	exportFailures := &exportstats.Recorder{}
 
