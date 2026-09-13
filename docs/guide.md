@@ -532,7 +532,9 @@ variables only where the span-specific one is unset) as integers, and
 `OTEL_TRACES_SAMPLER` (one of the SDK's sampler names, parsed whether or
 not a sampler is configured) with `OTEL_TRACES_SAMPLER_ARG` as a number
 for a ratio sampler; with logs, the `OTEL_BLRP_*` batcher settings and
-the `OTEL_LOGRECORD_*` limits as integers; on the OTLP metrics push path,
+the `OTEL_LOGRECORD_*` limits as integers; with metrics on either path,
+`OTEL_GO_X_CARDINALITY_LIMIT` as an integer (the MeterProvider parses it
+before `WithCardinalityLimit` applies); on the OTLP metrics push path,
 `OTEL_METRIC_EXPORT_INTERVAL` and `OTEL_METRIC_EXPORT_TIMEOUT` as
 positive integers.
 The endpoints given to `WithOTLPEndpoint` and
