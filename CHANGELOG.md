@@ -49,7 +49,10 @@ adopters can plan their upgrades.
   `CLIENT_CERTIFICATE` or `CLIENT_KEY` variable naming a file that cannot
   be read or parsed, that the enabled exporters would actually read (the
   log exporter reads one only where `Init` passes no explicit option, and
-  verbatim, where the trace and metric exporters trim it), and
+  verbatim, where the trace and metric exporters trim it), the SDK's own
+  `OTEL_BSP_*`, span-limit, `OTEL_TRACES_SAMPLER` / `_ARG`, `OTEL_BLRP_*`,
+  `OTEL_LOGRECORD_*` and `OTEL_METRIC_EXPORT_*` variables the enabled
+  providers read the same way, and
   a malformed endpoint given to `WithOTLPEndpoint`
   or `WithMetricsOTLPEndpoint`, which the trace and metric exporters echo
   the same way, with an error that names the variable or option and the

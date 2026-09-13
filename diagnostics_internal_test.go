@@ -127,6 +127,13 @@ func TestValidateOTLPExporterEnv(t *testing.T) {
 		t.Setenv("OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE", "Delta")
 		t.Setenv("OTEL_EXPORTER_OTLP_METRICS_DEFAULT_HISTOGRAM_AGGREGATION", "base2_exponential_bucket_histogram")
 		t.Setenv("OTEL_EXPORTER_OTLP_TRACES_COMPRESSION", "brotli")
+		t.Setenv("OTEL_BSP_SCHEDULE_DELAY", "5000")
+		t.Setenv("OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT", "64")
+		t.Setenv("OTEL_TRACES_SAMPLER", "ParentBased_TraceIDRatio")
+		t.Setenv("OTEL_TRACES_SAMPLER_ARG", "0.25")
+		t.Setenv("OTEL_BLRP_EXPORT_TIMEOUT", "30000")
+		t.Setenv("OTEL_LOGRECORD_ATTRIBUTE_COUNT_LIMIT", "128")
+		t.Setenv("OTEL_METRIC_EXPORT_INTERVAL", "60000")
 		require.NoError(t, validateOTLPExporterEnv(all), "the trace exporter maps an unknown compression to none without a message")
 	})
 
@@ -140,6 +147,14 @@ func TestValidateOTLPExporterEnv(t *testing.T) {
 		{"bad logs compression", "OTEL_EXPORTER_OTLP_LOGS_COMPRESSION", "brotli", `neither "gzip" nor "none"`, "brotli"},
 		{"bad metrics temporality", "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE", "sometimes", `none of "cumulative", "delta" and "lowmemory"`, "sometimes"},
 		{"bad histogram aggregation", "OTEL_EXPORTER_OTLP_METRICS_DEFAULT_HISTOGRAM_AGGREGATION", "sketch", `neither "explicit_bucket_histogram" nor "base2_exponential_bucket_histogram"`, "sketch"},
+		{"bad span batcher delay", "OTEL_BSP_SCHEDULE_DELAY", "soon", "not an integer", "soon"},
+		{"bad span limit", "OTEL_SPAN_EVENT_COUNT_LIMIT", "many", "not an integer", "many"},
+		{"bad generic attribute limit", "OTEL_ATTRIBUTE_COUNT_LIMIT", "lots", "not an integer", "lots"},
+		{"bad sampler", "OTEL_TRACES_SAMPLER", "BearerSecret", "not one of the sampler names", "BearerSecret"},
+		{"bad log batcher timeout", "OTEL_BLRP_EXPORT_TIMEOUT", "BearerSecret", "not an integer", "BearerSecret"},
+		{"bad log record limit", "OTEL_LOGRECORD_ATTRIBUTE_VALUE_LENGTH_LIMIT", "long", "not an integer", "long"},
+		{"bad metric interval", "OTEL_METRIC_EXPORT_INTERVAL", "never", "not a positive integer", "never"},
+		{"non-positive metric timeout", "OTEL_METRIC_EXPORT_TIMEOUT", "-5", "not a positive integer", "-5"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(tc.variable, tc.value)
@@ -236,6 +251,50 @@ func TestValidateOTLPExporterEnv(t *testing.T) {
 			require.NoError(t, validateOTLPExporterEnv(logsOnly), "a LOGS_ CA file shadows the generic one")
 			require.Error(t, validateOTLPExporterEnv(all), "the trace exporter still reads the generic CA file")
 		})
+	})
+
+	t.Run("SDK variables follow the enabled pillars", func(t *testing.T) {
+		tracesOnly := &Config{traceEnabled: true}
+		logsOnly := &Config{logEnabled: true}
+		pull := &Config{metricsEnabled: true}
+		push := &Config{metricsEnabled: true, metricsOTLPEndpoint: "http://collector:4318"}
+
+		t.Setenv("OTEL_BSP_MAX_QUEUE_SIZE", "huge")
+		require.Error(t, validateOTLPExporterEnv(tracesOnly))
+		require.NoError(t, validateOTLPExporterEnv(logsOnly), "the span batcher is not built without traces")
+		t.Setenv("OTEL_BSP_MAX_QUEUE_SIZE", "")
+
+		t.Setenv("OTEL_BLRP_MAX_QUEUE_SIZE", "huge")
+		require.Error(t, validateOTLPExporterEnv(logsOnly))
+		require.NoError(t, validateOTLPExporterEnv(tracesOnly), "the log batcher is not built without logs")
+		t.Setenv("OTEL_BLRP_MAX_QUEUE_SIZE", "")
+
+		t.Setenv("OTEL_METRIC_EXPORT_TIMEOUT", "later")
+		require.Error(t, validateOTLPExporterEnv(push))
+		require.NoError(t, validateOTLPExporterEnv(pull), "the periodic reader exists only on the push path")
+		t.Setenv("OTEL_METRIC_EXPORT_TIMEOUT", "")
+
+		t.Setenv("OTEL_ATTRIBUTE_COUNT_LIMIT", "lots")
+		t.Setenv("OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT", "64")
+		require.NoError(t, validateOTLPExporterEnv(tracesOnly), "a valid span limit shadows the generic one, which the SDK never reads")
+		t.Setenv("OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT", "many")
+		t.Setenv("OTEL_ATTRIBUTE_COUNT_LIMIT", "64")
+		err := validateOTLPExporterEnv(tracesOnly)
+		require.Error(t, err, "a span limit that fails to parse is echoed before the SDK falls back")
+		assert.Contains(t, err.Error(), "OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT cannot be used")
+		t.Setenv("OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT", "")
+		t.Setenv("OTEL_ATTRIBUTE_COUNT_LIMIT", "")
+
+		t.Setenv("OTEL_TRACES_SAMPLER_ARG", "half")
+		t.Setenv("OTEL_TRACES_SAMPLER", "always_on")
+		require.NoError(t, validateOTLPExporterEnv(tracesOnly), "the argument is read only for a ratio sampler")
+		t.Setenv("OTEL_TRACES_SAMPLER", " TraceIDRatio ")
+		err = validateOTLPExporterEnv(tracesOnly)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "OTEL_TRACES_SAMPLER_ARG cannot be used (it is not a number")
+		assert.NotContains(t, err.Error(), "half")
+		t.Setenv("OTEL_TRACES_SAMPLER_ARG", "2")
+		require.NoError(t, validateOTLPExporterEnv(tracesOnly), "a ratio out of range is reported by the SDK without the value")
 	})
 
 	t.Run("log exporter reads values verbatim", func(t *testing.T) {

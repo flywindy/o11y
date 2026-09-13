@@ -523,6 +523,18 @@ generic one only when the `LOGS_` variable is unset (for the client
 certificate, when the `LOGS_` pair is incomplete). Each value is checked
 as the exporter reading it will see it: the trace and metric exporters
 trim surrounding whitespace, the log exporter parses the value verbatim.
+The SDK's own variables get the same treatment where a provider `Init`
+builds reads them, since the SDK echoes a value it cannot parse the same
+way: with traces, the `OTEL_BSP_*` batcher settings, the span limits
+(`OTEL_SPAN_*`, `OTEL_EVENT_ATTRIBUTE_COUNT_LIMIT`,
+`OTEL_LINK_ATTRIBUTE_COUNT_LIMIT`, and the generic `OTEL_ATTRIBUTE_*`
+variables only where the span-specific one is unset) as integers, and
+`OTEL_TRACES_SAMPLER` (one of the SDK's sampler names, parsed whether or
+not a sampler is configured) with `OTEL_TRACES_SAMPLER_ARG` as a number
+for a ratio sampler; with logs, the `OTEL_BLRP_*` batcher settings and
+the `OTEL_LOGRECORD_*` limits as integers; on the OTLP metrics push path,
+`OTEL_METRIC_EXPORT_INTERVAL` and `OTEL_METRIC_EXPORT_TIMEOUT` as
+positive integers.
 The endpoints given to `WithOTLPEndpoint` and
 `WithMetricsOTLPEndpoint` get the same check, since the trace and metric
 exporters echo a URL they cannot parse the same way and then fall back to

@@ -27,6 +27,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	otlpmetrichttp "go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
+	otelmetric "go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
@@ -324,7 +325,7 @@ func InitMeter(ctx context.Context, cfg Config) (*sdkmetric.MeterProvider, Close
 		return nil, nil, err
 	}
 	if cfg.ExportFailures != nil {
-		if err := cfg.ExportFailures.Register(provider.Meter(exportstats.ScopeName)); err != nil {
+		if err := cfg.ExportFailures.Register(provider.Meter(exportstats.ScopeName, otelmetric.WithSchemaURL(semconv.SchemaURL))); err != nil {
 			if closer != nil {
 				_ = closer(ctx)
 			}
