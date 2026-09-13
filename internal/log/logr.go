@@ -147,7 +147,10 @@ func (s *logrSink) write(level slog.Level, key, msg string, keysAndValues []any)
 	}
 	args := make([]any, 0, len(s.values)+len(keysAndValues)+2)
 	if s.name != "" {
-		args = append(args, slog.String("logger", s.name))
+		// The name is caller-chosen text too: a WithName segment holding
+		// an endpoint or a credential goes through the same redaction as
+		// the message, keys and values.
+		args = append(args, slog.String("logger", s.redaction.Text(s.name)))
 	}
 	for _, v := range s.values {
 		args = append(args, s.resolve(v))
