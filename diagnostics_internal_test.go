@@ -71,10 +71,10 @@ func TestOTelErrorHandler_RedactsSecrets(t *testing.T) {
 }
 
 // TestDiagnosticSecrets collects the configured and environment-provided
-// header values: whole variable, each pair, each value and its unescaped
-// form, deduplicated, short values included, empty ones left out.
+// header values: whole variable, each pair, each name and value with their
+// unescaped forms, deduplicated, short values included, empty ones left out.
 func TestDiagnosticSecrets(t *testing.T) {
-	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer%20abcdef, x-short=1, api-key=k-1234567890")
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer%20abcdef, x-short=1, api-key=k-1234567890, BearerSecret%zz=oops")
 	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "")
 	cfg := &Config{
 		otlpHeaders:          map[string]string{"x-api-key": "configured-secret", "x-tiny": "ab"},
@@ -85,10 +85,11 @@ func TestDiagnosticSecrets(t *testing.T) {
 
 	for _, want := range []string{
 		"configured-secret", "Basic cHJvZmlsZXM=",
-		"authorization=Bearer%20abcdef, x-short=1, api-key=k-1234567890",
+		"authorization=Bearer%20abcdef, x-short=1, api-key=k-1234567890, BearerSecret%zz=oops",
 		"authorization=Bearer%20abcdef", "Bearer%20abcdef", "Bearer abcdef",
 		"api-key=k-1234567890", "k-1234567890",
 		"x-short=1", "1", "ab",
+		"BearerSecret%zz=oops", "BearerSecret%zz", "authorization", "api-key",
 	} {
 		assert.Contains(t, got, want)
 	}

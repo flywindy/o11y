@@ -37,10 +37,10 @@ adopters can plan their upgrades.
   the SDK's stdout log (handled errors at ERROR, so an error-only log level
   keeps them), one per distinct error or message per minute, with
   the suppression window under `repeat_suppressed_for`. Both redact the
-  configured endpoints and the header values of `WithOTLPHeaders`,
-  `WithProfilingAuthHeaders` and the `OTEL_EXPORTER_OTLP_*HEADERS`
-  variables, which the pinned exporters echo verbatim when a value fails to
-  parse; `Logr()` maps OTel's
+  configured endpoints and the header values of `WithOTLPHeaders` and
+  `WithProfilingAuthHeaders` and the header names and values in the
+  `OTEL_EXPORTER_OTLP_*HEADERS` variables, which the pinned exporters echo
+  verbatim when one fails to parse; `Logr()` maps OTel's
   verbosity convention (V(1) warn, V(4) info, V(8) debug) onto the SDK's
   log level, so at the default INFO level the warnings the default logger
   dropped ("dropped log records") now appear. The SDK does not install them

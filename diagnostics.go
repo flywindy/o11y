@@ -137,9 +137,9 @@ var otlpHeaderEnvVars = []string{
 // fails to unescape, report it verbatim ("escape header value", "value",
 // v) through the logger installed with otel.SetLogger; a bearer token has
 // no "@" or endpoint for redact.InText to recognise, so it has to be named
-// up front. Each variable contributes its whole value, each "k=v" pair, the
-// raw value part and its unescaped form, so the fragment the exporter
-// echoes is covered whichever one it is. Every non-empty value is listed
+// up front. Each variable contributes its whole value, each "k=v" pair, and
+// the raw name and value parts with their unescaped forms, so the fragment
+// the exporter echoes ("key" or "value") is covered whichever one it is. Every non-empty value is listed
 // whatever its length: an exporter can echo a value on its own, so a short
 // one is not safe to skip, and redact.Secrets replaces a short value only
 // where it stands as a whole token so a "1" or "true" does not rewrite
@@ -172,9 +172,16 @@ func diagnosticSecrets(cfg *Config) []string {
 		add(raw)
 		for pair := range strings.SplitSeq(raw, ",") {
 			add(pair)
-			if _, v, ok := strings.Cut(pair, "="); ok {
-				add(v)
-				if unescaped, err := url.PathUnescape(strings.TrimSpace(v)); err == nil {
+			k, v, ok := strings.Cut(pair, "=")
+			if !ok {
+				continue
+			}
+			// The exporter reports a name that fails to unescape on its own
+			// ("key", k), the same way it reports a value, and a credential
+			// pasted into the wrong side of the "=" is still a credential.
+			for _, part := range []string{k, v} {
+				add(part)
+				if unescaped, err := url.PathUnescape(strings.TrimSpace(part)); err == nil {
 					add(unescaped)
 				}
 			}
