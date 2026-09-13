@@ -407,14 +407,24 @@ func validateConfiguredEndpoints(cfg *Config) error {
 // Go-escaped, in the error the exporter returns, which the ErrorHandler
 // records; an escaped control character no longer matches the name in
 // the redaction list, so the name is rejected up front and not repeated.
+// Only headers a client Init will start would send are checked: the OTLP
+// headers when a trace or log exporter or the OTLP metrics exporter is
+// built, the profiling headers when the profiler starts, so dormant
+// configuration behind a disabled pillar does not fail Init.
 func validateConfiguredHeaders(cfg *Config) error {
+	otlpClient := cfg.traceEnabled || cfg.logEnabled || (cfg.metricsEnabled && cfg.metricsOTLPEndpoint != "")
+	profiler := cfg.profilingEnabled && cfg.profilingEndpoint != ""
 	for _, h := range []struct {
 		option  string
 		headers map[string]string
+		used    bool
 	}{
-		{"WithOTLPHeaders", cfg.otlpHeaders},
-		{"WithProfilingAuthHeaders", cfg.profilingAuthHeaders},
+		{"WithOTLPHeaders", cfg.otlpHeaders, otlpClient},
+		{"WithProfilingAuthHeaders", cfg.profilingAuthHeaders, profiler},
 	} {
+		if !h.used {
+			continue
+		}
 		for name := range h.headers {
 			if !isHTTPToken(name) {
 				return fmt.Errorf("o11y: a header name given to %s is not a valid HTTP header name (an RFC 7230 token); net/http would reject every request carrying it and quote the name, escaped, in the export error, so the option is rejected instead and the name is not repeated here", h.option)

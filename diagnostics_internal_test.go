@@ -316,18 +316,32 @@ func TestValidateConfiguredEndpoints(t *testing.T) {
 // name, and that token names pass.
 func TestValidateConfiguredHeaders(t *testing.T) {
 	require.NoError(t, validateConfiguredHeaders(&Config{
+		traceEnabled:         true,
+		profilingEnabled:     true,
+		profilingEndpoint:    "http://pyroscope:4040",
 		otlpHeaders:          map[string]string{"authorization": "Bearer x", "x-tenant": "acme"},
 		profilingAuthHeaders: map[string]string{"x-api-key": "k"},
 	}))
 
-	err := validateConfiguredHeaders(&Config{otlpHeaders: map[string]string{"Bearer\nSecret": "v"}})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "WithOTLPHeaders is not a valid HTTP header name")
-	assert.NotContains(t, err.Error(), "Secret", "the name stays out of the error")
+	bad := map[string]string{"Bearer\nSecret": "v"}
+	for _, cfg := range []*Config{
+		{traceEnabled: true, otlpHeaders: bad},
+		{logEnabled: true, otlpHeaders: bad},
+		{metricsEnabled: true, metricsOTLPEndpoint: "http://collector:4318", otlpHeaders: bad},
+	} {
+		err := validateConfiguredHeaders(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "WithOTLPHeaders is not a valid HTTP header name")
+		assert.NotContains(t, err.Error(), "Secret", "the name stays out of the error")
+	}
 
-	err = validateConfiguredHeaders(&Config{profilingAuthHeaders: map[string]string{"x api key": "k"}})
+	err := validateConfiguredHeaders(&Config{profilingEnabled: true, profilingEndpoint: "http://pyroscope:4040", profilingAuthHeaders: map[string]string{"x api key": "k"}})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "WithProfilingAuthHeaders is not a valid HTTP header name")
+
+	dormant := &Config{metricsEnabled: true, otlpHeaders: bad, profilingEndpoint: "http://pyroscope:4040", profilingAuthHeaders: map[string]string{"x api key": "k"}}
+	require.NoError(t, validateConfiguredHeaders(dormant), "no OTLP exporter on the pull path and no profiler without the toggle, so neither map is sent")
+	require.NoError(t, validateConfiguredHeaders(&Config{profilingEnabled: true, profilingAuthHeaders: map[string]string{"x api key": "k"}}), "profiling without an endpoint does not start")
 }
 
 // TestDiagnosticSecrets_EscapedForms pins that a configured value whose
