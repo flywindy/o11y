@@ -198,12 +198,15 @@ func shutdownBudget(ctx context.Context, remaining int) (context.Context, contex
 // then is counted on the export-failure Recorder. On the OTLP push path the
 // meter provider's own shutdown performs the last collection, so with
 // metrics last that count is shipped; with metrics first it would be
-// recorded into a counter nothing reads again. On the Prometheus pull path
-// the otelprom reader's shutdown collects nothing, so only a scrape that
-// lands between the drain and the scrape server stopping sees the count;
-// the ErrorHandler record is the durable evidence there, provided the
-// application installed SDK.ErrorHandler with otel.SetErrorHandler (OTel's
-// default handler prints the error to stderr instead). This holds for a
+// recorded into a counter nothing reads again. A failure of that last
+// collection's own export is the one increment the push path cannot ship:
+// the snapshot was taken before the call failed and nothing collects
+// again. On the Prometheus pull path the otelprom reader's shutdown
+// collects nothing, so only a scrape that lands between the drain and the
+// scrape server stopping sees the count. In both cases the ErrorHandler
+// record is the durable evidence, provided the application installed
+// SDK.ErrorHandler with otel.SetErrorHandler (OTel's default handler
+// prints the error to stderr instead). This holds for a
 // drain that finishes within its closer's share of the deadline; past it
 // the two batchers differ. The trace BatchSpanProcessor drains on a
 // background context of its own (bounded by the export timeout, 30s by

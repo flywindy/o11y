@@ -235,7 +235,10 @@ func (e logExporter) Export(ctx context.Context, records []sdklog.Record) error 
 // checkpoints each interval's delta before the export that then fails, and
 // a failed delta is not re-sent, so the first successful export carries
 // only the last interval's failures; the Recorder's own total stays exact
-// but is not recoverable through that pipeline.
+// but is not recoverable through that pipeline. The same applies to the
+// export the PeriodicReader's Shutdown performs: it is the last collection,
+// so when that call fails the increment lands after the final snapshot was
+// taken and no later collection carries it.
 func MetricExporter(inner sdkmetric.Exporter, r *Recorder) sdkmetric.Exporter {
 	r.activate(SignalMetrics)
 	return metricExporter{Exporter: inner, recorder: r}
