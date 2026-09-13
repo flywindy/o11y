@@ -96,8 +96,11 @@ func (s *logrSink) Enabled(level int) bool {
 	return s.logger.Enabled(context.Background(), slogLevel(level))
 }
 
-// Info implements logr.LogSink.
+// Info implements logr.LogSink. The message goes through the redaction
+// rules like every value, since an OTel component may put an endpoint or a
+// header value in the message text rather than in a key/value pair.
 func (s *logrSink) Info(level int, msg string, keysAndValues ...any) {
+	msg = s.redaction.Text(msg)
 	s.write(slogLevel(level), msg, msg, keysAndValues)
 }
 
@@ -125,6 +128,7 @@ func ErrorText(err error) (text string) {
 // message are each logged. The text comes from ErrorText, so a typed nil
 // or a panicking Error method cannot crash the process.
 func (s *logrSink) Error(err error, msg string, keysAndValues ...any) {
+	msg = s.redaction.Text(msg)
 	key := msg
 	if err != nil {
 		text := s.redaction.Text(ErrorText(err))
