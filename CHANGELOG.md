@@ -15,17 +15,22 @@ adopters can plan their upgrades.
 
 ### Added
 
-- `o11y_export_failures_total{signal}` counts every batch the OTLP exporters
-  failed to deliver, per signal (`traces`, `logs`, `metrics`). The OTel
-  batchers drop a rejected batch after handing the error to `otel.Handle`, so
-  until now a collector outage left no number behind; the counter is an
-  SDK-owned instrument on the same `/metrics` endpoint, reported for every
-  signal (zero when healthy), and needs no code change. See the guide's
-  "Export failures & OTel diagnostics" section for the alert.
+- `o11y_export_failures_total{otel_component_type}` counts every batch the
+  OTLP exporters failed to deliver, one series per exporter (semconv's
+  `otel.component.type`: `otlp_http_span_exporter`, `otlp_http_log_exporter`,
+  `otlp_http_metric_exporter`). The OTel batchers drop a rejected batch after
+  handing the error to `otel.Handle`, so until now a collector outage left no
+  number behind. The counter is an SDK-owned instrument among the SDK's own
+  metrics — on `/metrics` on the Prometheus pull path, through the OTLP
+  metrics pipeline with `WithMetricsOTLPEndpoint`, absent when the metrics
+  pillar is off — reported for every exporter (zero when healthy), and needs
+  no code change. See the guide's "Export failures & OTel diagnostics"
+  section for the alert and `docs/semconv.md` for the catalog entry.
 - `SDK.ErrorHandler()` and `SDK.Logr()` return replacements for OTel's
   default error handler and internal logger, which print plain text to
   stderr on every occurrence. The replacements write structured records to
-  the SDK's stdout log, one per distinct error or message per minute, with
+  the SDK's stdout log (handled errors at ERROR, so an error-only log level
+  keeps them), one per distinct error or message per minute, with
   the suppression window under `repeat_suppressed_for`; `Logr()` maps OTel's
   verbosity convention (V(1) warn, V(4) info, V(8) debug) onto the SDK's
   log level. The SDK does not install them (ADR 0003); the application does

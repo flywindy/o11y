@@ -12,7 +12,7 @@ import (
 )
 
 // TestOTelErrorHandler_LogsOncePerWindow checks identical errors collapse to
-// one WARN per window while distinct errors are each logged.
+// one ERROR per window while distinct errors are each logged.
 func TestOTelErrorHandler_LogsOncePerWindow(t *testing.T) {
 	var buf bytes.Buffer
 	h := newOTelErrorHandler(slog.New(slog.NewTextHandler(&buf, nil)))
@@ -29,7 +29,7 @@ func TestOTelErrorHandler_LogsOncePerWindow(t *testing.T) {
 	out := buf.String()
 	assert.Equal(t, 2, strings.Count(out, "connection refused"), "identical errors collapse to one line per window")
 	assert.Equal(t, 1, strings.Count(out, "something else"))
-	assert.Equal(t, 3, strings.Count(out, "level=WARN"))
+	assert.Equal(t, 3, strings.Count(out, "level=ERROR"), "handled OTel errors must survive an error-only log level")
 	assert.Contains(t, out, `msg="otel internal error"`)
 	assert.Contains(t, out, "repeat_suppressed_for=1m0s")
 }

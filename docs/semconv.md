@@ -132,6 +132,26 @@ package is the authoritative source and changes across contrib versions.
 
 ---
 
+## SDK Diagnostics (package `github.com/flywindy/o11y`, scope `github.com/flywindy/o11y`)
+
+Emitted by the root package's exporter wrappers (`internal/exportstats`) on
+the SDK's own MeterProvider, so they appear wherever the metrics pillar
+exports (Prometheus pull or OTLP push) and not at all when it is off.
+
+### Instruments
+
+| Name | Kind | Unit | Attributes |
+|---|---|---|---|
+| `o11y.export.failures` | Int64ObservableCounter | `{batch}` | SDK-owned name (see Deviations). `otel.component.type`. One batch the OTLP exporter returned an error for; one data point per exporter, zero when healthy. |
+
+### Attributes
+
+| Key | Type | Notes |
+|---|---|---|
+| `otel.component.type` | string | semconv v1.39.0 well-known values, one per OTLP/HTTP exporter the SDK builds: `otlp_http_span_exporter`, `otlp_http_log_exporter`, `otlp_http_metric_exporter`. Closed set; never a caller-supplied value. |
+
+---
+
 ## Messaging - NATS (package `github.com/flywindy/o11y/nats`)
 
 Spans are emitted by
@@ -759,6 +779,7 @@ Data Model attributes automatically.
 | `minio.error.kind`, `minio.client.operation.duration` | `minio` wrapper | MinIO-specific bounded SRE classification (span-only) and per-operation duration histogram. No stable OTel object-store metric exists, so the instrument name stays package-local; standard `error.type` is co-emitted on spans and as the metric failure label. |
 | Legacy ES keys (`db.system`, `db.operation`, `db.statement`, `db.elasticsearch.*`) | `go-elasticsearch/v8` first-party instrumentation | The pinned `elastic-transport-go/v8 v8.8.0` predates DB semconv stabilization and emits these deprecated spellings on its own span. A T2 facade has no seam to rewrite them, so the drift is accepted and documented (ADR 0020 §4, option (a)) rather than normalized via a span processor. A compatibility test pins the exact emitted keys; an upstream fix is inherited for free. The SDK-owned `db.client.operation.duration` (ADR 0027) is unaffected and uses the current keys. |
 | `cassandra.query.attempts`, `cassandra.connection.attempts`, `cassandra.query.attempt` | `cassandra` wrapper | SDK-owned names for the client-side attempt/retry/speculative-execution signal, which server-side exporters cannot provide. semconv v1.39.0 defines no attempts metric or attribute; kept package-local (per ADR 0019 §7.B) so they are easy to retire/rename if semconv later standardizes one. |
+| `o11y.export.failures` | root package exporter wrappers | SDK-owned instrument name. semconv v1.39.0 describes SDK self-metrics for exporters (`otel.sdk.exporter.span.exported`, `otel.sdk.exporter.log.exported`, `otel.sdk.exporter.metric_data_point.exported`, status Development) that count exported *items* and carry `error.type` on failure; the OTel Go SDK (v1.44) does not emit them yet, and when it does they will land on the same MeterProvider under those exact names. This counter is the batch-level failure signal the batchers already observe, so it keeps a package-local name to avoid colliding with the SDK's own metrics later; its attribute is the semconv `otel.component.type`. Mitigation: retire once the Go SDK ships self-observability and the item-level metrics cover the same alert. |
 
 Any new deviation must list:
 
