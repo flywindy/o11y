@@ -2,6 +2,7 @@ package o11y
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestOTelErrorHandler_LogsOncePerWindow checks identical errors collapse to
@@ -54,4 +56,30 @@ func TestOTelErrorHandler_NilIsIgnored(t *testing.T) {
 	assert.Empty(t, buf.String())
 
 	assert.NotPanics(t, func() { newOTelErrorHandler(nil).Handle(errors.New("x")) })
+}
+
+// TestShutdownSequence_DrainsTracesAndLogsBeforeMetrics pins the closer
+// order: a batch that fails during the tracer's or logger's final flush is
+// counted on the export-failure Recorder, and only a meter provider that
+// shuts down afterwards still collects that count.
+func TestShutdownSequence_DrainsTracesAndLogsBeforeMetrics(t *testing.T) {
+	var order []string
+	closer := func(name string) func(context.Context) error {
+		return func(context.Context) error {
+			order = append(order, name)
+			return nil
+		}
+	}
+
+	seq := shutdownSequence(closer("profiler"), closer("traces"), closer("logs"), closer("metrics-server"), closer("meter"))
+	for _, fn := range seq {
+		require.NoError(t, fn(context.Background()))
+	}
+	assert.Equal(t, []string{"profiler", "traces", "logs", "metrics-server", "meter"}, order)
+
+	order = nil
+	for _, fn := range shutdownSequence(nil, closer("traces"), closer("logs"), closer("metrics-server"), closer("meter")) {
+		require.NoError(t, fn(context.Background()))
+	}
+	assert.Equal(t, []string{"traces", "logs", "metrics-server", "meter"}, order, "a nil profiler closer is skipped")
 }

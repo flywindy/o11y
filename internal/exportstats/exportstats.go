@@ -168,8 +168,14 @@ func (e logExporter) Export(ctx context.Context, records []sdklog.Record) error 
 // MetricExporter wraps inner so every failed Export call is counted under
 // SignalMetrics. Temporality, Aggregation, ForceFlush and Shutdown pass
 // through unchanged. A count taken on the OTLP metrics path is only visible
-// once an export succeeds again; it still answers "how many collections were
-// lost while the collector was down" after the fact.
+// once an export succeeds again; with cumulative temporality (the default)
+// it still answers "how many collections were lost while the collector was
+// down" after the fact. Under delta temporality
+// (OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta) the SDK
+// checkpoints each interval's delta before the export that then fails, and
+// a failed delta is not re-sent, so the first successful export carries
+// only the last interval's failures; the Recorder's own total stays exact
+// but is not recoverable through that pipeline.
 func MetricExporter(inner sdkmetric.Exporter, r *Recorder) sdkmetric.Exporter {
 	return metricExporter{Exporter: inner, recorder: r}
 }
