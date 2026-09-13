@@ -420,8 +420,8 @@ pillar: on the
 default Prometheus pull path it is scraped from `/metrics`; on the OTLP
 metrics push path (`WithMetricsOTLPEndpoint`) the metric exporter's own
 count travels through the pipeline that is failing and lands once an export
-succeeds again, which with the default cumulative temporality still answers
-"how many collections were lost" after the outage (under
+succeeds again, which with the default cumulative temporality still carries
+the full count of erroring metric export calls made during the outage (under
 `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta` a failed
 interval's delta is not re-sent, so only the last interval's failures
 arrive); with the metrics pillar off (`WithMetricsEnabled(false)`) the

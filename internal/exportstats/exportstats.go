@@ -229,8 +229,8 @@ func (e logExporter) Export(ctx context.Context, records []sdklog.Record) error 
 // SignalMetrics. Temporality, Aggregation, ForceFlush and Shutdown pass
 // through unchanged. A count taken on the OTLP metrics path is only visible
 // once an export succeeds again; with cumulative temporality (the default)
-// it still answers "how many collections were lost while the collector was
-// down" after the fact. Under delta temporality
+// the first successful export still carries the full count of erroring
+// export calls made while the collector was down. Under delta temporality
 // (OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta) the SDK
 // checkpoints each interval's delta before the export that then fails, and
 // a failed delta is not re-sent, so the first successful export carries
