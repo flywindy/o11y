@@ -424,11 +424,17 @@ arrive); with the metrics pillar off (`WithMetricsEnabled(false)`) the
 counter is not registered anywhere. At shutdown the tracer and logger drain
 before the meter provider, so a batch that fails in their final flush is
 still counted and, on the push path, shipped with the last collection; the
-`Shutdown` deadline is shared out evenly across the components still to
-run, recomputed as each finishes, so a tracer drain that waits on a
+`Shutdown` deadline is shared out evenly across the enabled components
+still to run, recomputed as each finishes, so a tracer drain that waits on a
 collector that is down cannot use up the whole deadline and leave the meter
-provider's final collection with a context that is already done. Size the
-deadline for the whole sequence, not for one flush.
+provider's final collection with a context that is already done. That holds
+for a drain that finishes within its share: the OTel batchers drain on a
+background context of their own (bounded by `OTEL_BSP_EXPORT_TIMEOUT` /
+`OTEL_BLRP_EXPORT_TIMEOUT`, 30s by default) that cannot be cancelled, so a
+drain that outlives its share is reported as a `Shutdown` error, keeps
+running on its own, and a failure it records after the meter provider's
+final collection is not reported; the batch is lost when the process exits
+either way. Size the deadline for the whole sequence, not for one flush.
 
 **Structured diagnostics.** The SDK builds replacements for the OTel
 default error handler and logger but does not install them — ADR 0003, the

@@ -144,7 +144,10 @@ func (s *SDK) Meter(name string) metric.Meter {
 // exporter retries a failing collector for up to a minute) cannot consume
 // the whole deadline and leave the components after it, the meter
 // provider's final collection in particular, with a context that is
-// already done. A context without a deadline is passed through unchanged.
+// already done. Only enabled pillars count as components. A context
+// without a deadline is passed through unchanged. A component whose share
+// runs out is reported as timed out, and its drain, which the OTel batchers
+// run on a background context, continues on its own; see shutdownSequence.
 //
 // Shutdown is idempotent: subsequent calls return the same joined error
 // without rerunning any closer. Callers may safely register Shutdown in
@@ -183,24 +186,45 @@ func shutdownBudget(ctx context.Context, remaining int) (context.Context, contex
 	return context.WithTimeout(ctx, share)
 }
 
-// shutdownSequence orders the per-pillar closers Shutdown runs. Disabled
-// pillars contribute a no-op that returns nil; a nil profiler closer is
-// skipped.
+// shutdownSequence orders the per-pillar closers Shutdown runs. A nil
+// closer (a disabled pillar, or no profiler) is left out, so it neither
+// runs nor counts as a component when the deadline is shared out: with
+// traces the only enabled pillar the tracer's drain gets the whole
+// deadline, not a quarter of it.
 //
 // Traces and logs drain before metrics on purpose: their final flush is
 // where a batch queued until shutdown gets exported, and a batch that fails
 // then is counted on the export-failure Recorder. The meter provider's own
 // shutdown performs the last collection, so with metrics last that count is
 // still observed and, on the OTLP push path, shipped; with metrics first it
-// would be recorded into a counter nothing reads again. The profiler stops
-// before the tracer it wraps, and the scrape server stops just before the
-// meter provider so no scrape races the final collection.
+// would be recorded into a counter nothing reads again. This holds for a
+// drain that finishes within its closer's share of the deadline. The OTel
+// batchers drain on a background context of their own (bounded by the
+// export timeout, 30s by default) and offer no way to cancel it, so a drain
+// that outlives its share keeps running after its closer returned, and a
+// failure it records after the meter provider's final collection is not
+// reported; the batch is lost when the process exits either way. The
+// profiler stops before the tracer it wraps, and the scrape server stops
+// just before the meter provider so no scrape races the final collection.
 func shutdownSequence(profiler, traces, logs, metricsServer, meter func(context.Context) error) []func(context.Context) error {
 	seq := make([]func(context.Context) error, 0, 5)
-	if profiler != nil {
-		seq = append(seq, profiler)
+	for _, fn := range []func(context.Context) error{profiler, traces, logs, metricsServer, meter} {
+		if fn != nil {
+			seq = append(seq, fn)
+		}
 	}
-	return append(seq, traces, logs, metricsServer, meter)
+	return seq
+}
+
+// closeAll runs the given closers in order on Init's failure paths, skipping
+// nil ones (a pillar that was not enabled or not yet built). Errors are
+// dropped: the error being returned is the one that matters.
+func closeAll(ctx context.Context, closers ...func(context.Context) error) {
+	for _, fn := range closers {
+		if fn != nil {
+			_ = fn(ctx)
+		}
+	}
 }
 
 // Init initializes and returns a configured *SDK for the calling service.
@@ -269,7 +293,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	var tpInternal *sdktrace.TracerProvider
 	tracerProviderPublic := oteltrace.TracerProvider(tracenoop.NewTracerProvider())
 	prop := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})
-	tpShutdown := func(_ context.Context) error { return nil }
+	var tpShutdown func(context.Context) error
 
 	if cfg.traceEnabled {
 		var spanProcessors []sdktrace.SpanProcessor
@@ -312,8 +336,8 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	//    is started; existing Grafana dashboards are unaffected.
 	var mpInternal *sdkmetric.MeterProvider
 	meterProviderPublic := metric.MeterProvider(metricnoop.NewMeterProvider())
-	metricsCloser := metrics.Closer(func(_ context.Context) error { return nil })
-	mpShutdown := func(_ context.Context) error { return nil }
+	var metricsCloser metrics.Closer
+	var mpShutdown func(context.Context) error
 
 	if cfg.metricsEnabled {
 		mp, closer, initErr := metrics.InitMeter(ctx, metrics.Config{
@@ -347,7 +371,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 			ExportFailures:          exportFailures,
 		})
 		if initErr != nil {
-			_ = tpShutdown(ctx)
+			closeAll(ctx, tpShutdown)
 			return nil, initErr
 		}
 		mpInternal, meterProviderPublic = mp, mp
@@ -365,15 +389,13 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	// 5. Initialize LoggerProvider and build the dual-output logger.
 	//    When log is disabled, only the stdout handler is active; no OTLP
 	//    connection is attempted and no LoggerProvider is started.
-	lpShutdown := func(_ context.Context) error { return nil }
+	var lpShutdown func(context.Context) error
 	var logger *slog.Logger
 
 	if cfg.logEnabled {
 		lp, initErr := o11ylog.InitLogger(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, providerRes, exportFailures)
 		if initErr != nil {
-			_ = metricsCloser(ctx)
-			_ = mpShutdown(ctx)
-			_ = tpShutdown(ctx)
+			closeAll(ctx, metricsCloser, mpShutdown, tpShutdown)
 			return nil, initErr
 		}
 		lpShutdown = lp.Shutdown
@@ -462,10 +484,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		})
 		if startErr != nil {
 			if errors.Is(startErr, profiling.ErrAlreadyStarted) {
-				_ = metricsCloser(ctx)
-				_ = mpShutdown(ctx)
-				_ = lpShutdown(ctx)
-				_ = tpShutdown(ctx)
+				closeAll(ctx, metricsCloser, mpShutdown, lpShutdown, tpShutdown)
 				return nil, startErr
 			}
 			logger.WarnContext(ctx, "profiling disabled after Pyroscope start failure",

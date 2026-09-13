@@ -139,4 +139,32 @@ func TestShutdownSequence_DrainsTracesAndLogsBeforeMetrics(t *testing.T) {
 		require.NoError(t, fn(context.Background()))
 	}
 	assert.Equal(t, []string{"traces", "logs", "metrics-server", "meter"}, order, "a nil profiler closer is skipped")
+
+	order = nil
+	seq = shutdownSequence(nil, closer("traces"), nil, nil, nil)
+	require.Len(t, seq, 1, "disabled pillars neither run nor count towards the deadline share")
+	for _, fn := range seq {
+		require.NoError(t, fn(context.Background()))
+	}
+	assert.Equal(t, []string{"traces"}, order)
+}
+
+// TestShutdown_DisabledPillarsDoNotShareTheDeadline checks the case Codex
+// raised: with tracing the only enabled pillar, the tracer's closer must get
+// the whole deadline rather than a quarter of it.
+func TestShutdown_DisabledPillarsDoNotShareTheDeadline(t *testing.T) {
+	var got time.Time
+	sdk := &SDK{
+		Logger: slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+		shutdowns: shutdownSequence(nil, func(ctx context.Context) error {
+			got, _ = ctx.Deadline()
+			return nil
+		}, nil, nil, nil),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	want, _ := ctx.Deadline()
+	require.NoError(t, sdk.Shutdown(ctx))
+	assert.Equal(t, want, got, "the only closer runs under the caller's own deadline")
 }
