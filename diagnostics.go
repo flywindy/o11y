@@ -254,8 +254,67 @@ func otlpExporterEnvChecks(cfg *Config) []otlpEnvCheck {
 	return checks
 }
 
-// validateOTLPExporterEnv rejects a malformed OTLP exporter variable before
-// any exporter is built. The pinned exporters parse their environment while
+// sdkEnvChecks lists the OTel SDK's own variables the providers Init builds
+// read while they are constructed, each with the SDK's parsing rule; like
+// the exporters, the SDK echoes a value it cannot parse (the trace SDK
+// through global.Info with the value, the metric reader through
+// global.Error, the log SDK and the sampler through otel.Handle with the
+// value in the error). With traces enabled: the OTEL_BSP_* batcher
+// settings and the span limits (the OTEL_SPAN_* variables, which fall back
+// to the generic OTEL_ATTRIBUTE_* ones only when unset, and the event and
+// link attribute counts), read verbatim as integers, and
+// OTEL_TRACES_SAMPLER, parsed whether or not Init passes a sampler, with
+// OTEL_TRACES_SAMPLER_ARG read only for a ratio sampler (a ratio outside
+// [0, 1] is reported without the value, so only a non-number is
+// rejected). With logs enabled: the OTEL_BLRP_* batcher settings and the
+// OTEL_LOGRECORD_* limits, verbatim integers, since Init passes no
+// explicit option for them. On the OTLP metrics push path:
+// OTEL_METRIC_EXPORT_INTERVAL and OTEL_METRIC_EXPORT_TIMEOUT, verbatim
+// positive integers (the reader echoes a non-positive one too).
+func sdkEnvChecks(cfg *Config) []otlpEnvCheck {
+	var checks []otlpEnvCheck
+	integer := func(name string) otlpEnvCheck {
+		return otlpEnvCheck{name: name, check: checkInteger, verbatim: true}
+	}
+	if cfg.traceEnabled {
+		for _, name := range []string{
+			"OTEL_BSP_SCHEDULE_DELAY", "OTEL_BSP_EXPORT_TIMEOUT", "OTEL_BSP_MAX_QUEUE_SIZE", "OTEL_BSP_MAX_EXPORT_BATCH_SIZE",
+			"OTEL_SPAN_EVENT_COUNT_LIMIT", "OTEL_SPAN_LINK_COUNT_LIMIT", "OTEL_EVENT_ATTRIBUTE_COUNT_LIMIT", "OTEL_LINK_ATTRIBUTE_COUNT_LIMIT",
+		} {
+			checks = append(checks, integer(name))
+		}
+		for _, limit := range []string{"ATTRIBUTE_VALUE_LENGTH_LIMIT", "ATTRIBUTE_COUNT_LIMIT"} {
+			generic := integer("OTEL_" + limit)
+			specific := integer("OTEL_SPAN_" + limit)
+			specific.fallback = &generic
+			checks = append(checks, specific)
+		}
+		checks = append(checks, otlpEnvCheck{name: "OTEL_TRACES_SAMPLER", check: checkSamplerName})
+		switch strings.ToLower(strings.TrimSpace(os.Getenv("OTEL_TRACES_SAMPLER"))) {
+		case "traceidratio", "parentbased_traceidratio":
+			checks = append(checks, otlpEnvCheck{name: "OTEL_TRACES_SAMPLER_ARG", check: checkSamplerRatio})
+		}
+	}
+	if cfg.logEnabled {
+		for _, name := range []string{
+			"OTEL_BLRP_SCHEDULE_DELAY", "OTEL_BLRP_EXPORT_TIMEOUT", "OTEL_BLRP_MAX_QUEUE_SIZE", "OTEL_BLRP_MAX_EXPORT_BATCH_SIZE",
+			"OTEL_LOGRECORD_ATTRIBUTE_COUNT_LIMIT", "OTEL_LOGRECORD_ATTRIBUTE_VALUE_LENGTH_LIMIT",
+		} {
+			checks = append(checks, integer(name))
+		}
+	}
+	if cfg.metricsEnabled && cfg.metricsOTLPEndpoint != "" {
+		for _, name := range []string{"OTEL_METRIC_EXPORT_INTERVAL", "OTEL_METRIC_EXPORT_TIMEOUT"} {
+			checks = append(checks, otlpEnvCheck{name: name, check: checkPositiveInteger, verbatim: true})
+		}
+	}
+	return checks
+}
+
+// validateOTLPExporterEnv rejects a malformed OTLP exporter or OTel SDK
+// variable before any exporter or provider is built (see
+// otlpExporterEnvChecks and sdkEnvChecks for the variables and rules). The
+// pinned exporters parse their environment while
 // they are constructed and report a value they cannot parse with the raw
 // text attached: the trace and metric exporters through OTel's global
 // logger ("input", "key" or "value"), the log exporter through otel.Handle
@@ -282,7 +341,7 @@ func otlpExporterEnvChecks(cfg *Config) []otlpEnvCheck {
 // skipped, as the exporters skip it; each value is checked as the exporter
 // that reads it will see it, trimmed or verbatim.
 func validateOTLPExporterEnv(cfg *Config) error {
-	for _, c := range otlpExporterEnvChecks(cfg) {
+	for _, c := range append(otlpExporterEnvChecks(cfg), sdkEnvChecks(cfg)...) {
 		for c.fallback != nil && !c.set() {
 			c = *c.fallback
 		}
@@ -299,6 +358,45 @@ func validateOTLPExporterEnv(cfg *Config) error {
 func checkURL(v string) (string, bool) {
 	if _, err := url.Parse(v); err != nil {
 		return "it is not a valid URL", true
+	}
+	return "", false
+}
+
+// checkInteger applies the SDK's rule for a batcher setting or a limit:
+// strconv.Atoi must accept the value.
+func checkInteger(v string) (string, bool) {
+	if _, err := strconv.Atoi(v); err != nil {
+		return "it is not an integer", true
+	}
+	return "", false
+}
+
+// checkPositiveInteger applies the metric reader's rule for its interval
+// and timeout: an integer count of milliseconds above zero.
+func checkPositiveInteger(v string) (string, bool) {
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return "it is not a positive integer count of milliseconds", true
+	}
+	return "", false
+}
+
+// checkSamplerName applies the trace SDK's rule for OTEL_TRACES_SAMPLER:
+// one of its six sampler names, compared case-insensitively.
+func checkSamplerName(v string) (string, bool) {
+	switch strings.ToLower(v) {
+	case "always_on", "always_off", "traceidratio", "parentbased_always_on", "parentbased_always_off", "parentbased_traceidratio":
+		return "", false
+	}
+	return "it is not one of the sampler names the SDK knows", true
+}
+
+// checkSamplerRatio applies the trace SDK's rule for
+// OTEL_TRACES_SAMPLER_ARG as far as an echo is concerned: the value must
+// parse as a number (a ratio outside [0, 1] is reported without it).
+func checkSamplerRatio(v string) (string, bool) {
+	if _, err := strconv.ParseFloat(v, 64); err != nil {
+		return "it is not a number", true
 	}
 	return "", false
 }
@@ -442,7 +540,7 @@ func validateOTLPEnvVar(name, value string, check func(string) (reason string, b
 		return nil
 	}
 	if reason, bad := check(value); bad {
-		return fmt.Errorf("o11y: %s cannot be used (%s); the OTLP exporters would report its raw text through OTel's global logger while Init builds them, before Logr() can be installed, so the variable is rejected instead", name, reason)
+		return fmt.Errorf("o11y: %s cannot be used (%s); the OTel SDK and its OTLP exporters would report its raw text through OTel's global logger or error handler while Init builds them, before Logr() and ErrorHandler() can be installed, so the variable is rejected instead", name, reason)
 	}
 	return nil
 }

@@ -136,7 +136,10 @@ package is the authoritative source and changes across contrib versions.
 
 Emitted by the root package's exporter wrappers (`internal/exportstats`) on
 the SDK's own MeterProvider, so they appear wherever the metrics pillar
-exports (Prometheus pull or OTLP push) and not at all when it is off.
+exports (Prometheus pull or OTLP push) and not at all when it is off. The
+meter carries the pinned semconv schema URL (`semconv.SchemaURL`, v1.39.0),
+as the other SDK-owned instrumentation does, so a collector can tell which
+schema governs the `otel.component.type` attribute.
 
 ### Instruments
 
