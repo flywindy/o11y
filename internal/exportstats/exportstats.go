@@ -70,6 +70,7 @@ func (r *Recorder) Failures(signal Signal) int64 {
 	return 0
 }
 
+// counter returns the atomic behind signal, or nil for an unknown signal.
 func (r *Recorder) counter(signal Signal) *atomic.Int64 {
 	switch signal {
 	case SignalTraces:

@@ -81,6 +81,8 @@ func (s *logrSink) Error(err error, msg string, keysAndValues ...any) {
 	s.write(slog.LevelError, key, msg, keysAndValues)
 }
 
+// write applies suppression keyed by key and emits msg with the sink's
+// name, accumulated values and the caller's key/value pairs.
 func (s *logrSink) write(level slog.Level, key, msg string, keysAndValues []any) {
 	if s.suppress != nil && s.suppress.SuppressedAt(key, s.now()) {
 		return
