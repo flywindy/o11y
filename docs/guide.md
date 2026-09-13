@@ -445,10 +445,16 @@ failure of that last collection's own export is the one increment the push
 path cannot ship: the snapshot was taken before the call failed and the
 meter provider collects nothing afterwards. On the pull path only a scrape
 that lands between that drain and the scrape server stopping sees a
-shutdown-time failure, so in practice it is not observable there. In both
-cases the `ErrorHandler()` record is the durable evidence, provided the
-application installed it with `otel.SetErrorHandler` (the wiring block
-below; without it OTel's default handler prints the error to stderr). The
+shutdown-time failure, so in practice it is not observable there. The
+durable evidence for a shutdown-time failure differs by signal. The trace
+batcher hands the error of its final drain to `otel.Handle`, so it is the
+`ErrorHandler()` record once the application installed it with
+`otel.SetErrorHandler` (the wiring block below; without it OTel's default
+handler prints the error to stderr). The log batcher and the metric reader
+return the error of their final export from `Shutdown` instead of handing it
+to `otel.Handle`, so it surfaces as `SDK.Shutdown`'s returned error and the
+`SDK component shutdown failed` record on the SDK's stdout log, with or
+without the handler installed. The
 `Shutdown` deadline is shared out evenly across the enabled components
 still to run, recomputed as each finishes, so a tracer drain that waits on a
 collector that is down cannot use up the whole deadline and leave the meter
@@ -482,6 +488,14 @@ otel.SetTextMapPropagator(sdk.Propagator)
 otel.SetErrorHandler(sdk.ErrorHandler()) // OTel-internal errors → structured ERROR records
 otel.SetLogger(sdk.Logr())               // OTel-internal messages → structured records
 ```
+
+One message cannot wait for that wiring: the OTLP exporters parse the
+`OTEL_EXPORTER_OTLP_*HEADERS` variables while `Init` builds them and report
+a pair they cannot parse through OTel's global logger with its raw text, so
+`Init` rejects a malformed variable (a pair without `=`, a name that is not
+an HTTP token, a value that is not valid percent-encoding) before any
+exporter exists. The error names the variable and the pair's position, not
+its text.
 
 `ErrorHandler()` writes each distinct OTel-internal error once per minute as
 an ERROR record (so it survives an error-only log level) with the error text

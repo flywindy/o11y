@@ -40,7 +40,10 @@ adopters can plan their upgrades.
   configured endpoints and the header values of `WithOTLPHeaders` and
   `WithProfilingAuthHeaders` and the header names and values in the
   `OTEL_EXPORTER_OTLP_*HEADERS` variables, which the pinned exporters echo
-  verbatim when one fails to parse; `Logr()` maps OTel's
+  verbatim when one fails to parse. The exporters parse those variables
+  while `Init` builds them, before `Logr()` can be installed, so `Init`
+  now rejects a malformed variable up front with an error that names the
+  variable and the pair's position but not its text; `Logr()` maps OTel's
   verbosity convention (V(1) warn, V(4) info, V(8) debug) onto the SDK's
   log level, so at the default INFO level the warnings the default logger
   dropped ("dropped log records") now appear. The SDK does not install them
@@ -81,9 +84,12 @@ adopters can plan their upgrades.
   collection (which is what ships the shutdown-time failures on the OTLP
   push path, except a failure of that last export itself, which nothing
   collects again; on the Prometheus pull path only a scrape landing before
-  the scrape server stops sees them; in both cases the ErrorHandler record
-  is the durable evidence once the application has installed it) with a
-  context that is already done. Disabled pillars and the OTLP metrics path
+  the scrape server stops sees them; the durable evidence is the
+  ErrorHandler record for a trace drain, once installed, and `Shutdown`'s
+  returned error plus its "SDK component shutdown failed" record for the
+  log batcher and the metric reader, which return their final export's
+  error instead of handing it to `otel.Handle`) with a context that is
+  already done. Disabled pillars and the OTLP metrics path
   (whose exporter the MeterProvider's own shutdown covers) no longer
   contribute a no-op closer, so they neither run nor take a share. A
   context without a deadline is passed through unchanged. A trace drain

@@ -2,11 +2,13 @@ package o11y
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/url"
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/go-logr/logr"
 	"go.opentelemetry.io/otel"
@@ -128,6 +130,86 @@ var otlpHeaderEnvVars = []string{
 	"OTEL_EXPORTER_OTLP_TRACES_HEADERS",
 	"OTEL_EXPORTER_OTLP_METRICS_HEADERS",
 	"OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+}
+
+// otlpHeaderEnvVarsFor returns the header variables the OTLP exporters Init
+// is about to build will read: the generic variable when any OTLP exporter
+// is built, and the per-signal variable for each signal exported over OTLP.
+// A variable no exporter reads is left alone.
+func otlpHeaderEnvVarsFor(cfg *Config) []string {
+	traces := cfg.traceEnabled
+	logs := cfg.logEnabled
+	metrics := cfg.metricsEnabled && cfg.metricsOTLPEndpoint != ""
+	if !traces && !logs && !metrics {
+		return nil
+	}
+	vars := []string{"OTEL_EXPORTER_OTLP_HEADERS"}
+	if traces {
+		vars = append(vars, "OTEL_EXPORTER_OTLP_TRACES_HEADERS")
+	}
+	if metrics {
+		vars = append(vars, "OTEL_EXPORTER_OTLP_METRICS_HEADERS")
+	}
+	if logs {
+		vars = append(vars, "OTEL_EXPORTER_OTLP_LOGS_HEADERS")
+	}
+	return vars
+}
+
+// validateOTLPHeaderEnv rejects a malformed OTLP header variable before any
+// exporter is built. The pinned exporters parse these variables while they
+// are constructed and report a pair they cannot parse through OTel's global
+// logger with the raw text attached ("input", "key" or "value"), and Init
+// builds the exporters before it returns, so nothing the application can
+// install later reaches those messages: Logr's redaction only covers what
+// is logged after otel.SetLogger. Failing Init instead keeps the raw text
+// out of stderr; the error names the variable and the pair's position, not
+// its text. The rules mirror the exporters' parser: a pair without "=", a
+// name that is not an HTTP token, or a value that is not valid
+// percent-encoding. An empty variable is skipped, as the exporters skip it.
+func validateOTLPHeaderEnv(cfg *Config) error {
+	for _, name := range otlpHeaderEnvVarsFor(cfg) {
+		raw := strings.TrimSpace(os.Getenv(name))
+		if raw == "" {
+			continue
+		}
+		for i, pair := range strings.Split(raw, ",") {
+			k, v, found := strings.Cut(pair, "=")
+			var reason string
+			switch {
+			case !found:
+				reason = "missing '='"
+			case !isHTTPToken(strings.TrimSpace(k)):
+				reason = "the name is not a valid HTTP header name"
+			default:
+				if _, err := url.PathUnescape(v); err != nil {
+					reason = "the value is not valid percent-encoding"
+				}
+			}
+			if reason != "" {
+				return fmt.Errorf("o11y: %s: pair %d is malformed (%s); the OTLP exporters would report its raw text through OTel's global logger while Init builds them, before Logr() can be installed, so the variable is rejected instead", name, i+1, reason)
+			}
+		}
+	}
+	return nil
+}
+
+// isHTTPToken reports whether s is a non-empty RFC 7230 token, the check the
+// pinned exporters apply to a header name from the environment.
+func isHTTPToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c > unicode.MaxASCII {
+			return false
+		}
+		if unicode.IsLetter(c) || unicode.IsDigit(c) || strings.ContainsRune("!#$%&'*+-.^_`|~", c) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // diagnosticSecrets lists the header values the diagnostics must never

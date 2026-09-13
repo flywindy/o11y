@@ -83,6 +83,22 @@ func TestInit_UnknownEnvironment(t *testing.T) {
 	assert.Contains(t, err.Error(), "unknown deployment environment")
 }
 
+// TestInit_RejectsMalformedOTLPHeaderEnv pins that a malformed
+// OTEL_EXPORTER_OTLP_*HEADERS value fails Init before any exporter is built,
+// with an error that names the variable and the pair but not its text: the
+// exporters would otherwise print the raw value through OTel's global logger
+// while Init builds them, before sdk.Logr() can be installed.
+func TestInit_RejectsMalformedOTLPHeaderEnv(t *testing.T) {
+	srv := testutil.FakeOTLPServer(t)
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-ok=1, authorization=BearerSecret%zz")
+
+	_, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_HEADERS: pair 2 is malformed")
+	assert.NotContains(t, err.Error(), "BearerSecret")
+}
+
 // TestInit_EnvironmentAliases verifies that common shorthand values are
 // normalized to canonical names without error.
 func TestInit_EnvironmentAliases(t *testing.T) {
