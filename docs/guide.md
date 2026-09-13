@@ -533,7 +533,10 @@ quotes the offending part of a URL. A header name given to
 a related reason: `net/http` refuses every request carrying any other
 name and quotes it, escaped, in the export error, where a control
 character no longer matches the redaction list, so `Init` rejects the
-option without repeating the name.
+option without repeating the name; the check applies only when a client
+that would send the headers starts (an OTLP exporter for the former, the
+profiler for the latter), so dormant configuration behind a disabled
+pillar is left alone.
 
 `ErrorHandler()` writes each distinct OTel-internal error once per minute as
 an ERROR record (so it survives an error-only log level) with the error text
