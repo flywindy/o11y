@@ -104,14 +104,23 @@ func TestRecorder_UnknownSignalIsIgnored(t *testing.T) {
 	}
 }
 
-// TestRegister_ObservesOnePointPerSignal collects the observable counter
-// through a manual reader and checks it reports every signal, including the
-// ones with no failures, so a dashboard sees a zero rather than no series.
-func TestRegister_ObservesOnePointPerSignal(t *testing.T) {
+// TestRegister_ObservesOnePointPerConstructedExporter collects the
+// observable counter through a manual reader and checks it reports every
+// signal that has an exporter wrapped through the Recorder, including one
+// with no failures (a zero rather than no series), and nothing for a signal
+// without one: on the Prometheus pull path there is no OTLP metric exporter,
+// and a zero there would advertise a component that does not exist.
+func TestRegister_ObservesOnePointPerConstructedExporter(t *testing.T) {
 	var rec exportstats.Recorder
+	_ = exportstats.SpanExporter(&flakySpanExporter{}, &rec)
+	_ = exportstats.LogExporter(&flakyLogExporter{}, &rec)
 	rec.Fail(exportstats.SignalTraces)
 	rec.Fail(exportstats.SignalTraces)
-	rec.Fail(exportstats.SignalLogs)
+	rec.Fail(exportstats.SignalMetrics) // counted, but never observed: no exporter
+	assert.True(t, rec.Active(exportstats.SignalTraces))
+	assert.True(t, rec.Active(exportstats.SignalLogs))
+	assert.False(t, rec.Active(exportstats.SignalMetrics))
+	assert.False(t, rec.Active(exportstats.Signal("profiles")))
 
 	reader := sdkmetric.NewManualReader()
 	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
@@ -139,10 +148,30 @@ func TestRegister_ObservesOnePointPerSignal(t *testing.T) {
 		got[v] = dp.Value
 	}
 	assert.Equal(t, map[attribute.Value]int64{
-		semconv.OTelComponentTypeOtlpHTTPSpanExporter.Value:   2,
-		semconv.OTelComponentTypeOtlpHTTPLogExporter.Value:    1,
-		semconv.OTelComponentTypeOtlpHTTPMetricExporter.Value: 0,
-	}, got)
+		semconv.OTelComponentTypeOtlpHTTPSpanExporter.Value: 2,
+		semconv.OTelComponentTypeOtlpHTTPLogExporter.Value:  0,
+	}, got, "the log exporter reports a zero, the absent metric exporter reports nothing")
+}
+
+// TestRegister_NoExportersNoSeries checks a Recorder nothing was wrapped
+// through contributes no data points, so the instrument is absent rather
+// than three zeros.
+func TestRegister_NoExportersNoSeries(t *testing.T) {
+	var rec exportstats.Recorder
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	require.NoError(t, rec.Register(provider.Meter("test")))
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if sum, ok := m.Data.(metricdata.Sum[int64]); ok {
+				assert.Empty(t, sum.DataPoints)
+			}
+		}
+	}
 }
 
 // TestComponentType pins the signal to semconv component-type mapping and the

@@ -47,7 +47,11 @@ type Config struct {
 	Logger      *slog.Logger
 }
 
-// Start starts the Pyroscope profiler and returns a shutdown function.
+// Start starts the Pyroscope profiler and returns a shutdown function. The
+// shutdown function honours its context: Pyroscope's Stop flushes the
+// uploader, which can wait up to its own 30s client timeout, so when the
+// context ends first the function returns ctx.Err() while Stop completes in
+// the background and releases the profiler slot when it does.
 func Start(ctx context.Context, cfg Config) (func(context.Context) error, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -82,19 +86,35 @@ func Start(ctx context.Context, cfg Config) (func(context.Context) error, error)
 	}
 	profilerStarted = true
 
-	return func(context.Context) error {
-		// Release the process-wide pprof slot whatever Stop reports. The flag
-		// tracks "this process holds the profiler", not "shutdown was clean":
-		// the profiler is no longer running either way, and SDK.Shutdown runs
-		// each closer at most once, so a flag left set on a Stop error could
-		// never be cleared and every later Start would fail with
-		// ErrAlreadyStarted for the life of the process.
-		defer func() {
+	return func(ctx context.Context) error {
+		// Stop flushes the uploader, which waits on requests it makes with
+		// its own 30s client timeout and ignores any context, so it runs on
+		// a goroutine and the closer returns ctx.Err() if the caller's
+		// deadline ends first: SDK.Shutdown shares its deadline across the
+		// pillars and the profiler stops first, so a stalled upload must not
+		// consume the tracer's and logger's share. Stop then finishes on its
+		// own and releases the process-wide pprof slot when it does.
+		//
+		// The slot is released whatever Stop reports. The flag tracks "this
+		// process holds the profiler", not "shutdown was clean": the profiler
+		// is no longer running either way, and SDK.Shutdown runs each closer
+		// at most once, so a flag left set on a Stop error could never be
+		// cleared and every later Start would fail with ErrAlreadyStarted
+		// for the life of the process.
+		done := make(chan error, 1)
+		go func() {
+			err := profiler.Stop()
 			profilerMu.Lock()
 			profilerStarted = false
 			profilerMu.Unlock()
+			done <- err
 		}()
-		return profiler.Stop()
+		select {
+		case err := <-done:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}, nil
 }
 

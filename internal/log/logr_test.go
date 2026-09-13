@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -176,6 +177,52 @@ func TestLogr_RedactsMarshalerAndContainerValues(t *testing.T) {
 	assert.NotContains(t, out, "hunter2")
 	assert.Equal(t, 6, strings.Count(out, "collector:4318"), "every redacted copy keeps the host")
 	assert.Contains(t, out, "otlp.endpoint", "the attribute.Set's key survives")
+}
+
+// TestLogr_RedactsTypedNestedContainers covers container types that are not
+// the plain map[string]string / []any shapes: a slice of maps, a map of
+// slices, a named string type, a pointer to a map, and a []byte that must
+// be left alone.
+func TestLogr_RedactsTypedNestedContainers(t *testing.T) {
+	logger, buf := newRecordingLogger(slog.LevelInfo)
+	const endpoint = "http://svc:hunter2@collector:4318"
+	type named string
+	l := o11ylog.NewLogr(logger, nil, endpoint)
+
+	m := map[string]string{"p": endpoint}
+	l.Info("typed",
+		"maps", []map[string]string{{"a": endpoint}},
+		"lists", map[string][]string{"b": {endpoint}},
+		"named", named(endpoint),
+		"ptr", &m,
+		"array", [1]named{named(endpoint)},
+		"raw", []byte("not-a-credential"),
+	)
+
+	out := buf.String()
+	assert.NotContains(t, out, "hunter2")
+	assert.Equal(t, 5, strings.Count(out, "collector:4318"), "every redacted copy keeps the host")
+	assert.Contains(t, out, "not-a-credential", "a []byte is passed through")
+}
+
+// TestLogr_BoundsGroupNesting checks a slog.Group nested deeper than the
+// resolver follows is cut off with the placeholder rather than descended
+// into forever or passed through unredacted.
+func TestLogr_BoundsGroupNesting(t *testing.T) {
+	logger, buf := newRecordingLogger(slog.LevelInfo)
+	const endpoint = "http://svc:hunter2@collector:4318"
+	l := o11ylog.NewLogr(logger, nil, endpoint)
+
+	attr := slog.String("endpoint", endpoint)
+	for i := range 40 {
+		attr = slog.Group("g"+strconv.Itoa(i), attr)
+	}
+	assert.NotPanics(t, func() { l.Info("deep", attr) })
+
+	out := buf.String()
+	assert.Contains(t, out, "msg=deep")
+	assert.NotContains(t, out, "hunter2", "a value below the depth bound is dropped, not leaked")
+	assert.Contains(t, out, "omitted: nested deeper")
 }
 
 // selfMarshaler returns itself from MarshalLog; the depth bound must stop

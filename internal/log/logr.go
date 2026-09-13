@@ -3,6 +3,7 @@ package log
 import (
 	"context"
 	"log/slog"
+	"reflect"
 	"strings"
 	"time"
 
@@ -113,11 +114,15 @@ func (s *logrSink) write(level slog.Level, key, msg string, keysAndValues []any)
 	s.logger.Log(context.Background(), level, msg, args...)
 }
 
-// maxResolveDepth bounds the recursion through nested containers and
-// Marshaler results, so a Marshaler that returns another Marshaler (or
-// itself) cannot recurse without end. Values deeper than this pass through
-// unchanged.
-const maxResolveDepth = 8
+// maxResolveDepth bounds the recursion through nested containers, groups
+// and Marshaler results, so a Marshaler that returns another Marshaler (or
+// itself) and a value nested without end cannot recurse without end. A
+// value below the bound is replaced by tooDeep rather than passed through
+// unchanged, so nothing unredacted reaches the log.
+const maxResolveDepth = 32
+
+// tooDeep replaces a value nested deeper than maxResolveDepth.
+const tooDeep = "[omitted: nested deeper than the SDK redacts]"
 
 // resolve prepares one logr key or value for slog. A logr.Marshaler (OTel
 // passes an attribute.Set as the "attributes" value of its "Tracer created"
@@ -125,7 +130,8 @@ const maxResolveDepth = 8
 // otherwise see only unexported fields and render "{}"; that result is then
 // resolved like any other value, so the map[string]string an attribute.Set
 // marshals to has its values redacted too. Strings, errors, string-valued
-// slog.Attrs and the strings inside maps and slices go through
+// slog.Attrs and the strings inside string-keyed maps, slices and arrays
+// (of any element type, nested in any combination) go through
 // redact.InText with the configured endpoints: otlptracehttp reports an
 // endpoint that fails to parse as a "url" value beside the error, and the
 // error text alone being redacted would leave the credential in that
@@ -139,44 +145,61 @@ func (s *logrSink) resolve(v any) any {
 // maxResolveDepth.
 func (s *logrSink) resolveDepth(v any, depth int) any {
 	if depth > maxResolveDepth {
-		return v
+		return tooDeep
 	}
 	if m, ok := v.(logr.Marshaler); ok {
 		return s.resolveDepth(m.MarshalLog(), depth+1)
 	}
 	switch t := v.(type) {
-	case string:
-		return redact.InText(t, s.endpoints...)
 	case error:
 		return redact.InText(t.Error(), s.endpoints...)
 	case slog.Attr:
 		return s.resolveAttr(t, depth)
-	case map[string]string:
-		out := make(map[string]string, len(t))
-		for k, val := range t {
-			out[k] = redact.InText(val, s.endpoints...)
+	}
+	return s.resolveReflected(reflect.ValueOf(v), v, depth)
+}
+
+// resolveReflected walks v by kind so a container of any static type is
+// covered: a string (named string types included) is redacted, a
+// string-keyed map is rebuilt as map[string]any and a slice or array as
+// []any with every element resolved, a pointer to one of those is
+// followed, and a []byte or anything else (numbers, structs, times) is
+// returned as is. orig is the value v was taken from, returned unchanged
+// for the kinds that are left alone.
+func (s *logrSink) resolveReflected(rv reflect.Value, orig any, depth int) any {
+	switch rv.Kind() {
+	case reflect.String:
+		return redact.InText(rv.String(), s.endpoints...)
+	case reflect.Map:
+		if rv.Type().Key().Kind() != reflect.String || rv.IsNil() {
+			return orig
+		}
+		out := make(map[string]any, rv.Len())
+		for it := rv.MapRange(); it.Next(); {
+			out[it.Key().String()] = s.resolveDepth(it.Value().Interface(), depth+1)
 		}
 		return out
-	case map[string]any:
-		out := make(map[string]any, len(t))
-		for k, val := range t {
-			out[k] = s.resolveDepth(val, depth+1)
+	case reflect.Slice, reflect.Array:
+		if rv.Type().Elem().Kind() == reflect.Uint8 || (rv.Kind() == reflect.Slice && rv.IsNil()) {
+			return orig
+		}
+		out := make([]any, rv.Len())
+		for i := range rv.Len() {
+			out[i] = s.resolveDepth(rv.Index(i).Interface(), depth+1)
 		}
 		return out
-	case []string:
-		out := make([]string, len(t))
-		for i, val := range t {
-			out[i] = redact.InText(val, s.endpoints...)
+	case reflect.Pointer:
+		if rv.IsNil() {
+			return orig
 		}
-		return out
-	case []any:
-		out := make([]any, len(t))
-		for i, val := range t {
-			out[i] = s.resolveDepth(val, depth+1)
+		switch rv.Elem().Kind() {
+		case reflect.String, reflect.Map, reflect.Slice, reflect.Array:
+			return s.resolveDepth(rv.Elem().Interface(), depth+1)
+		default:
+			return orig
 		}
-		return out
 	default:
-		return v
+		return orig
 	}
 }
 
@@ -185,8 +208,13 @@ func (s *logrSink) resolveDepth(v any, depth int) any {
 // redacted like one at the top level. A LogValuer is resolved first so its
 // output is what gets inspected, and any other kind is unwrapped and
 // resolved as a plain value, which covers a map or slice carried as
-// slog.Any.
+// slog.Any. The depth bound applies to groups too: a group nested deeper
+// than maxResolveDepth is replaced by tooDeep rather than descended into
+// or passed through.
 func (s *logrSink) resolveAttr(a slog.Attr, depth int) slog.Attr {
+	if depth > maxResolveDepth {
+		return slog.String(a.Key, tooDeep)
+	}
 	val := a.Value.Resolve()
 	switch val.Kind() {
 	case slog.KindString:
