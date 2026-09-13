@@ -45,8 +45,10 @@ adopters can plan their upgrades.
   `Logr()` can be installed, so `Init` now rejects a malformed `ENDPOINT`,
   `TIMEOUT`, `COMPRESSION` or `HEADERS` variable the enabled exporters
   would actually read (the log exporter reads one only where `Init` passes
-  no explicit option), with an error that names the variable and the pair's
-  position but not its text. `ErrorHandler()` and `Logr()` render a typed
+  no explicit option), and a malformed endpoint given to `WithOTLPEndpoint`
+  or `WithMetricsOTLPEndpoint`, which the trace and metric exporters echo
+  the same way, with an error that names the variable or option and the
+  pair's position but not the text. `ErrorHandler()` and `Logr()` render a typed
   nil error and an `Error` method that panics as placeholders rather than
   crashing; `Logr()` maps OTel's
   verbosity convention (V(1) warn, V(4) info, V(8) debug) onto the SDK's

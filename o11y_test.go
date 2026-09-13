@@ -106,6 +106,14 @@ func TestInit_RejectsMalformedOTLPExporterEnv(t *testing.T) {
 		assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_ENDPOINT is malformed (it is not a valid URL")
 		assert.NotContains(t, err.Error(), "secret%zz")
 	})
+
+	t.Run("configured endpoint", func(t *testing.T) {
+		opts := append(commonOpts(srv.URL), o11y.WithOTLPEndpoint("http://user:secret%zz@collector:4318"))
+		_, err := o11y.Init(context.Background(), opts...)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "WithOTLPEndpoint is not a valid URL")
+		assert.NotContains(t, err.Error(), "secret%zz")
+	})
 }
 
 // TestInit_EnvironmentAliases verifies that common shorthand values are

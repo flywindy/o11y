@@ -2,6 +2,7 @@ package log
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -29,7 +30,14 @@ func InitLogger(ctx context.Context, endpoint string, headers map[string]string,
 	// endpoint like "http://localhost:4318" routes correctly to the collector.
 	logEndpoint, err := logEndpointURL(endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("invalid OTLP endpoint %q: %w", endpoint, err)
+		// The value is not repeated: a credential in its userinfo must not
+		// reach the Init error, and a *url.Error carries the URL, so only
+		// the parser's reason is kept.
+		var uerr *url.Error
+		if errors.As(err, &uerr) && uerr.Err != nil {
+			err = uerr.Err
+		}
+		return nil, fmt.Errorf("invalid OTLP endpoint: %w", err)
 	}
 	expOpts := []otlploghttp.Option{otlploghttp.WithEndpointURL(logEndpoint)}
 	if len(headers) > 0 {
