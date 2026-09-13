@@ -3,6 +3,9 @@ package o11y
 import (
 	"context"
 	"log/slog"
+	"net/url"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -34,6 +37,8 @@ type otelErrorHandler struct {
 	suppress  *repeat.Suppressor
 	now       func() time.Time
 	endpoints []string
+	// secrets are opaque values replaced wholesale, see diagnosticSecrets.
+	secrets []string
 }
 
 // newOTelErrorHandler returns a handler writing to logger. endpoints are the
@@ -56,7 +61,7 @@ func (h *otelErrorHandler) Handle(err error) {
 	if err == nil {
 		return
 	}
-	msg := redact.InText(err.Error(), h.endpoints...)
+	msg := redact.Secrets(redact.InText(err.Error(), h.endpoints...), h.secrets...)
 	if h.suppress.SuppressedAt(msg, h.now()) {
 		return
 	}
@@ -108,6 +113,71 @@ func (s *SDK) Logr() logr.Logger {
 
 // newLogr builds the Logr diagnostics logger over logger; endpoints are
 // redacted from error text as in newOTelErrorHandler.
-func newLogr(logger *slog.Logger, endpoints ...string) logr.Logger {
-	return o11ylog.NewLogr(logger, repeat.NewSuppressor(otelDiagnosticRepeatWindow, maxTrackedOTelDiagnostics), endpoints...)
+func newLogr(logger *slog.Logger, endpoints, secrets []string) logr.Logger {
+	return o11ylog.NewLogrRedacting(logger, repeat.NewSuppressor(otelDiagnosticRepeatWindow, maxTrackedOTelDiagnostics),
+		o11ylog.Redaction{Endpoints: endpoints, Secrets: secrets})
+}
+
+// otlpHeaderEnvVars are the environment variables the pinned OTLP exporters
+// read headers from. The SDK never sets them (ADR 0003); it reads them so
+// their values can be redacted from diagnostics.
+var otlpHeaderEnvVars = []string{
+	"OTEL_EXPORTER_OTLP_HEADERS",
+	"OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+	"OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+	"OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+}
+
+// minDiagnosticSecretLen is the shortest header value treated as a secret.
+// A value shorter than this ("1", "true", "gzip") is not a credential, and
+// replacing every occurrence of it would mangle unrelated text.
+const minDiagnosticSecretLen = 6
+
+// diagnosticSecrets lists the header values the diagnostics must never
+// print: the values of WithOTLPHeaders and WithProfilingAuthHeaders, and
+// whatever the OTLP header environment variables hold. The pinned
+// exporters parse OTEL_EXPORTER_OTLP_HEADERS themselves and, when a value
+// fails to unescape, report it verbatim ("escape header value", "value",
+// v) through the logger installed with otel.SetLogger; a bearer token has
+// no "@" or endpoint for redact.InText to recognise, so it has to be named
+// up front. Each variable contributes its whole value, each "k=v" pair, the
+// raw value part and its unescaped form, so the fragment the exporter
+// echoes is covered whichever one it is.
+func diagnosticSecrets(cfg *Config) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	add := func(v string) {
+		v = strings.TrimSpace(v)
+		if len(v) < minDiagnosticSecretLen {
+			return
+		}
+		if _, dup := seen[v]; dup {
+			return
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	for _, v := range cfg.otlpHeaders {
+		add(v)
+	}
+	for _, v := range cfg.profilingAuthHeaders {
+		add(v)
+	}
+	for _, name := range otlpHeaderEnvVars {
+		raw := os.Getenv(name)
+		if raw == "" {
+			continue
+		}
+		add(raw)
+		for pair := range strings.SplitSeq(raw, ",") {
+			add(pair)
+			if _, v, ok := strings.Cut(pair, "="); ok {
+				add(v)
+				if unescaped, err := url.PathUnescape(strings.TrimSpace(v)); err == nil {
+					add(unescaped)
+				}
+			}
+		}
+	}
+	return out
 }

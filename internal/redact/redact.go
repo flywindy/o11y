@@ -4,6 +4,7 @@ package redact
 import (
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -106,6 +107,33 @@ func InText(text string, knownEndpoints ...string) string {
 	// made safe.
 	if strings.Contains(strings.ReplaceAll(text, placeholder+"@", ""), "@") {
 		return redactedWhole
+	}
+	return text
+}
+
+// opaquePlaceholder replaces a secret Secrets was told about.
+const opaquePlaceholder = "[redacted]"
+
+// Secrets returns text with every occurrence of each non-empty secret
+// replaced by a placeholder. It is for values that carry no structure the
+// other rules can recognise — an OTLP header value such as a bearer token,
+// which the pinned exporters echo verbatim when the OTEL_EXPORTER_OTLP_HEADERS
+// value fails to parse — so the caller names them up front. Longer secrets
+// are replaced first, so a whole "k=v,k2=v2" string and its parts can both
+// be listed without the parts breaking the whole.
+func Secrets(text string, secrets ...string) string {
+	if len(secrets) == 0 || text == "" {
+		return text
+	}
+	ordered := make([]string, 0, len(secrets))
+	for _, secret := range secrets {
+		if secret != "" {
+			ordered = append(ordered, secret)
+		}
+	}
+	sort.SliceStable(ordered, func(i, j int) bool { return len(ordered[i]) > len(ordered[j]) })
+	for _, secret := range ordered {
+		text = strings.ReplaceAll(text, secret, opaquePlaceholder)
 	}
 	return text
 }
