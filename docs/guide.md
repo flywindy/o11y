@@ -423,7 +423,12 @@ interval's delta is not re-sent, so only the last interval's failures
 arrive); with the metrics pillar off (`WithMetricsEnabled(false)`) the
 counter is not registered anywhere. At shutdown the tracer and logger drain
 before the meter provider, so a batch that fails in their final flush is
-still counted and, on the push path, shipped with the last collection.
+still counted and, on the push path, shipped with the last collection; the
+`Shutdown` deadline is shared out evenly across the components still to
+run, recomputed as each finishes, so a tracer drain that waits on a
+collector that is down cannot use up the whole deadline and leave the meter
+provider's final collection with a context that is already done. Size the
+deadline for the whole sequence, not for one flush.
 
 **Structured diagnostics.** The SDK builds replacements for the OTel
 default error handler and logger but does not install them — ADR 0003, the

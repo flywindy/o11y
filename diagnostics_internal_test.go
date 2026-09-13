@@ -58,6 +58,63 @@ func TestOTelErrorHandler_NilIsIgnored(t *testing.T) {
 	assert.NotPanics(t, func() { newOTelErrorHandler(nil).Handle(errors.New("x")) })
 }
 
+// TestShutdownBudget_SharesDeadlineAcrossClosers checks the share each
+// closer gets: an even split of the time left, the whole remainder for the
+// last closer, and ctx itself when there is no deadline or it has passed.
+func TestShutdownBudget_SharesDeadlineAcrossClosers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	deadline, _ := ctx.Deadline()
+
+	first, cancelFirst := shutdownBudget(ctx, 4)
+	defer cancelFirst()
+	firstDeadline, ok := first.Deadline()
+	require.True(t, ok)
+	assert.WithinDuration(t, time.Now().Add(250*time.Millisecond), firstDeadline, 50*time.Millisecond)
+
+	last, cancelLast := shutdownBudget(ctx, 1)
+	defer cancelLast()
+	lastDeadline, _ := last.Deadline()
+	assert.Equal(t, deadline, lastDeadline, "the last closer gets everything that is left")
+
+	noDeadline, cancelNone := shutdownBudget(context.Background(), 3)
+	defer cancelNone()
+	_, ok = noDeadline.Deadline()
+	assert.False(t, ok, "no deadline to share")
+
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+	past, cancelPast := shutdownBudget(expired, 3)
+	defer cancelPast()
+	assert.ErrorIs(t, past.Err(), context.DeadlineExceeded, "an expired deadline is passed through")
+}
+
+// TestShutdown_LaterClosersKeepALiveContext is the failure Codex described:
+// a closer that blocks until its context is done must not leave the ones
+// after it, the meter provider's final collection, with a context that is
+// already cancelled.
+func TestShutdown_LaterClosersKeepALiveContext(t *testing.T) {
+	var sawLive bool
+	sdk := &SDK{
+		Logger: slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+		shutdowns: []func(context.Context) error{
+			func(ctx context.Context) error { <-ctx.Done(); return ctx.Err() },
+			func(ctx context.Context) error {
+				sawLive = ctx.Err() == nil
+				return nil
+			},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	err := sdk.Shutdown(ctx)
+
+	assert.ErrorIs(t, err, context.DeadlineExceeded, "the slow closer's own timeout is reported")
+	assert.True(t, sawLive, "the closer after a slow one still ran with a live context")
+	assert.NoError(t, ctx.Err(), "the caller's deadline itself was not exhausted")
+}
+
 // TestShutdownSequence_DrainsTracesAndLogsBeforeMetrics pins the closer
 // order: a batch that fails during the tracer's or logger's final flush is
 // counted on the export-failure Recorder, and only a meter provider that

@@ -153,6 +153,48 @@ func TestLogr_ResolvesMarshalerValues(t *testing.T) {
 	assert.Contains(t, out, `k`, "the attribute.Set's contents survive MarshalLog")
 }
 
+// TestLogr_RedactsMarshalerAndContainerValues covers the shape the OTel
+// tracer provider produces for "Tracer created": an attribute.Set, whose
+// MarshalLog returns a map[string]string, so an instrumentation attribute
+// carrying the configured endpoint must be redacted inside that map. Maps
+// and slices passed directly, nested in each other, and carried as
+// slog.Any go through the same path.
+func TestLogr_RedactsMarshalerAndContainerValues(t *testing.T) {
+	logger, buf := newRecordingLogger(slog.LevelInfo)
+	const endpoint = "http://svc:hunter2@collector:4318"
+	l := o11ylog.NewLogr(logger, nil, endpoint)
+
+	l.Info("Tracer created",
+		"attributes", attribute.NewSet(attribute.String("otlp.endpoint", endpoint)),
+		"strings", map[string]string{"a": endpoint},
+		"nested", map[string]any{"inner": []any{endpoint, map[string]string{"b": endpoint}}},
+		"list", []string{endpoint},
+		slog.Any("wrapped", map[string]string{"c": endpoint}),
+	)
+
+	out := buf.String()
+	assert.NotContains(t, out, "hunter2")
+	assert.Equal(t, 6, strings.Count(out, "collector:4318"), "every redacted copy keeps the host")
+	assert.Contains(t, out, "otlp.endpoint", "the attribute.Set's key survives")
+}
+
+// selfMarshaler returns itself from MarshalLog; the depth bound must stop
+// the recursion.
+type selfMarshaler struct{}
+
+// MarshalLog implements logr.Marshaler.
+func (m selfMarshaler) MarshalLog() any { return m }
+
+// TestLogr_BoundsMarshalerRecursion checks a Marshaler that marshals to
+// itself is logged rather than recursed on forever.
+func TestLogr_BoundsMarshalerRecursion(t *testing.T) {
+	logger, buf := newRecordingLogger(slog.LevelInfo)
+	l := o11ylog.NewLogr(logger, nil)
+
+	assert.NotPanics(t, func() { l.Info("loop", "m", selfMarshaler{}) })
+	assert.Contains(t, buf.String(), "msg=loop")
+}
+
 // TestLogr_WithValuesAndWithName checks names and values reach the record.
 func TestLogr_WithValuesAndWithName(t *testing.T) {
 	logger, buf := newRecordingLogger(slog.LevelInfo)
