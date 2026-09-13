@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"log/slog"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -248,16 +249,41 @@ func TestLogr_RedactsStructsStringersAndLogValuers(t *testing.T) {
 
 	out := buf.String()
 	assert.NotContains(t, out, "hunter2")
-	assert.Equal(t, 5, strings.Count(out, "collector:4318"), "every redacted copy keeps the host")
+	assert.Equal(t, 4, strings.Count(out, "collector:4318"), "every redacted copy keeps the host")
 	assert.Contains(t, out, "Inner", "the struct's exported fields survive")
 	assert.NotContains(t, out, "hidden", "unexported fields are not rendered")
+	assert.Contains(t, out, `opaque="[omitted: opaque`, "a struct with no exported field is named, not printed; the host count above shows its contents were not")
 	assert.Contains(t, out, "dur=1.5s", "a Duration keeps its slog rendering")
 	assert.Contains(t, out, "when=2026-09-13T10:00:00.000Z", "a Time keeps its slog rendering")
 }
 
-// endpointStringerless has no exported field and no String method, so the
-// only way to inspect it is the %+v rendering the handler would print.
+// endpointStringerless has no exported field and no String method; the
+// walk cannot inspect it, so it must be named and omitted rather than
+// printed with the credential in its unexported field.
 type endpointStringerless struct{ url string }
+
+// TestLogr_RedactsURLValues covers net/url values, which OTel components
+// hold parsed endpoints in: a *url.URL and a url.URL value have their
+// userinfo replaced the way redact.URL does it, and a *url.Userinfo or
+// url.Userinfo on its own (whose String() is "user:password", with nothing
+// for the text rules to anchor on) is replaced by the same placeholder.
+func TestLogr_RedactsURLValues(t *testing.T) {
+	logger, buf := newRecordingLogger(slog.LevelInfo)
+	const endpoint = "http://svc:hunter2@collector:4318/v1/traces"
+	u, err := url.Parse(endpoint)
+	require.NoError(t, err)
+	l := o11ylog.NewLogr(logger, nil, endpoint)
+
+	l.Info("urls", "ptr", u, "val", *u, "userptr", u.User, "userval", *u.User, "nilptr", (*url.URL)(nil))
+
+	out := buf.String()
+	assert.NotContains(t, out, "hunter2")
+	assert.NotContains(t, out, "svc", "the username goes with the password")
+	assert.Equal(t, 2, strings.Count(out, "redacted@collector:4318/v1/traces"), "both URL forms keep host and path")
+	assert.Contains(t, out, "userptr=redacted")
+	assert.Contains(t, out, "userval=redacted")
+	assert.Contains(t, out, "nilptr=<nil>")
+}
 
 // TestLogr_BoundsGroupNesting checks a slog.Group nested deeper than the
 // resolver follows is cut off with the placeholder rather than descended

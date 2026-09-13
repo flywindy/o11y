@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"reflect"
 	"strings"
 	"time"
@@ -167,6 +168,21 @@ func (s *logrSink) resolveDepth(v any, depth int) any {
 		// Both are Stringers, but carry no text and have slog kinds of
 		// their own; leave them so the handler renders them as usual.
 		return v
+	case url.URL:
+		// A URL is handled before the generic paths: its String() carries
+		// the userinfo, and walking it as a struct would reach the
+		// *url.Userinfo field, whose own String() is "user:password" with
+		// nothing for the text rules to anchor on.
+		return redact.URL(t.String())
+	case *url.URL:
+		if t == nil {
+			return v
+		}
+		return redact.URL(t.String())
+	case url.Userinfo, *url.Userinfo:
+		// Userinfo on its own is a credential and nothing else; replace it
+		// the way redact.URL replaces it inside a URL.
+		return redactedUserinfo
 	case fmt.Stringer:
 		// The handler would render it through String() anyway; redact
 		// that rendering rather than let it reach the log unseen.
@@ -175,16 +191,21 @@ func (s *logrSink) resolveDepth(v any, depth int) any {
 	return s.resolveReflected(reflect.ValueOf(v), v, depth)
 }
 
+// redactedUserinfo replaces a url.Userinfo value; it is the placeholder
+// redact.URL puts in place of a URL's userinfo, so a Userinfo logged on its
+// own and one inside a URL read the same.
+const redactedUserinfo = "redacted"
+
 // resolveReflected walks v by kind so a container of any static type is
 // covered: a string (named string types included) is redacted, a
 // string-keyed map is rebuilt as map[string]any and a slice or array as
 // []any with every element resolved, a struct is rebuilt as a
 // map[string]any of its exported fields (each resolved; one with no
-// exported field is rendered with %+v and redacted, since that is what
-// the handler would print), a pointer to one of those is followed, and a
-// []byte or anything else (numbers, bools) is returned as is. orig is the
-// value v was taken from, returned unchanged for the kinds that are left
-// alone.
+// exported field is replaced by a placeholder naming its type, since its
+// unexported fields cannot be inspected and must not be printed), a
+// pointer to one of those is followed, and a []byte or anything else
+// (numbers, bools) is returned as is. orig is the value v was taken from,
+// returned unchanged for the kinds that are left alone.
 func (s *logrSink) resolveReflected(rv reflect.Value, orig any, depth int) any {
 	switch rv.Kind() {
 	case reflect.String:
@@ -200,7 +221,10 @@ func (s *logrSink) resolveReflected(rv reflect.Value, orig any, depth int) any {
 			out[f.Name] = s.resolveDepth(rv.Field(i).Interface(), depth+1)
 		}
 		if len(out) == 0 {
-			return redact.InText(fmt.Sprintf("%+v", orig), s.endpoints...)
+			// Nothing the walk can inspect; rendering the unexported fields
+			// with %v would print whatever they hold, so name the type and
+			// omit the value.
+			return fmt.Sprintf("[omitted: opaque %T]", orig)
 		}
 		return out
 	case reflect.Map:
