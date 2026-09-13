@@ -381,11 +381,12 @@ Important caveats:
 ## Export failures & OTel diagnostics
 
 The OTel SDK's batchers — the `BatchSpanProcessor`, the log `BatchProcessor`
-and the metric `PeriodicReader` — hand every batch the OTLP exporter rejects
-to `otel.Handle` and drop it. With the collector unreachable each queue drains
-into nothing every few seconds, the default handler prints one plain-text
-line to stderr per attempt, and afterward nobody can say how much was lost.
-Two things make that visible.
+and the metric `PeriodicReader` — hand every export call that returned an
+error to `otel.Handle` and move on; a batch the collector rejected or could
+not be reached for is dropped. With the collector unreachable each queue
+drains into nothing every few seconds, the default handler prints one
+plain-text line to stderr per attempt, and afterward nobody can say how much
+was lost. Two things make that visible.
 
 **`o11y_export_failures_total{otel_component_type}`** counts every export
 call the OTLP exporters returned an error for, one series per exporter the
@@ -397,10 +398,22 @@ healthy collector shows a zero series per exporter. A series exists only for
 an exporter that exists: the metric exporter's appears with
 `WithMetricsOTLPEndpoint` and not on the Prometheus pull path, and a
 disabled pillar has none, so an absent series means "no such exporter", not
-"no failures". Alert on it:
+"no failures". Alert on it. On the Prometheus pull path the resource is
+promoted onto every series as constant labels, so `service_name` is there
+to group by:
 
 ```promql
 sum by (service_name, otel_component_type) (rate(o11y_export_failures_total[5m])) > 0
+```
+
+On the OTLP push path through the repository's Collector the
+`prometheusremotewrite` exporter keeps the resource in `target_info` and
+derives the `job` label (`<service.namespace>/<service.name>`) instead, and
+no `service_name` label exists on the series; group by `job` there, or join
+on `target_info` for the other resource attributes:
+
+```promql
+sum by (job, otel_component_type) (rate(o11y_export_failures_total[5m])) > 0
 ```
 
 The unit is an export call, not a span: the span batcher sends up to 512
@@ -553,7 +566,9 @@ series, which bounds memory and is worth an alert:
 sum by (service_name, __name__) ({otel_metric_overflow="true"}) > 0
 ```
 
-`WithCardinalityLimit(n)` replaces the derived value when `n > 0`; zero or a
+`WithCardinalityLimit(n)` replaces the derived value when `n > 0` (floored
+at 4, so the SDK's own three-series `o11y_export_failures_total` stream and
+its overflow slot always fit); zero or a
 negative value returns to the derived sizing. Use a positive limit for a
 service whose `http.server.request.duration` legitimately needs more method ×
 route × status combinations, and keep the decision in code where a reviewer

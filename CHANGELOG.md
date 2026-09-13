@@ -51,6 +51,9 @@ adopters can plan their upgrades.
 - `WithCardinalityLimit(n)` sets the OTel SDK's per-stream cardinality
   limit explicitly, and `DefaultCardinalityLimit` (2,000) exposes the floor
   of the derived value. See the Changed entry below for the new derivation.
+  An override below `metrics.MinCardinalityLimit` (4) is raised to it, so
+  the SDK's own three-series `o11y_export_failures_total` stream and its
+  overflow slot always fit.
 - `WithResourceAttributes(attrs ...attribute.KeyValue)` adds caller-owned
   attributes to the Resource shared by traces, metrics and logs (for example
   `k8s.pod.name` when it is not supplied through `OTEL_RESOURCE_ATTRIBUTES`).

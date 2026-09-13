@@ -87,6 +87,9 @@ func TestCardinalityLimitBudget(t *testing.T) {
 	assert.Equal(t, 8000, cardinalityLimitBudget(100, 2000, 0))
 	// An explicit override replaces the derivation entirely.
 	assert.Equal(t, 100, cardinalityLimitBudget(1000, 200, 100))
+	assert.Equal(t, MinCardinalityLimit, cardinalityLimitBudget(1000, 200, 1), "an override below the floor is raised to it")
+	assert.Equal(t, MinCardinalityLimit, cardinalityLimitBudget(1000, 200, 3))
+	assert.Equal(t, MinCardinalityLimit, cardinalityLimitBudget(1000, 200, MinCardinalityLimit))
 	assert.Equal(t, 50000, cardinalityLimitBudget(1000, 200, 50000))
 	// Saturates instead of overflowing.
 	assert.Positive(t, cardinalityLimitBudget(int(^uint(0)>>1), 0, 0))

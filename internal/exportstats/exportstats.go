@@ -164,7 +164,10 @@ func (r *Recorder) counter(signal Signal) *atomic.Int64 {
 // not matter. It is observable rather than synchronous so the counts can
 // start accumulating before the MeterProvider exists (the tracer is built
 // first) and so the metric pipeline's own failures can be counted without
-// re-entering it.
+// re-entering it. The stream holds at most three attribute sets, so it
+// needs a per-stream cardinality limit of at least four (the OTel SDK
+// reserves one slot for the overflow series); metrics.MinCardinalityLimit
+// keeps an application override from going below that.
 func (r *Recorder) Register(meter metric.Meter) error {
 	_, err := meter.Int64ObservableCounter(InstrumentName,
 		metric.WithDescription("Export calls the OTLP exporters returned an error for: a batch the collector rejected or could not be reached for (its spans, log records or data points are dropped), or a partial-success response that rejected some items or carried a warning."),
