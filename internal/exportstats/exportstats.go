@@ -4,20 +4,25 @@
 // stderr.
 //
 // The OTel SDK's batchers (BatchSpanProcessor, the log BatchProcessor and the
-// metric PeriodicReader) hand each failed batch to otel.Handle and move on;
-// the spans, records or data points in that batch are gone. Nothing in the
-// SDK counts them. The wrappers here sit between the batcher and the OTLP
-// exporter, count every Export call the exporter returns an error for, and
-// leave the error untouched so the batcher's own reporting still runs.
+// metric PeriodicReader) hand the error of a scheduled export to otel.Handle
+// and move on; a batch the collector rejected or could not be reached for
+// is gone with it. Nothing in the SDK counts those calls. The wrappers here
+// sit between the batcher and the OTLP exporter, count every Export call
+// the exporter returns an error for, and leave the error untouched so the
+// batcher's own reporting still runs.
 //
 // "Returned an error" is wider than "dropped the batch". The pinned OTLP/HTTP
 // exporters also return an error for a partial-success response: the
 // collector accepted the request but rejected some items, or accepted every
 // item and attached a warning message. Both count here, so the counter is a
 // count of erroring export calls, not of lost data: it can exceed the number
-// of dropped batches and says nothing about lost items on its own. The
-// rejected-item count and the message are in the error text the batcher
-// hands to otel.Handle, which the SDK's ErrorHandler logs.
+// of dropped batches and says nothing about lost items on its own. Nor does
+// every counted error reach otel.Handle: the final export the log batcher
+// and the metric reader make at shutdown returns its error from Shutdown
+// instead, so the SDK's ErrorHandler sees the scheduled failures and the
+// trace batcher's final drain, and Shutdown's returned error carries the
+// other two. The rejected-item count and the warning message are in that
+// error text either way.
 package exportstats
 
 import (
