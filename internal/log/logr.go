@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-logr/logr"
 
+	"github.com/flywindy/o11y/internal/redact"
 	"github.com/flywindy/o11y/internal/repeat"
 )
 
@@ -27,20 +28,26 @@ import (
 // records" with a different count on every poll while the collector is
 // unreachable, and one line per poll would say nothing new. The first
 // occurrence in each window carries the count it saw.
-func NewLogr(logger *slog.Logger, suppress *repeat.Suppressor) logr.Logger {
+//
+// endpoints are the configured export endpoints; an error that quotes one
+// back (net/url does, verbatim) goes through redact.InText before it is
+// logged or used as a repeat key, so embedded credentials never reach the
+// log.
+func NewLogr(logger *slog.Logger, suppress *repeat.Suppressor, endpoints ...string) logr.Logger {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	return logr.New(&logrSink{logger: logger, suppress: suppress, now: time.Now})
+	return logr.New(&logrSink{logger: logger, suppress: suppress, now: time.Now, endpoints: endpoints})
 }
 
 // logrSink adapts logr's LogSink to slog.
 type logrSink struct {
-	logger   *slog.Logger
-	suppress *repeat.Suppressor
-	now      func() time.Time
-	name     string
-	values   []any
+	logger    *slog.Logger
+	suppress  *repeat.Suppressor
+	now       func() time.Time
+	endpoints []string
+	name      string
+	values    []any
 }
 
 // slogLevel maps a logr verbosity to the slog level OTel's convention gives
@@ -69,14 +76,16 @@ func (s *logrSink) Info(level int, msg string, keysAndValues ...any) {
 	s.write(slogLevel(level), msg, msg, keysAndValues)
 }
 
-// Error implements logr.LogSink. The error is carried as the "error"
-// attribute and takes part in the repeat key, so two different errors under
-// the same message are each logged.
+// Error implements logr.LogSink. The error text, with any configured
+// endpoint's credentials redacted, is carried as the "error" attribute and
+// takes part in the repeat key, so two different errors under the same
+// message are each logged.
 func (s *logrSink) Error(err error, msg string, keysAndValues ...any) {
 	key := msg
 	if err != nil {
-		key = msg + ": " + err.Error()
-		keysAndValues = append([]any{slog.Any("error", err)}, keysAndValues...)
+		text := redact.InText(err.Error(), s.endpoints...)
+		key = msg + ": " + text
+		keysAndValues = append([]any{slog.String("error", text)}, keysAndValues...)
 	}
 	s.write(slog.LevelError, key, msg, keysAndValues)
 }

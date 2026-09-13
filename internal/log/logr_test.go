@@ -88,6 +88,21 @@ func TestLogr_ErrorsWithDifferentTextAreNotCollapsed(t *testing.T) {
 	assert.Equal(t, 2, strings.Count(buf.String(), "export failed"))
 }
 
+// TestLogr_RedactsEndpointCredentials checks an error that quotes a
+// configured endpoint back loses the endpoint's userinfo before it is
+// logged, on the same terms as the SDK's error handler.
+func TestLogr_RedactsEndpointCredentials(t *testing.T) {
+	logger, buf := newRecordingLogger(slog.LevelInfo)
+	l := o11ylog.NewLogr(logger, repeat.NewSuppressor(time.Minute, 8), "http://svc:hunter2@collector:4318")
+
+	l.Error(errors.New(`Post "http://svc:hunter2@collector:4318/v1/traces": EOF`), "export failed")
+
+	out := buf.String()
+	assert.NotContains(t, out, "hunter2")
+	assert.Contains(t, out, "collector:4318")
+	assert.Contains(t, out, "export failed")
+}
+
 // TestLogr_WithValuesAndWithName checks names and values reach the record.
 func TestLogr_WithValuesAndWithName(t *testing.T) {
 	logger, buf := newRecordingLogger(slog.LevelInfo)

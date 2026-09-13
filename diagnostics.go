@@ -99,7 +99,8 @@ func (s *SDK) Logr() logr.Logger {
 	return s.logr
 }
 
-// newLogr builds the Logr diagnostics logger over logger.
-func newLogr(logger *slog.Logger) logr.Logger {
-	return o11ylog.NewLogr(logger, repeat.NewSuppressor(otelDiagnosticRepeatWindow, maxTrackedOTelDiagnostics))
+// newLogr builds the Logr diagnostics logger over logger; endpoints are
+// redacted from error text as in newOTelErrorHandler.
+func newLogr(logger *slog.Logger, endpoints ...string) logr.Logger {
+	return o11ylog.NewLogr(logger, repeat.NewSuppressor(otelDiagnosticRepeatWindow, maxTrackedOTelDiagnostics), endpoints...)
 }
