@@ -114,15 +114,18 @@ func TestLogr_RedactsEndpointCredentialsInValues(t *testing.T) {
 	const endpoint = "http://svc:hunter2@collector:4318"
 	l := o11ylog.NewLogr(logger, nil, endpoint).WithValues("configured", endpoint)
 
-	// The last value is not a configured endpoint and does not even parse;
-	// redact.InText's userinfo rule still strips it.
+	// The "raw" value is not a configured endpoint and does not even parse;
+	// redact.InText's userinfo rule still strips it. The group nests a copy
+	// two levels deep.
 	l.Error(errors.New("invalid endpoint"), "otlptrace: parse endpoint",
-		"url", endpoint, "attr", slog.String("again", endpoint), "raw", "http://user:secret%zz@host")
+		"url", endpoint, "attr", slog.String("again", endpoint), "raw", "http://user:secret%zz@host",
+		"group", slog.Group("exporter", slog.Group("config", slog.String("endpoint", endpoint))))
 
 	out := buf.String()
 	assert.NotContains(t, out, "hunter2")
 	assert.NotContains(t, out, "secret%zz")
-	assert.Equal(t, 3, strings.Count(out, "collector:4318"), "every redacted copy keeps the host")
+	assert.Equal(t, 4, strings.Count(out, "collector:4318"), "every redacted copy keeps the host")
+	assert.Contains(t, out, "group.exporter.config.endpoint=", "the group structure survives redaction")
 	assert.Contains(t, out, "url=")
 	assert.Contains(t, out, "configured=")
 }

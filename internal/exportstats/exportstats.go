@@ -13,8 +13,9 @@
 // "Returned an error" is wider than "dropped the batch". The pinned OTLP/HTTP
 // exporters also return an error for a partial-success response: the
 // collector accepted the request but rejected some items, or accepted every
-// item and attached a warning message. Both count here, so the counter is an
-// upper bound on failed batches and a lower bound on lost items; the
+// item and attached a warning message. Both count here, so the counter is a
+// count of erroring export calls, not of lost data: it can exceed the number
+// of dropped batches and says nothing about lost items on its own. The
 // rejected-item count and the message are in the error text the batcher
 // hands to otel.Handle, which the SDK's ErrorHandler logs.
 package exportstats

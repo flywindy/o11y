@@ -406,9 +406,12 @@ counted calls are a batch the collector rejected or could not be reached
 for, whose items are dropped; the pinned exporters also return an error for
 a *partial-success* response, where the collector accepted the request but
 rejected some items, or accepted everything and attached a warning message.
-So the count is an upper bound on dropped batches and a lower bound on lost
-items; the rejected-item count and the collector's message are in the error
-text `ErrorHandler()` logs. Where the counter lands follows the metrics
+Read it as a cumulative count of export calls that failed, not as a measure
+of lost telemetry: it can exceed the number of dropped batches (a
+warning-only partial success drops nothing) and by itself says nothing about
+how many items were lost. The rejected-item count and the collector's
+message are in the error text `ErrorHandler()` logs, and that record is
+where loss is established. Where the counter lands follows the metrics
 pillar: on the
 default Prometheus pull path it is scraped from `/metrics`; on the OTLP
 metrics push path (`WithMetricsOTLPEndpoint`) the metric exporter's own
