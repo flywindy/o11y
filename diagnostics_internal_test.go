@@ -97,12 +97,14 @@ func TestDiagnosticSecrets(t *testing.T) {
 	assert.Len(t, got, len(slices.Compact(slices.Sorted(slices.Values(got)))), "no duplicates")
 }
 
-// TestValidateOTLPExporterEnv mirrors the pinned exporters' parsers: a
-// header pair without "=", with a name that is not an HTTP token or a value
-// that is not valid percent-encoding, an endpoint that is not a URL, or a
-// timeout that is not an integer fails Init with an error that names the
-// variable (and the pair's position) but never its text; an empty variable
-// and a variable no enabled exporter reads are ignored.
+// TestValidateOTLPExporterEnv mirrors the pinned exporters' parsers and
+// their reading order: with traces or push-path metrics enabled every
+// ENDPOINT, TIMEOUT and HEADERS variable under the generic and the signal
+// prefix is checked; the log exporter reads a variable only where Init
+// passes no explicit option, so its endpoint is never checked, its headers
+// only without WithOTLPHeaders, and its timeout and compression always. A
+// malformed value fails with an error that names the variable (and the
+// pair's position) but never its text; an empty variable is ignored.
 func TestValidateOTLPExporterEnv(t *testing.T) {
 	all := &Config{traceEnabled: true, logEnabled: true, metricsEnabled: true, metricsOTLPEndpoint: "http://collector:4318"}
 
@@ -110,6 +112,7 @@ func TestValidateOTLPExporterEnv(t *testing.T) {
 		t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer%20abcdef, x-tenant=acme")
 		t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318")
 		t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "10000")
+		t.Setenv("OTEL_EXPORTER_OTLP_COMPRESSION", "gzip")
 		t.Setenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "")
 		require.NoError(t, validateOTLPExporterEnv(all))
 	})
@@ -121,6 +124,7 @@ func TestValidateOTLPExporterEnv(t *testing.T) {
 		{"bad endpoint", "OTEL_EXPORTER_OTLP_ENDPOINT", "http://user:secret%zz@collector:4318", "not a valid URL", "secret%zz"},
 		{"bad metrics endpoint", "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "http://user:secret%zz@collector:4318", "not a valid URL", "secret%zz"},
 		{"bad timeout", "OTEL_EXPORTER_OTLP_TIMEOUT", "10s", "not an integer count of milliseconds", "10s"},
+		{"bad logs compression", "OTEL_EXPORTER_OTLP_LOGS_COMPRESSION", "brotli", `neither "gzip" nor "none"`, "brotli"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(tc.variable, tc.value)
@@ -140,6 +144,23 @@ func TestValidateOTLPExporterEnv(t *testing.T) {
 		require.Error(t, validateOTLPExporterEnv(all))
 		none := &Config{}
 		require.NoError(t, validateOTLPExporterEnv(none), "no OTLP exporter, nothing to validate")
+	})
+
+	t.Run("log exporter reads only what Init leaves to the environment", func(t *testing.T) {
+		logsOnly := &Config{logEnabled: true}
+		t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://user:secret%zz@collector:4318")
+		t.Setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "http://user:secret%zz@collector:4318")
+		t.Setenv("OTEL_EXPORTER_OTLP_LOGS_INSECURE", "maybe")
+		require.NoError(t, validateOTLPExporterEnv(logsOnly), "Init always passes the log endpoint URL, which pins endpoint, path and insecure")
+
+		t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "authorization=BearerSecret%zz")
+		require.Error(t, validateOTLPExporterEnv(logsOnly), "without WithOTLPHeaders the log exporter reads the headers variable")
+		withHeaders := &Config{logEnabled: true, otlpHeaders: map[string]string{"x-api-key": "configured"}}
+		require.NoError(t, validateOTLPExporterEnv(withHeaders), "explicit headers take precedence and the variable is never parsed")
+
+		t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "")
+		t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "soon")
+		require.Error(t, validateOTLPExporterEnv(withHeaders), "the log exporter always reads the timeout")
 	})
 }
 

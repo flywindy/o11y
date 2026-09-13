@@ -493,15 +493,21 @@ otel.SetLogger(sdk.Logr())               // OTel-internal messages → structure
 ```
 
 One message cannot wait for that wiring: the OTLP exporters parse their
-`OTEL_EXPORTER_OTLP_*` variables while `Init` builds them, before the
-explicit options apply, and report a value they cannot parse through OTel's
-global logger with its raw text, so `Init` rejects a malformed variable
-before any exporter exists: an `ENDPOINT` that is not a URL (a credential
-in its userinfo is what makes the echo dangerous), a `TIMEOUT` that is not
-an integer count of milliseconds, or a `HEADERS` pair without `=`, with a
-name that is not an HTTP token or a value that is not valid
-percent-encoding. Only the variables the enabled OTLP exporters read are
-checked, and the error names the variable and the pair's position, not its
+`OTEL_EXPORTER_OTLP_*` variables while `Init` builds them and report a
+value they cannot parse with its raw text (the trace and metric exporters
+through OTel's global logger, the log exporter through `otel.Handle`), so
+`Init` rejects a malformed variable before any exporter exists: an
+`ENDPOINT` that is not a URL (a credential in its userinfo is what makes
+the echo dangerous), a `TIMEOUT` that is not an integer count of
+milliseconds, a `COMPRESSION` that is neither `gzip` nor `none`, or a
+`HEADERS` pair without `=`, with a name that is not an HTTP token or a
+value that is not valid percent-encoding. Only the variables the enabled
+exporters actually read are checked: the trace and metric exporters apply
+the environment before the explicit options, so their `ENDPOINT`, `TIMEOUT`
+and `HEADERS` variables are always read; the log exporter reads a variable
+only where `Init` passes no explicit option, so its endpoint is never read,
+its headers only without `WithOTLPHeaders`, and its timeout and compression
+always. The error names the variable and the pair's position, not its
 text.
 
 `ErrorHandler()` writes each distinct OTel-internal error once per minute as
