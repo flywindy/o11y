@@ -140,14 +140,15 @@ func (s *SDK) Meter(name string) metric.Meter {
 // The deadline is shared out: each component runs under an even share of
 // the time left, recomputed as the sequence advances, so a component that
 // finishes early hands its slack to the ones after it, and one that drains
-// slowly (the OTel batchers drain on a background context while the OTLP
+// slowly (the trace batcher drains on a background context while the OTLP
 // exporter retries a failing collector for up to a minute) cannot consume
 // the whole deadline and leave the components after it, the meter
 // provider's final collection in particular, with a context that is
-// already done. Only enabled pillars count as components. A context
-// without a deadline is passed through unchanged. A component whose share
-// runs out is reported as timed out, and its drain, which the OTel batchers
-// run on a background context, continues on its own; see shutdownSequence.
+// already done. Only components that exist count: a disabled pillar, and
+// the OTLP metrics path, which has no closer of its own, take no share. A
+// context without a deadline is passed through unchanged. A component
+// whose share runs out is reported as timed out; what happens to its queue
+// then differs per batcher, see shutdownSequence.
 //
 // Shutdown is idempotent: subsequent calls return the same joined error
 // without rerunning any closer. Callers may safely register Shutdown in
@@ -198,14 +199,19 @@ func shutdownBudget(ctx context.Context, remaining int) (context.Context, contex
 // shutdown performs the last collection, so with metrics last that count is
 // still observed and, on the OTLP push path, shipped; with metrics first it
 // would be recorded into a counter nothing reads again. This holds for a
-// drain that finishes within its closer's share of the deadline. The OTel
-// batchers drain on a background context of their own (bounded by the
-// export timeout, 30s by default) and offer no way to cancel it, so a drain
-// that outlives its share keeps running after its closer returned, and a
-// failure it records after the meter provider's final collection is not
-// reported; the batch is lost when the process exits either way. The
-// profiler stops before the tracer it wraps, and the scrape server stops
-// just before the meter provider so no scrape races the final collection.
+// drain that finishes within its closer's share of the deadline; past it
+// the two batchers differ. The trace BatchSpanProcessor drains on a
+// background context of its own (bounded by the export timeout, 30s by
+// default) and offers no way to cancel it, so a drain that outlives its
+// share keeps running after its closer returned, and a failure it records
+// after the meter provider's final collection is not reported; the batch
+// is lost when the process exits either way. The log BatchProcessor
+// flushes its queue under the closer's context: when the share runs out it
+// stops, shuts the exporter down with that expired context and drops what
+// is still queued without an export call, so nothing is counted for those
+// records. The profiler stops before the tracer it wraps, and the scrape
+// server stops just before the meter provider so no scrape races the final
+// collection.
 func shutdownSequence(profiler, traces, logs, metricsServer, meter func(context.Context) error) []func(context.Context) error {
 	seq := make([]func(context.Context) error, 0, 5)
 	for _, fn := range []func(context.Context) error{profiler, traces, logs, metricsServer, meter} {

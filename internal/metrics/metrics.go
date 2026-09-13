@@ -116,9 +116,11 @@ type Config struct {
 	ExportFailures *exportstats.Recorder
 }
 
-// Closer is a function that shuts down a component. For the Prometheus path it
-// shuts down the HTTP server; for the OTLP path it shuts down the exporter.
-// It is always safe to call even if the component was never started.
+// Closer is a function that shuts down a component. For the Prometheus path
+// it shuts down the scrape server and is always safe to call. The OTLP path
+// has no component of its own to close (the MeterProvider's Shutdown drains
+// the PeriodicReader, which shuts the exporter down), so InitMeter returns a
+// nil Closer there; callers skip a nil Closer rather than call it.
 type Closer func(context.Context) error
 
 // The SDK cardinality limit is an in-process memory guard applied to every
@@ -310,7 +312,9 @@ func InitMeter(ctx context.Context, cfg Config) (*sdkmetric.MeterProvider, Close
 	}
 	if cfg.ExportFailures != nil {
 		if err := cfg.ExportFailures.Register(provider.Meter(exportstats.ScopeName)); err != nil {
-			_ = closer(ctx)
+			if closer != nil {
+				_ = closer(ctx)
+			}
 			_ = provider.Shutdown(ctx)
 			return nil, nil, fmt.Errorf("metrics: register export failure counter: %w", err)
 		}
@@ -519,9 +523,11 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []s
 	initSucceeded = true
 	// provider.Shutdown drains the PeriodicReader which in turn calls
 	// exporter.Shutdown. Returning exporter.Shutdown here would cause a
-	// second shutdown when o11y.go also calls mp.Shutdown, so we return a
-	// no-op: the MeterProvider shutdown path handles everything.
-	return provider, func(_ context.Context) error { return nil }, nil
+	// second shutdown when o11y.go also calls mp.Shutdown, and a no-op
+	// would count as a component when SDK.Shutdown shares its deadline
+	// out, so there is no Closer at all: the MeterProvider shutdown path
+	// handles everything.
+	return provider, nil, nil
 }
 
 // meterProviderOptions assembles the sdkmetric options shared by both export

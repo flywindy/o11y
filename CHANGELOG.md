@@ -72,12 +72,15 @@ adopters can plan their upgrades.
   tracer or logger drain that waits on a collector that is down cannot
   consume the whole deadline and leave the meter provider's final
   collection (which is what publishes the shutdown-time failures) with a
-  context that is already done. Disabled pillars no longer contribute a
-  no-op closer, so they neither run nor take a share. A context without a
-  deadline is passed through unchanged. A drain that outlives its share is
-  reported as timed out and continues on the OTel batcher's own background
-  context, which the SDK cannot cancel; a failure it records after the
-  final collection is not reported. The profiler's closer now honours its
+  context that is already done. Disabled pillars and the OTLP metrics path
+  (whose exporter the MeterProvider's own shutdown covers) no longer
+  contribute a no-op closer, so they neither run nor take a share. A
+  context without a deadline is passed through unchanged. A trace drain
+  that outlives its share is reported as timed out and continues on the
+  batcher's own background context, which the SDK cannot cancel; a failure
+  it records after the final collection is not reported. A log flush that
+  outlives its share stops, and the records still queued are dropped
+  without an export call. The profiler's closer now honours its
   context the same way: Pyroscope's `Stop` waits on the uploader's own 30s
   client timeout, so a stalled upload used to hold `Shutdown` for that long
   and hand every later component an expired context; it now returns
