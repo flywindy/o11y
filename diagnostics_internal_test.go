@@ -97,6 +97,46 @@ func TestDiagnosticSecrets(t *testing.T) {
 	assert.Len(t, got, len(slices.Compact(slices.Sorted(slices.Values(got)))), "no duplicates")
 }
 
+// TestValidateOTLPHeaderEnv mirrors the pinned exporters' parser: a pair
+// without "=", a name that is not an HTTP token or a value that is not
+// valid percent-encoding fails Init with an error that names the variable
+// and the pair's position but never its text; an empty variable and a
+// variable no enabled exporter reads are ignored.
+func TestValidateOTLPHeaderEnv(t *testing.T) {
+	all := &Config{traceEnabled: true, logEnabled: true, metricsEnabled: true, metricsOTLPEndpoint: "http://collector:4318"}
+
+	t.Run("well-formed", func(t *testing.T) {
+		t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer%20abcdef, x-tenant=acme")
+		t.Setenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "")
+		require.NoError(t, validateOTLPHeaderEnv(all))
+	})
+
+	for _, tc := range []struct{ name, value, reason string }{
+		{"missing equals", "authorization", "missing '='"},
+		{"bad name", "bad name=value", "not a valid HTTP header name"},
+		{"bad value", "authorization=BearerSecret%zz", "not valid percent-encoding"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-ok=1, "+tc.value)
+			err := validateOTLPHeaderEnv(all)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_HEADERS: pair 2")
+			assert.Contains(t, err.Error(), tc.reason)
+			assert.NotContains(t, err.Error(), "BearerSecret", "the raw text stays out of the error")
+			assert.NotContains(t, err.Error(), "bad name")
+		})
+	}
+
+	t.Run("variable no exporter reads is ignored", func(t *testing.T) {
+		t.Setenv("OTEL_EXPORTER_OTLP_METRICS_HEADERS", "authorization=BearerSecret%zz")
+		pull := &Config{traceEnabled: true, logEnabled: true, metricsEnabled: true}
+		require.NoError(t, validateOTLPHeaderEnv(pull), "the metrics variable is read only on the OTLP push path")
+		require.Error(t, validateOTLPHeaderEnv(all))
+		none := &Config{}
+		require.NoError(t, validateOTLPHeaderEnv(none), "no OTLP exporter, nothing to validate")
+	})
+}
+
 // TestOTelErrorHandler_NilIsIgnored checks nil errors and a nil logger are safe.
 func TestOTelErrorHandler_NilIsIgnored(t *testing.T) {
 	var buf bytes.Buffer

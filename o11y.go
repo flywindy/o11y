@@ -203,10 +203,14 @@ func shutdownBudget(ctx context.Context, remaining int) (context.Context, contex
 // the snapshot was taken before the call failed and nothing collects
 // again. On the Prometheus pull path the otelprom reader's shutdown
 // collects nothing, so only a scrape that lands between the drain and the
-// scrape server stopping sees the count. In both cases the ErrorHandler
-// record is the durable evidence, provided the application installed
+// scrape server stopping sees the count. The durable evidence differs by
+// signal: the trace batcher hands its final drain's error to otel.Handle,
+// so it is the ErrorHandler record once the application installed
 // SDK.ErrorHandler with otel.SetErrorHandler (OTel's default handler
-// prints the error to stderr instead). This holds for a
+// prints it to stderr instead), while the log batcher and the metric
+// reader return their final export's error from Shutdown, so it is
+// Shutdown's returned error and the "SDK component shutdown failed"
+// record on the SDK's stdout log, handler or not. This holds for a
 // drain that finishes within its closer's share of the deadline; past it
 // the two batchers differ. The trace BatchSpanProcessor drains on a
 // background context of its own (bounded by the export timeout, 30s by
@@ -294,6 +298,14 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		return nil, err
 	}
 	appendBaggageWarnings(cfg, whitelist)
+
+	// The OTLP exporters parse the OTEL_EXPORTER_OTLP_*HEADERS variables as
+	// they are built and report a malformed pair's raw text through OTel's
+	// global logger, which nothing installed after Init can redact, so a
+	// malformed variable fails Init before any exporter exists.
+	if err := validateOTLPHeaderEnv(cfg); err != nil {
+		return nil, err
+	}
 
 	// Every OTLP exporter reports each Export call that returned an error
 	// here; the MeterProvider registers the count as
