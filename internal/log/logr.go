@@ -91,7 +91,8 @@ func (s *logrSink) Error(err error, msg string, keysAndValues ...any) {
 }
 
 // write applies suppression keyed by key and emits msg with the sink's
-// name, accumulated values and the caller's key/value pairs.
+// name, accumulated values and the caller's key/value pairs, each value
+// normalized by resolve.
 func (s *logrSink) write(level slog.Level, key, msg string, keysAndValues []any) {
 	if s.suppress != nil && s.suppress.SuppressedAt(key, s.now()) {
 		return
@@ -100,12 +101,44 @@ func (s *logrSink) write(level slog.Level, key, msg string, keysAndValues []any)
 	if s.name != "" {
 		args = append(args, slog.String("logger", s.name))
 	}
-	args = append(args, s.values...)
-	args = append(args, keysAndValues...)
+	for _, v := range s.values {
+		args = append(args, s.resolve(v))
+	}
+	for _, v := range keysAndValues {
+		args = append(args, s.resolve(v))
+	}
 	if s.suppress != nil {
 		args = append(args, slog.String("repeat_suppressed_for", s.suppress.Window().String()))
 	}
 	s.logger.Log(context.Background(), level, msg, args...)
+}
+
+// resolve prepares one logr key or value for slog. A logr.Marshaler (OTel
+// passes an attribute.Set as the "attributes" value of its "Tracer created"
+// diagnostic) is replaced by what MarshalLog returns, since slog would
+// otherwise see only unexported fields and render "{}". Strings, errors and
+// string-valued slog.Attrs then go through redact.InText with the
+// configured endpoints: otlptracehttp reports an endpoint that fails to
+// parse as a "url" value beside the error, and the error text alone being
+// redacted would leave the credential in that field. Keys are strings too
+// and pass through unchanged in practice; redacting them is harmless.
+func (s *logrSink) resolve(v any) any {
+	if m, ok := v.(logr.Marshaler); ok {
+		v = m.MarshalLog()
+	}
+	switch t := v.(type) {
+	case string:
+		return redact.InText(t, s.endpoints...)
+	case error:
+		return redact.InText(t.Error(), s.endpoints...)
+	case slog.Attr:
+		if t.Value.Kind() == slog.KindString {
+			return slog.String(t.Key, redact.InText(t.Value.String(), s.endpoints...))
+		}
+		return t
+	default:
+		return v
+	}
 }
 
 // WithValues implements logr.LogSink.

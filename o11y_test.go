@@ -17,9 +17,11 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/flywindy/o11y"
+	"github.com/flywindy/o11y/internal/metrics"
 	"github.com/flywindy/o11y/internal/testutil"
 	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 )
 
 // commonOpts returns the full set of required options for Init to succeed in
@@ -512,15 +514,22 @@ func TestInit_ExportFailuresCounted(t *testing.T) {
 			return false
 		}
 		body = b
-		return seriesValue(b, "o11y_export_failures_total", `otel_component_type="otlp_http_span_exporter"`) >= 1 &&
-			seriesValue(b, "o11y_export_failures_total", `otel_component_type="otlp_http_log_exporter"`) >= 1
+		return seriesValue(b, "o11y_export_failures_total", componentLabel(semconv.OTelComponentTypeOtlpHTTPSpanExporter)) >= 1 &&
+			seriesValue(b, "o11y_export_failures_total", componentLabel(semconv.OTelComponentTypeOtlpHTTPLogExporter)) >= 1
 	}, 5*time.Second, 50*time.Millisecond, "export failures should be counted per exporter; last scrape:\n%s", body)
 
 	// Every exporter is reported, so a dashboard sees a zero rather than no
 	// series, and the SDK's own scope names the instrument.
-	assert.Equal(t, float64(0), seriesValue(body, "o11y_export_failures_total", `otel_component_type="otlp_http_metric_exporter"`))
+	assert.Equal(t, float64(0), seriesValue(body, "o11y_export_failures_total", componentLabel(semconv.OTelComponentTypeOtlpHTTPMetricExporter)))
 	assert.GreaterOrEqual(t, seriesValue(body, "o11y_export_failures_total", `otel_scope_name="github.com/flywindy/o11y"`), float64(0),
 		"the counter is registered under the SDK's own instrumentation scope")
+}
+
+// componentLabel renders a semconv otel.component.type attribute the way
+// otelprom labels a series with it, so the assertion follows the pinned
+// constant instead of restating the key.
+func componentLabel(kv attribute.KeyValue) string {
+	return fmt.Sprintf(`%s=%q`, metrics.NormalizePrometheusLabelName(string(kv.Key)), kv.Value.AsString())
 }
 
 // seriesValue returns the value of the first series of family whose label set
