@@ -210,6 +210,25 @@ func TestLogr_RedactsTypedNestedContainers(t *testing.T) {
 	assert.Contains(t, out, "intkeys=map[7:", "a map with non-string keys is rebuilt, not passed through")
 }
 
+// TestLogr_RedactsMessageText pins that the message text itself goes
+// through the redaction rules, for a component that puts an endpoint or a
+// configured secret in the message rather than in a key/value pair.
+func TestLogr_RedactsMessageText(t *testing.T) {
+	logger, buf := newRecordingLogger(slog.LevelInfo)
+	const endpoint = "http://svc:hunter2@collector:4318"
+	l := o11ylog.NewLogrRedacting(logger, nil, o11ylog.Redaction{Endpoints: []string{endpoint}, Secrets: []string{"TopSecretToken"}})
+
+	l.Info("failed endpoint " + endpoint + " with TopSecretToken")
+	l.Error(nil, "bad endpoint "+endpoint)
+	l.Error(errors.New("boom"), "token TopSecretToken rejected")
+
+	out := buf.String()
+	assert.NotContains(t, out, "hunter2")
+	assert.NotContains(t, out, "TopSecretToken")
+	assert.Contains(t, out, "collector:4318", "the host survives")
+	assert.Contains(t, out, "[redacted]")
+}
+
 // derefError dereferences its receiver in Error, so a typed nil *derefError
 // panics when rendered the ordinary way.
 type derefError struct{ msg string }

@@ -70,9 +70,10 @@ func TestOTelErrorHandler_RedactsSecrets(t *testing.T) {
 	assert.Contains(t, buf.String(), "attempt 12", "text around it is left alone")
 }
 
-// TestDiagnosticSecrets collects the configured and environment-provided
-// header values: whole variable, each pair, each name and value with their
-// unescaped forms, deduplicated, short values included, empty ones left out.
+// TestDiagnosticSecrets collects the configured header names and values and
+// the environment-provided ones: whole variable, each pair, each name and
+// value with their unescaped forms, deduplicated, short values included,
+// empty ones left out.
 func TestDiagnosticSecrets(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer%20abcdef, x-short=1, api-key=k-1234567890, BearerSecret%zz=oops")
 	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "")
@@ -90,6 +91,7 @@ func TestDiagnosticSecrets(t *testing.T) {
 		"api-key=k-1234567890", "k-1234567890",
 		"x-short=1", "1", "ab",
 		"BearerSecret%zz=oops", "BearerSecret%zz", "authorization", "api-key",
+		"x-api-key", "x-tiny",
 	} {
 		assert.Contains(t, got, want)
 	}
@@ -161,6 +163,14 @@ func TestValidateOTLPExporterEnv(t *testing.T) {
 		t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "")
 		t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "soon")
 		require.Error(t, validateOTLPExporterEnv(withHeaders), "the log exporter always reads the timeout")
+
+		t.Setenv("OTEL_EXPORTER_OTLP_LOGS_TIMEOUT", "10000")
+		require.NoError(t, validateOTLPExporterEnv(withHeaders), "a valid signal value shadows the generic one, which the exporter never reads")
+		t.Setenv("OTEL_EXPORTER_OTLP_LOGS_TIMEOUT", "later")
+		t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "10000")
+		err := validateOTLPExporterEnv(withHeaders)
+		require.Error(t, err, "a signal value that fails to parse is echoed before the exporter falls through")
+		assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT is malformed")
 	})
 }
 

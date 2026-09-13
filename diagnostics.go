@@ -139,6 +139,12 @@ var otlpHeaderEnvVars = []string{
 type otlpEnvCheck struct {
 	name  string
 	check func(string) (reason string, bad bool)
+	// fallback, when set, is the variable the exporter reads instead when
+	// name is unset: the log exporter resolves a setting from the signal
+	// variable first and consults the generic one only when the signal
+	// variable is empty, so a generic value shadowed by a valid signal
+	// value is never parsed and must not be checked.
+	fallback string
 }
 
 // otlpExporterEnvChecks lists the variables the enabled OTLP exporters will
@@ -153,16 +159,19 @@ type otlpEnvCheck struct {
 // insecure flag, so its ENDPOINT and INSECURE variables are never read; it
 // passes headers only when WithOTLPHeaders set some, so the HEADERS
 // variables are read only then; and it never sets a timeout or a
-// compression, so those variables are always read. A variable no enabled
-// exporter reads is left alone.
+// compression, so those variables are always read. It also resolves each
+// setting from the signal variable first and reads the generic one only
+// when the signal variable is unset (a signal value that fails to parse is
+// echoed before it falls through, so it is still rejected). A variable no
+// enabled exporter reads is left alone.
 func otlpExporterEnvChecks(cfg *Config) []otlpEnvCheck {
 	var checks []otlpEnvCheck
 	envFirst := func(signal string) {
 		for _, prefix := range []string{"OTEL_EXPORTER_OTLP_", "OTEL_EXPORTER_OTLP_" + signal + "_"} {
 			checks = append(checks,
-				otlpEnvCheck{prefix + "ENDPOINT", checkURL},
-				otlpEnvCheck{prefix + "TIMEOUT", checkMilliseconds},
-				otlpEnvCheck{prefix + "HEADERS", malformedHeaderList},
+				otlpEnvCheck{name: prefix + "ENDPOINT", check: checkURL},
+				otlpEnvCheck{name: prefix + "TIMEOUT", check: checkMilliseconds},
+				otlpEnvCheck{name: prefix + "HEADERS", check: malformedHeaderList},
 			)
 		}
 	}
@@ -173,14 +182,19 @@ func otlpExporterEnvChecks(cfg *Config) []otlpEnvCheck {
 		envFirst("METRICS")
 	}
 	if cfg.logEnabled {
-		for _, prefix := range []string{"OTEL_EXPORTER_OTLP_LOGS_", "OTEL_EXPORTER_OTLP_"} {
-			checks = append(checks,
-				otlpEnvCheck{prefix + "TIMEOUT", checkMilliseconds},
-				otlpEnvCheck{prefix + "COMPRESSION", checkCompression},
-			)
-			if len(cfg.otlpHeaders) == 0 {
-				checks = append(checks, otlpEnvCheck{prefix + "HEADERS", malformedHeaderList})
+		signalFirst := func(setting string, check func(string) (string, bool)) otlpEnvCheck {
+			return otlpEnvCheck{
+				name:     "OTEL_EXPORTER_OTLP_LOGS_" + setting,
+				check:    check,
+				fallback: "OTEL_EXPORTER_OTLP_" + setting,
 			}
+		}
+		checks = append(checks,
+			signalFirst("TIMEOUT", checkMilliseconds),
+			signalFirst("COMPRESSION", checkCompression),
+		)
+		if len(cfg.otlpHeaders) == 0 {
+			checks = append(checks, signalFirst("HEADERS", malformedHeaderList))
 		}
 	}
 	return checks
@@ -207,7 +221,11 @@ func otlpExporterEnvChecks(cfg *Config) []otlpEnvCheck {
 // empty variable is skipped, as the exporters skip it.
 func validateOTLPExporterEnv(cfg *Config) error {
 	for _, c := range otlpExporterEnvChecks(cfg) {
-		if err := validateOTLPEnvVar(c.name, c.check); err != nil {
+		name := c.name
+		if c.fallback != "" && strings.TrimSpace(os.Getenv(c.name)) == "" {
+			name = c.fallback
+		}
+		if err := validateOTLPEnvVar(name, c.check); err != nil {
 			return err
 		}
 	}
@@ -286,8 +304,9 @@ func isHTTPToken(s string) bool {
 	return true
 }
 
-// diagnosticSecrets lists the header values the diagnostics must never
-// print: the values of WithOTLPHeaders and WithProfilingAuthHeaders, and
+// diagnosticSecrets lists the header names and values the diagnostics must
+// never print: the names and values of WithOTLPHeaders and
+// WithProfilingAuthHeaders, and
 // whatever the OTLP header environment variables hold. The pinned
 // exporters parse OTEL_EXPORTER_OTLP_HEADERS themselves and, when a value
 // fails to unescape, report it verbatim ("escape header value", "value",
@@ -314,10 +333,15 @@ func diagnosticSecrets(cfg *Config) []string {
 		seen[v] = struct{}{}
 		out = append(out, v)
 	}
-	for _, v := range cfg.otlpHeaders {
+	// Names as well as values: a credential pasted in as a header name
+	// reaches net/http, whose "invalid header field name" error echoes it
+	// through the export error the ErrorHandler records.
+	for k, v := range cfg.otlpHeaders {
+		add(k)
 		add(v)
 	}
-	for _, v := range cfg.profilingAuthHeaders {
+	for k, v := range cfg.profilingAuthHeaders {
+		add(k)
 		add(v)
 	}
 	for _, name := range otlpHeaderEnvVars {

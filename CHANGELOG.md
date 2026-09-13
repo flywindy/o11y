@@ -37,9 +37,9 @@ adopters can plan their upgrades.
   the SDK's stdout log (handled errors at ERROR, so an error-only log level
   keeps them), one per distinct error or message per minute, with
   the suppression window under `repeat_suppressed_for`. Both redact the
-  configured endpoints and the header values of `WithOTLPHeaders` and
-  `WithProfilingAuthHeaders` and the header names and values in the
-  `OTEL_EXPORTER_OTLP_*HEADERS` variables, which the pinned exporters echo
+  configured endpoints and the header names and values of `WithOTLPHeaders`,
+  `WithProfilingAuthHeaders` and the `OTEL_EXPORTER_OTLP_*HEADERS`
+  variables, which the pinned exporters (and, for a name, `net/http`) echo
   verbatim when one fails to parse. The exporters parse their
   `OTEL_EXPORTER_OTLP_*` variables while `Init` builds them, before
   `Logr()` can be installed, so `Init` now rejects a malformed `ENDPOINT`,

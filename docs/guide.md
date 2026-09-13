@@ -507,8 +507,9 @@ the environment before the explicit options, so their `ENDPOINT`, `TIMEOUT`
 and `HEADERS` variables are always read; the log exporter reads a variable
 only where `Init` passes no explicit option, so its endpoint is never read,
 its headers only without `WithOTLPHeaders`, and its timeout and compression
-always. The error names the variable and the pair's position, not its
-text.
+always, taking the `LOGS_` variable first and the generic one only when the
+`LOGS_` variable is unset. The error names the variable and the pair's
+position, not its text.
 
 `ErrorHandler()` writes each distinct OTel-internal error once per minute as
 an ERROR record (so it survives an error-only log level) with the error text

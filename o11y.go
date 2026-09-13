@@ -140,8 +140,9 @@ func (s *SDK) Meter(name string) metric.Meter {
 // The deadline is shared out: each component runs under an even share of
 // the time left, recomputed as the sequence advances, so a component that
 // finishes early hands its slack to the ones after it, and one that drains
-// slowly (the trace batcher drains on a background context while the OTLP
-// exporter retries a failing collector for up to a minute) cannot consume
+// slowly (the trace batcher drains on a background context bounded by its
+// export timeout, OTEL_BSP_EXPORT_TIMEOUT, 30s by default, which cuts the
+// OTLP exporter's longer retry policy short) cannot consume
 // the whole deadline and leave the components after it, the meter
 // provider's final collection in particular, with a context that is
 // already done. Only components that exist count: a disabled pillar, and
