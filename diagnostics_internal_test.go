@@ -61,11 +61,18 @@ func TestOTelErrorHandler_RedactsSecrets(t *testing.T) {
 
 	assert.NotContains(t, buf.String(), "BearerSecret")
 	assert.Contains(t, buf.String(), "[redacted]")
+
+	buf.Reset()
+	h.secrets = diagnosticSecrets(&Config{otlpHeaders: map[string]string{"x-tiny": "a%zz"}})
+	h.Handle(errors.New(`escape header value: invalid URL escape "%zz" in a%zz (attempt 12)`))
+
+	assert.NotContains(t, buf.String(), "a%zz", "a short configured value echoed on its own is redacted")
+	assert.Contains(t, buf.String(), "attempt 12", "text around it is left alone")
 }
 
 // TestDiagnosticSecrets collects the configured and environment-provided
 // header values: whole variable, each pair, each value and its unescaped
-// form, deduplicated, with short values left out.
+// form, deduplicated, short values included, empty ones left out.
 func TestDiagnosticSecrets(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer%20abcdef, x-short=1, api-key=k-1234567890")
 	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "")
@@ -81,13 +88,11 @@ func TestDiagnosticSecrets(t *testing.T) {
 		"authorization=Bearer%20abcdef, x-short=1, api-key=k-1234567890",
 		"authorization=Bearer%20abcdef", "Bearer%20abcdef", "Bearer abcdef",
 		"api-key=k-1234567890", "k-1234567890",
+		"x-short=1", "1", "ab",
 	} {
 		assert.Contains(t, got, want)
 	}
-	for _, unwanted := range []string{"ab", "1", ""} {
-		assert.NotContains(t, got, unwanted, "short values are not secrets")
-	}
-	assert.Contains(t, got, "x-short=1", "a whole pair is long enough to be listed even when its value is not; replacing that exact pair is harmless")
+	assert.NotContains(t, got, "", "an empty value is not a secret")
 	assert.Len(t, got, len(slices.Compact(slices.Sorted(slices.Values(got)))), "no duplicates")
 }
 

@@ -128,11 +128,6 @@ var otlpHeaderEnvVars = []string{
 	"OTEL_EXPORTER_OTLP_LOGS_HEADERS",
 }
 
-// minDiagnosticSecretLen is the shortest header value treated as a secret.
-// A value shorter than this ("1", "true", "gzip") is not a credential, and
-// replacing every occurrence of it would mangle unrelated text.
-const minDiagnosticSecretLen = 6
-
 // diagnosticSecrets lists the header values the diagnostics must never
 // print: the values of WithOTLPHeaders and WithProfilingAuthHeaders, and
 // whatever the OTLP header environment variables hold. The pinned
@@ -142,13 +137,17 @@ const minDiagnosticSecretLen = 6
 // no "@" or endpoint for redact.InText to recognise, so it has to be named
 // up front. Each variable contributes its whole value, each "k=v" pair, the
 // raw value part and its unescaped form, so the fragment the exporter
-// echoes is covered whichever one it is.
+// echoes is covered whichever one it is. Every non-empty value is listed
+// whatever its length: an exporter can echo a value on its own, so a short
+// one is not safe to skip, and redact.Secrets replaces a short value only
+// where it stands as a whole token so a "1" or "true" does not rewrite
+// unrelated text.
 func diagnosticSecrets(cfg *Config) []string {
 	seen := make(map[string]struct{})
 	var out []string
 	add := func(v string) {
 		v = strings.TrimSpace(v)
-		if len(v) < minDiagnosticSecretLen {
+		if v == "" {
 			return
 		}
 		if _, dup := seen[v]; dup {

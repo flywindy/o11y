@@ -198,12 +198,16 @@ func TestLogr_RedactsTypedNestedContainers(t *testing.T) {
 		"ptr", &m,
 		"array", [1]named{named(endpoint)},
 		"raw", []byte("not-a-credential"),
+		"intkeys", map[int]string{7: endpoint},
+		"keyed", map[string]bool{endpoint: true},
+		"structkeys", map[endpointStringer]int{{url: endpoint}: 1},
 	)
 
 	out := buf.String()
 	assert.NotContains(t, out, "hunter2")
-	assert.Equal(t, 5, strings.Count(out, "collector:4318"), "every redacted copy keeps the host")
+	assert.Equal(t, 8, strings.Count(out, "collector:4318"), "every redacted copy keeps the host")
 	assert.Contains(t, out, "not-a-credential", "a []byte is passed through")
+	assert.Contains(t, out, "intkeys=map[7:", "a map with non-string keys is rebuilt, not passed through")
 }
 
 // endpointStringer renders an endpoint through String(), the way a type with

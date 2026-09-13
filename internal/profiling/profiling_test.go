@@ -24,11 +24,17 @@ type fakeProfiler struct {
 	// block, when set, holds Stop until it is closed, standing in for a
 	// Pyroscope uploader waiting on a stalled request.
 	block chan struct{}
+	// onStop, when set, runs inside Stop before it returns, so a test can
+	// end the closer's context while Stop is still in flight.
+	onStop func()
 }
 
 func (f *fakeProfiler) Stop() error {
 	if f.block != nil {
 		<-f.block
+	}
+	if f.onStop != nil {
+		f.onStop()
 	}
 	f.stopped = true
 	f.stopCalls++
@@ -217,6 +223,28 @@ func TestCloser_ReportsAnAlreadyCancelledContext(t *testing.T) {
 		return !profilerStarted
 	}, time.Second, 5*time.Millisecond, "Stop still runs and releases the slot")
 	assert.Equal(t, 1, fast.stopCalls)
+}
+
+// TestCloser_ReportsAContextCancelledWhileStopRuns pins the race the
+// select cannot order on its own: when the context ends while Stop is in
+// flight and Stop then completes, both cases are ready, and the closer
+// must still report ctx.Err() rather than Stop's result.
+func TestCloser_ReportsAContextCancelledWhileStopRuns(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	racing := &fakeProfiler{onStop: cancel}
+	withFakePyroscopeStart(t, func(pyroscope.Config) (profilerHandle, error) { return racing, nil })
+
+	closer, err := Start(context.Background(), Config{ServiceName: "profiled-svc", Endpoint: "http://alloy:4040"})
+	require.NoError(t, err)
+
+	require.ErrorIs(t, closer(ctx), context.Canceled)
+	require.Eventually(t, func() bool {
+		profilerMu.Lock()
+		defer profilerMu.Unlock()
+		return !profilerStarted
+	}, time.Second, 5*time.Millisecond, "Stop completed and released the slot")
+	assert.Equal(t, 1, racing.stopCalls)
 }
 
 // TestCloser_ReleasesSlotEvenWhenStopFails pins that a failed Stop does not

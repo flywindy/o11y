@@ -109,14 +109,15 @@ func Start(ctx context.Context, cfg Config) (func(context.Context) error, error)
 			profilerMu.Unlock()
 			done <- err
 		}()
-		// A context that is already done wins over a Stop that returned
-		// at once: select picks at random between two ready cases, and the
-		// contract is that an expired context is reported as such.
-		if err := ctx.Err(); err != nil {
-			return err
-		}
+		// A context that is done wins over a Stop that has finished, whether
+		// it was done before the closer ran or ended while Stop was running:
+		// select picks at random between two ready cases, and the contract
+		// is that an expired context is reported as such.
 		select {
 		case err := <-done:
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			return err
 		case <-ctx.Done():
 			return ctx.Err()
