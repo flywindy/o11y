@@ -21,8 +21,8 @@ import (
 //
 // headers is optional; when non-empty, every OTLP/HTTP request emitted by
 // the exporter carries the given headers (used for authentication). failures
-// counts every batch the exporter fails to deliver; it may be nil when
-// nothing reports the count.
+// counts every Export call the exporter returned an error for; it may be nil
+// when nothing reports the count.
 func InitLogger(ctx context.Context, endpoint string, headers map[string]string, res *resource.Resource, failures *exportstats.Recorder) (*sdklog.LoggerProvider, error) {
 	// otlploghttp.WithEndpointURL does not append a default path when none is
 	// provided (unlike otlptracehttp). Explicitly set /v1/logs so that a bare

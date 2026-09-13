@@ -111,9 +111,11 @@ type Config struct {
 	Logger *slog.Logger
 
 	// ExportFailures, when set, is registered on the provider as the
-	// o11y.export.failures observable counter and counts every batch the
-	// OTLP metrics exporter fails to deliver. The trace and log exporters
-	// share the same Recorder, so one instrument reports all three signals.
+	// o11y.export.failures observable counter and counts every Export call
+	// the OTLP metrics exporter returned an error for (a rejected or
+	// undeliverable collection, or a partial-success response). The trace
+	// and log exporters share the same Recorder, so one instrument reports
+	// all three signals.
 	ExportFailures *exportstats.Recorder
 }
 
