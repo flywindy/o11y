@@ -189,7 +189,10 @@ func clientCertCheck(prefix string, verbatim bool) otlpEnvCheck {
 // explicit options, so with traces enabled, or metrics on the push path,
 // every ENDPOINT, TIMEOUT, HEADERS, CERTIFICATE and CLIENT_CERTIFICATE /
 // CLIENT_KEY variable under the generic and the signal prefix is read
-// whatever Init passes in. The pinned log exporter consults a variable only
+// whatever Init passes in, and the metric exporter also reads its
+// METRICS_TEMPORALITY_PREFERENCE and METRICS_DEFAULT_HISTOGRAM_AGGREGATION
+// (their COMPRESSION variables map any other value to no compression
+// without a message, so they are not checked). The pinned log exporter consults a variable only
 // when the matching explicit option is absent: Init always passes the log
 // endpoint URL, which also pins the path and the insecure flag, so its
 // ENDPOINT and INSECURE variables are never read; it passes headers only
@@ -221,6 +224,10 @@ func otlpExporterEnvChecks(cfg *Config) []otlpEnvCheck {
 	}
 	if cfg.metricsEnabled && cfg.metricsOTLPEndpoint != "" {
 		envFirst("METRICS")
+		checks = append(checks,
+			otlpEnvCheck{name: "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE", check: checkTemporalityPreference},
+			otlpEnvCheck{name: "OTEL_EXPORTER_OTLP_METRICS_DEFAULT_HISTOGRAM_AGGREGATION", check: checkHistogramAggregation},
+		)
 	}
 	if cfg.logEnabled {
 		const generic, logs = "OTEL_EXPORTER_OTLP_", "OTEL_EXPORTER_OTLP_LOGS_"
@@ -262,9 +269,13 @@ func otlpExporterEnvChecks(cfg *Config) []otlpEnvCheck {
 // enabled exporters actually read are checked (see otlpExporterEnvChecks),
 // with the rules their parsers apply: ENDPOINT must parse as a URL (a
 // credential in its userinfo is what makes the echo dangerous), TIMEOUT
-// must be an integer count of milliseconds, COMPRESSION must be "gzip" or
-// "none", and each HEADERS pair must carry "=", a name that is an HTTP
-// token and a value that is valid percent-encoding. CERTIFICATE must name
+// must be an integer count of milliseconds, the log exporter's COMPRESSION
+// must be "gzip" or "none", the metric exporter's TEMPORALITY_PREFERENCE
+// and DEFAULT_HISTOGRAM_AGGREGATION must be one of the values it knows
+// (it echoes any other through global.Warn, which a logger the
+// application installed before Init would print), and each HEADERS pair
+// must carry "=", a name that is an HTTP token and a value that is valid
+// percent-encoding. CERTIFICATE must name
 // a readable file holding a PEM certificate, and CLIENT_CERTIFICATE with
 // CLIENT_KEY (read only when both are set) must name readable files that
 // form a key pair: the exporters echo the path of a file they cannot read,
@@ -306,6 +317,28 @@ func checkCompression(v string) (string, bool) {
 		return "", false
 	}
 	return `it is neither "gzip" nor "none"`, true
+}
+
+// checkTemporalityPreference applies the metric exporter's rule for
+// METRICS_TEMPORALITY_PREFERENCE: one of its three selectors, compared
+// case-insensitively as the exporter does.
+func checkTemporalityPreference(v string) (string, bool) {
+	switch strings.ToLower(v) {
+	case "cumulative", "delta", "lowmemory":
+		return "", false
+	}
+	return `it is none of "cumulative", "delta" and "lowmemory"`, true
+}
+
+// checkHistogramAggregation applies the metric exporter's rule for
+// METRICS_DEFAULT_HISTOGRAM_AGGREGATION: one of its two histogram
+// aggregations, compared case-insensitively as the exporter does.
+func checkHistogramAggregation(v string) (string, bool) {
+	switch strings.ToLower(v) {
+	case "explicit_bucket_histogram", "base2_exponential_bucket_histogram":
+		return "", false
+	}
+	return `it is neither "explicit_bucket_histogram" nor "base2_exponential_bucket_histogram"`, true
 }
 
 // checkCertificateFile applies the exporters' CA certificate rule: the
