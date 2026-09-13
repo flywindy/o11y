@@ -132,12 +132,30 @@ func (s *logrSink) resolve(v any) any {
 	case error:
 		return redact.InText(t.Error(), s.endpoints...)
 	case slog.Attr:
-		if t.Value.Kind() == slog.KindString {
-			return slog.String(t.Key, redact.InText(t.Value.String(), s.endpoints...))
-		}
-		return t
+		return s.resolveAttr(t)
 	default:
 		return v
+	}
+}
+
+// resolveAttr redacts a string-valued attribute and rebuilds a group
+// attribute member by member, so an endpoint nested inside slog.Group is
+// redacted like one at the top level. A LogValuer is resolved first so its
+// output is what gets inspected.
+func (s *logrSink) resolveAttr(a slog.Attr) slog.Attr {
+	val := a.Value.Resolve()
+	switch val.Kind() {
+	case slog.KindString:
+		return slog.String(a.Key, redact.InText(val.String(), s.endpoints...))
+	case slog.KindGroup:
+		members := val.Group()
+		args := make([]any, 0, len(members))
+		for _, m := range members {
+			args = append(args, s.resolveAttr(m))
+		}
+		return slog.Group(a.Key, args...)
+	default:
+		return slog.Attr{Key: a.Key, Value: val}
 	}
 }
 
