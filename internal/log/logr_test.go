@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
 
 	o11ylog "github.com/flywindy/o11y/internal/log"
 	"github.com/flywindy/o11y/internal/repeat"
@@ -101,6 +102,52 @@ func TestLogr_RedactsEndpointCredentials(t *testing.T) {
 	assert.NotContains(t, out, "hunter2")
 	assert.Contains(t, out, "collector:4318")
 	assert.Contains(t, out, "export failed")
+}
+
+// TestLogr_RedactsEndpointCredentialsInValues covers the shape otlptracehttp
+// produces for an endpoint that fails to parse: the URL arrives as a "url"
+// key/value beside the error, so redacting the error text alone would leave
+// the credential in the structured field. Accumulated WithValues and
+// slog.Attr values go through the same redaction.
+func TestLogr_RedactsEndpointCredentialsInValues(t *testing.T) {
+	logger, buf := newRecordingLogger(slog.LevelInfo)
+	const endpoint = "http://svc:hunter2@collector:4318"
+	l := o11ylog.NewLogr(logger, nil, endpoint).WithValues("configured", endpoint)
+
+	// The last value is not a configured endpoint and does not even parse;
+	// redact.InText's userinfo rule still strips it.
+	l.Error(errors.New("invalid endpoint"), "otlptrace: parse endpoint",
+		"url", endpoint, "attr", slog.String("again", endpoint), "raw", "http://user:secret%zz@host")
+
+	out := buf.String()
+	assert.NotContains(t, out, "hunter2")
+	assert.NotContains(t, out, "secret%zz")
+	assert.Equal(t, 3, strings.Count(out, "collector:4318"), "every redacted copy keeps the host")
+	assert.Contains(t, out, "url=")
+	assert.Contains(t, out, "configured=")
+}
+
+// marshalsToText implements logr.Marshaler the way attribute.Set does, with
+// nothing slog could render on its own.
+type marshalsToText struct{ hidden string }
+
+// MarshalLog implements logr.Marshaler.
+func (m marshalsToText) MarshalLog() any { return "resolved:" + m.hidden }
+
+// TestLogr_ResolvesMarshalerValues checks a logr.Marshaler value reaches
+// slog as what MarshalLog returns rather than as an opaque struct; OTel's
+// "Tracer created" diagnostic passes an attribute.Set this way.
+func TestLogr_ResolvesMarshalerValues(t *testing.T) {
+	logger, buf := newRecordingLogger(slog.LevelInfo)
+	l := o11ylog.NewLogr(logger, nil)
+
+	l.Info("Tracer created", "attributes", marshalsToText{hidden: "scope"})
+	l.Info("attribute set", "attributes", attribute.NewSet(attribute.String("k", "v")))
+
+	out := buf.String()
+	assert.Contains(t, out, "attributes=resolved:scope")
+	assert.NotContains(t, out, "attributes={}")
+	assert.Contains(t, out, `k`, "the attribute.Set's contents survive MarshalLog")
 }
 
 // TestLogr_WithValuesAndWithName checks names and values reach the record.

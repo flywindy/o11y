@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 
 	"github.com/flywindy/o11y/internal/exportstats"
 )
@@ -130,25 +131,25 @@ func TestRegister_ObservesOnePointPerSignal(t *testing.T) {
 	assert.True(t, sum.IsMonotonic)
 	assert.Equal(t, metricdata.CumulativeTemporality, sum.Temporality)
 
-	got := map[string]int64{}
+	got := map[attribute.Value]int64{}
 	for _, dp := range sum.DataPoints {
 		require.Equal(t, 1, dp.Attributes.Len(), "exactly one attribute per data point")
-		v, ok := dp.Attributes.Value(attribute.Key("otel.component.type"))
+		v, ok := dp.Attributes.Value(semconv.OTelComponentTypeKey)
 		require.True(t, ok, "every data point carries the semconv otel.component.type attribute")
-		got[v.AsString()] = dp.Value
+		got[v] = dp.Value
 	}
-	assert.Equal(t, map[string]int64{
-		"otlp_http_span_exporter":   2,
-		"otlp_http_log_exporter":    1,
-		"otlp_http_metric_exporter": 0,
+	assert.Equal(t, map[attribute.Value]int64{
+		semconv.OTelComponentTypeOtlpHTTPSpanExporter.Value:   2,
+		semconv.OTelComponentTypeOtlpHTTPLogExporter.Value:    1,
+		semconv.OTelComponentTypeOtlpHTTPMetricExporter.Value: 0,
 	}, got)
 }
 
 // TestComponentType pins the signal to semconv component-type mapping and the
 // empty value for an unknown signal.
 func TestComponentType(t *testing.T) {
-	assert.Equal(t, "otlp_http_span_exporter", exportstats.ComponentType(exportstats.SignalTraces).Value.AsString())
-	assert.Equal(t, "otlp_http_log_exporter", exportstats.ComponentType(exportstats.SignalLogs).Value.AsString())
-	assert.Equal(t, "otlp_http_metric_exporter", exportstats.ComponentType(exportstats.SignalMetrics).Value.AsString())
+	assert.Equal(t, semconv.OTelComponentTypeOtlpHTTPSpanExporter, exportstats.ComponentType(exportstats.SignalTraces))
+	assert.Equal(t, semconv.OTelComponentTypeOtlpHTTPLogExporter, exportstats.ComponentType(exportstats.SignalLogs))
+	assert.Equal(t, semconv.OTelComponentTypeOtlpHTTPMetricExporter, exportstats.ComponentType(exportstats.SignalMetrics))
 	assert.False(t, exportstats.ComponentType(exportstats.Signal("profiles")).Valid())
 }

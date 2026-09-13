@@ -39,14 +39,9 @@ func NewSuppressor(window time.Duration, maxEntries int) *Suppressor {
 // Window returns the repeat window.
 func (s *Suppressor) Window() time.Duration { return s.window }
 
-// Suppressed records msg as seen now and reports whether it was already seen
-// inside the repeat window.
-func (s *Suppressor) Suppressed(msg string) bool {
-	return s.SuppressedAt(msg, time.Now())
-}
-
-// SuppressedAt is Suppressed with an explicit clock reading; it exists so a
-// caller with its own clock (or a test) can drive the window deterministically.
+// SuppressedAt records msg as seen at now and reports whether it was already
+// seen inside the repeat window. Callers pass their own clock reading so the
+// window can be driven deterministically in tests.
 func (s *Suppressor) SuppressedAt(msg string, now time.Time) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
