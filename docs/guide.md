@@ -527,7 +527,13 @@ The endpoints given to `WithOTLPEndpoint` and
 `WithMetricsOTLPEndpoint` get the same check, since the trace and metric
 exporters echo a URL they cannot parse the same way and then fall back to
 their default endpoint. The error names the variable or option and the
-pair's position, not the text.
+pair's position, not the text, and not the parser's message either, which
+quotes the offending part of a URL. A header name given to
+`WithOTLPHeaders` or `WithProfilingAuthHeaders` must be an HTTP token for
+a related reason: `net/http` refuses every request carrying any other
+name and quotes it, escaped, in the export error, where a control
+character no longer matches the redaction list, so `Init` rejects the
+option without repeating the name.
 
 `ErrorHandler()` writes each distinct OTel-internal error once per minute as
 an ERROR record (so it survives an error-only log level) with the error text

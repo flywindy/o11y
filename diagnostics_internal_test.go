@@ -295,8 +295,12 @@ func TestValidateConfiguredEndpoints(t *testing.T) {
 	err := validateConfiguredEndpoints(&Config{traceEnabled: true, otlpEndpoint: bad})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "WithOTLPEndpoint is not a valid URL")
-	assert.Contains(t, err.Error(), "invalid URL escape")
 	assert.NotContains(t, err.Error(), "secret", "the value stays out of the error")
+	assert.NotContains(t, err.Error(), "%zz", "and so does the parser's message, which quotes the escape")
+
+	err = validateConfiguredEndpoints(&Config{traceEnabled: true, otlpEndpoint: "http://collector:BearerSecret"})
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "BearerSecret", "the parser quotes a non-numeric port in its message")
 
 	err = validateConfiguredEndpoints(&Config{metricsEnabled: true, metricsOTLPEndpoint: bad})
 	require.Error(t, err)
@@ -305,6 +309,45 @@ func TestValidateConfiguredEndpoints(t *testing.T) {
 
 	require.NoError(t, validateConfiguredEndpoints(&Config{metricsEnabled: true, otlpEndpoint: bad}), "no trace or log exporter uses the OTLP endpoint")
 	require.NoError(t, validateConfiguredEndpoints(&Config{traceEnabled: true, logEnabled: true, otlpEndpoint: "http://collector:4318", metricsEnabled: true, metricsOTLPEndpoint: "http://collector:4318"}))
+}
+
+// TestValidateConfiguredHeaders pins that a configured header name that is
+// not an HTTP token fails Init with an error naming the option but not the
+// name, and that token names pass.
+func TestValidateConfiguredHeaders(t *testing.T) {
+	require.NoError(t, validateConfiguredHeaders(&Config{
+		otlpHeaders:          map[string]string{"authorization": "Bearer x", "x-tenant": "acme"},
+		profilingAuthHeaders: map[string]string{"x-api-key": "k"},
+	}))
+
+	err := validateConfiguredHeaders(&Config{otlpHeaders: map[string]string{"Bearer\nSecret": "v"}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "WithOTLPHeaders is not a valid HTTP header name")
+	assert.NotContains(t, err.Error(), "Secret", "the name stays out of the error")
+
+	err = validateConfiguredHeaders(&Config{profilingAuthHeaders: map[string]string{"x api key": "k"}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "WithProfilingAuthHeaders is not a valid HTTP header name")
+}
+
+// TestDiagnosticSecrets_EscapedForms pins that a configured value whose
+// %q rendering differs from the value is listed in both forms, since
+// net/http quotes a header name that way in its error.
+func TestDiagnosticSecrets_EscapedForms(t *testing.T) {
+	secrets := diagnosticSecrets(&Config{otlpHeaders: map[string]string{"x-token": "Bearer\nSecret"}})
+	assert.Contains(t, secrets, "Bearer\nSecret")
+	assert.Contains(t, secrets, `Bearer\nSecret`)
+	assert.Equal(t, 1, countOf(secrets, "x-token"), "a value the escaping leaves alone is listed once")
+}
+
+func countOf(list []string, v string) int {
+	n := 0
+	for _, s := range list {
+		if s == v {
+			n++
+		}
+	}
+	return n
 }
 
 // derefError dereferences its receiver in Error, so a typed nil *derefError

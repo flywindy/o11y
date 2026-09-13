@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -382,7 +381,9 @@ func checkClientKeyPair(keyVar string, verbatim bool) func(string) (string, bool
 // then keeps their fallback endpoint, so Init would succeed while a
 // credential in the URL's userinfo reached stderr. Only an endpoint an
 // enabled OTLP exporter will use is checked, and the error names the
-// option and the parser's reason, never the value.
+// option only: neither the value nor the parser's message, which quotes
+// the offending part of the URL (a port, an escape, a host character),
+// is repeated.
 func validateConfiguredEndpoints(cfg *Config) error {
 	type configured struct{ option, value string }
 	var endpoints []configured
@@ -394,20 +395,33 @@ func validateConfiguredEndpoints(cfg *Config) error {
 	}
 	for _, e := range endpoints {
 		if _, err := url.Parse(e.value); err != nil {
-			return fmt.Errorf("o11y: the endpoint given to %s is not a valid URL (%w); the OTLP exporters would report its raw text through OTel's global logger while Init builds them, so the option is rejected instead and its value is not repeated here", e.option, urlParseReason(err))
+			return fmt.Errorf("o11y: the endpoint given to %s is not a valid URL; the OTLP exporters would report its raw text through OTel's global logger while Init builds them, so the option is rejected instead, and neither the value nor the parser's message, which quotes part of it, is repeated here", e.option)
 		}
 	}
 	return nil
 }
 
-// urlParseReason returns the parser's reason from a url.Parse error without
-// the URL the *url.Error carries, so a credential in the URL is not echoed.
-func urlParseReason(err error) error {
-	var uerr *url.Error
-	if errors.As(err, &uerr) && uerr.Err != nil {
-		return uerr.Err
+// validateConfiguredHeaders rejects a header name given through
+// WithOTLPHeaders or WithProfilingAuthHeaders that is not an HTTP token.
+// net/http refuses every request carrying such a name and quotes it,
+// Go-escaped, in the error the exporter returns, which the ErrorHandler
+// records; an escaped control character no longer matches the name in
+// the redaction list, so the name is rejected up front and not repeated.
+func validateConfiguredHeaders(cfg *Config) error {
+	for _, h := range []struct {
+		option  string
+		headers map[string]string
+	}{
+		{"WithOTLPHeaders", cfg.otlpHeaders},
+		{"WithProfilingAuthHeaders", cfg.profilingAuthHeaders},
+	} {
+		for name := range h.headers {
+			if !isHTTPToken(name) {
+				return fmt.Errorf("o11y: a header name given to %s is not a valid HTTP header name (an RFC 7230 token); net/http would reject every request carrying it and quote the name, escaped, in the export error, so the option is rejected instead and the name is not repeated here", h.option)
+			}
+		}
 	}
-	return err
+	return nil
 }
 
 // validateOTLPEnvVar applies check to value, the variable name as the
@@ -459,6 +473,13 @@ func isHTTPToken(s string) bool {
 	return true
 }
 
+// goEscaped returns v as strconv.Quote renders it between the quotes, the
+// form net/http and fmt's %q verb give a string in an error message.
+func goEscaped(v string) string {
+	q := strconv.Quote(v)
+	return q[1 : len(q)-1]
+}
+
 // diagnosticSecrets lists the header names and values the diagnostics must
 // never print: the names and values of WithOTLPHeaders and
 // WithProfilingAuthHeaders, and
@@ -478,15 +499,20 @@ func diagnosticSecrets(cfg *Config) []string {
 	seen := make(map[string]struct{})
 	var out []string
 	add := func(v string) {
-		v = strings.TrimSpace(v)
-		if v == "" {
-			return
+		// A rendering that quotes the value with %q escapes control and
+		// non-printable characters, so that form is listed too whenever
+		// it differs; a value the escaping leaves alone is added once.
+		for _, s := range []string{v, goEscaped(v)} {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				continue
+			}
+			if _, dup := seen[s]; dup {
+				continue
+			}
+			seen[s] = struct{}{}
+			out = append(out, s)
 		}
-		if _, dup := seen[v]; dup {
-			return
-		}
-		seen[v] = struct{}{}
-		out = append(out, v)
 	}
 	// Names as well as values: a credential pasted in as a header name
 	// reaches net/http, whose "invalid header field name" error echoes it

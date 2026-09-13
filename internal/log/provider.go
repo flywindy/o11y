@@ -30,14 +30,11 @@ func InitLogger(ctx context.Context, endpoint string, headers map[string]string,
 	// endpoint like "http://localhost:4318" routes correctly to the collector.
 	logEndpoint, err := logEndpointURL(endpoint)
 	if err != nil {
-		// The value is not repeated: a credential in its userinfo must not
-		// reach the Init error, and a *url.Error carries the URL, so only
-		// the parser's reason is kept.
-		var uerr *url.Error
-		if errors.As(err, &uerr) && uerr.Err != nil {
-			err = uerr.Err
-		}
-		return nil, fmt.Errorf("invalid OTLP endpoint: %w", err)
+		// Neither the value nor the parser's message is repeated: a
+		// credential in the URL's userinfo must not reach the Init error,
+		// the *url.Error carries the whole URL, and the message inside it
+		// quotes the offending part (a port, an escape, a host character).
+		return nil, errors.New("invalid OTLP endpoint: it is not a valid URL")
 	}
 	expOpts := []otlploghttp.Option{otlploghttp.WithEndpointURL(logEndpoint)}
 	if len(headers) > 0 {

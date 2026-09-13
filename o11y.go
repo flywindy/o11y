@@ -304,11 +304,16 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	// endpoint options as they are built and report a malformed value's raw
 	// text through OTel's global logger, which nothing installed after Init
 	// can redact, so a malformed variable or endpoint fails Init before any
-	// exporter exists.
+	// exporter exists; a configured header name that is not an HTTP token
+	// fails too, since net/http would quote it, escaped, in every export
+	// error, past what the redaction list can match.
 	if err := validateOTLPExporterEnv(cfg); err != nil {
 		return nil, err
 	}
 	if err := validateConfiguredEndpoints(cfg); err != nil {
+		return nil, err
+	}
+	if err := validateConfiguredHeaders(cfg); err != nil {
 		return nil, err
 	}
 
