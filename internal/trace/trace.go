@@ -12,6 +12,8 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+
+	"github.com/flywindy/o11y/internal/exportstats"
 )
 
 // InitTracer initializes the OTLP HTTP exporter and a TracerProvider using the
@@ -23,8 +25,10 @@ import (
 // headers is optional; when non-empty, every OTLP/HTTP request emitted by
 // the exporter carries the given headers (used for authentication against
 // managed observability backends). sampler is optional; when nil, OTel's
-// environment/default sampler path remains active.
-func InitTracer(ctx context.Context, endpoint string, headers map[string]string, res *resource.Resource, sampler sdktrace.Sampler, spanProcessors ...sdktrace.SpanProcessor) (*sdktrace.TracerProvider, propagation.TextMapPropagator, error) {
+// environment/default sampler path remains active. failures counts every
+// batch the exporter fails to deliver; it may be nil when nothing reports the
+// count.
+func InitTracer(ctx context.Context, endpoint string, headers map[string]string, res *resource.Resource, sampler sdktrace.Sampler, failures *exportstats.Recorder, spanProcessors ...sdktrace.SpanProcessor) (*sdktrace.TracerProvider, propagation.TextMapPropagator, error) {
 	// 1. OTLP HTTP trace exporter
 	expOpts := []otlptracehttp.Option{
 		otlptracehttp.WithEndpointURL(endpoint),
@@ -58,7 +62,11 @@ func InitTracer(ctx context.Context, endpoint string, headers map[string]string,
 			tpOpts = append(tpOpts, sdktrace.WithSpanProcessor(processor))
 		}
 	}
-	tpOpts = append(tpOpts, sdktrace.WithBatcher(exporter))
+	var batched sdktrace.SpanExporter = exporter
+	if failures != nil {
+		batched = exportstats.SpanExporter(exporter, failures)
+	}
+	tpOpts = append(tpOpts, sdktrace.WithBatcher(batched))
 	tp := sdktrace.NewTracerProvider(tpOpts...)
 
 	// 3. Composite propagator (W3C TraceContext + Baggage)

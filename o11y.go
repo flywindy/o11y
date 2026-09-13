@@ -23,12 +23,14 @@ import (
 	"sync"
 
 	"github.com/flywindy/o11y/internal/baggageattrs"
+	"github.com/flywindy/o11y/internal/exportstats"
 	o11ylog "github.com/flywindy/o11y/internal/log"
 	"github.com/flywindy/o11y/internal/metrics"
 	"github.com/flywindy/o11y/internal/profiling"
 	"github.com/flywindy/o11y/internal/redact"
 	"github.com/flywindy/o11y/internal/trace"
 	"github.com/flywindy/o11y/internal/views"
+	"github.com/go-logr/logr"
 	otelpyroscope "github.com/grafana/otel-profiling-go"
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel/metric"
@@ -92,6 +94,11 @@ type SDK struct {
 	meterProviderInternal  *sdkmetric.MeterProvider
 	meterProviderPublic    metric.MeterProvider
 	shutdowns              []func(context.Context) error
+
+	// Diagnostics for OTel's own error and message paths; see ErrorHandler
+	// and Logr.
+	errorHandler *otelErrorHandler
+	logr         logr.Logger
 
 	shutdownOnce sync.Once
 	shutdownErr  error
@@ -201,6 +208,11 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	}
 	appendBaggageWarnings(cfg, whitelist)
 
+	// Every OTLP exporter reports its failed batches here; the MeterProvider
+	// registers the count as o11y_export_failures_total once it exists. The
+	// Recorder is created first because the tracer is built before the meter.
+	exportFailures := &exportstats.Recorder{}
+
 	// 2. Initialize TracerProvider (no global state).
 	//    When trace is disabled, a no-op provider is used and the W3C propagator
 	//    is constructed directly so that downstream trace headers are still
@@ -215,7 +227,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		if whitelist.Len() > 0 {
 			spanProcessors = append(spanProcessors, whitelist.NewSpanProcessor())
 		}
-		tp, p, initErr := trace.InitTracer(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, providerRes, cfg.sampler, spanProcessors...)
+		tp, p, initErr := trace.InitTracer(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, providerRes, cfg.sampler, exportFailures, spanProcessors...)
 		if initErr != nil {
 			return nil, initErr
 		}
@@ -283,6 +295,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 			ExtraHTTPServerAttrKeys: cfg.extraHTTPServerAttrKeys,
 			Exemplars:               cfg.exemplars,
 			Logger:                  slog.New(stdoutHandler),
+			ExportFailures:          exportFailures,
 		})
 		if initErr != nil {
 			_ = tpShutdown(ctx)
@@ -307,7 +320,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	var logger *slog.Logger
 
 	if cfg.logEnabled {
-		lp, initErr := o11ylog.InitLogger(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, providerRes)
+		lp, initErr := o11ylog.InitLogger(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, providerRes, exportFailures)
 		if initErr != nil {
 			_ = metricsCloser(ctx)
 			_ = mpShutdown(ctx)
@@ -454,6 +467,10 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		meterProviderInternal:  mpInternal,
 		meterProviderPublic:    meterProviderPublic,
 		shutdowns:              shutdowns,
+		// Both write to stdout only: an OTel-internal error about the OTLP
+		// log pipeline must not be queued behind the batch that is failing.
+		errorHandler: newOTelErrorHandler(slog.New(stdoutHandler), cfg.otlpEndpoint, cfg.metricsOTLPEndpoint, cfg.profilingEndpoint),
+		logr:         newLogr(slog.New(stdoutHandler)),
 	}, nil
 }
 
