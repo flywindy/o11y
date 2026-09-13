@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/grafana/pyroscope-go"
@@ -20,9 +21,15 @@ type fakeProfiler struct {
 	stopErr   error
 	stopped   bool
 	stopCalls int
+	// block, when set, holds Stop until it is closed, standing in for a
+	// Pyroscope uploader waiting on a stalled request.
+	block chan struct{}
 }
 
 func (f *fakeProfiler) Stop() error {
+	if f.block != nil {
+		<-f.block
+	}
 	f.stopped = true
 	f.stopCalls++
 	return f.stopErr
@@ -161,6 +168,34 @@ func TestPyroscopeSlogAdapter_InfofUsesInfoLevel(t *testing.T) {
 	output := buf.String()
 	assert.Contains(t, output, `"level":"INFO"`)
 	assert.Contains(t, output, `"msg":"upload started"`)
+}
+
+// TestCloser_HonoursContextWhileStopBlocks pins that a Stop stalled on the
+// uploader does not hold the closer past the caller's deadline: the closer
+// returns ctx.Err(), Stop finishes on its own, and the profiler slot is
+// released once it has.
+func TestCloser_HonoursContextWhileStopBlocks(t *testing.T) {
+	release := make(chan struct{})
+	stalled := &fakeProfiler{block: release}
+	withFakePyroscopeStart(t, func(pyroscope.Config) (profilerHandle, error) { return stalled, nil })
+
+	closer, err := Start(context.Background(), Config{ServiceName: "profiled-svc", Endpoint: "http://alloy:4040"})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	require.ErrorIs(t, closer(ctx), context.DeadlineExceeded)
+
+	_, err = Start(context.Background(), Config{ServiceName: "profiled-svc", Endpoint: "http://alloy:4040"})
+	require.ErrorIs(t, err, ErrAlreadyStarted, "the slot stays held while Stop is still running")
+
+	close(release)
+	require.Eventually(t, func() bool {
+		profilerMu.Lock()
+		defer profilerMu.Unlock()
+		return !profilerStarted
+	}, time.Second, 5*time.Millisecond, "the slot is released once Stop completes")
+	assert.Equal(t, 1, stalled.stopCalls)
 }
 
 // TestCloser_ReleasesSlotEvenWhenStopFails pins that a failed Stop does not

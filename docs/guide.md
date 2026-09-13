@@ -388,12 +388,16 @@ line to stderr per attempt, and afterward nobody can say how much was lost.
 Two things make that visible.
 
 **`o11y_export_failures_total{otel_component_type}`** counts every export
-call the OTLP exporters returned an error for, one series per exporter: the label is
-semconv's `otel.component.type`, with the values `otlp_http_span_exporter`,
-`otlp_http_log_exporter` and `otlp_http_metric_exporter`. It is an SDK-owned
-instrument among the SDK's own metrics, present after upgrading with no code
-change; a service with a healthy collector shows three zero series. Alert on
-it:
+call the OTLP exporters returned an error for, one series per exporter the
+SDK built: the label is semconv's `otel.component.type`, with the values
+`otlp_http_span_exporter`, `otlp_http_log_exporter` and
+`otlp_http_metric_exporter`. It is an SDK-owned instrument among the SDK's
+own metrics, present after upgrading with no code change; a service with a
+healthy collector shows a zero series per exporter. A series exists only for
+an exporter that exists: the metric exporter's appears with
+`WithMetricsOTLPEndpoint` and not on the Prometheus pull path, and a
+disabled pillar has none, so an absent series means "no such exporter", not
+"no failures". Alert on it:
 
 ```promql
 sum by (service_name, otel_component_type) (rate(o11y_export_failures_total[5m])) > 0

@@ -142,7 +142,7 @@ exports (Prometheus pull or OTLP push) and not at all when it is off.
 
 | Name | Kind | Unit | Attributes |
 |---|---|---|---|
-| `o11y.export.failures` | Int64ObservableCounter | `{batch}` | SDK-owned name (see Deviations). `otel.component.type`. One Export call the OTLP exporter returned an error for: a rejected or undeliverable batch (items dropped), or a partial-success response (some items rejected, or a warning with none rejected). One data point per exporter, zero when healthy. |
+| `o11y.export.failures` | Int64ObservableCounter | `{batch}` | SDK-owned name (see Deviations). `otel.component.type`. One Export call the OTLP exporter returned an error for: a rejected or undeliverable batch (items dropped), or a partial-success response (some items rejected, or a warning with none rejected). One data point per exporter the SDK built (none for a disabled pillar or, on the Prometheus pull path, for the metric exporter), zero when healthy. |
 
 ### Attributes
 

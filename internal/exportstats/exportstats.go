@@ -77,13 +77,18 @@ func ComponentType(signal Signal) attribute.KeyValue {
 	}
 }
 
-// Recorder holds one failure count per signal. The zero value is ready to
-// use; Fail is safe for concurrent use and never blocks, so it can run inside
-// an exporter's Export path.
+// Recorder holds one failure count per signal and remembers which signals
+// have an exporter wrapped through it. The zero value is ready to use; Fail
+// is safe for concurrent use and never blocks, so it can run inside an
+// exporter's Export path.
 type Recorder struct {
 	traces  atomic.Int64
 	logs    atomic.Int64
 	metrics atomic.Int64
+
+	tracesActive  atomic.Bool
+	logsActive    atomic.Bool
+	metricsActive atomic.Bool
 }
 
 // Fail records one export call that returned an error for signal. Unknown
@@ -102,6 +107,40 @@ func (r *Recorder) Failures(signal Signal) int64 {
 	return 0
 }
 
+// Active reports whether an exporter for signal has been wrapped through
+// this Recorder, i.e. whether the signal's series exists at all: on the
+// Prometheus pull path no OTLP metric exporter is built, and a disabled
+// pillar builds none, so the counter carries no series for them rather than
+// a zero that would advertise a component that does not exist.
+func (r *Recorder) Active(signal Signal) bool {
+	if a := r.active(signal); a != nil {
+		return a.Load()
+	}
+	return false
+}
+
+// activate marks signal as having an exporter; the wrapper constructors call
+// it.
+func (r *Recorder) activate(signal Signal) {
+	if a := r.active(signal); a != nil {
+		a.Store(true)
+	}
+}
+
+// active returns the flag behind signal, or nil for an unknown signal.
+func (r *Recorder) active(signal Signal) *atomic.Bool {
+	switch signal {
+	case SignalTraces:
+		return &r.tracesActive
+	case SignalLogs:
+		return &r.logsActive
+	case SignalMetrics:
+		return &r.metricsActive
+	default:
+		return nil
+	}
+}
+
 // counter returns the atomic behind signal, or nil for an unknown signal.
 func (r *Recorder) counter(signal Signal) *atomic.Int64 {
 	switch signal {
@@ -117,17 +156,24 @@ func (r *Recorder) counter(signal Signal) *atomic.Int64 {
 }
 
 // Register creates the o11y.export.failures observable counter on meter,
-// reporting one data point per signal, attributed by otel.component.type,
-// from the Recorder's counts. It is
-// observable rather than synchronous so the counts can start accumulating
-// before the MeterProvider exists (the tracer is built first) and so the
-// metric pipeline's own failures can be counted without re-entering it.
+// reporting one data point per signal that has an exporter wrapped through
+// the Recorder (see Active), attributed by otel.component.type, from the
+// Recorder's counts; a signal with an exporter and no failures reports
+// zero, a signal without one reports nothing. Which signals are active is
+// read at each collection, so the order in which the pillars are built does
+// not matter. It is observable rather than synchronous so the counts can
+// start accumulating before the MeterProvider exists (the tracer is built
+// first) and so the metric pipeline's own failures can be counted without
+// re-entering it.
 func (r *Recorder) Register(meter metric.Meter) error {
 	_, err := meter.Int64ObservableCounter(InstrumentName,
 		metric.WithDescription("Export calls the OTLP exporters returned an error for: a batch the collector rejected or could not be reached for (its spans, log records or data points are dropped), or a partial-success response that rejected some items or carried a warning."),
 		metric.WithUnit("{batch}"),
 		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
 			for _, signal := range []Signal{SignalTraces, SignalLogs, SignalMetrics} {
+				if !r.Active(signal) {
+					continue
+				}
 				o.Observe(r.Failures(signal), metric.WithAttributes(ComponentType(signal)))
 			}
 			return nil
@@ -139,6 +185,7 @@ func (r *Recorder) Register(meter metric.Meter) error {
 // SpanExporter wraps inner so every failed ExportSpans call is counted
 // under SignalTraces. Shutdown and the error itself pass through unchanged.
 func SpanExporter(inner sdktrace.SpanExporter, r *Recorder) sdktrace.SpanExporter {
+	r.activate(SignalTraces)
 	return spanExporter{SpanExporter: inner, recorder: r}
 }
 
@@ -160,6 +207,7 @@ func (e spanExporter) ExportSpans(ctx context.Context, spans []sdktrace.ReadOnly
 // SignalLogs. Shutdown, ForceFlush and the error itself pass through
 // unchanged.
 func LogExporter(inner sdklog.Exporter, r *Recorder) sdklog.Exporter {
+	r.activate(SignalLogs)
 	return logExporter{Exporter: inner, recorder: r}
 }
 
@@ -189,6 +237,7 @@ func (e logExporter) Export(ctx context.Context, records []sdklog.Record) error 
 // only the last interval's failures; the Recorder's own total stays exact
 // but is not recoverable through that pipeline.
 func MetricExporter(inner sdkmetric.Exporter, r *Recorder) sdkmetric.Exporter {
+	r.activate(SignalMetrics)
 	return metricExporter{Exporter: inner, recorder: r}
 }
 

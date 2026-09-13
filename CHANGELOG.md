@@ -25,8 +25,9 @@ adopters can plan their upgrades.
   number behind. The counter is an SDK-owned instrument among the SDK's own
   metrics — on `/metrics` on the Prometheus pull path, through the OTLP
   metrics pipeline with `WithMetricsOTLPEndpoint`, absent when the metrics
-  pillar is off — reported for every exporter (zero when healthy), and needs
-  no code change. See the guide's "Export failures & OTel diagnostics"
+  pillar is off — reported for every exporter the SDK built (zero when
+  healthy; no series for a disabled pillar's exporter or, on the Prometheus
+  pull path, for the metric exporter), and needs no code change. See the guide's "Export failures & OTel diagnostics"
   section for the alert and `docs/semconv.md` for the catalog entry.
 - `SDK.ErrorHandler()` and `SDK.Logr()` return replacements for OTel's
   default error handler and internal logger: the default handler prints
@@ -76,7 +77,12 @@ adopters can plan their upgrades.
   deadline is passed through unchanged. A drain that outlives its share is
   reported as timed out and continues on the OTel batcher's own background
   context, which the SDK cannot cancel; a failure it records after the
-  final collection is not reported.
+  final collection is not reported. The profiler's closer now honours its
+  context the same way: Pyroscope's `Stop` waits on the uploader's own 30s
+  client timeout, so a stalled upload used to hold `Shutdown` for that long
+  and hand every later component an expired context; it now returns
+  `ctx.Err()` and lets `Stop` finish in the background, releasing the
+  profiler slot when it does.
 - dependencies: the root `o11y` package no longer links the Cassandra,
   MinIO, MongoDB or Redis drivers. It imported those four packages for one
   reason — to collect their `MetricViews` — and because Go links at package

@@ -518,9 +518,12 @@ func TestInit_ExportFailuresCounted(t *testing.T) {
 			seriesValue(b, "o11y_export_failures_total", componentLabel(semconv.OTelComponentTypeOtlpHTTPLogExporter)) >= 1
 	}, 5*time.Second, 50*time.Millisecond, "export failures should be counted per exporter; last scrape:\n%s", body)
 
-	// Every exporter is reported, so a dashboard sees a zero rather than no
-	// series, and the SDK's own scope names the instrument.
-	assert.Equal(t, float64(0), seriesValue(body, "o11y_export_failures_total", componentLabel(semconv.OTelComponentTypeOtlpHTTPMetricExporter)))
+	// Only exporters that exist are reported: this is the Prometheus pull
+	// path, so there is no OTLP metric exporter and no series for it, rather
+	// than a zero advertising a component that was never built. The SDK's
+	// own scope names the instrument.
+	assert.Equal(t, float64(-1), seriesValue(body, "o11y_export_failures_total", componentLabel(semconv.OTelComponentTypeOtlpHTTPMetricExporter)),
+		"no OTLP metric exporter on the pull path, so no series for it")
 	assert.GreaterOrEqual(t, seriesValue(body, "o11y_export_failures_total", `otel_scope_name="github.com/flywindy/o11y"`), float64(0),
 		"the counter is registered under the SDK's own instrumentation scope")
 }
