@@ -66,12 +66,17 @@ adopters can plan their upgrades.
 
 ### Changed
 
-- `SDK.Shutdown` shares its deadline out evenly across the components still
-  to run, recomputing the share as each finishes, so a tracer or logger
-  drain that waits on a collector that is down cannot consume the whole
-  deadline and leave the meter provider's final collection (which is what
-  publishes the shutdown-time failures) with a context that is already
-  done. A context without a deadline is passed through unchanged.
+- `SDK.Shutdown` shares its deadline out evenly across the enabled
+  components still to run, recomputing the share as each finishes, so a
+  tracer or logger drain that waits on a collector that is down cannot
+  consume the whole deadline and leave the meter provider's final
+  collection (which is what publishes the shutdown-time failures) with a
+  context that is already done. Disabled pillars no longer contribute a
+  no-op closer, so they neither run nor take a share. A context without a
+  deadline is passed through unchanged. A drain that outlives its share is
+  reported as timed out and continues on the OTel batcher's own background
+  context, which the SDK cannot cancel; a failure it records after the
+  final collection is not reported.
 - dependencies: the root `o11y` package no longer links the Cassandra,
   MinIO, MongoDB or Redis drivers. It imported those four packages for one
   reason — to collect their `MetricViews` — and because Go links at package
