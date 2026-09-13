@@ -154,6 +154,26 @@ func (s *SDK) Shutdown(ctx context.Context) error {
 	return s.shutdownErr
 }
 
+// shutdownSequence orders the per-pillar closers Shutdown runs. Disabled
+// pillars contribute a no-op that returns nil; a nil profiler closer is
+// skipped.
+//
+// Traces and logs drain before metrics on purpose: their final flush is
+// where a batch queued until shutdown gets exported, and a batch that fails
+// then is counted on the export-failure Recorder. The meter provider's own
+// shutdown performs the last collection, so with metrics last that count is
+// still observed and, on the OTLP push path, shipped; with metrics first it
+// would be recorded into a counter nothing reads again. The profiler stops
+// before the tracer it wraps, and the scrape server stops just before the
+// meter provider so no scrape races the final collection.
+func shutdownSequence(profiler, traces, logs, metricsServer, meter func(context.Context) error) []func(context.Context) error {
+	seq := make([]func(context.Context) error, 0, 5)
+	if profiler != nil {
+		seq = append(seq, profiler)
+	}
+	return append(seq, traces, logs, metricsServer, meter)
+}
+
 // Init initializes and returns a configured *SDK for the calling service.
 //
 // The following options are required; Init returns an error if any are missing
@@ -440,18 +460,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		}
 	}
 
-	// Shutdowns run in registration order: drain scrape traffic first
-	// (metricsServer), then flush the meter provider, logs, optional profiling,
-	// then traces. Disabled pillars contribute a no-op that returns nil.
-	shutdowns := []func(context.Context) error{
-		metricsCloser,
-		mpShutdown,
-		lpShutdown,
-	}
-	if profilerCloser != nil {
-		shutdowns = append(shutdowns, profilerCloser)
-	}
-	shutdowns = append(shutdowns, tpShutdown)
+	shutdowns := shutdownSequence(profilerCloser, tpShutdown, lpShutdown, metricsCloser, mpShutdown)
 
 	return &SDK{
 		Logger:     logger,

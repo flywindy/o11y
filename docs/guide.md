@@ -406,9 +406,14 @@ items lost. Where the counter lands follows the metrics pillar: on the
 default Prometheus pull path it is scraped from `/metrics`; on the OTLP
 metrics push path (`WithMetricsOTLPEndpoint`) the metric exporter's own
 count travels through the pipeline that is failing and lands once an export
-succeeds again, which still answers "how many collections were lost" after
-the outage; with the metrics pillar off (`WithMetricsEnabled(false)`) the
-counter is not registered anywhere.
+succeeds again, which with the default cumulative temporality still answers
+"how many collections were lost" after the outage (under
+`OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta` a failed
+interval's delta is not re-sent, so only the last interval's failures
+arrive); with the metrics pillar off (`WithMetricsEnabled(false)`) the
+counter is not registered anywhere. At shutdown the tracer and logger drain
+before the meter provider, so a batch that fails in their final flush is
+still counted and, on the push path, shipped with the last collection.
 
 **Structured diagnostics.** The SDK builds replacements for the OTel
 default error handler and logger but does not install them — ADR 0003, the
