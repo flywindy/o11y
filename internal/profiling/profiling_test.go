@@ -198,6 +198,27 @@ func TestCloser_HonoursContextWhileStopBlocks(t *testing.T) {
 	assert.Equal(t, 1, stalled.stopCalls)
 }
 
+// TestCloser_ReportsAnAlreadyCancelledContext pins that a context that is
+// done before the closer runs is reported as ctx.Err() even when Stop
+// returns at once, and that Stop still ran and released the slot.
+func TestCloser_ReportsAnAlreadyCancelledContext(t *testing.T) {
+	fast := &fakeProfiler{}
+	withFakePyroscopeStart(t, func(pyroscope.Config) (profilerHandle, error) { return fast, nil })
+
+	closer, err := Start(context.Background(), Config{ServiceName: "profiled-svc", Endpoint: "http://alloy:4040"})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, closer(ctx), context.Canceled)
+	require.Eventually(t, func() bool {
+		profilerMu.Lock()
+		defer profilerMu.Unlock()
+		return !profilerStarted
+	}, time.Second, 5*time.Millisecond, "Stop still runs and releases the slot")
+	assert.Equal(t, 1, fast.stopCalls)
+}
+
 // TestCloser_ReleasesSlotEvenWhenStopFails pins that a failed Stop does not
 // strand the process-wide pprof slot. The closer used to clear profilerStarted
 // only on a nil error, and SDK.Shutdown runs each closer at most once, so a
