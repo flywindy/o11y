@@ -9,6 +9,7 @@ import (
 	"github.com/flywindy/o11y/internal/repeat"
 )
 
+// TestSuppressor_RepeatsAfterWindow checks a message passes once per window.
 func TestSuppressor_RepeatsAfterWindow(t *testing.T) {
 	s := repeat.NewSuppressor(time.Minute, 8)
 	now := time.Unix(1_700_000_000, 0)
@@ -19,6 +20,8 @@ func TestSuppressor_RepeatsAfterWindow(t *testing.T) {
 	assert.False(t, s.SuppressedAt("boom", now.Add(time.Minute)), "the message returns once the window elapsed")
 }
 
+// TestSuppressor_TracksEachMessageSeparately checks two alternating messages
+// are each suppressed on their own clock.
 func TestSuppressor_TracksEachMessageSeparately(t *testing.T) {
 	s := repeat.NewSuppressor(time.Minute, 8)
 	now := time.Unix(1_700_000_000, 0)
@@ -38,6 +41,8 @@ func TestSuppressor_TracksEachMessageSeparately(t *testing.T) {
 	assert.Equal(t, 4, passed)
 }
 
+// TestSuppressor_TableIsBounded checks the oldest entry is evicted once the
+// table is full, so memory stays bounded.
 func TestSuppressor_TableIsBounded(t *testing.T) {
 	const maxEntries = 4
 	s := repeat.NewSuppressor(time.Hour, maxEntries)
@@ -53,6 +58,7 @@ func TestSuppressor_TableIsBounded(t *testing.T) {
 	assert.True(t, s.SuppressedAt("d", later), "an entry inside the bound is still suppressed")
 }
 
+// TestSuppressor_MinimumOneEntry checks a zero bound still tracks one entry.
 func TestSuppressor_MinimumOneEntry(t *testing.T) {
 	s := repeat.NewSuppressor(time.Hour, 0)
 	now := time.Unix(1_700_000_000, 0)

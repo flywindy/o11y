@@ -11,6 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// TestOTelErrorHandler_LogsOncePerWindow checks identical errors collapse to
+// one WARN per window while distinct errors are each logged.
 func TestOTelErrorHandler_LogsOncePerWindow(t *testing.T) {
 	var buf bytes.Buffer
 	h := newOTelErrorHandler(slog.New(slog.NewTextHandler(&buf, nil)))
@@ -32,6 +34,8 @@ func TestOTelErrorHandler_LogsOncePerWindow(t *testing.T) {
 	assert.Contains(t, out, "repeat_suppressed_for=1m0s")
 }
 
+// TestOTelErrorHandler_RedactsEndpointCredentials checks an endpoint quoted
+// back in the error text loses its userinfo before it is logged.
 func TestOTelErrorHandler_RedactsEndpointCredentials(t *testing.T) {
 	var buf bytes.Buffer
 	h := newOTelErrorHandler(slog.New(slog.NewTextHandler(&buf, nil)), "http://svc:hunter2@collector:4318")
@@ -42,6 +46,7 @@ func TestOTelErrorHandler_RedactsEndpointCredentials(t *testing.T) {
 	assert.Contains(t, buf.String(), "collector:4318")
 }
 
+// TestOTelErrorHandler_NilIsIgnored checks nil errors and a nil logger are safe.
 func TestOTelErrorHandler_NilIsIgnored(t *testing.T) {
 	var buf bytes.Buffer
 	h := newOTelErrorHandler(slog.New(slog.NewTextHandler(&buf, nil)))

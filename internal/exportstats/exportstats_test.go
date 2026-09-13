@@ -25,6 +25,7 @@ type flakySpanExporter struct {
 	fail bool
 }
 
+// ExportSpans implements sdktrace.SpanExporter.
 func (f *flakySpanExporter) ExportSpans(ctx context.Context, spans []sdktrace.ReadOnlySpan) error {
 	if f.fail {
 		return errUpstream
@@ -32,11 +33,13 @@ func (f *flakySpanExporter) ExportSpans(ctx context.Context, spans []sdktrace.Re
 	return f.SpanExporter.ExportSpans(ctx, spans)
 }
 
+// flakyLogExporter fails every call while fail is set.
 type flakyLogExporter struct {
 	sdklog.Exporter
 	fail bool
 }
 
+// Export implements sdklog.Exporter.
 func (f *flakyLogExporter) Export(context.Context, []sdklog.Record) error {
 	if f.fail {
 		return errUpstream
@@ -44,11 +47,13 @@ func (f *flakyLogExporter) Export(context.Context, []sdklog.Record) error {
 	return nil
 }
 
+// flakyMetricExporter fails every call while fail is set.
 type flakyMetricExporter struct {
 	sdkmetric.Exporter
 	fail bool
 }
 
+// Export implements sdkmetric.Exporter.
 func (f *flakyMetricExporter) Export(context.Context, *metricdata.ResourceMetrics) error {
 	if f.fail {
 		return errUpstream
@@ -56,6 +61,8 @@ func (f *flakyMetricExporter) Export(context.Context, *metricdata.ResourceMetric
 	return nil
 }
 
+// TestWrappers_CountOnlyFailedBatchesAndPassErrorsThrough drives each wrapper
+// through a failing and a healthy call and checks only the failures count.
 func TestWrappers_CountOnlyFailedBatchesAndPassErrorsThrough(t *testing.T) {
 	var rec exportstats.Recorder
 	ctx := context.Background()
@@ -86,6 +93,8 @@ func TestWrappers_CountOnlyFailedBatchesAndPassErrorsThrough(t *testing.T) {
 	assert.Equal(t, int64(0), rec.Failures(exportstats.Signal("unknown")))
 }
 
+// TestRecorder_UnknownSignalIsIgnored pins that a stray signal is dropped
+// rather than counted under a wrong label.
 func TestRecorder_UnknownSignalIsIgnored(t *testing.T) {
 	var rec exportstats.Recorder
 	rec.Fail(exportstats.Signal("profiles"))

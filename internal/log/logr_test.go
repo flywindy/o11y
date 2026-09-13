@@ -15,11 +15,13 @@ import (
 	"github.com/flywindy/o11y/internal/repeat"
 )
 
+// newRecordingLogger returns a text-format slog logger writing into a buffer.
 func newRecordingLogger(level slog.Level) (*slog.Logger, *bytes.Buffer) {
 	var buf bytes.Buffer
 	return slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: level})), &buf
 }
 
+// TestLogr_MapsOTelVerbosityToSlogLevels pins the V-level to slog level mapping.
 func TestLogr_MapsOTelVerbosityToSlogLevels(t *testing.T) {
 	logger, buf := newRecordingLogger(slog.LevelDebug)
 	l := o11ylog.NewLogr(logger, nil)
@@ -42,6 +44,7 @@ func TestLogr_MapsOTelVerbosityToSlogLevels(t *testing.T) {
 	assert.Contains(t, lines[4], `component=exporter`)
 }
 
+// TestLogr_EnabledHonoursTheSlogLevel checks Enabled follows the slog gate.
 func TestLogr_EnabledHonoursTheSlogLevel(t *testing.T) {
 	logger, buf := newRecordingLogger(slog.LevelInfo)
 	l := o11ylog.NewLogr(logger, nil)
@@ -53,6 +56,8 @@ func TestLogr_EnabledHonoursTheSlogLevel(t *testing.T) {
 	assert.Empty(t, buf.String())
 }
 
+// TestLogr_SuppressesRepeatsByMessage checks repeats collapse on message text
+// alone, so a changing count does not defeat suppression.
 func TestLogr_SuppressesRepeatsByMessage(t *testing.T) {
 	logger, buf := newRecordingLogger(slog.LevelInfo)
 	l := o11ylog.NewLogr(logger, repeat.NewSuppressor(time.Minute, 8))
@@ -70,6 +75,8 @@ func TestLogr_SuppressesRepeatsByMessage(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(out, "another message"))
 }
 
+// TestLogr_ErrorsWithDifferentTextAreNotCollapsed checks the error text takes
+// part in the repeat key.
 func TestLogr_ErrorsWithDifferentTextAreNotCollapsed(t *testing.T) {
 	logger, buf := newRecordingLogger(slog.LevelInfo)
 	l := o11ylog.NewLogr(logger, repeat.NewSuppressor(time.Minute, 8))
@@ -81,6 +88,7 @@ func TestLogr_ErrorsWithDifferentTextAreNotCollapsed(t *testing.T) {
 	assert.Equal(t, 2, strings.Count(buf.String(), "export failed"))
 }
 
+// TestLogr_WithValuesAndWithName checks names and values reach the record.
 func TestLogr_WithValuesAndWithName(t *testing.T) {
 	logger, buf := newRecordingLogger(slog.LevelInfo)
 	l := o11ylog.NewLogr(logger, nil).WithName("otel").WithName("sdk").WithValues("pipeline", "traces")
@@ -93,6 +101,7 @@ func TestLogr_WithValuesAndWithName(t *testing.T) {
 	assert.Contains(t, out, "n=1")
 }
 
+// TestLogr_NilLoggerDiscards checks a nil logger is safe to use.
 func TestLogr_NilLoggerDiscards(t *testing.T) {
 	l := o11ylog.NewLogr(nil, nil)
 	assert.NotPanics(t, func() {
