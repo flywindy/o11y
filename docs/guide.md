@@ -427,7 +427,10 @@ interval's delta is not re-sent, so only the last interval's failures
 arrive); with the metrics pillar off (`WithMetricsEnabled(false)`) the
 counter is not registered anywhere. At shutdown the tracer and logger drain
 before the meter provider, so a batch that fails in their final flush is
-still counted and, on the push path, shipped with the last collection; the
+still counted and, on the push path, shipped with the last collection. On
+the pull path only a scrape that lands between that drain and the scrape
+server stopping sees it, so in practice a shutdown-time failure is not
+observable there; the `ErrorHandler()` record is the durable evidence. The
 `Shutdown` deadline is shared out evenly across the enabled components
 still to run, recomputed as each finishes, so a tracer drain that waits on a
 collector that is down cannot use up the whole deadline and leave the meter

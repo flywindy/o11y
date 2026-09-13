@@ -37,10 +37,32 @@ import (
 // logged or used as a repeat key, so embedded credentials never reach the
 // log.
 func NewLogr(logger *slog.Logger, suppress *repeat.Suppressor, endpoints ...string) logr.Logger {
+	return NewLogrRedacting(logger, suppress, Redaction{Endpoints: endpoints})
+}
+
+// Redaction names what the sink strips from every piece of text it emits:
+// Endpoints are the configured export endpoints, handled by redact.InText
+// (userinfo and the endpoints' own credentials); Secrets are opaque values
+// replaced wholesale by redact.Secrets, such as configured OTLP header
+// values, which carry no structure the text rules could recognise and which
+// the pinned exporters echo verbatim when OTEL_EXPORTER_OTLP_HEADERS fails
+// to parse.
+type Redaction struct {
+	Endpoints []string
+	Secrets   []string
+}
+
+// Text applies both rules to s, endpoints first.
+func (r Redaction) Text(s string) string {
+	return redact.Secrets(redact.InText(s, r.Endpoints...), r.Secrets...)
+}
+
+// NewLogrRedacting is NewLogr with the full Redaction, secrets included.
+func NewLogrRedacting(logger *slog.Logger, suppress *repeat.Suppressor, r Redaction) logr.Logger {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	return logr.New(&logrSink{logger: logger, suppress: suppress, now: time.Now, endpoints: endpoints})
+	return logr.New(&logrSink{logger: logger, suppress: suppress, now: time.Now, redaction: r})
 }
 
 // logrSink adapts logr's LogSink to slog.
@@ -48,7 +70,7 @@ type logrSink struct {
 	logger    *slog.Logger
 	suppress  *repeat.Suppressor
 	now       func() time.Time
-	endpoints []string
+	redaction Redaction
 	name      string
 	values    []any
 }
@@ -86,7 +108,7 @@ func (s *logrSink) Info(level int, msg string, keysAndValues ...any) {
 func (s *logrSink) Error(err error, msg string, keysAndValues ...any) {
 	key := msg
 	if err != nil {
-		text := redact.InText(err.Error(), s.endpoints...)
+		text := s.redaction.Text(err.Error())
 		key = msg + ": " + text
 		keysAndValues = append([]any{slog.String("error", text)}, keysAndValues...)
 	}
@@ -145,16 +167,30 @@ func (s *logrSink) resolve(v any) any {
 
 // resolveDepth is resolve with the recursion depth tracked; see
 // maxResolveDepth.
-func (s *logrSink) resolveDepth(v any, depth int) any {
+func (s *logrSink) resolveDepth(v any, depth int) (out any) {
 	if depth > maxResolveDepth {
 		return tooDeep
 	}
+	// A typed nil pointer satisfies the interfaces below, and Go does not
+	// require a String, LogValue or MarshalLog method to accept a nil
+	// receiver; the handler would render it as <nil> without calling any
+	// of them, so do the same. A method that panics anyway (on some other
+	// input) must not take the process down over a diagnostic: the value is
+	// omitted and named instead.
+	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Pointer && rv.IsNil() {
+		return v
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			out = fmt.Sprintf("[omitted: %T panicked while rendering]", v)
+		}
+	}()
 	if m, ok := v.(logr.Marshaler); ok {
 		return s.resolveDepth(m.MarshalLog(), depth+1)
 	}
 	switch t := v.(type) {
 	case error:
-		return redact.InText(t.Error(), s.endpoints...)
+		return s.redaction.Text(t.Error())
 	case slog.Attr:
 		return s.resolveAttr(t, depth)
 	case slog.Value:
@@ -173,12 +209,9 @@ func (s *logrSink) resolveDepth(v any, depth int) any {
 		// the userinfo, and walking it as a struct would reach the
 		// *url.Userinfo field, whose own String() is "user:password" with
 		// nothing for the text rules to anchor on.
-		return redact.URL(t.String())
+		return s.redaction.Text(redact.URL(t.String()))
 	case *url.URL:
-		if t == nil {
-			return v
-		}
-		return redact.URL(t.String())
+		return s.redaction.Text(redact.URL(t.String()))
 	case url.Userinfo, *url.Userinfo:
 		// Userinfo on its own is a credential and nothing else; replace it
 		// the way redact.URL replaces it inside a URL.
@@ -186,7 +219,7 @@ func (s *logrSink) resolveDepth(v any, depth int) any {
 	case fmt.Stringer:
 		// The handler would render it through String() anyway; redact
 		// that rendering rather than let it reach the log unseen.
-		return redact.InText(t.String(), s.endpoints...)
+		return s.redaction.Text(t.String())
 	}
 	return s.resolveReflected(reflect.ValueOf(v), v, depth)
 }
@@ -209,7 +242,7 @@ const redactedUserinfo = "redacted"
 func (s *logrSink) resolveReflected(rv reflect.Value, orig any, depth int) any {
 	switch rv.Kind() {
 	case reflect.String:
-		return redact.InText(rv.String(), s.endpoints...)
+		return s.redaction.Text(rv.String())
 	case reflect.Struct:
 		rt := rv.Type()
 		out := make(map[string]any, rt.NumField())
@@ -275,7 +308,7 @@ func (s *logrSink) resolveAttr(a slog.Attr, depth int) slog.Attr {
 	val := a.Value.Resolve()
 	switch val.Kind() {
 	case slog.KindString:
-		return slog.String(a.Key, redact.InText(val.String(), s.endpoints...))
+		return slog.String(a.Key, s.redaction.Text(val.String()))
 	case slog.KindGroup:
 		members := val.Group()
 		args := make([]any, 0, len(members))

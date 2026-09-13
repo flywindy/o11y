@@ -195,10 +195,13 @@ func shutdownBudget(ctx context.Context, remaining int) (context.Context, contex
 //
 // Traces and logs drain before metrics on purpose: their final flush is
 // where a batch queued until shutdown gets exported, and a batch that fails
-// then is counted on the export-failure Recorder. The meter provider's own
-// shutdown performs the last collection, so with metrics last that count is
-// still observed and, on the OTLP push path, shipped; with metrics first it
-// would be recorded into a counter nothing reads again. This holds for a
+// then is counted on the export-failure Recorder. On the OTLP push path the
+// meter provider's own shutdown performs the last collection, so with
+// metrics last that count is shipped; with metrics first it would be
+// recorded into a counter nothing reads again. On the Prometheus pull path
+// the otelprom reader's shutdown collects nothing, so only a scrape that
+// lands between the drain and the scrape server stopping sees the count;
+// the ErrorHandler record is the durable evidence there. This holds for a
 // drain that finishes within its closer's share of the deadline; past it
 // the two batchers differ. The trace BatchSpanProcessor drains on a
 // background context of its own (bounded by the export timeout, 30s by
@@ -516,6 +519,14 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 
 	shutdowns := shutdownSequence(profilerCloser, tpShutdown, lpShutdown, metricsCloser, mpShutdown)
 
+	// Both diagnostics write to stdout only: an OTel-internal error about the
+	// OTLP log pipeline must not be queued behind the batch that is failing.
+	// Both redact the configured endpoints and the header values the
+	// exporters may echo back (see diagnosticSecrets).
+	diagnosticEndpoints := []string{cfg.otlpEndpoint, cfg.metricsOTLPEndpoint, cfg.profilingEndpoint}
+	errorHandler := newOTelErrorHandler(slog.New(stdoutHandler), diagnosticEndpoints...)
+	errorHandler.secrets = diagnosticSecrets(cfg)
+
 	return &SDK{
 		Logger:     logger,
 		Propagator: prop,
@@ -530,10 +541,8 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		meterProviderInternal:  mpInternal,
 		meterProviderPublic:    meterProviderPublic,
 		shutdowns:              shutdowns,
-		// Both write to stdout only: an OTel-internal error about the OTLP
-		// log pipeline must not be queued behind the batch that is failing.
-		errorHandler: newOTelErrorHandler(slog.New(stdoutHandler), cfg.otlpEndpoint, cfg.metricsOTLPEndpoint, cfg.profilingEndpoint),
-		logr:         newLogr(slog.New(stdoutHandler), cfg.otlpEndpoint, cfg.metricsOTLPEndpoint, cfg.profilingEndpoint),
+		errorHandler:           errorHandler,
+		logr:                   newLogr(slog.New(stdoutHandler), diagnosticEndpoints, diagnosticSecrets(cfg)),
 	}, nil
 }
 

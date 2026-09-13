@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -46,6 +47,48 @@ func TestOTelErrorHandler_RedactsEndpointCredentials(t *testing.T) {
 
 	assert.NotContains(t, buf.String(), "hunter2")
 	assert.Contains(t, buf.String(), "collector:4318")
+}
+
+// TestOTelErrorHandler_RedactsSecrets checks a configured header value is
+// replaced in the error text even though nothing about it looks like an
+// endpoint.
+func TestOTelErrorHandler_RedactsSecrets(t *testing.T) {
+	var buf bytes.Buffer
+	h := newOTelErrorHandler(slog.New(slog.NewTextHandler(&buf, nil)))
+	h.secrets = []string{"BearerSecret%zz"}
+
+	h.Handle(errors.New(`escape header value: invalid URL escape "%zz" in BearerSecret%zz`))
+
+	assert.NotContains(t, buf.String(), "BearerSecret")
+	assert.Contains(t, buf.String(), "[redacted]")
+}
+
+// TestDiagnosticSecrets collects the configured and environment-provided
+// header values: whole variable, each pair, each value and its unescaped
+// form, deduplicated, with short values left out.
+func TestDiagnosticSecrets(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer%20abcdef, x-short=1, api-key=k-1234567890")
+	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "")
+	cfg := &Config{
+		otlpHeaders:          map[string]string{"x-api-key": "configured-secret", "x-tiny": "ab"},
+		profilingAuthHeaders: map[string]string{"authorization": "Basic cHJvZmlsZXM="},
+	}
+
+	got := diagnosticSecrets(cfg)
+
+	for _, want := range []string{
+		"configured-secret", "Basic cHJvZmlsZXM=",
+		"authorization=Bearer%20abcdef, x-short=1, api-key=k-1234567890",
+		"authorization=Bearer%20abcdef", "Bearer%20abcdef", "Bearer abcdef",
+		"api-key=k-1234567890", "k-1234567890",
+	} {
+		assert.Contains(t, got, want)
+	}
+	for _, unwanted := range []string{"ab", "1", ""} {
+		assert.NotContains(t, got, unwanted, "short values are not secrets")
+	}
+	assert.Contains(t, got, "x-short=1", "a whole pair is long enough to be listed even when its value is not; replacing that exact pair is harmless")
+	assert.Len(t, got, len(slices.Compact(slices.Sorted(slices.Values(got)))), "no duplicates")
 }
 
 // TestOTelErrorHandler_NilIsIgnored checks nil errors and a nil logger are safe.

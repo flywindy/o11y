@@ -36,7 +36,11 @@ adopters can plan their upgrades.
   and informational messages. The replacements write structured records to
   the SDK's stdout log (handled errors at ERROR, so an error-only log level
   keeps them), one per distinct error or message per minute, with
-  the suppression window under `repeat_suppressed_for`; `Logr()` maps OTel's
+  the suppression window under `repeat_suppressed_for`. Both redact the
+  configured endpoints and the header values of `WithOTLPHeaders`,
+  `WithProfilingAuthHeaders` and the `OTEL_EXPORTER_OTLP_*HEADERS`
+  variables, which the pinned exporters echo verbatim when a value fails to
+  parse; `Logr()` maps OTel's
   verbosity convention (V(1) warn, V(4) info, V(8) debug) onto the SDK's
   log level, so at the default INFO level the warnings the default logger
   dropped ("dropped log records") now appear. The SDK does not install them
@@ -71,8 +75,10 @@ adopters can plan their upgrades.
   components still to run, recomputing the share as each finishes, so a
   tracer or logger drain that waits on a collector that is down cannot
   consume the whole deadline and leave the meter provider's final
-  collection (which is what publishes the shutdown-time failures) with a
-  context that is already done. Disabled pillars and the OTLP metrics path
+  collection (which is what ships the shutdown-time failures on the OTLP
+  push path; on the Prometheus pull path only a scrape landing before the
+  scrape server stops sees them, so the ErrorHandler record is the durable
+  evidence there) with a context that is already done. Disabled pillars and the OTLP metrics path
   (whose exporter the MeterProvider's own shutdown covers) no longer
   contribute a no-op closer, so they neither run nor take a share. A
   context without a deadline is passed through unchanged. A trace drain

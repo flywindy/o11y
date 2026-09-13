@@ -257,6 +257,57 @@ func TestLogr_RedactsStructsStringersAndLogValuers(t *testing.T) {
 	assert.Contains(t, out, "when=2026-09-13T10:00:00.000Z", "a Time keeps its slog rendering")
 }
 
+// nilStringer's String dereferences its receiver, so a typed nil must be
+// caught before it is called.
+type nilStringer struct{ s string }
+
+// String implements fmt.Stringer.
+func (n *nilStringer) String() string { return n.s }
+
+// panickingStringer panics on any receiver.
+type panickingStringer struct{}
+
+// String implements fmt.Stringer.
+func (panickingStringer) String() string { panic("no") }
+
+// TestLogr_SurvivesTypedNilAndPanickingValues checks a typed nil pointer
+// with a receiver-dereferencing String is rendered as <nil> without calling
+// it, and a String that panics is replaced by a placeholder rather than
+// taking the process down over a diagnostic.
+func TestLogr_SurvivesTypedNilAndPanickingValues(t *testing.T) {
+	logger, buf := newRecordingLogger(slog.LevelInfo)
+	l := o11ylog.NewLogr(logger, nil)
+
+	assert.NotPanics(t, func() {
+		l.Info("nils", "typed", (*nilStringer)(nil), "boom", panickingStringer{}, "ok", &nilStringer{s: "fine"})
+	})
+
+	out := buf.String()
+	assert.Contains(t, out, "typed=<nil>")
+	assert.Contains(t, out, `boom="[omitted: log_test.panickingStringer panicked while rendering]"`)
+	assert.Contains(t, out, "ok=fine")
+}
+
+// TestLogr_RedactsConfiguredSecrets covers the shape the pinned exporters
+// produce when OTEL_EXPORTER_OTLP_HEADERS fails to parse: the raw header
+// value goes out as a "value" key/value, and a bearer token has no "@" or
+// endpoint for the text rules to recognise, so it must be listed as a
+// secret and replaced wherever it appears, in strings, errors and nested
+// values alike.
+func TestLogr_RedactsConfiguredSecrets(t *testing.T) {
+	logger, buf := newRecordingLogger(slog.LevelInfo)
+	const token = "BearerSecret%zz" // nosemgrep: hardcoded-credential-literal -- test fixture, the value the redaction must remove
+	l := o11ylog.NewLogrRedacting(logger, nil, o11ylog.Redaction{Secrets: []string{token, "k-1234567890"}})
+
+	l.Error(errors.New(`invalid URL escape "%zz" in `+token), "escape header value",
+		"value", token, "nested", map[string]string{"authorization": "Bearer " + token}, "key", "k-1234567890")
+
+	out := buf.String()
+	assert.NotContains(t, out, "BearerSecret")
+	assert.NotContains(t, out, "k-1234567890")
+	assert.Equal(t, 4, strings.Count(out, "[redacted]"))
+}
+
 // endpointStringerless has no exported field and no String method; the
 // walk cannot inspect it, so it must be named and omitted rather than
 // printed with the credential in its unexported field.
