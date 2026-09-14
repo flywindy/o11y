@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/flywindy/o11y/internal/exportstats"
 	"github.com/flywindy/o11y/internal/metricscap"
 	"github.com/flywindy/o11y/internal/views"
 	"github.com/prometheus/client_golang/prometheus"
@@ -26,6 +27,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	otlpmetrichttp "go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
+	otelmetric "go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
@@ -85,8 +87,9 @@ type Config struct {
 	// CardinalityLimit overrides the OTel SDK's per-stream cardinality limit,
 	// the in-process guard that folds attribute sets beyond the limit into a
 	// single overflow series (otel_metric_overflow="true" on Prometheus).
-	// Only a positive value overrides; zero derives the limit from the
-	// export caps, see cardinalityLimitBudget.
+	// Only a positive value overrides, and never below MinCardinalityLimit;
+	// zero derives the limit from the export caps, see
+	// cardinalityLimitBudget.
 	CardinalityLimit int
 
 	// ExtraHTTPServerAttrKeys augments the SDK-managed attribute allow-list
@@ -107,11 +110,21 @@ type Config struct {
 	// Logger receives the Prometheus handler's gather errors (rate-limited).
 	// Optional; nil discards them.
 	Logger *slog.Logger
+
+	// ExportFailures, when set, is registered on the provider as the
+	// o11y.export.failures observable counter and counts every Export call
+	// the OTLP metrics exporter returned an error for (a rejected or
+	// undeliverable collection, or a partial-success response). The trace
+	// and log exporters share the same Recorder, so one instrument reports
+	// all three signals.
+	ExportFailures *exportstats.Recorder
 }
 
-// Closer is a function that shuts down a component. For the Prometheus path it
-// shuts down the HTTP server; for the OTLP path it shuts down the exporter.
-// It is always safe to call even if the component was never started.
+// Closer is a function that shuts down a component. For the Prometheus path
+// it shuts down the scrape server and is always safe to call. The OTLP path
+// has no component of its own to close (the MeterProvider's Shutdown drains
+// the PeriodicReader, which shuts the exporter down), so InitMeter returns a
+// nil Closer there; callers skip a nil Closer rather than call it.
 type Closer func(context.Context) error
 
 // The SDK cardinality limit is an in-process memory guard applied to every
@@ -127,6 +140,13 @@ const (
 	// SDK's own default. It is what an application instrument gets when the
 	// export caps are left at their defaults or lowered.
 	DefaultCardinalityLimit = 2000
+
+	// MinCardinalityLimit is the lowest per-stream limit an override can
+	// set. The SDK's own o11y.export.failures counter carries one series per
+	// OTLP exporter, three at most, and the OTel SDK reserves one slot of
+	// every stream for the overflow series, so a limit below four would fold
+	// the SDK's fixed series into overflow and lose the per-exporter counts.
+	MinCardinalityLimit = 4
 
 	// sdkCardinalityCapMultiplier sizes the derived limit against the export
 	// caps: a route or collection still needs a few attribute-set variants
@@ -273,13 +293,16 @@ func prometheusCapRules(cfg Config) []metricscap.PrometheusRule {
 }
 
 // InitMeter initializes an OTel MeterProvider and returns it together with a
-// Closer that must be called during SDK shutdown.
+// Closer for the resources the MeterProvider's own Shutdown does not cover.
+// The Closer is nil when there are none; a caller must nil-check it before
+// calling it, and must call MeterProvider.Shutdown on either path.
 //
 // Exporter strategy:
 //   - cfg.MetricsOTLPEndpoint == "" → Prometheus pull: private registry +
-//     HTTP server on cfg.MetricsAddr; Closer shuts down the HTTP server.
+//     HTTP server on cfg.MetricsAddr; the Closer shuts down the HTTP server.
 //   - cfg.MetricsOTLPEndpoint != "" → OTLP push: otlpmetrichttp exporter;
-//     Closer shuts down the exporter. MetricsAddr is ignored.
+//     the Closer is nil, since MeterProvider.Shutdown drains the
+//     PeriodicReader and shuts the exporter down. MetricsAddr is ignored.
 //
 // Bind errors (Prometheus path) are surfaced synchronously.
 func InitMeter(ctx context.Context, cfg Config) (*sdkmetric.MeterProvider, Closer, error) {
@@ -291,10 +314,26 @@ func InitMeter(ctx context.Context, cfg Config) (*sdkmetric.MeterProvider, Close
 	views := defaultViews(cfg)
 	views = append(views, cfg.ExtraViews...)
 
+	var provider *sdkmetric.MeterProvider
+	var closer Closer
 	if cfg.MetricsOTLPEndpoint != "" {
-		return initOTLP(ctx, cfg, res, views)
+		provider, closer, err = initOTLP(ctx, cfg, res, views)
+	} else {
+		provider, closer, err = initPrometheus(ctx, cfg, res, views)
 	}
-	return initPrometheus(ctx, cfg, res, views)
+	if err != nil {
+		return nil, nil, err
+	}
+	if cfg.ExportFailures != nil {
+		if err := cfg.ExportFailures.Register(provider.Meter(exportstats.ScopeName, otelmetric.WithSchemaURL(semconv.SchemaURL))); err != nil {
+			if closer != nil {
+				_ = closer(ctx)
+			}
+			_ = provider.Shutdown(ctx)
+			return nil, nil, fmt.Errorf("metrics: register export failure counter: %w", err)
+		}
+	}
+	return provider, closer, nil
 }
 
 // defaultViews returns the views the SDK installs unless
@@ -454,8 +493,13 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []s
 		return nil, nil, fmt.Errorf("metrics: create OTLP exporter: %w", err)
 	}
 	cappedExporter := sdkmetric.Exporter(exporter)
+	if cfg.ExportFailures != nil {
+		// Innermost wrapper: it counts the upload itself failing, before any
+		// rewriting layer sits between the reader and the wire.
+		cappedExporter = exportstats.MetricExporter(exporter, cfg.ExportFailures)
+	}
 	if rules := otlpCapRules(cfg); len(rules) > 0 {
-		cappedExporter = metricscap.NewExporter(exporter, rules...)
+		cappedExporter = metricscap.NewExporter(cappedExporter, rules...)
 	}
 	// Ship res, not the provider's Resource: the provider merges the raw
 	// environment back in, which would resurrect an alias
@@ -493,9 +537,11 @@ func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []s
 	initSucceeded = true
 	// provider.Shutdown drains the PeriodicReader which in turn calls
 	// exporter.Shutdown. Returning exporter.Shutdown here would cause a
-	// second shutdown when o11y.go also calls mp.Shutdown, so we return a
-	// no-op: the MeterProvider shutdown path handles everything.
-	return provider, func(_ context.Context) error { return nil }, nil
+	// second shutdown when o11y.go also calls mp.Shutdown, and a no-op
+	// would count as a component when SDK.Shutdown shares its deadline
+	// out, so there is no Closer at all: the MeterProvider shutdown path
+	// handles everything.
+	return provider, nil, nil
 }
 
 // meterProviderOptions assembles the sdkmetric options shared by both export
@@ -511,7 +557,9 @@ func meterProviderOptions(reader sdkmetric.Reader, res *resource.Resource, views
 }
 
 // cardinalityLimitBudget returns the per-stream cardinality limit the
-// MeterProvider is built with. An explicit override wins; otherwise the limit
+// MeterProvider is built with. An explicit override wins, floored at
+// MinCardinalityLimit so the SDK's own fixed-cardinality streams stay out
+// of overflow; otherwise the limit
 // is the largest of DefaultCardinalityLimit and sdkCardinalityCapMultiplier
 // times each export cap, so lowering a cap never pushes the SDK's own streams
 // into overflow while their exported key is still within its cap, and
@@ -520,7 +568,7 @@ func meterProviderOptions(reader sdkmetric.Reader, res *resource.Resource, views
 // value in the OTel SDK, so every instrument gets the same limit.
 func cardinalityLimitBudget(maxUniqueRoutes, maxUniqueCollections, override int) int {
 	if override > 0 {
-		return override
+		return max(override, MinCardinalityLimit)
 	}
 	routes := scaleBudget(maxUniqueRoutes, sdkCardinalityCapMultiplier)
 	collections := scaleBudget(maxUniqueCollections, sdkCardinalityCapMultiplier)

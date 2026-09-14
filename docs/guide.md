@@ -25,6 +25,7 @@ For project setup, the `Init` options reference, and feature toggles, see the
     - [Logging Guidelines](#logging-guidelines)
   - [Metrics](#metrics)
   - [Profiling](#profiling)
+  - [Export failures & OTel diagnostics](#export-failures--otel-diagnostics)
 - [Integrations](#integrations)
   - [HTTP](#http)
     - [net/http server & client](#nethttp-server--client)
@@ -377,6 +378,205 @@ Important caveats:
   goroutine is captured in the service-level profile, but it is not linked to
   the span unless the application propagates pprof labels explicitly.
 
+## Export failures & OTel diagnostics
+
+The OTel SDK's batchers — the `BatchSpanProcessor`, the log `BatchProcessor`
+and the metric `PeriodicReader` — hand every scheduled export call that
+returned an error to `otel.Handle` and move on; a batch the collector
+rejected or could not be reached for is dropped. (At shutdown only the trace
+batcher still goes through `otel.Handle`; the log batcher and the metric
+reader return their final export's error from `Shutdown` instead, see the
+shutdown notes below.) With the collector unreachable each queue
+drains into nothing every few seconds, the default handler prints one
+plain-text line to stderr per attempt, and afterward nobody can say how much
+was lost. Two things make that visible.
+
+**`o11y_export_failures_total{otel_component_type}`** counts every export
+call the OTLP exporters returned an error for, one series per exporter the
+SDK built: the label is semconv's `otel.component.type`, with the values
+`otlp_http_span_exporter`, `otlp_http_log_exporter` and
+`otlp_http_metric_exporter`. It is an SDK-owned instrument among the SDK's
+own metrics, present after upgrading with no code change; a service with a
+healthy collector shows a zero series per exporter. A series exists only for
+an exporter that exists: the metric exporter's appears with
+`WithMetricsOTLPEndpoint` and not on the Prometheus pull path, and a
+disabled pillar has none, so an absent series means "no such exporter", not
+"no failures". Alert on it. On the Prometheus pull path the resource is
+promoted onto every series as constant labels, so `service_name` is there
+to group by:
+
+```promql
+sum by (service_name, otel_component_type) (rate(o11y_export_failures_total[5m])) > 0
+```
+
+On the OTLP push path through the repository's Collector the
+`prometheusremotewrite` exporter keeps the resource in `target_info` and
+derives the `job` label (`<service.namespace>/<service.name>`) instead, and
+no `service_name` label exists on the series; group by `job` there, or join
+on `target_info` for the other resource attributes:
+
+```promql
+sum by (job, otel_component_type) (rate(o11y_export_failures_total[5m])) > 0
+```
+
+The unit is an export call, not a span: the span batcher sends up to 512
+spans per batch and the log batcher up to 512 records
+(`OTEL_BSP_MAX_EXPORT_BATCH_SIZE` / `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE`). Most
+counted calls are a batch the collector rejected or could not be reached
+for, whose items are dropped; the pinned exporters also return an error for
+a *partial-success* response, where the collector accepted the request but
+rejected some items, or accepted everything and attached a warning message.
+Read it as a cumulative count of export calls that failed, not as a measure
+of lost telemetry: it can exceed the number of dropped batches (a
+warning-only partial success drops nothing) and by itself says nothing about
+how many items were lost. The rejected-item count and the collector's
+message are in the error text `ErrorHandler()` logs, and that record is
+where loss is established. Where the counter lands follows the metrics
+pillar: on the
+default Prometheus pull path it is scraped from `/metrics`; on the OTLP
+metrics push path (`WithMetricsOTLPEndpoint`) the metric exporter's own
+count travels through the pipeline that is failing and lands once an export
+succeeds again, which with the default cumulative temporality still carries
+the full count of erroring metric export calls made during the outage (under
+`OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta` a failed
+interval's delta is not re-sent, so only the last interval's failures
+arrive); with the metrics pillar off (`WithMetricsEnabled(false)`) the
+counter is not registered anywhere. At shutdown the tracer and logger drain
+before the meter provider, so a batch that fails in their final flush is
+still counted and, on the push path, shipped with the last collection. A
+failure of that last collection's own export is the one increment the push
+path cannot ship: the snapshot was taken before the call failed and the
+meter provider collects nothing afterwards. On the pull path only a scrape
+that lands between that drain and the scrape server stopping sees a
+shutdown-time failure, so in practice it is not observable there. The
+durable evidence for a shutdown-time failure differs by signal. The trace
+batcher hands the error of its final drain to `otel.Handle`, so it is the
+`ErrorHandler()` record once the application installed it with
+`otel.SetErrorHandler` (the wiring block below; without it OTel's default
+handler prints the error to stderr). The log batcher and the metric reader
+return the error of their final export from `Shutdown` instead of handing it
+to `otel.Handle`, so it surfaces as `SDK.Shutdown`'s returned error and the
+`SDK component shutdown failed` record on the SDK's stdout log, with or
+without the handler installed. The
+`Shutdown` deadline is shared out evenly across the enabled components
+still to run, recomputed as each finishes, so a tracer drain that waits on a
+collector that is down cannot use up the whole deadline and leave the meter
+provider's final collection with a context that is already done. That holds
+for a drain that finishes within its share; past it the two batchers
+differ. The trace batcher drains on a background context of its own
+(bounded by `OTEL_BSP_EXPORT_TIMEOUT`, 30s by default) that cannot be
+cancelled, so a trace drain that outlives its share is reported as a
+`Shutdown` error, keeps running on its own, and a failure it records after
+the meter provider's final collection is not reported; the batch is lost
+when the process exits either way. The log batcher flushes under the
+closer's context: when its share runs out it stops, shuts the exporter down
+with that expired context and drops the records still queued without an
+export call, so nothing is counted for them. Size the deadline for the
+whole sequence, not for one flush.
+
+**Structured diagnostics.** The SDK builds replacements for the OTel
+default error handler and logger but does not install them — ADR 0003, the
+SDK never touches OTel globals. Out of the box the OTel default handler
+prints every handled error as plain text to stderr, and the default logger
+prints only its error-level messages: its warnings and informational
+messages ("dropped log records", "Tracer created") are dropped, because the
+default `stdr` logger sits at verbosity 0 and OTel logs them at V(1) and
+V(4). The application installs the replacements next to the providers it
+already wires:
+
+```go
+otel.SetTracerProvider(sdk.TracerProvider())
+otel.SetMeterProvider(sdk.MeterProvider())
+otel.SetTextMapPropagator(sdk.Propagator)
+otel.SetErrorHandler(sdk.ErrorHandler()) // OTel-internal errors → structured ERROR records
+otel.SetLogger(sdk.Logr())               // OTel-internal messages → structured records
+```
+
+One message cannot wait for that wiring: the OTLP exporters parse their
+`OTEL_EXPORTER_OTLP_*` variables while `Init` builds them and report a
+value they cannot parse with its raw text (the trace and metric exporters
+through OTel's global logger, the log exporter through `otel.Handle`), so
+`Init` rejects a malformed variable before any exporter exists: an
+`ENDPOINT` that is not a URL (a credential in its userinfo is what makes
+the echo dangerous), a `TIMEOUT` that is not an integer count of
+milliseconds, the log exporter's `COMPRESSION` when it is neither `gzip`
+nor `none` (the trace and metric exporters map any other value to no
+compression without a message), the metric exporter's
+`METRICS_TEMPORALITY_PREFERENCE` and `METRICS_DEFAULT_HISTOGRAM_AGGREGATION`
+when they are none of the values it knows (it warns with the value
+through OTel's global logger, which a logger installed before `Init`
+would print), a
+`HEADERS` pair without `=`, with a name that is not an HTTP token or a
+value that is not valid percent-encoding, a `CERTIFICATE` that does not
+name a readable file holding a PEM certificate, or a `CLIENT_CERTIFICATE`
+and `CLIENT_KEY` (read only when both are set) that do not name readable
+files forming a key pair; the exporters echo the path of a file they
+cannot read. Only the variables the enabled exporters actually read are
+checked: the trace and metric exporters apply the environment before the
+explicit options, so their `ENDPOINT`, `TIMEOUT`, `HEADERS` and
+certificate variables, and the metric exporter's two preference
+variables, are always read; the log exporter reads a variable
+only where `Init` passes no explicit option, so its endpoint is never read,
+its headers only without `WithOTLPHeaders`, and its timeout, compression
+and certificate files always, taking the `LOGS_` variable first and the
+generic one only when the `LOGS_` variable is unset (for the client
+certificate, when the `LOGS_` pair is incomplete). Each value is checked
+as the exporter reading it will see it: the trace and metric exporters
+trim surrounding whitespace, the log exporter parses the value verbatim.
+The SDK's own variables get the same treatment where a provider `Init`
+builds reads them, since the SDK echoes a value it cannot parse the same
+way: with traces, the `OTEL_BSP_*` batcher settings, the span limits
+(`OTEL_SPAN_*`, `OTEL_EVENT_ATTRIBUTE_COUNT_LIMIT`,
+`OTEL_LINK_ATTRIBUTE_COUNT_LIMIT`, and the generic `OTEL_ATTRIBUTE_*`
+variables only where the span-specific one is unset) as integers, and
+`OTEL_TRACES_SAMPLER` (one of the SDK's sampler names, parsed whether or
+not a sampler is configured) with `OTEL_TRACES_SAMPLER_ARG` as a number
+for a ratio sampler; with logs, the `OTEL_BLRP_*` batcher settings and
+the `OTEL_LOGRECORD_*` limits as integers; with metrics on either path,
+`OTEL_GO_X_CARDINALITY_LIMIT` as an integer (the MeterProvider parses it
+before `WithCardinalityLimit` applies); on the OTLP metrics push path,
+`OTEL_METRIC_EXPORT_INTERVAL` and `OTEL_METRIC_EXPORT_TIMEOUT` as
+positive integers.
+The endpoints given to `WithOTLPEndpoint` and
+`WithMetricsOTLPEndpoint` get the same check, since the trace and metric
+exporters echo a URL they cannot parse the same way and then fall back to
+their default endpoint. The error names the variable or option and the
+pair's position, not the text, and not the parser's message either, which
+quotes the offending part of a URL. A header name given to
+`WithOTLPHeaders` or `WithProfilingAuthHeaders` must be an HTTP token for
+a related reason: `net/http` refuses every request carrying any other
+name and quotes it, escaped, in the export error, where a control
+character no longer matches the redaction list, so `Init` rejects the
+option without repeating the name; the check applies only when a client
+that would send the headers starts (an OTLP exporter for the former, the
+profiler for the latter), so dormant configuration behind a disabled
+pillar is left alone.
+
+`ErrorHandler()` writes each distinct OTel-internal error once per minute as
+an ERROR record (so it survives an error-only log level) with the error text
+under `error` and the suppression window under `repeat_suppressed_for`; a
+collector outage becomes one line per minute per exporter instead of one per
+attempt. `Logr()` does the same for the
+messages the SDK logs on its own ("dropped log records", an invalid
+instrument name), mapping OTel's verbosity convention onto the SDK's log
+level: V(1) is WARN, V(4) is INFO, V(8) is DEBUG. Note that this is more
+than a format change: at the SDK's default INFO level the WARN and INFO
+diagnostics the OTel default logger was dropping now appear, one per
+distinct message per minute. Both write to the stdout
+JSON log only, not through the OTLP log pipeline: an error about the log
+pipeline must not queue another record behind the batch that is failing.
+
+```json
+{"time":"2026-09-13T06:07:40Z","level":"ERROR","msg":"otel internal error",
+ "service.name":"room-service","environment":"production",
+ "error":"traces export: Post \"http://otel-collector:4318/v1/traces\": dial tcp 10.0.0.5:4318: connect: connection refused",
+ "repeat_suppressed_for":"1m0s"}
+```
+
+An endpoint that carries credentials in its URL is redacted in the error
+text before it is logged, the same way the profiling and scrape diagnostics
+redact theirs.
+
 ---
 
 # Integrations
@@ -435,7 +635,9 @@ series, which bounds memory and is worth an alert:
 sum by (service_name, __name__) ({otel_metric_overflow="true"}) > 0
 ```
 
-`WithCardinalityLimit(n)` replaces the derived value when `n > 0`; zero or a
+`WithCardinalityLimit(n)` replaces the derived value when `n > 0` (floored
+at 4, so the SDK's own three-series `o11y_export_failures_total` stream and
+its overflow slot always fit); zero or a
 negative value returns to the derived sizing. Use a positive limit for a
 service whose `http.server.request.duration` legitimately needs more method ×
 route × status combinations, and keep the decision in code where a reviewer

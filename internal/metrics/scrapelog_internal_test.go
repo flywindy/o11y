@@ -114,9 +114,9 @@ func TestScrapeErrorLogger_TableIsBounded(t *testing.T) {
 		l.Println("error gathering metrics:", "family", i)
 		now = now.Add(time.Second)
 	}
-	assert.LessOrEqual(t, len(l.lastSeen), maxTrackedScrapeErrors)
-
-	l.Println("error gathering metrics:", "family", 0) // evicted, so logged again
+	// The suppression table is bounded (see repeat.Suppressor); "family 0"
+	// was the oldest entry, so it was evicted and is logged again.
+	l.Println("error gathering metrics:", "family", 0)
 	assert.Equal(t, 2, strings.Count(logs.String(), `metrics: family 0"`))
 }
 

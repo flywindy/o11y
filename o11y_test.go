@@ -2,9 +2,14 @@ package o11y_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -13,9 +18,11 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/flywindy/o11y"
+	"github.com/flywindy/o11y/internal/metrics"
 	"github.com/flywindy/o11y/internal/testutil"
 	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 )
 
 // commonOpts returns the full set of required options for Init to succeed in
@@ -75,6 +82,56 @@ func TestInit_UnknownEnvironment(t *testing.T) {
 	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unknown deployment environment")
+}
+
+// TestInit_RejectsMalformedOTLPExporterEnv pins that a malformed
+// OTEL_EXPORTER_OTLP_* value fails Init before any exporter is built, with
+// an error that names the variable but not its text: the exporters would
+// otherwise print the raw value through OTel's global logger while Init
+// builds them, before sdk.Logr() can be installed.
+func TestInit_RejectsMalformedOTLPExporterEnv(t *testing.T) {
+	srv := testutil.FakeOTLPServer(t)
+
+	t.Run("headers", func(t *testing.T) {
+		t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-ok=1, authorization=BearerSecret%zz")
+		_, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_HEADERS cannot be used (the value of pair 2")
+		assert.NotContains(t, err.Error(), "BearerSecret")
+	})
+
+	t.Run("endpoint", func(t *testing.T) {
+		t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://user:secret%zz@collector:4318")
+		_, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_ENDPOINT cannot be used (it is not a valid URL")
+		assert.NotContains(t, err.Error(), "secret%zz")
+	})
+
+	t.Run("certificate", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "ca.pem")
+		t.Setenv("OTEL_EXPORTER_OTLP_CERTIFICATE", missing)
+		_, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_CERTIFICATE cannot be used (the file it names cannot be read")
+		assert.NotContains(t, err.Error(), missing)
+	})
+
+	t.Run("configured header name", func(t *testing.T) {
+		opts := append(commonOpts(srv.URL), o11y.WithOTLPHeaders(map[string]string{"Bearer\nSecret": "v"}))
+		_, err := o11y.Init(context.Background(), opts...)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "WithOTLPHeaders is not a valid HTTP header name")
+		assert.NotContains(t, err.Error(), "Secret")
+	})
+
+	t.Run("configured endpoint", func(t *testing.T) {
+		opts := append(commonOpts(srv.URL), o11y.WithOTLPEndpoint("http://user:secret%zz@collector:4318"))
+		_, err := o11y.Init(context.Background(), opts...)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "WithOTLPEndpoint is not a valid URL")
+		assert.NotContains(t, err.Error(), "secret%zz")
+	})
 }
 
 // TestInit_EnvironmentAliases verifies that common shorthand values are
@@ -475,4 +532,99 @@ func TestInit_TargetInfoCarriesNarrowProcessAndSDKAttributes(t *testing.T) {
 	} {
 		assert.NotContains(t, line, unwanted)
 	}
+}
+
+// TestInit_ExportFailuresCounted points the OTLP exporters at a server that
+// rejects everything and checks the failures show up on the Prometheus
+// endpoint as o11y_export_failures_total, one series per exporter. The
+// batchers are told to flush quickly so the test does not wait for their
+// default schedules.
+func TestInit_ExportFailuresCounted(t *testing.T) {
+	t.Setenv("OTEL_BSP_SCHEDULE_DELAY", "50")
+	t.Setenv("OTEL_BLRP_SCHEDULE_DELAY", "50")
+	// 400 is not retried by the OTLP/HTTP exporters, so each batch fails once
+	// and immediately.
+	rejecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	t.Cleanup(rejecting.Close)
+	addr := testutil.FreeAddr(t)
+
+	sdk, err := o11y.Init(t.Context(), append(commonOpts(rejecting.URL), o11y.WithMetricsAddr(addr))...)
+	require.NoError(t, err)
+	defer testutil.MustShutdown(t.Context(), t, sdk)
+
+	_, span := sdk.Tracer("export-test").Start(t.Context(), "probe")
+	span.End()
+	sdk.Logger.InfoContext(t.Context(), "probe record")
+
+	var body string
+	require.Eventually(t, func() bool {
+		b, err := testutil.TryScrapeMetrics(t.Context(), addr)
+		if err != nil {
+			return false
+		}
+		body = b
+		return seriesValue(b, "o11y_export_failures_total", componentLabel(semconv.OTelComponentTypeOtlpHTTPSpanExporter)) >= 1 &&
+			seriesValue(b, "o11y_export_failures_total", componentLabel(semconv.OTelComponentTypeOtlpHTTPLogExporter)) >= 1
+	}, 5*time.Second, 50*time.Millisecond, "export failures should be counted per exporter; last scrape:\n%s", body)
+
+	// Only exporters that exist are reported: this is the Prometheus pull
+	// path, so there is no OTLP metric exporter and no series for it, rather
+	// than a zero advertising a component that was never built. The SDK's
+	// own scope names the instrument.
+	assert.Equal(t, float64(-1), seriesValue(body, "o11y_export_failures_total", componentLabel(semconv.OTelComponentTypeOtlpHTTPMetricExporter)),
+		"no OTLP metric exporter on the pull path, so no series for it")
+	assert.GreaterOrEqual(t, seriesValue(body, "o11y_export_failures_total", `otel_scope_name="github.com/flywindy/o11y"`), float64(0),
+		"the counter is registered under the SDK's own instrumentation scope")
+}
+
+// componentLabel renders a semconv otel.component.type attribute the way
+// otelprom labels a series with it, so the assertion follows the pinned
+// constant instead of restating the key.
+func componentLabel(kv attribute.KeyValue) string {
+	return fmt.Sprintf(`%s=%q`, metrics.NormalizePrometheusLabelName(string(kv.Key)), kv.Value.AsString())
+}
+
+// seriesValue returns the value of the first series of family whose label set
+// contains match, or -1 when there is none.
+func seriesValue(body, family, match string) float64 {
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, family+"{") || !strings.Contains(line, match) {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		v, err := strconv.ParseFloat(fields[1], 64)
+		if err != nil {
+			continue
+		}
+		return v
+	}
+	return -1
+}
+
+// TestInit_DiagnosticsAccessors checks the ErrorHandler and Logr accessors
+// are usable straight after Init: non-nil, safe on nil errors, and
+// installable through the otel globals by a caller (the SDK itself never
+// installs them).
+func TestInit_DiagnosticsAccessors(t *testing.T) {
+	srv := testutil.FakeOTLPServer(t)
+	sdk, err := o11y.Init(t.Context(), commonOpts(srv.URL)...)
+	require.NoError(t, err)
+	defer testutil.MustShutdown(t.Context(), t, sdk)
+
+	h := sdk.ErrorHandler()
+	require.NotNil(t, h)
+	assert.NotPanics(t, func() {
+		h.Handle(nil)
+		h.Handle(errors.New("traces export: probe"))
+	})
+
+	l := sdk.Logr()
+	assert.True(t, l.V(1).Enabled(), "OTel warnings pass the default INFO level")
+	assert.False(t, l.V(8).Enabled(), "OTel debug messages are gated by the SDK log level")
+	assert.NotPanics(t, func() { l.V(1).Info("dropped log records", "dropped", 3) })
 }

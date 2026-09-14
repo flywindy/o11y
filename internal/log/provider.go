@@ -2,6 +2,7 @@ package log
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -9,6 +10,8 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/resource"
+
+	"github.com/flywindy/o11y/internal/exportstats"
 )
 
 // InitLogger initialises an OTLP/HTTP LoggerProvider backed by a BatchProcessor.
@@ -18,14 +21,20 @@ import (
 // The returned provider must be shut down via Shutdown when no longer needed.
 //
 // headers is optional; when non-empty, every OTLP/HTTP request emitted by
-// the exporter carries the given headers (used for authentication).
-func InitLogger(ctx context.Context, endpoint string, headers map[string]string, res *resource.Resource) (*sdklog.LoggerProvider, error) {
+// the exporter carries the given headers (used for authentication). failures
+// counts every Export call the exporter returned an error for; it may be nil
+// when nothing reports the count.
+func InitLogger(ctx context.Context, endpoint string, headers map[string]string, res *resource.Resource, failures *exportstats.Recorder) (*sdklog.LoggerProvider, error) {
 	// otlploghttp.WithEndpointURL does not append a default path when none is
 	// provided (unlike otlptracehttp). Explicitly set /v1/logs so that a bare
 	// endpoint like "http://localhost:4318" routes correctly to the collector.
 	logEndpoint, err := logEndpointURL(endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("invalid OTLP endpoint %q: %w", endpoint, err)
+		// Neither the value nor the parser's message is repeated: a
+		// credential in the URL's userinfo must not reach the Init error,
+		// the *url.Error carries the whole URL, and the message inside it
+		// quotes the offending part (a port, an escape, a host character).
+		return nil, errors.New("invalid OTLP endpoint: it is not a valid URL")
 	}
 	expOpts := []otlploghttp.Option{otlploghttp.WithEndpointURL(logEndpoint)}
 	if len(headers) > 0 {
@@ -45,8 +54,12 @@ func InitLogger(ctx context.Context, endpoint string, headers map[string]string,
 		}
 	}()
 
+	var batched sdklog.Exporter = exp
+	if failures != nil {
+		batched = exportstats.LogExporter(exp, failures)
+	}
 	lp := sdklog.NewLoggerProvider(
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(exp)),
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(batched)),
 		sdklog.WithResource(res),
 	)
 

@@ -659,7 +659,11 @@ func WithMaxUniqueRoutes(n int) Option {
 // or user id — and the overflow series is the signal to alert on.
 //
 // Only n > 0 overrides the derived limit; zero or a negative value returns
-// to it. The derived limit is
+// to it. An override below metrics.MinCardinalityLimit (4) is raised to it:
+// the SDK's own o11y.export.failures counter holds one series per OTLP
+// exporter, three at most, and the OTel SDK keeps one slot of every stream
+// for the overflow series, so a smaller limit would fold those fixed series
+// into overflow. The derived limit is
 // max(DefaultCardinalityLimit, 4 × MaxUniqueRoutes, 4 × MaxUniqueCollections),
 // which is 4,000 at the defaults. Set it explicitly only for a service whose
 // http.server.request.duration legitimately carries more method × route ×

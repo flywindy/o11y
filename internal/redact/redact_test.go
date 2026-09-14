@@ -152,3 +152,23 @@ func TestInTextLeavesUnrelatedTextAlone(t *testing.T) {
 		})
 	}
 }
+
+// TestSecrets checks opaque secrets are replaced wherever they occur, the
+// longest first so a whole header string and its parts coexist, and that
+// empty secrets and an empty list are no-ops.
+func TestSecrets(t *testing.T) {
+	const raw = "authorization=BearerSecret%zz, x-api-key=k-1234567890"
+	got := redact.Secrets(`escape header value: value="BearerSecret%zz" in `+raw, raw, "BearerSecret%zz", "", "k-1234567890")
+	assert.NotContains(t, got, "BearerSecret")
+	assert.NotContains(t, got, "k-1234567890")
+	assert.Equal(t, `escape header value: value="[redacted]" in [redacted]`, got, "the whole string is replaced as one, the loose copy on its own")
+
+	assert.Equal(t, "value=[redacted] at 2026-09-13T11:00 attempt 12, x=[redacted]; [redacted]",
+		redact.Secrets("value=1 at 2026-09-13T11:00 attempt 12, x=ab; 1", "1", "ab"),
+		"a short secret is replaced only where it is a whole token")
+	assert.Equal(t, "tab table", redact.Secrets("tab table", "ab"), "a short secret inside a word is left alone")
+
+	assert.Equal(t, "plain", redact.Secrets("plain"))
+	assert.Equal(t, "plain", redact.Secrets("plain", ""))
+	assert.Equal(t, "", redact.Secrets("", "x"))
+}

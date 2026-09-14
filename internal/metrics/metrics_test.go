@@ -609,7 +609,9 @@ func TestInitMeter_BindFailure(t *testing.T) {
 // TestInitMeter_OTLPPath verifies that when MetricsOTLPEndpoint is set, no
 // HTTP scrape server is started and the OTLP exporter is initialized.
 // We use a non-existent endpoint — the test only checks that Init succeeds
-// and the returned Closer does not panic.
+// and that there is no Closer to call: the MeterProvider's Shutdown covers
+// the exporter, and a no-op would count as a component when SDK.Shutdown
+// shares its deadline out.
 func TestInitMeter_OTLPPath(t *testing.T) {
 	mp, closer, err := metrics.InitMeter(context.Background(), metrics.Config{
 		ServiceName:         "test-svc",
@@ -620,10 +622,9 @@ func TestInitMeter_OTLPPath(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NotNil(t, mp)
-	require.NotNil(t, closer)
+	require.Nil(t, closer, "the OTLP path has nothing of its own to close")
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_ = closer(ctx)
 	_ = mp.Shutdown(ctx)
 }
 
@@ -668,7 +669,7 @@ func TestInitMeter_OTLPHeadersAttached(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	require.NoError(t, mp.ForceFlush(ctx))
-	_ = closer(ctx)
+	require.Nil(t, closer)
 	_ = mp.Shutdown(ctx)
 
 	requests := srv.Requests()

@@ -4,7 +4,10 @@ package redact
 import (
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // placeholder replaces userinfo that was present but must not be logged. It
@@ -109,3 +112,88 @@ func InText(text string, knownEndpoints ...string) string {
 	}
 	return text
 }
+
+// opaquePlaceholder replaces a secret Secrets was told about.
+const opaquePlaceholder = "[redacted]"
+
+// shortSecretLen is the length below which a secret is replaced only where
+// it stands as a whole token. A configured header value such as "1" or
+// "true" is a secret the caller must not print, but replacing every "1"
+// inside timestamps and counts would mangle the rest of the line; matching
+// it only between non-alphanumeric characters (the "1" in "value=1", not
+// the one in "attempt 12" or "13T11:00") keeps both.
+const shortSecretLen = 6
+
+// Secrets returns text with every occurrence of each non-empty secret
+// replaced by a placeholder. It is for values that carry no structure the
+// other rules can recognise — an OTLP header value such as a bearer token,
+// which the pinned exporters echo verbatim when the OTEL_EXPORTER_OTLP_HEADERS
+// value fails to parse — so the caller names them up front. Longer secrets
+// are replaced first, so a whole "k=v,k2=v2" string and its parts can both
+// be listed without the parts breaking the whole. A secret shorter than
+// shortSecretLen is replaced only where it is a whole token (not adjacent
+// to a letter or digit), so a short configured value is still covered
+// where an exporter echoes it on its own without rewriting every number
+// in the message.
+func Secrets(text string, secrets ...string) string {
+	if len(secrets) == 0 || text == "" {
+		return text
+	}
+	ordered := make([]string, 0, len(secrets))
+	for _, secret := range secrets {
+		if secret != "" {
+			ordered = append(ordered, secret)
+		}
+	}
+	sort.SliceStable(ordered, func(i, j int) bool { return len(ordered[i]) > len(ordered[j]) })
+	for _, secret := range ordered {
+		if len(secret) < shortSecretLen {
+			text = replaceWholeToken(text, secret)
+			continue
+		}
+		text = strings.ReplaceAll(text, secret, opaquePlaceholder)
+	}
+	return text
+}
+
+// replaceWholeToken replaces each occurrence of secret in text that is not
+// adjacent to a letter or digit on either side.
+func replaceWholeToken(text, secret string) string {
+	var b strings.Builder
+	pos := 0
+	for pos < len(text) {
+		i := strings.Index(text[pos:], secret)
+		if i < 0 {
+			break
+		}
+		start := pos + i
+		end := start + len(secret)
+		if tokenBoundaryBefore(text, start) && tokenBoundaryAfter(text, end) {
+			b.WriteString(text[pos:start])
+			b.WriteString(opaquePlaceholder)
+		} else {
+			b.WriteString(text[pos:end])
+		}
+		pos = end
+	}
+	b.WriteString(text[pos:])
+	return b.String()
+}
+
+func tokenBoundaryBefore(text string, i int) bool {
+	if i == 0 {
+		return true
+	}
+	r, _ := utf8.DecodeLastRuneInString(text[:i])
+	return !isTokenRune(r)
+}
+
+func tokenBoundaryAfter(text string, end int) bool {
+	if end == len(text) {
+		return true
+	}
+	r, _ := utf8.DecodeRuneInString(text[end:])
+	return !isTokenRune(r)
+}
+
+func isTokenRune(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }

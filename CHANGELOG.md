@@ -15,9 +15,68 @@ adopters can plan their upgrades.
 
 ### Added
 
+- `o11y_export_failures_total{otel_component_type}` counts every export
+  call the OTLP exporters returned an error for — a batch the collector
+  rejected or could not be reached for, or a partial-success response —
+  one series per exporter (semconv's
+  `otel.component.type`: `otlp_http_span_exporter`, `otlp_http_log_exporter`,
+  `otlp_http_metric_exporter`). The OTel batchers drop a rejected batch after
+  handing the error to `otel.Handle`, so until now a collector outage left no
+  number behind. The counter is an SDK-owned instrument among the SDK's own
+  metrics — on `/metrics` on the Prometheus pull path, through the OTLP
+  metrics pipeline with `WithMetricsOTLPEndpoint`, absent when the metrics
+  pillar is off — reported for every exporter the SDK built (zero when
+  healthy; no series for a disabled pillar's exporter or, on the Prometheus
+  pull path, for the metric exporter), and needs no code change. See the guide's "Export failures & OTel diagnostics"
+  section for the alert and `docs/semconv.md` for the catalog entry.
+- `SDK.ErrorHandler()` and `SDK.Logr()` return replacements for OTel's
+  default error handler and internal logger: the default handler prints
+  every handled error as plain text to stderr on every occurrence, and the
+  default logger prints only error-level messages, dropping OTel's warnings
+  and informational messages. The replacements write structured records to
+  the SDK's stdout log (handled errors at ERROR, so an error-only log level
+  keeps them), one per distinct error or message per minute, with
+  the suppression window under `repeat_suppressed_for`. Both redact the
+  configured endpoints and the header names and values of `WithOTLPHeaders`,
+  `WithProfilingAuthHeaders` and the `OTEL_EXPORTER_OTLP_*HEADERS`
+  variables, which the pinned exporters (and, for a name, `net/http`) echo
+  verbatim when one fails to parse. The exporters parse their
+  `OTEL_EXPORTER_OTLP_*` variables while `Init` builds them, before
+  `Logr()` can be installed, so `Init` now rejects a malformed `ENDPOINT`,
+  `TIMEOUT` or `HEADERS` variable, the log exporter's `COMPRESSION`, the
+  metric exporter's `TEMPORALITY_PREFERENCE` and
+  `DEFAULT_HISTOGRAM_AGGREGATION`, or a `CERTIFICATE`,
+  `CLIENT_CERTIFICATE` or `CLIENT_KEY` variable naming a file that cannot
+  be read or parsed, that the enabled exporters would actually read (the
+  log exporter reads one only where `Init` passes no explicit option, and
+  verbatim, where the trace and metric exporters trim it), the SDK's own
+  `OTEL_BSP_*`, span-limit, `OTEL_TRACES_SAMPLER` / `_ARG`, `OTEL_BLRP_*`,
+  `OTEL_LOGRECORD_*`, `OTEL_GO_X_CARDINALITY_LIMIT` and
+  `OTEL_METRIC_EXPORT_*` variables the enabled providers read the same
+  way, and
+  a malformed endpoint given to `WithOTLPEndpoint`
+  or `WithMetricsOTLPEndpoint`, which the trace and metric exporters echo
+  the same way, with an error that names the variable or option and the
+  pair's position but neither the text nor the parser's message, and a
+  header name given to `WithOTLPHeaders` or `WithProfilingAuthHeaders`
+  that is not an HTTP token, which `net/http` would quote, escaped, in
+  every export error (checked only when a client that would send the
+  headers starts). `ErrorHandler()` and `Logr()` render a typed
+  nil error and an `Error` method that panics as placeholders rather than
+  crashing; `Logr()` maps OTel's
+  verbosity convention (V(1) warn, V(4) info, V(8) debug) onto the SDK's
+  log level, so at the default INFO level the warnings the default logger
+  dropped ("dropped log records") now appear. The SDK does not install them
+  (ADR 0003); the application does
+  with `otel.SetErrorHandler` / `otel.SetLogger`. The scrape-error log line
+  introduced by #93 renders its `repeat_suppressed_for` field the same way
+  (`"5m0s"` rather than a nanosecond count).
 - `WithCardinalityLimit(n)` sets the OTel SDK's per-stream cardinality
   limit explicitly, and `DefaultCardinalityLimit` (2,000) exposes the floor
   of the derived value. See the Changed entry below for the new derivation.
+  An override below `metrics.MinCardinalityLimit` (4) is raised to it, so
+  the SDK's own three-series `o11y_export_failures_total` stream and its
+  overflow slot always fit.
 - `WithResourceAttributes(attrs ...attribute.KeyValue)` adds caller-owned
   attributes to the Resource shared by traces, metrics and logs (for example
   `k8s.pod.name` when it is not supplied through `OTEL_RESOURCE_ATTRIBUTES`).
@@ -38,6 +97,32 @@ adopters can plan their upgrades.
 
 ### Changed
 
+- `SDK.Shutdown` shares its deadline out evenly across the enabled
+  components still to run, recomputing the share as each finishes, so a
+  tracer or logger drain that waits on a collector that is down cannot
+  consume the whole deadline and leave the meter provider's final
+  collection (which is what ships the shutdown-time failures on the OTLP
+  push path, except a failure of that last export itself, which nothing
+  collects again; on the Prometheus pull path only a scrape landing before
+  the scrape server stops sees them; the durable evidence is the
+  ErrorHandler record for a trace drain, once installed, and `Shutdown`'s
+  returned error plus its "SDK component shutdown failed" record for the
+  log batcher and the metric reader, which return their final export's
+  error instead of handing it to `otel.Handle`) with a context that is
+  already done. Disabled pillars and the OTLP metrics path
+  (whose exporter the MeterProvider's own shutdown covers) no longer
+  contribute a no-op closer, so they neither run nor take a share. A
+  context without a deadline is passed through unchanged. A trace drain
+  that outlives its share is reported as timed out and continues on the
+  batcher's own background context, which the SDK cannot cancel; a failure
+  it records after the final collection is not reported. A log flush that
+  outlives its share stops, and the records still queued are dropped
+  without an export call. The profiler's closer now honours its
+  context the same way: Pyroscope's `Stop` waits on the uploader's own 30s
+  client timeout, so a stalled upload used to hold `Shutdown` for that long
+  and hand every later component an expired context; it now returns
+  `ctx.Err()` and lets `Stop` finish in the background, releasing the
+  profiler slot when it does.
 - dependencies: the root `o11y` package no longer links the Cassandra,
   MinIO, MongoDB or Redis drivers. It imported those four packages for one
   reason — to collect their `MetricViews` — and because Go links at package

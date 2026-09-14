@@ -21,14 +21,17 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/flywindy/o11y/internal/baggageattrs"
+	"github.com/flywindy/o11y/internal/exportstats"
 	o11ylog "github.com/flywindy/o11y/internal/log"
 	"github.com/flywindy/o11y/internal/metrics"
 	"github.com/flywindy/o11y/internal/profiling"
 	"github.com/flywindy/o11y/internal/redact"
 	"github.com/flywindy/o11y/internal/trace"
 	"github.com/flywindy/o11y/internal/views"
+	"github.com/go-logr/logr"
 	otelpyroscope "github.com/grafana/otel-profiling-go"
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel/metric"
@@ -93,6 +96,11 @@ type SDK struct {
 	meterProviderPublic    metric.MeterProvider
 	shutdowns              []func(context.Context) error
 
+	// Diagnostics for OTel's own error and message paths; see ErrorHandler
+	// and Logr.
+	errorHandler *otelErrorHandler
+	logr         logr.Logger
+
 	shutdownOnce sync.Once
 	shutdownErr  error
 }
@@ -129,6 +137,20 @@ func (s *SDK) Meter(name string) metric.Meter {
 // logged and returned joined. Always call with a context that has a timeout
 // to cap the flush wait.
 //
+// The deadline is shared out: each component runs under an even share of
+// the time left, recomputed as the sequence advances, so a component that
+// finishes early hands its slack to the ones after it, and one that drains
+// slowly (the trace batcher drains on a background context bounded by its
+// export timeout, OTEL_BSP_EXPORT_TIMEOUT, 30s by default, which cuts the
+// OTLP exporter's longer retry policy short) cannot consume
+// the whole deadline and leave the components after it, the meter
+// provider's final collection in particular, with a context that is
+// already done. Only components that exist count: a disabled pillar, and
+// the OTLP metrics path, which has no closer of its own, take no share. A
+// context without a deadline is passed through unchanged. A component
+// whose share runs out is reported as timed out; what happens to its queue
+// then differs per batcher, see shutdownSequence.
+//
 // Shutdown is idempotent: subsequent calls return the same joined error
 // without rerunning any closer. Callers may safely register Shutdown in
 // multiple defer chains (for example, both in main and in a signal handler)
@@ -136,8 +158,11 @@ func (s *SDK) Meter(name string) metric.Meter {
 func (s *SDK) Shutdown(ctx context.Context) error {
 	s.shutdownOnce.Do(func() {
 		var errs []error
-		for _, fn := range s.shutdowns {
-			if err := fn(ctx); err != nil {
+		for i, fn := range s.shutdowns {
+			closerCtx, cancel := shutdownBudget(ctx, len(s.shutdowns)-i)
+			err := fn(closerCtx)
+			cancel()
+			if err != nil {
 				s.Logger.ErrorContext(ctx, "SDK component shutdown failed", slog.Any("error", err))
 				errs = append(errs, err)
 			}
@@ -145,6 +170,80 @@ func (s *SDK) Shutdown(ctx context.Context) error {
 		s.shutdownErr = errors.Join(errs...)
 	})
 	return s.shutdownErr
+}
+
+// shutdownBudget derives the context one closer runs under: an even share
+// of the time left before ctx's deadline across the closers still to run,
+// this one included. The last closer, and every closer when ctx has no
+// deadline or its deadline has already passed, gets ctx itself.
+func shutdownBudget(ctx context.Context, remaining int) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok || remaining <= 1 {
+		return ctx, func() {}
+	}
+	share := time.Until(deadline) / time.Duration(remaining)
+	if share <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, share)
+}
+
+// shutdownSequence orders the per-pillar closers Shutdown runs. A nil
+// closer (a disabled pillar, or no profiler) is left out, so it neither
+// runs nor counts as a component when the deadline is shared out: with
+// traces the only enabled pillar the tracer's drain gets the whole
+// deadline, not a quarter of it.
+//
+// Traces and logs drain before metrics on purpose: their final flush is
+// where a batch queued until shutdown gets exported, and a batch that fails
+// then is counted on the export-failure Recorder. On the OTLP push path the
+// meter provider's own shutdown performs the last collection, so with
+// metrics last that count is shipped; with metrics first it would be
+// recorded into a counter nothing reads again. A failure of that last
+// collection's own export is the one increment the push path cannot ship:
+// the snapshot was taken before the call failed and nothing collects
+// again. On the Prometheus pull path the otelprom reader's shutdown
+// collects nothing, so only a scrape that lands between the drain and the
+// scrape server stopping sees the count. The durable evidence differs by
+// signal: the trace batcher hands its final drain's error to otel.Handle,
+// so it is the ErrorHandler record once the application installed
+// SDK.ErrorHandler with otel.SetErrorHandler (OTel's default handler
+// prints it to stderr instead), while the log batcher and the metric
+// reader return their final export's error from Shutdown, so it is
+// Shutdown's returned error and the "SDK component shutdown failed"
+// record on the SDK's stdout log, handler or not. This holds for a
+// drain that finishes within its closer's share of the deadline; past it
+// the two batchers differ. The trace BatchSpanProcessor drains on a
+// background context of its own (bounded by the export timeout, 30s by
+// default) and offers no way to cancel it, so a drain that outlives its
+// share keeps running after its closer returned, and a failure it records
+// after the meter provider's final collection is not reported; the batch
+// is lost when the process exits either way. The log BatchProcessor
+// flushes its queue under the closer's context: when the share runs out it
+// stops, shuts the exporter down with that expired context and drops what
+// is still queued without an export call, so nothing is counted for those
+// records. The profiler stops before the tracer it wraps, and the scrape
+// server stops just before the meter provider so no scrape races the final
+// collection.
+func shutdownSequence(profiler, traces, logs, metricsServer, meter func(context.Context) error) []func(context.Context) error {
+	seq := make([]func(context.Context) error, 0, 5)
+	for _, fn := range []func(context.Context) error{profiler, traces, logs, metricsServer, meter} {
+		if fn != nil {
+			seq = append(seq, fn)
+		}
+	}
+	return seq
+}
+
+// closeAll runs the given closers in order on Init's failure paths, skipping
+// nil ones (a pillar that was not enabled or not yet built). Errors are
+// dropped: the error being returned is the one that matters.
+func closeAll(ctx context.Context, closers ...func(context.Context) error) {
+	for _, fn := range closers {
+		if fn != nil {
+			_ = fn(ctx)
+		}
+	}
 }
 
 // Init initializes and returns a configured *SDK for the calling service.
@@ -201,6 +300,29 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	}
 	appendBaggageWarnings(cfg, whitelist)
 
+	// The OTLP exporters parse their OTEL_EXPORTER_OTLP_* variables and the
+	// endpoint options as they are built and report a malformed value's raw
+	// text through OTel's global logger, which nothing installed after Init
+	// can redact, so a malformed variable or endpoint fails Init before any
+	// exporter exists; a configured header name that is not an HTTP token
+	// fails too, since net/http would quote it, escaped, in every export
+	// error, past what the redaction list can match.
+	if err := validateOTLPExporterEnv(cfg); err != nil {
+		return nil, err
+	}
+	if err := validateConfiguredEndpoints(cfg); err != nil {
+		return nil, err
+	}
+	if err := validateConfiguredHeaders(cfg); err != nil {
+		return nil, err
+	}
+
+	// Every OTLP exporter reports each Export call that returned an error
+	// here; the MeterProvider registers the count as
+	// o11y_export_failures_total once it exists. The
+	// Recorder is created first because the tracer is built before the meter.
+	exportFailures := &exportstats.Recorder{}
+
 	// 2. Initialize TracerProvider (no global state).
 	//    When trace is disabled, a no-op provider is used and the W3C propagator
 	//    is constructed directly so that downstream trace headers are still
@@ -208,14 +330,14 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	var tpInternal *sdktrace.TracerProvider
 	tracerProviderPublic := oteltrace.TracerProvider(tracenoop.NewTracerProvider())
 	prop := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})
-	tpShutdown := func(_ context.Context) error { return nil }
+	var tpShutdown func(context.Context) error
 
 	if cfg.traceEnabled {
 		var spanProcessors []sdktrace.SpanProcessor
 		if whitelist.Len() > 0 {
 			spanProcessors = append(spanProcessors, whitelist.NewSpanProcessor())
 		}
-		tp, p, initErr := trace.InitTracer(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, providerRes, cfg.sampler, spanProcessors...)
+		tp, p, initErr := trace.InitTracer(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, providerRes, cfg.sampler, exportFailures, spanProcessors...)
 		if initErr != nil {
 			return nil, initErr
 		}
@@ -251,8 +373,8 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	//    is started; existing Grafana dashboards are unaffected.
 	var mpInternal *sdkmetric.MeterProvider
 	meterProviderPublic := metric.MeterProvider(metricnoop.NewMeterProvider())
-	metricsCloser := metrics.Closer(func(_ context.Context) error { return nil })
-	mpShutdown := func(_ context.Context) error { return nil }
+	var metricsCloser metrics.Closer
+	var mpShutdown func(context.Context) error
 
 	if cfg.metricsEnabled {
 		mp, closer, initErr := metrics.InitMeter(ctx, metrics.Config{
@@ -283,9 +405,10 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 			ExtraHTTPServerAttrKeys: cfg.extraHTTPServerAttrKeys,
 			Exemplars:               cfg.exemplars,
 			Logger:                  slog.New(stdoutHandler),
+			ExportFailures:          exportFailures,
 		})
 		if initErr != nil {
-			_ = tpShutdown(ctx)
+			closeAll(ctx, tpShutdown)
 			return nil, initErr
 		}
 		mpInternal, meterProviderPublic = mp, mp
@@ -303,15 +426,13 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	// 5. Initialize LoggerProvider and build the dual-output logger.
 	//    When log is disabled, only the stdout handler is active; no OTLP
 	//    connection is attempted and no LoggerProvider is started.
-	lpShutdown := func(_ context.Context) error { return nil }
+	var lpShutdown func(context.Context) error
 	var logger *slog.Logger
 
 	if cfg.logEnabled {
-		lp, initErr := o11ylog.InitLogger(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, providerRes)
+		lp, initErr := o11ylog.InitLogger(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, providerRes, exportFailures)
 		if initErr != nil {
-			_ = metricsCloser(ctx)
-			_ = mpShutdown(ctx)
-			_ = tpShutdown(ctx)
+			closeAll(ctx, metricsCloser, mpShutdown, tpShutdown)
 			return nil, initErr
 		}
 		lpShutdown = lp.Shutdown
@@ -400,10 +521,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		})
 		if startErr != nil {
 			if errors.Is(startErr, profiling.ErrAlreadyStarted) {
-				_ = metricsCloser(ctx)
-				_ = mpShutdown(ctx)
-				_ = lpShutdown(ctx)
-				_ = tpShutdown(ctx)
+				closeAll(ctx, metricsCloser, mpShutdown, lpShutdown, tpShutdown)
 				return nil, startErr
 			}
 			logger.WarnContext(ctx, "profiling disabled after Pyroscope start failure",
@@ -427,18 +545,15 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		}
 	}
 
-	// Shutdowns run in registration order: drain scrape traffic first
-	// (metricsServer), then flush the meter provider, logs, optional profiling,
-	// then traces. Disabled pillars contribute a no-op that returns nil.
-	shutdowns := []func(context.Context) error{
-		metricsCloser,
-		mpShutdown,
-		lpShutdown,
-	}
-	if profilerCloser != nil {
-		shutdowns = append(shutdowns, profilerCloser)
-	}
-	shutdowns = append(shutdowns, tpShutdown)
+	shutdowns := shutdownSequence(profilerCloser, tpShutdown, lpShutdown, metricsCloser, mpShutdown)
+
+	// Both diagnostics write to stdout only: an OTel-internal error about the
+	// OTLP log pipeline must not be queued behind the batch that is failing.
+	// Both redact the configured endpoints and the header values the
+	// exporters may echo back (see diagnosticSecrets).
+	diagnosticEndpoints := []string{cfg.otlpEndpoint, cfg.metricsOTLPEndpoint, cfg.profilingEndpoint}
+	errorHandler := newOTelErrorHandler(slog.New(stdoutHandler), diagnosticEndpoints...)
+	errorHandler.secrets = diagnosticSecrets(cfg)
 
 	return &SDK{
 		Logger:     logger,
@@ -454,6 +569,8 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		meterProviderInternal:  mpInternal,
 		meterProviderPublic:    meterProviderPublic,
 		shutdowns:              shutdowns,
+		errorHandler:           errorHandler,
+		logr:                   newLogr(slog.New(stdoutHandler), diagnosticEndpoints, diagnosticSecrets(cfg)),
 	}, nil
 }
 
