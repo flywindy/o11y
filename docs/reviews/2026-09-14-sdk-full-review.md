@@ -55,7 +55,7 @@ review flagged as P0/P1 are fixed. What remains is a second tier:
 2. **Four credential paths the SDK's own no-`@` rule does not cover**: the
    profiler's log adapter at DEBUG (R-3), `nats.Connect` errors (R-5),
    `url.full` on resty client spans (R-6), and `Shutdown`'s logged error
-   (R-24).
+   (R-23).
 3. **Endpoint configuration contract**: `OTEL_EXPORTER_OTLP_ENDPOINT` and
    its per-signal forms are validated at `Init` (since #100) but never used,
    because `Init` always passes the option's default (R-4); a scheme-less or
