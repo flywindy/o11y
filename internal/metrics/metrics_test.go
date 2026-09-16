@@ -2,6 +2,7 @@ package metrics_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -1156,4 +1157,99 @@ func TestInitMeter_StandaloneResourceOmitsCommandArgs(t *testing.T) {
 	} {
 		assert.NotContains(t, body, unwanted)
 	}
+}
+
+// TestInitMeter_CapsMongoPeerAddress pins the always-on safety net for
+// network.peer.address on the MongoDB operation metric.
+//
+// otelmongo derives that label from the driver's connection identifier, which
+// carries a process-global per-connection counter; the mongo package strips it
+// before otelmongo parses it, and this cap is what keeps a future upstream
+// format change from costing a permanent series per connection again. It also
+// pins the rendered family and label names the rule is keyed on, which otelprom
+// derives from the instrument name and unit: a naming change upstream would
+// silently disable the cap rather than fail loudly.
+func TestInitMeter_CapsMongoPeerAddress(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	meter := mp.Meter("go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/v2/mongo/otelmongo")
+	hist, err := meter.Float64Histogram("db.client.operation.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+
+	// One peer beyond the cap: the first 50 keep their address, the rest merge.
+	const peers = 60
+	for i := range peers {
+		hist.Record(context.Background(), 0.01, metric.WithAttributes(
+			semconv.DBSystemNameMongoDB,
+			semconv.DBOperationName("find"),
+			semconv.NetworkPeerAddress(fmt.Sprintf("mongo-%02d", i)),
+			semconv.NetworkPeerPort(27017),
+		))
+	}
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	require.Contains(t, body, "db_client_operation_duration_seconds")
+	assert.Contains(t, body, `network_peer_address="mongo-00"`)
+	assert.Contains(t, body, `network_peer_address="other"`)
+	assert.NotContains(t, body, `network_peer_address="mongo-59"`)
+
+	// 50 addresses keep their own series; the remaining 10 merge into one
+	// "other" series rather than adding 10 more.
+	var series, overflow int
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "db_client_operation_duration_seconds_count{") {
+			continue
+		}
+		series++
+		if strings.Contains(line, `network_peer_address="other"`) {
+			overflow++
+			assert.True(t, strings.HasSuffix(line, "} 10"), "overflow series should carry every capped peer: %s", line)
+		}
+	}
+	assert.Equal(t, 51, series, "peer values beyond the cap must merge into one series")
+	assert.Equal(t, 1, overflow)
+}
+
+// The MongoDB peer cap must not reach another integration's
+// db.client.operation.duration. Cassandra emits the same instrument name and can
+// carry network.peer.address of its own under cassandra.WithHostAttributes.
+func TestInitMeter_MongoPeerCapIgnoresOtherScopes(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	meter := mp.Meter("github.com/flywindy/o11y/cassandra")
+	hist, err := meter.Float64Histogram("db.client.operation.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	for i := range 60 {
+		hist.Record(context.Background(), 0.01, metric.WithAttributes(
+			semconv.DBSystemNameCassandra,
+			semconv.DBOperationName("SELECT"),
+			semconv.NetworkPeerAddress(fmt.Sprintf("cass-%02d", i)),
+		))
+	}
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	assert.Contains(t, body, `network_peer_address="cass-59"`)
+	assert.NotContains(t, body, `network_peer_address="other"`)
 }

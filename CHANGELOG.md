@@ -188,6 +188,30 @@ adopters can plan their upgrades.
 
 ### Fixed
 
+- `mongo`: `db.client.operation.duration` no longer grows a new series for
+  every MongoDB connection a process opens. otelmongo derives
+  `network.peer.address` and `network.peer.port` from the driver's connection
+  identifier, which the v2 driver formats as `"<host>:<port>[-<n>]"` with `n`
+  drawn from a process-global counter; its `net.SplitHostPort` call rejects the
+  bracket and falls back to using the whole identifier as the address and a
+  hardcoded `27017` as the port. Because pool growth, idle reaping and topology
+  recovery all mint fresh identifiers, and the histogram is cumulative, a
+  long-lived pod accumulated one permanent attribute set per connection until
+  the stream hit its cardinality limit and collapsed into
+  `otel_metric_overflow="true"` — a service with two pools could saturate a
+  4,000-set limit within hours. The package now strips the counter before
+  otelmongo reads the event, on the span path as well as the metric path, so
+  the address is bounded by the deployment's server count and the port is the
+  one the driver actually connected to (previously always `27017`, wrong for
+  any deployment on another port). The labels are kept rather than filtered
+  out, so replica-set members stay distinguishable. As a backstop against a
+  future upstream format change, the export boundary now also caps the metric
+  at 50 distinct `network.peer.address` values and collapses the rest to
+  `other`; a real topology never approaches that, so an `other` series there
+  means the identifier stopped being an address. Existing dashboards and alerts
+  that grouped by `network_peer_address` will see the label change value from
+  `host:port[-n]` to `host`, and series counts drop accordingly. See
+  ADR 0021 §Connection-identifier normalization.
 - `metrics`: a single mislabeled datapoint can no longer take the whole
   `/metrics` endpoint down. An attribute whose key normalizes to a label the
   Prometheus exporter already owns — the four resource constants

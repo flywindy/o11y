@@ -3,6 +3,7 @@ package mongo
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -611,6 +612,15 @@ func TestSpanName(t *testing.T) {
 	})
 }
 
+// testConnectionID is a connection identifier in the shape the v2 driver
+// actually produces: the server address followed by the process-global
+// per-connection counter (x/mongo/driver/topology/connection.go). Fixtures
+// carried a bare "127.0.0.1:27017" for a long time — a shape the driver never
+// emits — which is why the counter leaking into network.peer.address went
+// unnoticed. Every assertion on the peer attributes below is a regression test
+// for that only because this constant keeps the real shape.
+const testConnectionID = "127.0.0.1:27017[-3]"
+
 func commandStartedEvent(t *testing.T, command, database, collection string, requestID int64) *event.CommandStartedEvent {
 	t.Helper()
 
@@ -625,7 +635,7 @@ func commandStartedEvent(t *testing.T, command, database, collection string, req
 		DatabaseName: database,
 		CommandName:  command,
 		RequestID:    requestID,
-		ConnectionID: "127.0.0.1:27017",
+		ConnectionID: testConnectionID,
 	}
 }
 
@@ -635,7 +645,7 @@ func commandSucceededEvent(command, database string, requestID int64) *event.Com
 			Duration:     25 * time.Millisecond,
 			CommandName:  command,
 			DatabaseName: database,
-			ConnectionID: "127.0.0.1:27017",
+			ConnectionID: testConnectionID,
 			RequestID:    requestID,
 		},
 	}
@@ -647,7 +657,7 @@ func commandFailedEvent(command, database string, requestID int64, failure error
 			Duration:     10 * time.Millisecond,
 			CommandName:  command,
 			DatabaseName: database,
-			ConnectionID: "127.0.0.1:27017",
+			ConnectionID: testConnectionID,
 			RequestID:    requestID,
 		},
 		Failure: failure,
@@ -826,4 +836,234 @@ func assertMetricAbsentOrEmpty(t *testing.T, rm metricdata.ResourceMetrics, name
 	default:
 		t.Fatalf("unsupported metric data type %T for %s", metric.Data, metric.Name)
 	}
+}
+
+// commandStartedEventOn is commandStartedEvent with an explicit connection
+// identifier, for the tests that need several connections to the same server.
+func commandStartedEventOn(t *testing.T, connectionID, command, database, collection string, requestID int64) *event.CommandStartedEvent {
+	t.Helper()
+
+	evt := commandStartedEvent(t, command, database, collection, requestID)
+	evt.ConnectionID = connectionID
+	return evt
+}
+
+func commandSucceededEventOn(connectionID, command, database string, requestID int64) *event.CommandSucceededEvent {
+	evt := commandSucceededEvent(command, database, requestID)
+	evt.ConnectionID = connectionID
+	return evt
+}
+
+func commandFailedEventOn(connectionID, command, database string, requestID int64, failure error) *event.CommandFailedEvent {
+	evt := commandFailedEvent(command, database, requestID, failure)
+	evt.ConnectionID = connectionID
+	return evt
+}
+
+// TestNewMonitor_OperationDurationIgnoresConnectionCounter is the cardinality
+// regression test: the driver opens a new connection — and so mints a new
+// connection identifier — for every pool growth, idle reap and topology
+// recovery over a process's lifetime. If that counter reaches
+// network.peer.address, each one costs a permanent series on a cumulative
+// histogram, and db.client.operation.duration grows without bound until it
+// collapses into the SDK's overflow series.
+func TestNewMonitor_OperationDurationIgnoresConnectionCounter(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithView(MetricViews(testHistogramBuckets)...),
+	)
+
+	monitor := NewMonitor(tracenoop.NewTracerProvider(), provider)
+	for i := range 50 {
+		connectionID := fmt.Sprintf("mongo-0.mongo.svc:27017[-%d]", i)
+		monitor.Succeeded(context.Background(), commandSucceededEventOn(connectionID, "find", "o11y_test", int64(i)))
+	}
+
+	metric := findMetric(t, collectMongoMetrics(t, reader), "db.client.operation.duration")
+	histogram, ok := metric.Data.(metricdata.Histogram[float64])
+	require.True(t, ok, "expected MongoDB operation duration histogram")
+	require.Len(t, histogram.DataPoints, 1, "50 connections to one server must share one attribute set")
+
+	dp := histogram.DataPoints[0]
+	assert.Equal(t, uint64(50), dp.Count)
+	assert.Contains(t, dp.Attributes.ToSlice(), semconv.NetworkPeerAddress("mongo-0.mongo.svc"))
+	assert.Contains(t, dp.Attributes.ToSlice(), semconv.NetworkPeerPort(27017))
+}
+
+// TestNewMonitor_SeparatesDistinctServers guards the other direction: the peer
+// dimension must still tell replica-set members apart, which is the reason the
+// label is kept rather than filtered out of the view.
+func TestNewMonitor_SeparatesDistinctServers(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithView(MetricViews(testHistogramBuckets)...),
+	)
+
+	monitor := NewMonitor(tracenoop.NewTracerProvider(), provider)
+	monitor.Succeeded(context.Background(), commandSucceededEventOn("mongo-0:27017[-1]", "find", "o11y_test", 1))
+	monitor.Succeeded(context.Background(), commandSucceededEventOn("mongo-1:27017[-2]", "find", "o11y_test", 2))
+
+	metric := findMetric(t, collectMongoMetrics(t, reader), "db.client.operation.duration")
+	histogram, ok := metric.Data.(metricdata.Histogram[float64])
+	require.True(t, ok)
+	require.Len(t, histogram.DataPoints, 2)
+
+	addresses := make([]string, 0, len(histogram.DataPoints))
+	for _, dp := range histogram.DataPoints {
+		value, ok := dp.Attributes.Value(semconv.NetworkPeerAddressKey)
+		require.True(t, ok)
+		addresses = append(addresses, value.AsString())
+	}
+	assert.ElementsMatch(t, []string{"mongo-0", "mongo-1"}, addresses)
+}
+
+// TestNewMonitor_PeerPortFromConnectionID covers the second half of the
+// parsing bug: otelmongo falls back to a hardcoded 27017 for every identifier
+// it cannot split, so before normalization the port label was wrong for every
+// deployment not on the default port.
+func TestNewMonitor_PeerPortFromConnectionID(t *testing.T) {
+	tests := []struct {
+		name         string
+		connectionID string
+		wantAddress  string
+		wantPort     int
+	}{
+		{name: "non-default port", connectionID: "mongo:27117[-5]", wantAddress: "mongo", wantPort: 27117},
+		{name: "default port", connectionID: "mongo:27017[-5]", wantAddress: "mongo", wantPort: 27017},
+		{name: "IPv6 host", connectionID: "[::1]:27117[-5]", wantAddress: "::1", wantPort: 27117},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := sdkmetric.NewManualReader()
+			provider := sdkmetric.NewMeterProvider(
+				sdkmetric.WithReader(reader),
+				sdkmetric.WithView(MetricViews(testHistogramBuckets)...),
+			)
+
+			monitor := NewMonitor(tracenoop.NewTracerProvider(), provider)
+			monitor.Succeeded(context.Background(), commandSucceededEventOn(tc.connectionID, "find", "o11y_test", 1))
+
+			metric := findMetric(t, collectMongoMetrics(t, reader), "db.client.operation.duration")
+			histogram, ok := metric.Data.(metricdata.Histogram[float64])
+			require.True(t, ok)
+			require.Len(t, histogram.DataPoints, 1)
+
+			attrs := histogram.DataPoints[0].Attributes.ToSlice()
+			assert.Contains(t, attrs, semconv.NetworkPeerAddress(tc.wantAddress))
+			assert.Contains(t, attrs, semconv.NetworkPeerPort(tc.wantPort))
+		})
+	}
+}
+
+// TestNewMonitor_SpanPeerAttributesIgnoreConnectionCounter covers the span
+// side. The counter reached span attributes too, where it is both noise on
+// every MongoDB span and a cardinality hazard for any span-to-metrics
+// connector running in the collector.
+func TestNewMonitor_SpanPeerAttributesIgnoreConnectionCounter(t *testing.T) {
+	tp, _, sr := newTestProviders()
+	monitor := NewMonitor(tp, metricnoop.NewMeterProvider())
+
+	monitor.Started(context.Background(), commandStartedEventOn(t, "mongo:27117[-9]", "find", "o11y_test", "users", 1))
+	monitor.Succeeded(context.Background(), commandSucceededEventOn("mongo:27117[-9]", "find", "o11y_test", 1))
+
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	attrs := spans[0].Attributes()
+	assert.Contains(t, attrs, semconv.NetworkPeerAddress("mongo"))
+	assert.Contains(t, attrs, semconv.NetworkPeerPort(27117))
+}
+
+// TestNewMonitor_CorrelatesEventsAcrossConnections pins the invariant that
+// makes normalization safe: otelmongo keys its in-flight span map on
+// {ConnectionID, RequestID}, so collapsing many connections onto one address
+// must not let two concurrent commands collide. The driver draws RequestID
+// from a single process-global counter, so it identifies a command on its own.
+func TestNewMonitor_CorrelatesEventsAcrossConnections(t *testing.T) {
+	tp, _, sr := newTestProviders()
+	monitor := NewMonitor(tp, metricnoop.NewMeterProvider())
+
+	// Two commands in flight at once on two different connections to the same
+	// server, finishing in reverse order.
+	monitor.Started(context.Background(), commandStartedEventOn(t, "mongo:27017[-1]", "find", "o11y_test", "users", 11))
+	monitor.Started(context.Background(), commandStartedEventOn(t, "mongo:27017[-2]", "insert", "o11y_test", "events", 12))
+	monitor.Succeeded(context.Background(), commandSucceededEventOn("mongo:27017[-2]", "insert", "o11y_test", 12))
+	monitor.Failed(context.Background(), commandFailedEventOn("mongo:27017[-1]", "find", "o11y_test", 11, errors.New("boom")))
+
+	spans := sr.Ended()
+	require.Len(t, spans, 2, "both in-flight commands must be correlated and ended")
+	assert.NotNil(t, findSpanWithName(spans, "mongodb.find users"))
+	assert.NotNil(t, findSpanWithName(spans, "mongodb.insert events"))
+}
+
+// TestNewMonitor_DoesNotMutateDriverEvents guards the copy-on-change contract:
+// the driver owns the event structs, and Instrument fans out to any monitor
+// the application already installed, which must keep seeing the driver's own
+// identifier.
+func TestNewMonitor_DoesNotMutateDriverEvents(t *testing.T) {
+	monitor := NewMonitor(tracenoop.NewTracerProvider(), metricnoop.NewMeterProvider())
+
+	started := commandStartedEventOn(t, "mongo:27017[-1]", "find", "o11y_test", "users", 1)
+	succeeded := commandSucceededEventOn("mongo:27017[-1]", "find", "o11y_test", 1)
+	failed := commandFailedEventOn("mongo:27017[-2]", "find", "o11y_test", 2, errors.New("boom"))
+
+	monitor.Started(context.Background(), started)
+	monitor.Succeeded(context.Background(), succeeded)
+	monitor.Failed(context.Background(), failed)
+
+	assert.Equal(t, "mongo:27017[-1]", started.ConnectionID)
+	assert.Equal(t, "mongo:27017[-1]", succeeded.ConnectionID)
+	assert.Equal(t, "mongo:27017[-2]", failed.ConnectionID)
+}
+
+// TestInstrument_ComposedMonitorSeesDriverConnectionID is the same contract at
+// the composition seam an application actually observes.
+func TestInstrument_ComposedMonitorSeesDriverConnectionID(t *testing.T) {
+	var seen []string
+	opts := options.Client().ApplyURI("mongodb://localhost:27017")
+	opts.SetMonitor(&event.CommandMonitor{
+		Succeeded: func(_ context.Context, evt *event.CommandSucceededEvent) {
+			seen = append(seen, evt.ConnectionID)
+		},
+	})
+
+	tp, prop, _ := newTestProviders()
+	cleanup, err := Instrument(opts, tp, metricnoop.NewMeterProvider(), prop)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cleanup(context.Background()) })
+
+	opts.Monitor.Succeeded(context.Background(), commandSucceededEventOn("mongo:27017[-7]", "find", "o11y_test", 1))
+	assert.Equal(t, []string{"mongo:27017[-7]"}, seen)
+}
+
+// TestWithNormalizedConnectionIDs_NilHandling covers the seam's degenerate
+// inputs: a nil monitor, and a monitor with only some callbacks set.
+func TestWithNormalizedConnectionIDs_NilHandling(t *testing.T) {
+	assert.Nil(t, withNormalizedConnectionIDs(nil))
+
+	var started string
+	partial := withNormalizedConnectionIDs(&event.CommandMonitor{
+		Started: func(_ context.Context, evt *event.CommandStartedEvent) {
+			started = evt.ConnectionID
+		},
+	})
+	require.NotNil(t, partial)
+	assert.Nil(t, partial.Succeeded, "an unset inner callback must stay unset")
+	assert.Nil(t, partial.Failed, "an unset inner callback must stay unset")
+
+	partial.Started(context.Background(), commandStartedEventOn(t, "mongo:27017[-1]", "find", "o11y_test", "users", 1))
+	assert.Equal(t, "mongo:27017", started)
+
+	assert.NotPanics(t, func() {
+		full := withNormalizedConnectionIDs(&event.CommandMonitor{
+			Started:   func(context.Context, *event.CommandStartedEvent) {},
+			Succeeded: func(context.Context, *event.CommandSucceededEvent) {},
+			Failed:    func(context.Context, *event.CommandFailedEvent) {},
+		})
+		full.Started(context.Background(), nil)
+		full.Succeeded(context.Background(), nil)
+		full.Failed(context.Background(), nil)
+	})
 }

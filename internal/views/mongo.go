@@ -40,6 +40,14 @@ const MongoContribScope = "go.opentelemetry.io/contrib/instrumentation/go.mongod
 // duplicate, conflicting stream when both wrappers are active in the same
 // process. The pool views are scoped to the mongo package's own instrumentation,
 // which emits them.
+//
+// The operation-duration filter allows network.peer.address and
+// network.peer.port. Those are safe to keep — and worth keeping, since they are
+// what tells replica-set members apart — only because the mongo package strips
+// the driver's per-connection counter from the connection identifier before
+// otelmongo derives them (mongo.normalizeConnectionID). Without that the
+// address would carry the counter, and an allow-keys filter bounds which keys
+// appear, not how many values a key takes.
 func Mongo(histogramBuckets []float64) []sdkmetric.View {
 	views := []sdkmetric.View{
 		sdkmetric.NewView(
