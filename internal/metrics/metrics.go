@@ -217,6 +217,39 @@ var elasticsearchCollectionInstruments = []capInstrument{
 	{instrument: "db.client.operation.duration", family: "db_client_operation_duration_seconds"},
 }
 
+// mongoContribScope is the instrumentation scope otelmongo records
+// db.client.operation.duration under. The peer cap below is restricted to it
+// for the same reason the collection caps are scoped: the instrument name is
+// the standard semconv one and is emitted by several integrations.
+const mongoContribScope = views.MongoContribScope
+
+// mongoPeerBudget is the distinct-value budget for the MongoDB peer label.
+// Only one instrument carries it today; the budget key keeps a future MongoDB
+// instrument consistent with the duration histogram about which peers
+// overflowed.
+const mongoPeerBudget = "mongo/network.peer.address"
+
+// mongoPeerInstruments are the MongoDB client metrics that carry
+// network.peer.address, paired with the Prometheus family name each is exposed
+// as.
+var mongoPeerInstruments = []capInstrument{
+	{instrument: "db.client.operation.duration", family: "db_client_operation_duration_seconds"},
+}
+
+// maxUniqueMongoPeers caps distinct network.peer.address values on the MongoDB
+// operation metric. It is a safety net rather than a tuning knob, so it is a
+// constant and not an Init option.
+//
+// The label is derived from the driver's connection identifier, which carries
+// a per-connection counter the mongo package strips before otelmongo parses it
+// (mongo.normalizeConnectionID). That normalization is what actually bounds
+// the label; this cap is what keeps a future upstream format change from
+// costing a permanent series per connection again before anyone notices. A
+// real MongoDB deployment addresses a handful of replica-set members or mongos
+// routers, so a legitimate topology never approaches this number, and reaching
+// it means the identifier stopped being an address.
+const maxUniqueMongoPeers = 50
+
 // collectionCapScopes lists every integration the db.collection.name cap
 // applies to. Each entry is scoped and budgeted independently.
 var collectionCapScopes = []collectionCapScope{
@@ -254,6 +287,15 @@ func otlpCapRules(cfg Config) []metricscap.Rule {
 			}
 		}
 	}
+	for _, inst := range mongoPeerInstruments {
+		rules = append(rules, metricscap.Rule{
+			InstrumentName: inst.instrument,
+			ScopeName:      mongoContribScope,
+			Key:            semconv.NetworkPeerAddressKey,
+			Max:            maxUniqueMongoPeers,
+			BudgetKey:      mongoPeerBudget,
+		})
+	}
 	return rules
 }
 
@@ -288,6 +330,15 @@ func prometheusCapRules(cfg Config) []metricscap.PrometheusRule {
 				})
 			}
 		}
+	}
+	for _, inst := range mongoPeerInstruments {
+		rules = append(rules, metricscap.PrometheusRule{
+			MetricName: inst.family,
+			ScopeName:  mongoContribScope,
+			LabelName:  "network_peer_address",
+			Max:        maxUniqueMongoPeers,
+			BudgetKey:  mongoPeerBudget,
+		})
 	}
 	return rules
 }

@@ -332,6 +332,20 @@ CommandMonitor, wrapped by `github.com/flywindy/o11y/mongo`. Connection-pool
 metrics are emitted by the SDK-owned PoolMonitor observer accepted in ADR 0014.
 See ADR 0014 and ADR 0021.
 
+`network.peer.address` and `network.peer.port` are derived by otelmongo from
+`event.CommandStartedEvent.ConnectionID`. The v2 driver formats that identifier
+as `"<host>:<port>[-<n>]"`, where `n` is a process-global counter incremented
+for every connection the process opens, and otelmongo's `net.SplitHostPort` call
+rejects the bracket and falls back to the whole identifier as the address plus a
+hardcoded 27017 as the port. The `mongo` package therefore strips the counter
+before otelmongo reads the event (`mongo.normalizeConnectionID`), on the span
+and metric paths alike, so the address is bounded by the deployment's server
+count and the port is the one the driver connected to. As a backstop against a
+future upstream format change, the export boundary also caps the metric at 50
+distinct `network.peer.address` values and collapses the rest to `other`; a real
+topology never approaches that, so an `other` series there means the identifier
+stopped being an address.
+
 ### Instruments
 
 | Name | Kind | Unit | Attributes |
@@ -352,8 +366,8 @@ See ADR 0014 and ADR 0021.
 | `db.namespace` | string | Database name. |
 | `db.collection.name` | string | Collection name. |
 | `db.operation.name` | string | Wire command name (`insert`, `find`, `getMore`, `createIndexes`, ...). |
-| `network.peer.address` | string | MongoDB peer address reported by the driver connection ID. |
-| `network.peer.port` | int | MongoDB port parsed from the connection ID, defaulting to 27017 when omitted. |
+| `network.peer.address` | string | MongoDB server address, parsed from the driver connection identifier after the SDK strips its per-connection counter (see the note above). |
+| `network.peer.port` | int | MongoDB port, from the same identifier; 27017 when it carries none. |
 | `network.transport` | string | Constant `"tcp"` on command spans; filtered out of the metric view. |
 | `error.type` | string | Present on `db.client.operation.duration` when an operation fails. |
 | `db.client.connection.pool.name` | string | Pool grouping label, derived as `mongo-<primary-host>-<n>` where `<n>` is a process-local sequence that keeps separate clients on the same host distinct, or set by `mongo.WithPoolName`. |
@@ -775,7 +789,7 @@ Data Model attributes automatically.
 | Key family | Source | Reason |
 |---|---|---|
 | `nats.*` | `otel-nats` trace-event spans | NATS server trace-event payload fields have no direct stable OTel semconv equivalent. They are isolated to the optional infrastructure trace-event flow. |
-| MongoDB operation metric `network.peer.*` labels | contrib `otelmongo` CommandMonitor | The maintained contrib instrumentation emits `network.peer.address` / `network.peer.port` for `db.client.operation.duration`; the SDK keeps those labels and filters out `network.transport` rather than forking the T2 dependency. See ADR 0014. |
+| MongoDB operation metric `network.peer.*` labels | contrib `otelmongo` CommandMonitor | The maintained contrib instrumentation emits `network.peer.address` / `network.peer.port` for `db.client.operation.duration`; the SDK keeps those labels and filters out `network.transport` rather than forking the T2 dependency. Upstream derives both from the driver connection identifier without stripping its per-connection counter, which makes the address unbounded and the port always 27017; the SDK normalizes the identifier before otelmongo reads it rather than dropping the labels, so the peer dimension stays usable. See ADR 0014, ADR 0021 §Connection-identifier normalization, and the MongoDB section above. |
 | `redis.error.kind` | `redis` wrapper | Redis-specific bounded error class that distinguishes pool exhaustion from caller cancellation/deadline without using it as a metric label. |
 | `resty.error.kind`, `resty.retry.exhausted` | `resty` wrapper | Resty-specific bounded failure class and retry-budget marker. Standard `error.type` remains present; these keys preserve operator-facing retry and transport semantics without adding metric cardinality. |
 | `object_store.*` namespace (`system.name`, `operation.name`, `bucket.name`, `object.key`, `object.size`) | `minio` wrapper | OTel object-store semconv is at status Development and only the AWS-S3 page exists, framed as AWS-SDK / `rpc.system=aws-api`. The SDK-owned `object_store.*` namespace is package-local but shaped to mirror current OTel naming patterns; future migration to a blessed convention is expected to be a key rename. See ADR 0018 §4 and References. |
