@@ -17,7 +17,22 @@
 //
 // Since gosec.G101-1 is not in the public semgrep registry (see the note on
 // SEMGREP_FLAGS), no gate can run that rule. Enforcing that it is named
-// wherever a sibling scanner is suppressed is what this repo can do instead.
+// wherever a sibling scanner is known to fire is what this repo can do instead.
+//
+// Three signals say a scanner fires on a line, and each requires the external
+// id alongside it:
+//
+//	nosemgrep: hardcoded-credential-literal   this repo's rule fires here
+//	#nosec G101                               gosec fires here
+//	ruleid: hardcoded-credential-literal      a .semgrep/ fixture asserts it fires
+//
+// The third matters most for the directory the other gates all exclude.
+// .semgrep/ holds deliberate violations, so GOSEC_FLAGS, SEMGREP_FLAGS and
+// .semgrepignore skip it — but those are repo-local, and the fixture file says
+// so itself: an external scan reads the files directly and reports them
+// whatever the ignore list holds, which is what happened the first time this
+// tree was scanned elsewhere. The directory the convention matters most in was
+// the one nothing checked.
 package main
 
 import (
@@ -39,6 +54,10 @@ const repoRuleID = "hardcoded-credential-literal"
 // nosecG101 matches a gosec suppression naming G101. The rule id must follow
 // the directive, so prose that merely mentions "#nosec" is not a directive.
 var nosecG101 = regexp.MustCompile(`#nosec[ \t]+[A-Z0-9, \t]*G101`)
+
+// ruleIDMarker is how a .semgrep/ fixture asserts the repo rule fires on the
+// line below it.
+const ruleIDMarker = "ruleid: " + repoRuleID
 
 // selfName is this command's own file, excluded from the walk below.
 const selfName = "check_credential_directives.go"
@@ -73,8 +92,10 @@ func main() {
 
 // scan walks root for Go files and returns every directive violation found.
 //
-// .semgrep/ is skipped: its fixtures name gosec.G101-1 alone by design, so the
-// repo's own rule stays live for the rule's own test assertions.
+// .semgrep/ is walked like anything else. Its fixtures name gosec.G101-1 alone
+// by design, so the repo's own rule stays live for the rule's own assertions —
+// and checking that they do name it is the point, since every other gate
+// excludes that directory.
 func scan(root string) ([]violation, error) {
 	var found []violation
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -82,7 +103,7 @@ func scan(root string) ([]violation, error) {
 			return err
 		}
 		if d.IsDir() {
-			if d.Name() == ".semgrep" || d.Name() == ".git" {
+			if d.Name() == ".git" {
 				return fs.SkipDir
 			}
 			return nil
@@ -105,38 +126,86 @@ func scan(root string) ([]violation, error) {
 	return found, err
 }
 
-// check applies both invariants to one file's lines.
+// check applies the three invariants to one file's lines.
 //
-// They are deliberately one-directional. Naming the repo's rule, or
-// suppressing gosec's, both mean the line is a credential-shaped value that an
-// external scan reports too, so the registry id has to be named as well. The
-// converse is not a violation: the URL fixtures trip only the external rule,
-// because their identifiers are not credential-shaped, and name only that id.
+// They are deliberately one-directional. Naming the repo's rule, suppressing
+// gosec's, or asserting the repo's rule fires all mean the line is a
+// credential-shaped value that an external scan reports too, so the registry
+// id has to be named as well. The converse is not a violation: the URL
+// fixtures trip only the external rule, because their identifiers are not
+// credential-shaped, and name only that id.
 func check(file string, lines []string) []violation {
 	var found []violation
 	for i, line := range lines {
-		if strings.Contains(line, "nosemgrep:") &&
-			strings.Contains(line, repoRuleID) &&
-			!strings.Contains(line, registryID) {
+		ids := nosemgrepIDs(line)
+		if names(ids, repoRuleID) && !names(ids, registryID) {
 			found = append(found, violation{file, i + 1, line,
 				"nosemgrep directive names " + repoRuleID + " but not " + registryID})
 		}
-		if nosecG101.MatchString(line) && !hasRegistryIDNear(lines, i) {
+		if nosecG101.MatchString(line) && !namesRegistryIDNear(lines, i) {
 			found = append(found, violation{file, i + 1, line,
 				"#nosec G101 suppression has no nosemgrep: " + registryID + " within " +
 					fmt.Sprint(pairWindow) + " lines"})
+		}
+		// A fixture positive: the rule is asserted to fire on the next line, so
+		// that line is a planted credential an external scan reports too.
+		if strings.Contains(line, ruleIDMarker) && i+1 < len(lines) &&
+			!names(nosemgrepIDs(lines[i+1]), registryID) {
+			found = append(found, violation{file, i + 2, lines[i+1],
+				"fixture positive for " + repoRuleID + " does not name " + registryID})
 		}
 	}
 	return found
 }
 
-// hasRegistryIDNear reports whether the registry rule id appears within
-// pairWindow lines either side of i.
-func hasRegistryIDNear(lines []string, i int) bool {
+// namesRegistryIDNear reports whether a nosemgrep directive within pairWindow
+// lines either side of i names the registry rule id.
+//
+// The ids are parsed and compared exactly rather than searched for as a
+// substring: prose explaining the convention mentions the id without
+// suppressing anything, and a substring match would also accept a different
+// rule whose id merely starts with this one (gosec.G101-10).
+func namesRegistryIDNear(lines []string, i int) bool {
 	lo := max(0, i-pairWindow)
 	hi := min(len(lines)-1, i+pairWindow)
 	for j := lo; j <= hi; j++ {
-		if strings.Contains(lines[j], registryID) {
+		if names(nosemgrepIDs(lines[j]), registryID) {
+			return true
+		}
+	}
+	return false
+}
+
+// nosemgrepIDs returns the rule ids a nosemgrep directive on the line names,
+// or nil when it carries none. A reason may follow "--"; ids precede it.
+func nosemgrepIDs(line string) []string {
+	_, after, found := strings.Cut(line, "nosemgrep:")
+	if !found {
+		return nil
+	}
+	if before, _, ok := strings.Cut(after, "--"); ok {
+		after = before
+	}
+
+	var ids []string
+	for _, field := range strings.Split(after, ",") {
+		id := strings.Trim(strings.TrimSpace(field), "`")
+		// An id never contains whitespace, so anything after the first break
+		// is surrounding prose rather than part of the id.
+		if cut := strings.IndexAny(id, " \t`"); cut >= 0 {
+			id = id[:cut]
+		}
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// names reports whether ids contains want exactly.
+func names(ids []string, want string) bool {
+	for _, id := range ids {
+		if id == want {
 			return true
 		}
 	}
