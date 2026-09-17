@@ -82,10 +82,19 @@ GOSEC_FLAGS := -quiet -severity medium -confidence low -tests=true \
 # holding credential fixtures, r/gosec.G101-1 resolved to zero rules (semgrep
 # prints "Nothing to scan" and exits 0, so that gate would have passed having
 # scanned nothing), while p/gosec, p/security-audit and p/golang ran 23, 30
-# and 42 rules for zero findings. Whatever reports that id is a logged-in or
-# vendor ruleset — every anonymous scan ends with "need more rules? semgrep
-# login". sast-directives enforces the convention instead, since the rule
-# itself cannot be run here.
+# and 42 rules for zero findings, and every anonymous scan ends with "need
+# more rules? semgrep login".
+#
+# It is served to logged-in orgs: the deployment that reported this tree runs
+# Semgrep against an account, which is why the rule resolves for it and not
+# here. Reproducing it would need that account's SEMGREP_APP_TOKEN in this
+# repo's secrets, which is not a trade worth making for a gate — a scanning
+# credential is exactly the kind of value the rule itself exists to keep out
+# of a source tree. sast-directives enforces the convention instead.
+#
+# The directives do work there even though the rule cannot run here: semgrep
+# matches a nosemgrep id by suffix, so "gosec.G101-1" silences the finding
+# whatever namespace the full rule id carries in front of it.
 SEMGREP_FLAGS := --error --severity=WARNING --severity=ERROR --metrics=off \
                  --exclude=.semgrep --config=.semgrep/
 
