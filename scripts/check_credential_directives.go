@@ -110,6 +110,22 @@ var notFirstParty = []string{
 	".git", ".svn", ".hg",
 }
 
+// gosecCredentialName is gosec's G101 identifier pattern, copied from
+// rules/hardcoded_credentials.go in v2.26.1.
+//
+// The repo rule's $NAME regex is deliberately narrower -- it will not match a
+// bare `pass` or `pw`, to keep this library's own plumbing quiet -- so in
+// .semgrep/, which gosec never scans, neither vocabulary covers the other.
+// Both are applied there.
+//
+// This is a copy, and copies drift. It is a small, stable, published list and
+// the alternative was running gosec over a throwaway copy of the fixture from
+// inside this gate, which buys exactness at the price of a second scanner
+// invocation, a temp module and line-number remapping. If gosec's list changes,
+// this comment is where to look.
+var gosecCredentialName = regexp.MustCompile(
+	`(?i)passwd|pass|password|pwd|secret|token|pw|apiKey|bearer|cred`)
+
 // urlCredential matches a URL literal carrying a password in its userinfo,
 // the one credential shape whose identifier says nothing about it.
 var urlCredential = regexp.MustCompile(`(?i)[a-z][a-z0-9+.\-]*://[^/\s:@"` + "`" + `]+:[^/\s@"` + "`" + `]+@`)
@@ -442,6 +458,13 @@ func checkFixture(file string, src *source, parsed *ast.File) ([]violation, erro
 		return nil, nil
 	}
 
+	// Either vocabulary makes a binding a planted credential here: the repo
+	// rule's, and gosec's, since .semgrep/ is outside every scan that would
+	// otherwise apply one of them.
+	credentialName := func(name string) bool {
+		return nameRe.MatchString(name) || gosecCredentialName.MatchString(name)
+	}
+
 	var found []violation
 	report := func(pos token.Pos, name string) {
 		line := src.fset.Position(pos).Line
@@ -456,25 +479,28 @@ func checkFixture(file string, src *source, parsed *ast.File) ([]violation, erro
 		switch v := n.(type) {
 		case *ast.ValueSpec:
 			for i, name := range v.Names {
-				if i < len(v.Values) && nameRe.MatchString(name.Name) && isStringLiteral(v.Values[i]) {
+				if i < len(v.Values) && credentialName(name.Name) && isStringLiteral(v.Values[i]) {
 					report(v.Values[i].Pos(), name.Name)
 				}
 			}
 		case *ast.AssignStmt:
 			for i, lhs := range v.Lhs {
-				id, ok := lhs.(*ast.Ident)
+				// `cfg.Password = "..."` is what the rule's `$NAME = $VAL`
+				// pattern matches too -- a metavariable binds the whole target,
+				// not just a bare identifier.
+				name, ok := targetName(lhs)
 				if !ok || i >= len(v.Rhs) {
 					continue
 				}
-				if nameRe.MatchString(id.Name) && isStringLiteral(v.Rhs[i]) {
-					report(v.Rhs[i].Pos(), id.Name)
+				if credentialName(name) && isStringLiteral(v.Rhs[i]) {
+					report(v.Rhs[i].Pos(), name)
 				}
 			}
 		case *ast.KeyValueExpr:
 			// A composite-literal field, where the key names the credential and
 			// the value is the literal: a ProxyPassword or a ClientSecret.
 			if id, ok := v.Key.(*ast.Ident); ok &&
-				nameRe.MatchString(id.Name) && isStringLiteral(v.Value) {
+				credentialName(id.Name) && isStringLiteral(v.Value) {
 				report(v.Value.Pos(), id.Name)
 			}
 		}
@@ -657,6 +683,22 @@ func indentOf(line string) int {
 	return len(line) - len(strings.TrimLeft(line, " "))
 }
 
+// targetName renders an assignment target as the rule's $NAME metavariable
+// would bind it: an identifier, or a selector such as cfg.Password. Anything
+// else (an index, a dereference) is not a name this reader claims to read.
+func targetName(e ast.Expr) (string, bool) {
+	switch v := e.(type) {
+	case *ast.Ident:
+		return v.Name, true
+	case *ast.SelectorExpr:
+		if base, ok := targetName(v.X); ok {
+			return base + "." + v.Sel.Name, true
+		}
+		return v.Sel.Name, true
+	}
+	return "", false
+}
+
 // isStringLiteral reports whether e is a non-empty string literal, or a
 // concatenation of them ("sup3r-" + "secret" is as hard-coded as one literal).
 //
@@ -679,7 +721,7 @@ func isStringLiteral(e ast.Expr) bool {
 type comment struct {
 	startLine int
 	endLine   int
-	trailing  bool // code precedes it on its first line
+	inline    bool // code shares its first line, before it or after it
 	texts     []string
 }
 
@@ -696,20 +738,26 @@ func newSource(fset *token.FileSet, parsed *ast.File, lines []string) *source {
 	for _, group := range parsed.Comments {
 		for _, c := range group.List {
 			pos := fset.Position(c.Pos())
-			before := ""
+			// A comment shares its line with code either side: `x := 1 // c`
+			// and `/* c */ x := 1` both annotate that line, and gosec honors
+			// the prefix form on the declaration that follows it there.
+			before, after := "", ""
 			if pos.Line-1 < len(lines) {
 				line := lines[pos.Line-1]
 				before = line[:min(pos.Column-1, len(line))]
+				if end := fset.Position(c.End()); end.Line == pos.Line {
+					after = line[min(end.Column-1, len(line)):]
+				}
 			}
 			parsed := &comment{
 				startLine: pos.Line,
 				endLine:   fset.Position(c.End()).Line,
-				trailing:  strings.TrimSpace(before) != "",
+				inline:    strings.TrimSpace(before) != "" || isCode(after),
 				texts:     commentTexts(c.Text),
 			}
 			s.comments = append(s.comments, parsed)
 			for l := parsed.startLine; l <= parsed.endLine; l++ {
-				if l == parsed.startLine && parsed.trailing {
+				if l == parsed.startLine && parsed.inline {
 					continue
 				}
 				s.covered[l] = true
@@ -734,12 +782,37 @@ func commentTexts(raw string) []string {
 	return texts
 }
 
+// isCode reports whether the remainder of a line holds something other than
+// blank space and further comments.
+//
+// Block comments are stepped over rather than treated as the end of the line:
+// `/* #nosec G101 */ /* nosemgrep: … */ const x = "…"` is the natural way to
+// write both directives inline, and stopping at the second would put the first
+// back on the following statement.
+func isCode(rest string) bool {
+	for {
+		rest = strings.TrimSpace(rest)
+		switch {
+		case rest == "" || strings.HasPrefix(rest, "//"):
+			return false // nothing left, or a comment running to end of line
+		case strings.HasPrefix(rest, "/*"):
+			end := strings.Index(rest, "*/")
+			if end < 0 {
+				return false // the comment runs past this line
+			}
+			rest = rest[end+2:]
+		default:
+			return true
+		}
+	}
+}
+
 // statement returns the line the comment's directive governs: for a trailing
 // comment its own line, otherwise the next line that is neither blank nor
 // comment (gosec honors a directive across a blank line). It returns -1 when a
 // comment at the end of a file governs nothing.
 func (s *source) statement(c *comment) int {
-	if c.trailing {
+	if c.inline {
 		return c.startLine
 	}
 	for l := c.endLine + 1; l <= len(s.lines); l++ {
@@ -761,7 +834,7 @@ func (s *source) namedInSlot(stmt int) bool {
 		return false
 	}
 	for _, c := range s.comments {
-		inSlot := (c.trailing && c.startLine == stmt) || c.endLine == stmt-1
+		inSlot := (c.inline && c.startLine == stmt) || c.endLine == stmt-1
 		if inSlot && names(c.nosemgrepIDs(), registryID) {
 			return true
 		}
