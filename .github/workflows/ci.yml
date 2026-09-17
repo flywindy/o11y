@@ -151,5 +151,21 @@ jobs:
       # named registry rules (SEMGREP_REGISTRY_RULES). The registry step needs
       # network access to the semgrep registry, which this runner has and a
       # developer's sandbox may not.
+      # TEMPORARY probe, removed before this PR leaves draft. r/gosec.G101-1
+      # resolved to 0 rules on the previous run, so the registry path the
+      # repo's nosemgrep directives name has to be discovered empirically —
+      # semgrep cannot run in the authoring sandbox and semgrep.dev is
+      # unreachable from it. Non-blocking so one run reports every candidate.
+      - name: "SAST registry probe (temporary, non-blocking)"
+        continue-on-error: true
+        run: |
+          for cfg in r/gosec.G101-1 p/gosec p/security-audit p/golang; do
+            echo "::group::$cfg"
+            semgrep scan --config="$cfg" --metrics=off --no-git-ignore \
+              internal/log/logr_test.go diagnostics_internal_test.go \
+              internal/redact/redact_test.go 2>&1 | tail -40 || true
+            echo "::endgroup::"
+          done
+
       - name: "SAST (semgrep: repo-owned + registry rules, fail on medium+)"
         run: make sast

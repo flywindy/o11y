@@ -156,9 +156,23 @@ sast-semgrep: ## semgrep: repo-owned rules under .semgrep/
 # the fixture must be a sibling because semgrep's test runner matches by
 # basename and does not support a separate tests directory. Fixtures contain
 # deliberate violations, which is why SEMGREP_FLAGS excludes .semgrep above.
+# A registry config that resolves to nothing is the failure mode this target
+# exists to prevent: semgrep prints "0 Code rules / Nothing to scan" and exits
+# 0, so a typo'd or renamed rule id turns the gate into a green no-op that
+# certifies an unscanned tree. The rule count is parsed back out of the scan
+# banner and a zero count fails, so the gate can only pass by having actually
+# run something.
 sast-semgrep-registry: ## semgrep: registry rules an external scan reports (see SEMGREP_REGISTRY_RULES)
 	@command -v "$(SEMGREP)" >/dev/null 2>&1 || { echo "semgrep not installed — run 'make tools' (needs pipx), or: pipx install semgrep==$(SEMGREP_VERSION)"; exit 1; }
-	"$(SEMGREP)" scan $(SEMGREP_REGISTRY_FLAGS) .
+	@set -o pipefail; \
+	out=$$("$(SEMGREP)" scan $(SEMGREP_REGISTRY_FLAGS) . 2>&1); rc=$$?; \
+	printf '%s\n' "$$out"; \
+	rules=$$(printf '%s' "$$out" | sed -n 's/.*with \([0-9][0-9]*\) Code rule.*/\1/p' | head -1); \
+	if [ -z "$$rules" ] || [ "$$rules" -eq 0 ]; then \
+	  echo "sast-semgrep-registry: $(SEMGREP_REGISTRY_RULES) resolved to $${rules:-no} rules — the gate scanned nothing" >&2; \
+	  exit 1; \
+	fi; \
+	exit $$rc
 
 sast-semgrep-test: ## Run the repo-owned semgrep rules against their fixtures
 	@command -v "$(SEMGREP)" >/dev/null 2>&1 || { echo "semgrep not installed — run 'make tools' (needs pipx), or: pipx install semgrep==$(SEMGREP_VERSION)"; exit 1; }
