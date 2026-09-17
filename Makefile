@@ -164,35 +164,15 @@ sast-gosec-cred: ## gosec: hardcoded-credential findings only (G101), blocking
 	@test -x "$(GOSEC)" || { echo "gosec not installed — run 'make tools'"; exit 1; }
 	$(GOSEC) $(GOSEC_FLAGS) -include=G101 ./...
 
-# nosemgrep matches a rule id by exact suffix, so a directive naming one id
-# never silences another. hardcoded-credential-literal is this repo's rule and
-# runs in CI; gosec.G101-1 is what an external scan reports and runs nowhere
-# here — it is not in the public semgrep registry at all, so no CI gate can
-# check it (p/gosec, p/security-audit and p/golang were all probed and report
-# nothing on the files carrying these fixtures). A line naming only the repo's
-# rule therefore looks correct in review and in CI, and is caught for the first
-# time outside this repo. That is what happened to internal/log/logr_test.go,
-# and this check is the only thing that can catch the next one.
-#
-# The invariant is asymmetric on purpose. Naming hardcoded-credential-literal
-# means this repo's rule fires on that line, so the line is a credential-shaped
-# declaration and an external scan reports it too: the registry id has to be
-# named as well. The converse is legitimate — the URL fixtures trip only the
-# external rule, because their identifiers are not credential-shaped, and name
-# only that id.
-#
-# .semgrep/ is excluded: its fixtures name gosec.G101-1 alone by design, so
-# hardcoded-credential-literal stays live for the rule's own assertions.
-sast-directives: ## Check credential nosemgrep directives name both rule ids
-	@bad=$$(grep -rn 'nosemgrep:' --include='*.go' --exclude-dir=.semgrep . \
-	          | grep 'hardcoded-credential-literal' \
-	          | grep -v 'gosec\.G101-1' || true); \
-	if [ -n "$$bad" ]; then \
-	  echo "a nosemgrep directive naming hardcoded-credential-literal must also name gosec.G101-1:" >&2; \
-	  printf '%s\n' "$$bad" >&2; \
-	  exit 1; \
-	fi; \
-	echo "==> credential nosemgrep directives: OK"
+# gosec.G101-1, the id an external scan reports, runs nowhere here — it is not
+# in the public semgrep registry at all (see SEMGREP_FLAGS). So the only thing
+# this repo can enforce is that the id is named wherever a sibling scanner is
+# suppressed, which is what the script checks. Its doc comment carries the full
+# reasoning; a Go program rather than a shell recipe because the check needs to
+# look at neighbouring lines, and because an awk pipeline that errors mid-run
+# is exactly the silently-passing gate this whole target exists to prevent.
+sast-directives: ## Check credential suppressions carry the external rule id
+	$(GO) run ./scripts/check_credential_directives.go
 
 sast-semgrep-test: ## Run the repo-owned semgrep rules against their fixtures
 	@command -v "$(SEMGREP)" >/dev/null 2>&1 || { echo "semgrep not installed — run 'make tools' (needs pipx), or: pipx install semgrep==$(SEMGREP_VERSION)"; exit 1; }
