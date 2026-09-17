@@ -266,7 +266,11 @@ func reachableFiles() (map[string]bool, error) {
 	}
 	files := map[string]bool{}
 	for _, line := range strings.Split(string(out), "\n") {
-		if line = strings.TrimSpace(line); line != "" {
+		// .Dir carries the host's separators while the template appends "/",
+		// so on Windows a census entry is a mix of both. checkReachable
+		// normalizes the walked path; normalize this side to match, or nothing
+		// compares equal and every file reads as excluded.
+		if line = filepath.ToSlash(strings.TrimSpace(line)); line != "" {
 			files[line] = true
 		}
 	}
@@ -516,7 +520,11 @@ func ruleBlock(lines []string, id string) (lo, hi int, ok bool, err error) {
 
 	itemIndent, starts := -1, []int{}
 	for i := rulesAt + 1; i < len(lines); i++ {
-		if !strings.HasPrefix(strings.TrimSpace(lines[i]), "- ") {
+		// `- id: x` and a bare `-` with the mapping indented beneath it are the
+		// same sequence entry. Recognizing only the first let a formatting
+		// change leave the list looking empty, and an empty list of rules reads
+		// as "no such rule" -- the fixture check skipped, silently.
+		if trimmed := strings.TrimSpace(lines[i]); trimmed != "-" && !strings.HasPrefix(trimmed, "- ") {
 			continue
 		}
 		switch indent := indentOf(lines[i]); {
