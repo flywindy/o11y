@@ -359,6 +359,72 @@ removes that host, so this ADR fixes the lifecycle as **Option A**:
 
 ---
 
+## Connection-identifier normalization (amendment, 2026-09-16)
+
+Adopting the contrib monitor means inheriting its attribute derivation. One
+place that derivation is wrong, and wrong in a way that costs unbounded metric
+cardinality, so this ADR adds a normalization seam between the driver and
+otelmongo.
+
+**What upstream does.** `otelmongo`'s `peerInfo` derives
+`network.peer.address` and `network.peer.port` from
+`event.CommandStartedEvent.ConnectionID` with `net.SplitHostPort`, falling back
+to the whole identifier plus a hardcoded `27017` when the split fails. The v2
+driver formats that identifier as `fmt.Sprintf("%s[-%d]", addr, n)`
+(`x/mongo/driver/topology/connection.go`), where `n` comes from a process-global
+counter incremented for every connection the process opens. `SplitHostPort`
+rejects the trailing bracket, so the fallback always fires: the address label
+carries the counter and the port label is always `27017`.
+
+**Why it matters.** Pool growth, idle reaping (`maxIdleTimeMS`) and topology
+recovery all mint fresh identifiers over a pod's lifetime, and
+`db.client.operation.duration` is a cumulative histogram, so each one costs a
+permanent attribute set — roughly `buckets + 3` Prometheus series — until the
+stream reaches its per-stream cardinality limit and collapses into
+`otel_metric_overflow="true"`. The metric is then both enormous and useless. A
+wrong port label is the smaller, but equally silent, half.
+
+**Decision.** `NewMonitor` wraps the contrib monitor in a shim that strips the
+bracketed counter from the identifier before handing the event on
+(`mongo.normalizeConnectionID`). Three properties make this the right seam:
+
+- **It fixes both signals.** The counter reached span attributes as well as
+  metric labels; a metric view could only have addressed the latter.
+- **It keeps the dimension.** Dropping `network.peer.*` from the view would also
+  have bounded the metric, but replica-set members would stop being
+  distinguishable — and the port would stay wrong on spans.
+- **It does not mutate driver state.** Events are copied on change, so the
+  application's own `CommandMonitor` — which `Instrument` composes with, per
+  Decision point 6 — keeps seeing the driver's identifier.
+
+**Why collapsing the identifier is safe for correlation.** otelmongo keys its
+in-flight span map on `{ConnectionID, RequestID}`. Normalizing both the Started
+and the Finished side consistently preserves the key, and mapping many
+connections onto one address cannot introduce a collision: the driver draws
+`RequestID` from a single process-global counter
+(`wiremessage.NextRequestID`), so it already identifies an in-flight command on
+its own.
+
+**Backstop.** Normalization is what bounds the label; a constant-sized export
+cap (50 distinct `network.peer.address` values on the otelmongo scope,
+overflowing to `other`) is what keeps a future upstream format change from
+costing a permanent series per connection again before anyone notices. It is a
+constant rather than an `Init` option because it is a safety net, not a tuning
+knob — a real deployment addresses a handful of replica-set members or mongos
+routers.
+
+**Regression cover.** `mongo/driverformat_test.go` drives the real driver
+against an in-process wire-protocol fake and asserts both the upstream
+identifier shape and the resulting single attribute set. The synthetic fixtures
+that missed this originally carried a bare `"127.0.0.1:27017"`, a shape the
+driver never emits; they now carry the real one, which turns the package's
+existing peer-attribute assertions into regression tests.
+
+**Upstream.** The fix belongs in `otelmongo`'s `peerInfo`; the shim is
+removable once a release carries it, and the format test is what will say so.
+
+---
+
 ## Alternatives considered
 
 - **Keep Marz + add `type Database = …` aliases in `o11y/mongo`** (so callers

@@ -148,6 +148,11 @@ func Instrument(
 //
 // Callers should pass non-nil providers. Nil providers are converted to no-op
 // providers instead of allowing otelmongo to fall back to OpenTelemetry globals.
+//
+// The returned monitor normalizes the driver's connection identifier before
+// otelmongo reads it, so network.peer.address carries the server address
+// rather than a per-connection counter and network.peer.port carries the real
+// port. See withNormalizedConnectionIDs.
 func NewMonitor(tp trace.TracerProvider, mp metric.MeterProvider) *event.CommandMonitor {
 	if tp == nil {
 		tp = tracenoop.NewTracerProvider()
@@ -155,11 +160,77 @@ func NewMonitor(tp trace.TracerProvider, mp metric.MeterProvider) *event.Command
 	if mp == nil {
 		mp = metricnoop.NewMeterProvider()
 	}
-	return otelmongo.NewMonitor(
+	return withNormalizedConnectionIDs(otelmongo.NewMonitor(
 		otelmongo.WithTracerProvider(tp),
 		otelmongo.WithMeterProvider(mp),
 		otelmongo.WithSpanNameFormatter(spanName),
-	)
+	))
+}
+
+// withNormalizedConnectionIDs returns a CommandMonitor that hands inner the
+// same events with the driver's per-connection counter stripped from
+// ConnectionID (see normalizeConnectionID), which is what otelmongo derives
+// network.peer.address and network.peer.port from.
+//
+// Normalizing here rather than filtering the label out in the metric view
+// fixes the span attributes too, and keeps the peer dimension usable: a
+// replica-set member stays distinguishable on both signals, and the port is
+// the one the driver actually connected to.
+//
+// Events are copied, never mutated: the driver owns them, and Instrument
+// composes this monitor with any monitor the application already installed,
+// which must keep seeing the driver's own identifier. The copy is shallow,
+// which is safe because the only reference field (Command bson.Raw) is read
+// only, and is made only when the identifier actually changes.
+//
+// otelmongo correlates a command's Started and Finished events through a
+// {ConnectionID, RequestID} map key. Rewriting both sides consistently keeps
+// that key intact, and collapsing many connections onto one address cannot
+// make two in-flight commands collide: the driver draws RequestID from a
+// single process-global counter (wiremessage.NextRequestID), so it identifies
+// an in-flight command on its own.
+func withNormalizedConnectionIDs(inner *event.CommandMonitor) *event.CommandMonitor {
+	if inner == nil {
+		return nil
+	}
+	monitor := &event.CommandMonitor{}
+	if inner.Started != nil {
+		monitor.Started = func(ctx context.Context, evt *event.CommandStartedEvent) {
+			if evt != nil {
+				if id := normalizeConnectionID(evt.ConnectionID); id != evt.ConnectionID {
+					normalized := *evt
+					normalized.ConnectionID = id
+					evt = &normalized
+				}
+			}
+			inner.Started(ctx, evt)
+		}
+	}
+	if inner.Succeeded != nil {
+		monitor.Succeeded = func(ctx context.Context, evt *event.CommandSucceededEvent) {
+			if evt != nil {
+				if id := normalizeConnectionID(evt.ConnectionID); id != evt.ConnectionID {
+					normalized := *evt
+					normalized.ConnectionID = id
+					evt = &normalized
+				}
+			}
+			inner.Succeeded(ctx, evt)
+		}
+	}
+	if inner.Failed != nil {
+		monitor.Failed = func(ctx context.Context, evt *event.CommandFailedEvent) {
+			if evt != nil {
+				if id := normalizeConnectionID(evt.ConnectionID); id != evt.ConnectionID {
+					normalized := *evt
+					normalized.ConnectionID = id
+					evt = &normalized
+				}
+			}
+			inner.Failed(ctx, evt)
+		}
+	}
+	return monitor
 }
 
 // mongoSystemName is the db.system.name value this package emits (see

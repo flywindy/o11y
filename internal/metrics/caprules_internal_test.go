@@ -5,6 +5,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
+
+	"github.com/flywindy/o11y/internal/metricscap"
+	"github.com/flywindy/o11y/internal/views"
 )
 
 // The cap-rule builders are the single place both export paths agree on which
@@ -95,23 +98,38 @@ func TestCardinalityLimitBudget(t *testing.T) {
 	assert.Positive(t, cardinalityLimitBudget(int(^uint(0)>>1), 0, 0))
 }
 
-// Each cap is independent: configuring one must not install or suppress the
-// other, so a caller can bound tables without bounding routes and vice versa.
+// Each configurable cap is independent: configuring one must not install or
+// suppress the other, so a caller can bound tables without bounding routes and
+// vice versa. The MongoDB peer cap is not configurable — it is a constant-sized
+// safety net — so it is excluded here and covered by
+// TestCapRulesIncludeMongoPeerCap.
 func TestCapRulesAreIndependent(t *testing.T) {
-	routesOnly := otlpCapRules(Config{MaxUniqueRoutes: 10})
+	routesOnly := configurableOTLPCapRules(Config{MaxUniqueRoutes: 10})
 	assert.Len(t, routesOnly, 2)
 	for _, r := range routesOnly {
 		assert.Equal(t, semconv.HTTPRouteKey, r.Key)
 	}
 
-	collectionsOnly := otlpCapRules(Config{MaxUniqueCollections: 10})
+	collectionsOnly := configurableOTLPCapRules(Config{MaxUniqueCollections: 10})
 	assert.Len(t, collectionsOnly, 3) // two Cassandra instruments + one Elasticsearch
 	for _, r := range collectionsOnly {
 		assert.Equal(t, semconv.DBCollectionNameKey, r.Key)
 	}
 
-	assert.Empty(t, otlpCapRules(Config{}))
-	assert.Empty(t, prometheusCapRules(Config{}))
+	assert.Empty(t, configurableOTLPCapRules(Config{}))
+}
+
+// configurableOTLPCapRules drops the always-on rules, leaving the ones a
+// caller's Config turns on and off.
+func configurableOTLPCapRules(cfg Config) []metricscap.Rule {
+	var rules []metricscap.Rule
+	for _, r := range otlpCapRules(cfg) {
+		if r.Key == semconv.NetworkPeerAddressKey {
+			continue
+		}
+		rules = append(rules, r)
+	}
+	return rules
 }
 
 // The two export paths must cap the same set of instruments — a rule present on
@@ -131,4 +149,70 @@ func TestCapRulePathsCoverTheSameInstruments(t *testing.T) {
 				"Prometheus path is missing a cap rule for %s/%s", sc.scope, inst.instrument)
 		}
 	}
+}
+
+// The MongoDB peer cap is a safety net for a label derived from the driver's
+// connection identifier: the mongo package strips the per-connection counter
+// upstream of otelmongo, and this cap is what keeps a future format change
+// from costing a permanent series per connection before anyone notices. It is
+// a constant rather than a Config field, so it must be present whatever the
+// caller configured.
+func TestCapRulesIncludeMongoPeerCap(t *testing.T) {
+	configs := []Config{
+		{MaxUniqueRoutes: 1000, MaxUniqueCollections: 200},
+		{},
+	}
+
+	for _, cfg := range configs {
+		var otlp []metricscap.Rule
+		for _, r := range otlpCapRules(cfg) {
+			if r.Key == semconv.NetworkPeerAddressKey {
+				otlp = append(otlp, r)
+			}
+		}
+		assert.Equal(t, []metricscap.Rule{{
+			InstrumentName: "db.client.operation.duration",
+			ScopeName:      mongoContribScope,
+			Key:            semconv.NetworkPeerAddressKey,
+			Max:            maxUniqueMongoPeers,
+			BudgetKey:      mongoPeerBudget,
+		}}, otlp)
+
+		var prom []metricscap.PrometheusRule
+		for _, r := range prometheusCapRules(cfg) {
+			if r.LabelName == "network_peer_address" {
+				prom = append(prom, r)
+			}
+		}
+		assert.Equal(t, []metricscap.PrometheusRule{{
+			MetricName: "db_client_operation_duration_seconds",
+			ScopeName:  mongoContribScope,
+			LabelName:  "network_peer_address",
+			Max:        maxUniqueMongoPeers,
+			BudgetKey:  mongoPeerBudget,
+		}}, prom)
+	}
+}
+
+// The peer cap must never reach another integration's db.client.operation.duration
+// stream: Cassandra, Redis and Elasticsearch emit the same instrument name, and
+// Cassandra can carry network.peer.address of its own under
+// cassandra.WithHostAttributes.
+func TestMongoPeerCapIsScopedToContribInstrumentation(t *testing.T) {
+	assert.Equal(t, views.MongoContribScope, mongoContribScope)
+
+	for _, r := range otlpCapRules(Config{MaxUniqueRoutes: 1000, MaxUniqueCollections: 200}) {
+		if r.Key == semconv.NetworkPeerAddressKey {
+			assert.NotEmpty(t, r.ScopeName, "peer cap must name the scope that emits it")
+		}
+	}
+}
+
+// The peer cap must stay clear of the per-stream cardinality limit: with the
+// shipped budget it can only contribute maxUniqueMongoPeers × the operation
+// names a driver emits, which has to stay well under the limit or the cap
+// would be the thing that never gets a chance to fire.
+func TestMongoPeerCapFitsCardinalityBudget(t *testing.T) {
+	assert.Less(t, maxUniqueMongoPeers, cardinalityLimitBudget(1000, 200, 0)/20,
+		"peer cap must leave room for the operation-name dimension inside the stream limit")
 }
