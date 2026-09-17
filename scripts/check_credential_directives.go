@@ -155,13 +155,6 @@ func scan(root string) ([]violation, error) {
 		if filepath.Ext(path) != ".go" {
 			return nil
 		}
-		// This file necessarily contains the patterns it searches for, in its
-		// own doc comment and in the text of the messages it prints. Matched by
-		// path, not basename: a file of the same name in another package is
-		// ordinary source and must be checked like any other.
-		if filepath.Clean(path) == self {
-			return nil
-		}
 		lines, err := readLines(path)
 		if err != nil {
 			return err
@@ -172,8 +165,24 @@ func scan(root string) ([]violation, error) {
 			return fmt.Errorf("parse %s: %w", path, err)
 		}
 		src := newSource(fset, parsed, lines)
-		found = append(found, check(path, src)...)
-		found = append(found, checkReachable(path, reachable, lines)...)
+
+		// This file necessarily contains the directive patterns it searches
+		// for, in its own doc comment and in the text of the messages it
+		// prints, so those invariants would report itself. That is a reason to
+		// skip the directives, not the values: the URL check below keys on
+		// what a literal holds, so it applies here like anywhere gosec cannot
+		// read. Matched by path, not basename -- a file of the same name in
+		// another package is ordinary source and is checked like any other.
+		isSelf := filepath.Clean(path) == self
+		if !isSelf {
+			found = append(found, check(path, src)...)
+			found = append(found, checkReachable(path, reachable, lines)...)
+		}
+		// Files gosec's scan never reads, so its G101 cannot cover the one
+		// credential shape the repo rule is blind to.
+		if _, exempt := gosecExempt[filepath.ToSlash(filepath.Clean(path))]; exempt || isSelf {
+			found = append(found, checkURLLiterals(path, src, parsed)...)
+		}
 
 		if filepath.Base(filepath.Dir(path)) == fixtureDir {
 			fixtureFound, err := checkFixture(path, src, parsed)
@@ -276,6 +285,34 @@ func checkReachable(file string, reachable map[string]bool, lines []string) []vi
 			"check its build constraints and filename, or record it in gosecExempt"}}
 }
 
+// checkURLLiterals requires the registry id on every URL literal carrying a
+// password, wherever it sits.
+//
+// This is the one credential shape the repo rule's $NAME regex cannot see,
+// because the identifier holding it says nothing -- `endpoint`, `target`,
+// `addr`. Everywhere gosec reads, its G101 covers the shape and this check
+// would only duplicate it; it runs over the files gosec does not read, where
+// otherwise nothing would.
+func checkURLLiterals(file string, src *source, parsed *ast.File) []violation {
+	var found []violation
+	reported := map[int]bool{}
+	ast.Inspect(parsed, func(n ast.Node) bool {
+		lit, ok := n.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING || !urlCredential.MatchString(lit.Value) {
+			return true
+		}
+		line := src.fset.Position(lit.Pos()).Line
+		if src.namedInSlot(line) || reported[line] {
+			return true
+		}
+		reported[line] = true
+		found = append(found, src.violation(file, line,
+			"password in a URL does not name "+registryID))
+		return true
+	})
+	return found
+}
+
 // checkFixture requires the registry id on every credential-shaped binding in
 // a rule fixture, positive or negative.
 //
@@ -291,16 +328,12 @@ func checkFixture(file string, src *source, parsed *ast.File) ([]violation, erro
 	// Only the credential rule's own fixture. Another rule's fixture is not
 	// credential data, and demanding a $NAME regex of every rule would fail
 	// this gate the moment someone adds one written with a direct pattern.
-	defines, err := definesRule(ruleFile, repoRuleID)
+	nameRe, err := credentialNameRegex(ruleFile, repoRuleID)
 	if err != nil {
 		return nil, err
 	}
-	if !defines {
+	if nameRe == nil {
 		return nil, nil
-	}
-	nameRe, err := credentialNameRegex(ruleFile)
-	if err != nil {
-		return nil, err
 	}
 
 	var found []violation
@@ -338,39 +371,105 @@ func checkFixture(file string, src *source, parsed *ast.File) ([]violation, erro
 				nameRe.MatchString(id.Name) && isStringLiteral(v.Value) {
 				report(v.Value.Pos(), id.Name)
 			}
-		case *ast.BasicLit:
-			// A password in a URL, wherever it sits. This is the one credential
-			// shape the rule's $NAME regex cannot see, because the identifier
-			// holding it says nothing -- `endpoint`, `target`, `addr`. In
-			// ordinary source gosec's G101 covers it, but every scanner excludes
-			// this directory, so here the check has to be its own.
-			if v.Kind == token.STRING && urlCredential.MatchString(v.Value) {
-				report(v.Pos(), "password in a URL")
-			}
 		}
 		return true
 	})
 	return found, nil
 }
 
-// definesRule reports whether a semgrep rule file declares the given rule id.
+// credentialNameRegex reads the $NAME metavariable-regex belonging to the named
+// rule, or (nil, nil) when the file declares no such rule.
 //
-// The scalar is normalized rather than compared to one serialization: `id: x`,
-// `id: "x"` and `id: x # note` are the same YAML, and a comparison that
-// accepts only the first would silently skip the fixture check on a rule file
-// whose formatting changed.
-func definesRule(ruleFile, id string) (bool, error) {
+// Parsed by hand rather than with a YAML library so this gate adds no
+// dependency; an extraction failure inside the rule is an error rather than a
+// skip, because a silently empty pattern is the no-op gate this whole target
+// exists to prevent.
+//
+// Two bounds keep the answer the right rule's. The search runs inside the list
+// item whose `id` matches, so a sibling rule cannot lend its regex; and within
+// that, inside the block $NAME's own constraint opens, so $VAL cannot -- its
+// regex matches string literals rather than identifiers, which matches no
+// identifier at all and would check nothing while reporting OK.
+func credentialNameRegex(ruleFile, id string) (*regexp.Regexp, error) {
 	lines, err := readLines(ruleFile)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	for _, line := range lines {
-		key, value, ok := yamlEntry(strings.TrimPrefix(strings.TrimSpace(line), "- "))
-		if ok && key == "id" && yamlScalar(value) == id {
-			return true, nil
+	lo, hi, ok := ruleBlock(lines, id)
+	if !ok {
+		return nil, nil
+	}
+	for i := lo; i < hi; i++ {
+		key, value, ok := yamlEntry(strings.TrimSpace(lines[i]))
+		if !ok || key != "metavariable" || yamlScalar(value) != "$NAME" {
+			continue
+		}
+		base := indentOf(lines[i])
+		for j := i + 1; j < hi; j++ {
+			trimmed := strings.TrimSpace(lines[j])
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			nextKey, nextValue, ok := yamlEntry(trimmed)
+			if indentOf(lines[j]) < base || (ok && nextKey == "metavariable") {
+				break // left $NAME's constraint block
+			}
+			if !ok || nextKey != "regex" {
+				continue
+			}
+			re, err := regexp.Compile(yamlScalar(nextValue))
+			if err != nil {
+				return nil, fmt.Errorf("compile $NAME regex from %s: %w", ruleFile, err)
+			}
+			return re, nil
+		}
+		return nil, fmt.Errorf("no regex in the $NAME constraint block of %s", ruleFile)
+	}
+	return nil, fmt.Errorf("no $NAME metavariable-regex in rule %s of %s", id, ruleFile)
+}
+
+// ruleBlock returns the line range of the rules-list item declaring the given
+// id. Items are recognized by the indent of the first one under `rules:`, so a
+// nested list (patterns, pattern-either) does not read as a new rule.
+func ruleBlock(lines []string, id string) (lo, hi int, ok bool) {
+	rulesAt := -1
+	for i, line := range lines {
+		if key, _, ok := yamlEntry(strings.TrimSpace(line)); ok && key == "rules" {
+			rulesAt = i
+			break
 		}
 	}
-	return false, nil
+	if rulesAt < 0 {
+		return 0, 0, false
+	}
+
+	itemIndent, starts := -1, []int{}
+	for i := rulesAt + 1; i < len(lines); i++ {
+		if !strings.HasPrefix(strings.TrimSpace(lines[i]), "- ") {
+			continue
+		}
+		switch indent := indentOf(lines[i]); {
+		case itemIndent < 0:
+			itemIndent = indent
+			starts = append(starts, i)
+		case indent == itemIndent:
+			starts = append(starts, i)
+		}
+	}
+
+	for n, from := range starts {
+		to := len(lines)
+		if n+1 < len(starts) {
+			to = starts[n+1]
+		}
+		for i := from; i < to; i++ {
+			key, value, ok := yamlEntry(strings.TrimPrefix(strings.TrimSpace(lines[i]), "- "))
+			if ok && key == "id" && yamlScalar(value) == id {
+				return from, to, true
+			}
+		}
+	}
+	return 0, 0, false
 }
 
 // yamlEntry splits a mapping entry into its key and value. The key is trimmed
@@ -403,49 +502,6 @@ func yamlScalar(value string) string {
 // indentOf returns a line's leading-space count, YAML's block structure.
 func indentOf(line string) int {
 	return len(line) - len(strings.TrimLeft(line, " "))
-}
-
-// credentialNameRegex reads the $NAME metavariable-regex out of a semgrep rule
-// file. Parsed by hand rather than with a YAML library so this gate adds no
-// dependency; an extraction failure is an error rather than a skip, because a
-// silently empty pattern is the no-op gate this whole target exists to prevent.
-//
-// The search is bounded to the block $NAME's constraint opens. Reading on past
-// it would pick up the next metavariable's regex -- $VAL's, which matches
-// string literals rather than identifiers -- and the fixture check would then
-// quietly match nothing at all instead of raising the error promised above.
-func credentialNameRegex(ruleFile string) (*regexp.Regexp, error) {
-	lines, err := readLines(ruleFile)
-	if err != nil {
-		return nil, err
-	}
-	for i, line := range lines {
-		key, value, ok := yamlEntry(strings.TrimSpace(line))
-		if !ok || key != "metavariable" || yamlScalar(value) != "$NAME" {
-			continue
-		}
-		base := indentOf(line)
-		for _, next := range lines[i+1:] {
-			trimmed := strings.TrimSpace(next)
-			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-				continue
-			}
-			nextKey, nextValue, ok := yamlEntry(trimmed)
-			if indentOf(next) < base || (ok && nextKey == "metavariable") {
-				break // left $NAME's constraint block
-			}
-			if !ok || nextKey != "regex" {
-				continue
-			}
-			re, err := regexp.Compile(yamlScalar(nextValue))
-			if err != nil {
-				return nil, fmt.Errorf("compile $NAME regex from %s: %w", ruleFile, err)
-			}
-			return re, nil
-		}
-		return nil, fmt.Errorf("no regex in the $NAME constraint block of %s", ruleFile)
-	}
-	return nil, fmt.Errorf("no $NAME metavariable-regex found in %s", ruleFile)
 }
 
 // isStringLiteral reports whether e is a string literal, or a concatenation of
