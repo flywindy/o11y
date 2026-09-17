@@ -122,7 +122,7 @@ jobs:
     # credential-literal gap this job exists to catch; wiring it in as a
     # blocking gate needs a human triage pass first (fix vs justified
     # #nosec), tracked separately. `make sast-gosec` stays runnable locally.
-    name: sast (repo-owned semgrep rules)
+    name: "sast (semgrep: repo-owned + registry rules)"
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -147,5 +147,9 @@ jobs:
           make tools
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: SAST (repo-owned semgrep rules, fail on medium+)
+      # `make sast` runs the repo-owned rules, their fixture tests, and the
+      # named registry rules (SEMGREP_REGISTRY_RULES). The registry step needs
+      # network access to the semgrep registry, which this runner has and a
+      # developer's sandbox may not.
+      - name: "SAST (semgrep: repo-owned + registry rules, fail on medium+)"
         run: make sast

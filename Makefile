@@ -72,6 +72,25 @@ GOSEC_FLAGS := -quiet -severity medium -confidence low -tests=true \
 SEMGREP_FLAGS := --error --severity=WARNING --severity=ERROR --metrics=off \
                  --exclude=.semgrep --config=.semgrep/
 
+# Registry rules an external scan reports that the repo-owned rules do not
+# cover. Named rule ids rather than a whole pack (p/gosec, p/security-audit)
+# so this gate can block without dragging in the untriaged findings noted on
+# GOSEC_FLAGS above; widening it is the separate SAST-triage effort.
+#
+# gosec.G101-1 is the registry port of gosec's G101. It carries no entropy
+# filter, so it reports short fixture credentials that native gosec's G101
+# lets through. That gap is why .semgrep/hardcoded-credentials.go and
+# internal/redact/redact_test.go already name it in their nosemgrep
+# directives, and why a line that named only the repo-owned rule could reach
+# an external scan unflagged here.
+#
+# .semgrep/ is deliberately NOT excluded: every planted credential in the
+# fixture carries an in-place `nosemgrep: gosec.G101-1`, and running the rule
+# over it is what proves those directives still hold for a scanner that
+# honors no repo-local ignore list.
+SEMGREP_REGISTRY_RULES := r/gosec.G101-1
+SEMGREP_REGISTRY_FLAGS := --error --metrics=off --config=$(SEMGREP_REGISTRY_RULES)
+
 all: test lint vuln sast examples ## Run the full local check suite
 
 help: ## List available targets
@@ -113,11 +132,12 @@ tools: ## Install pinned SAST tooling (gosec, semgrep)
 # gosec is deliberately NOT included — see the note on GOSEC_FLAGS above; run
 # `make sast-gosec` directly to see its findings. Both remaining scans always
 # run (no fail-fast) so every category is reported in one pass.
-sast: ## Run repo-owned semgrep rules + their fixture tests (gosec: run separately, see sast-gosec)
-	@rc=0; s=PASS; t=PASS; \
-	$(MAKE) --no-print-directory sast-semgrep-test || { rc=1; t=FAIL; }; \
-	$(MAKE) --no-print-directory sast-semgrep      || { rc=1; s=FAIL; }; \
-	echo "==> SAST summary: semgrep=$$s rule-tests=$$t (gosec not included — run 'make sast-gosec')"; \
+sast: ## Run repo-owned + registry semgrep rules and the fixture tests (gosec: run separately, see sast-gosec)
+	@rc=0; s=PASS; t=PASS; r=PASS; \
+	$(MAKE) --no-print-directory sast-semgrep-test     || { rc=1; t=FAIL; }; \
+	$(MAKE) --no-print-directory sast-semgrep          || { rc=1; s=FAIL; }; \
+	$(MAKE) --no-print-directory sast-semgrep-registry || { rc=1; r=FAIL; }; \
+	echo "==> SAST summary: semgrep=$$s registry=$$r rule-tests=$$t (gosec not included — run 'make sast-gosec')"; \
 	exit $$rc
 
 sast-gosec: ## gosec: Go security static analysis (injection, weak crypto, unsafe code)
@@ -136,6 +156,10 @@ sast-semgrep: ## semgrep: repo-owned rules under .semgrep/
 # the fixture must be a sibling because semgrep's test runner matches by
 # basename and does not support a separate tests directory. Fixtures contain
 # deliberate violations, which is why SEMGREP_FLAGS excludes .semgrep above.
+sast-semgrep-registry: ## semgrep: registry rules an external scan reports (see SEMGREP_REGISTRY_RULES)
+	@command -v "$(SEMGREP)" >/dev/null 2>&1 || { echo "semgrep not installed — run 'make tools' (needs pipx), or: pipx install semgrep==$(SEMGREP_VERSION)"; exit 1; }
+	"$(SEMGREP)" scan $(SEMGREP_REGISTRY_FLAGS) .
+
 sast-semgrep-test: ## Run the repo-owned semgrep rules against their fixtures
 	@command -v "$(SEMGREP)" >/dev/null 2>&1 || { echo "semgrep not installed — run 'make tools' (needs pipx), or: pipx install semgrep==$(SEMGREP_VERSION)"; exit 1; }
 	@rc=0; n=0; \
