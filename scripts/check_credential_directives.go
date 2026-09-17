@@ -52,9 +52,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"io/fs"
 	"os"
@@ -466,13 +468,36 @@ func checkFixture(file string, src *source, parsed *ast.File) ([]violation, erro
 	}
 
 	var found []violation
+	reported := map[int]bool{}
 	report := func(pos token.Pos, name string) {
 		line := src.fset.Position(pos).Line
-		if src.namedInSlot(line) {
+		if src.namedInSlot(line) || reported[line] {
 			return
 		}
+		reported[line] = true
 		found = append(found, src.violation(file, line,
 			"planted credential "+name+" does not name "+registryID))
+	}
+
+	// A fixture positive: the rule is asserted to fire on the next line, so
+	// that line is a planted credential an external scan reports too. This
+	// catches what the AST walk below cannot read -- an assignment through a
+	// shape no metavariable rendering covers, say -- because the fixture said
+	// outright that the rule matches there.
+	//
+	// Only here, and only as a parsed annotation: `ruleid:` means something to
+	// semgrep's test runner and nowhere else.
+	for _, c := range src.comments {
+		if !names(c.ruleIDs(), repoRuleID) {
+			continue
+		}
+		if stmt := src.statement(c); !src.namedInSlot(stmt) && stmt >= 1 {
+			if !reported[stmt] {
+				reported[stmt] = true
+				found = append(found, src.violation(file, stmt,
+					"fixture positive for "+repoRuleID+" does not name "+registryID))
+			}
+		}
 	}
 
 	ast.Inspect(parsed, func(n ast.Node) bool {
@@ -488,7 +513,7 @@ func checkFixture(file string, src *source, parsed *ast.File) ([]violation, erro
 				// `cfg.Password = "..."` is what the rule's `$NAME = $VAL`
 				// pattern matches too -- a metavariable binds the whole target,
 				// not just a bare identifier.
-				name, ok := targetName(lhs)
+				name, ok := targetName(src.fset, lhs)
 				if !ok || i >= len(v.Rhs) {
 					continue
 				}
@@ -683,20 +708,20 @@ func indentOf(line string) int {
 	return len(line) - len(strings.TrimLeft(line, " "))
 }
 
-// targetName renders an assignment target as the rule's $NAME metavariable
-// would bind it: an identifier, or a selector such as cfg.Password. Anything
-// else (an index, a dereference) is not a name this reader claims to read.
-func targetName(e ast.Expr) (string, bool) {
-	switch v := e.(type) {
-	case *ast.Ident:
-		return v.Name, true
-	case *ast.SelectorExpr:
-		if base, ok := targetName(v.X); ok {
-			return base + "." + v.Sel.Name, true
-		}
-		return v.Sel.Name, true
+// targetName renders an assignment target as source, which is what the rule's
+// $NAME metavariable binds and matches its regex against: an identifier, a
+// selector such as cfg.Password, an index such as cfg["password"], or anything
+// else that can stand on the left of an assignment.
+//
+// Rendering rather than enumerating shapes is the point. Two rounds of review
+// found targets this did not read -- first a selector, then an index -- and
+// each was a fixture the rule matches and this check did not.
+func targetName(fset *token.FileSet, e ast.Expr) (string, bool) {
+	var buf bytes.Buffer
+	if err := printer.Fprint(&buf, fset, e); err != nil {
+		return "", false
 	}
-	return "", false
+	return buf.String(), buf.Len() > 0
 }
 
 // isStringLiteral reports whether e is a non-empty string literal, or a
@@ -911,8 +936,8 @@ func (c *comment) ruleIDs() []string {
 func (c *comment) nosemgrepIDs() []string {
 	var ids []string
 	for _, text := range c.texts {
-		_, after, found := strings.Cut(text, "nosemgrep:")
-		if !found {
+		after, ok := strings.CutPrefix(text, "nosemgrep:")
+		if !ok {
 			continue
 		}
 		ids = append(ids, splitIDs(after)...)
