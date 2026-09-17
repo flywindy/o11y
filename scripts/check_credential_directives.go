@@ -19,29 +19,40 @@
 // SEMGREP_FLAGS), no gate can run that rule. Enforcing that it is named
 // wherever a sibling scanner is known to fire is what this repo can do instead.
 //
-// Three signals say a scanner fires on a line, and each requires the external
-// id alongside it:
+// Four signals say a scanner fires on a line, and each requires the external id
+// alongside it:
 //
 //	nosemgrep: hardcoded-credential-literal   this repo's rule fires here
-//	#nosec G101                               gosec fires here
+//	#nosec covering G101                      gosec fires here
 //	ruleid: hardcoded-credential-literal      a .semgrep/ fixture asserts it fires
+//	a credential-shaped binding in .semgrep/  a planted credential, asserted either way
 //
-// The third matters most for the directory the other gates all exclude.
+// The last two matter most for the directory the other gates all exclude.
 // .semgrep/ holds deliberate violations, so GOSEC_FLAGS, SEMGREP_FLAGS and
 // .semgrepignore skip it — but those are repo-local, and the fixture file says
 // so itself: an external scan reads the files directly and reports them
 // whatever the ignore list holds, which is what happened the first time this
 // tree was scanned elsewhere. The directory the convention matters most in was
 // the one nothing checked.
+//
+// A fixture's negatives need the directive as much as its positives: a value
+// the repo's rule deliberately does not match (a composite-literal field, say)
+// is still a planted credential on disk. Rather than a second copy of the rule
+// that can drift from it, the check parses the fixture and reads the rule's own
+// $NAME regex out of the sibling .yml, so both key on the same identifiers.
 package main
 
 import (
 	"bufio"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -51,10 +62,6 @@ const registryID = "gosec.G101-1"
 // repoRuleID is this repository's own rule, defined in .semgrep/.
 const repoRuleID = "hardcoded-credential-literal"
 
-// nosecG101 matches a gosec suppression naming G101. The rule id must follow
-// the directive, so prose that merely mentions "#nosec" is not a directive.
-var nosecG101 = regexp.MustCompile(`#nosec[ \t]+[A-Z0-9, \t]*G101`)
-
 // ruleIDMarker is how a .semgrep/ fixture asserts the repo rule fires on the
 // line below it.
 const ruleIDMarker = "ruleid: " + repoRuleID
@@ -62,10 +69,14 @@ const ruleIDMarker = "ruleid: " + repoRuleID
 // selfName is this command's own file, excluded from the walk below.
 const selfName = "check_credential_directives.go"
 
-// pairWindow is how far from a #nosec directive its nosemgrep sibling may sit.
-// The house style puts them adjacent in the comment block above a declaration;
-// three lines allows a reason line between them.
-const pairWindow = 3
+// fixtureDir holds the semgrep rules and their fixtures.
+const fixtureDir = ".semgrep"
+
+// nosecTag is gosec's suppression directive.
+const nosecTag = "#nosec"
+
+// nosecRuleID matches one rule id in a gosec directive's list (G101, G304).
+var nosecRuleID = regexp.MustCompile(`^[A-Z]+[0-9]+$`)
 
 type violation struct {
 	file string
@@ -92,10 +103,9 @@ func main() {
 
 // scan walks root for Go files and returns every directive violation found.
 //
-// .semgrep/ is walked like anything else. Its fixtures name gosec.G101-1 alone
-// by design, so the repo's own rule stays live for the rule's own assertions —
-// and checking that they do name it is the point, since every other gate
-// excludes that directory.
+// .semgrep/ is walked like anything else, and gets the extra fixture check:
+// every other gate excludes that directory, so it is the one place where a
+// missing directive is invisible until an external scan reads the file.
 func scan(root string) ([]violation, error) {
 	var found []violation
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -121,12 +131,20 @@ func scan(root string) ([]violation, error) {
 			return err
 		}
 		found = append(found, check(path, lines)...)
+
+		if filepath.Base(filepath.Dir(path)) == fixtureDir {
+			fixtureFound, err := checkFixture(path, lines)
+			if err != nil {
+				return err
+			}
+			found = append(found, fixtureFound...)
+		}
 		return nil
 	})
 	return found, err
 }
 
-// check applies the three invariants to one file's lines.
+// check applies the three line-directive invariants to one file's lines.
 //
 // They are deliberately one-directional. Naming the repo's rule, suppressing
 // gosec's, or asserting the repo's rule fires all mean the line is a
@@ -142,44 +160,214 @@ func check(file string, lines []string) []violation {
 			found = append(found, violation{file, i + 1, line,
 				"nosemgrep directive names " + repoRuleID + " but not " + registryID})
 		}
-		if nosecG101.MatchString(line) && !namesRegistryIDNear(lines, i) {
-			found = append(found, violation{file, i + 1, line,
-				"#nosec G101 suppression has no nosemgrep: " + registryID + " within " +
-					fmt.Sprint(pairWindow) + " lines"})
+		if nosecCoversG101(line) {
+			if stmt := statementLine(lines, i); !namedInSlot(lines, stmt) {
+				found = append(found, violation{file, i + 1, line,
+					"gosec directive suppresses G101 with no nosemgrep: " + registryID +
+						" on the line it covers"})
+			}
 		}
 		// A fixture positive: the rule is asserted to fire on the next line, so
 		// that line is a planted credential an external scan reports too.
-		if strings.Contains(line, ruleIDMarker) && i+1 < len(lines) &&
-			!names(nosemgrepIDs(lines[i+1]), registryID) {
-			found = append(found, violation{file, i + 2, lines[i+1],
-				"fixture positive for " + repoRuleID + " does not name " + registryID})
+		if strings.Contains(line, ruleIDMarker) {
+			if stmt := statementLine(lines, i); !namedInSlot(lines, stmt) {
+				found = append(found, violation{file, i + 1, line,
+					"fixture positive for " + repoRuleID + " does not name " + registryID})
+			}
 		}
 	}
 	return found
 }
 
-// namesRegistryIDNear reports whether a nosemgrep directive within pairWindow
-// lines either side of i names the registry rule id.
+// checkFixture requires the registry id on every credential-shaped binding in
+// a rule fixture, positive or negative.
 //
-// The ids are parsed and compared exactly rather than searched for as a
-// substring: prose explaining the convention mentions the id without
-// suppressing anything, and a substring match would also accept a different
-// rule whose id merely starts with this one (gosec.G101-10).
-func namesRegistryIDNear(lines []string, i int) bool {
-	lo := max(0, i-pairWindow)
-	hi := min(len(lines)-1, i+pairWindow)
-	for j := lo; j <= hi; j++ {
-		if names(nosemgrepIDs(lines[j]), registryID) {
-			return true
+// The rule's own $NAME regex decides what counts, read from the sibling .yml so
+// there is one definition rather than two that drift. The value must be a string
+// literal: `password := lookup("GRAPH_PROXY_PASSWORD")` names an env var, it does
+// not hold a credential.
+func checkFixture(file string, lines []string) ([]violation, error) {
+	ruleFile := strings.TrimSuffix(file, ".go") + ".yml"
+	if _, err := os.Stat(ruleFile); err != nil {
+		return nil, nil // a .go without a sibling rule is not a fixture
+	}
+	nameRe, err := credentialNameRegex(ruleFile)
+	if err != nil {
+		return nil, err
+	}
+
+	fset := token.NewFileSet()
+	parsed, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		return nil, fmt.Errorf("parse fixture %s: %w", file, err)
+	}
+
+	var found []violation
+	report := func(pos token.Pos, name string) {
+		line := fset.Position(pos).Line
+		if namedInSlot(lines, line-1) {
+			return
+		}
+		found = append(found, violation{file, line, lines[line-1],
+			"planted credential " + name + " does not name " + registryID})
+	}
+
+	ast.Inspect(parsed, func(n ast.Node) bool {
+		switch v := n.(type) {
+		case *ast.ValueSpec:
+			for i, name := range v.Names {
+				if i < len(v.Values) && nameRe.MatchString(name.Name) && isStringLiteral(v.Values[i]) {
+					report(v.Values[i].Pos(), name.Name)
+				}
+			}
+		case *ast.AssignStmt:
+			for i, lhs := range v.Lhs {
+				id, ok := lhs.(*ast.Ident)
+				if !ok || i >= len(v.Rhs) {
+					continue
+				}
+				if nameRe.MatchString(id.Name) && isStringLiteral(v.Rhs[i]) {
+					report(v.Rhs[i].Pos(), id.Name)
+				}
+			}
+		case *ast.KeyValueExpr:
+			// A composite-literal field: config{ProxyPassword: "proxypass"}.
+			if id, ok := v.Key.(*ast.Ident); ok &&
+				nameRe.MatchString(id.Name) && isStringLiteral(v.Value) {
+				report(v.Value.Pos(), id.Name)
+			}
+		}
+		return true
+	})
+	return found, nil
+}
+
+// credentialNameRegex reads the $NAME metavariable-regex out of a semgrep rule
+// file. Parsed by hand rather than with a YAML library so this gate adds no
+// dependency; an extraction failure is an error rather than a skip, because a
+// silently empty pattern is the no-op gate this whole target exists to prevent.
+func credentialNameRegex(ruleFile string) (*regexp.Regexp, error) {
+	lines, err := readLines(ruleFile)
+	if err != nil {
+		return nil, err
+	}
+	for i, line := range lines {
+		if !strings.Contains(line, "metavariable: $NAME") {
+			continue
+		}
+		for _, next := range lines[i+1:] {
+			trimmed := strings.TrimSpace(next)
+			if !strings.HasPrefix(trimmed, "regex:") {
+				continue
+			}
+			expr := strings.TrimSpace(strings.TrimPrefix(trimmed, "regex:"))
+			expr = strings.Trim(expr, "'\"")
+			re, err := regexp.Compile(expr)
+			if err != nil {
+				return nil, fmt.Errorf("compile $NAME regex from %s: %w", ruleFile, err)
+			}
+			return re, nil
 		}
 	}
+	return nil, fmt.Errorf("no $NAME metavariable-regex found in %s", ruleFile)
+}
+
+// isStringLiteral reports whether e is a string literal, or a concatenation of
+// them ("sup3r-" + "secret" is as hard-coded as one literal).
+func isStringLiteral(e ast.Expr) bool {
+	switch v := e.(type) {
+	case *ast.BasicLit:
+		return v.Kind == token.STRING
+	case *ast.BinaryExpr:
+		return v.Op == token.ADD && isStringLiteral(v.X) && isStringLiteral(v.Y)
+	}
 	return false
+}
+
+// statementLine returns the index of the line a directive at i governs: for a
+// comment on its own line, the next line that is neither blank nor a comment
+// (gosec honors a directive across a blank line); for a trailing comment, its
+// own line. It returns -1 when a trailing comment block governs nothing.
+func statementLine(lines []string, i int) int {
+	if !isCommentLine(lines[i]) {
+		return i
+	}
+	for j := i + 1; j < len(lines); j++ {
+		if isCommentLine(lines[j]) || strings.TrimSpace(lines[j]) == "" {
+			continue
+		}
+		return j
+	}
+	return -1
+}
+
+// namedInSlot reports whether the registry id is named where semgrep would read
+// it for the statement at index stmt: trailing on that line, or on the comment
+// line directly above it. Binding the two directives to one statement is what
+// stops a suppression borrowing its neighbour's — semgrep honors a nosemgrep
+// comment only on the finding's own line or the one directly above.
+func namedInSlot(lines []string, stmt int) bool {
+	if stmt < 0 || stmt >= len(lines) {
+		return false
+	}
+	if names(nosemgrepIDs(lines[stmt]), registryID) {
+		return true
+	}
+	return stmt > 0 && names(nosemgrepIDs(lines[stmt-1]), registryID)
+}
+
+// nosecCoversG101 reports whether a gosec directive on the line suppresses
+// G101 — by naming it, or by naming no rule at all, which suppresses every
+// rule including this one.
+//
+// gosec honors the tag only at the start of a comment. Verified against gosec
+// v2.26.1 over a password-in-URL fixture: "// #nosec", "// #nosec -- reason"
+// and "// #nosec is not needed here" all suppress the finding, while
+// "// ... so it needs no #nosec." and "// see the note, #nosec G101" leave it
+// reported. So prose that mentions the tag mid-sentence is not a directive,
+// and a directive that names nothing is a blanket one.
+func nosecCoversG101(line string) bool {
+	text, ok := lineComment(line)
+	if !ok {
+		return false
+	}
+	rest, ok := strings.CutPrefix(text, nosecTag)
+	if !ok {
+		return false
+	}
+	if rest != "" && rest[0] != ' ' && rest[0] != '\t' && rest[0] != '-' {
+		return false // "#nosecurity", not a directive
+	}
+	ids := nosecRuleIDs(rest)
+	return len(ids) == 0 || slices.Contains(ids, "G101")
+}
+
+// nosecRuleIDs returns the rule ids a gosec directive names. A reason may
+// follow "--"; the list ends at the first token that is not a rule id.
+func nosecRuleIDs(rest string) []string {
+	if before, _, ok := strings.Cut(rest, "--"); ok {
+		rest = before
+	}
+	var ids []string
+	for _, field := range strings.FieldsFunc(rest, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t'
+	}) {
+		if !nosecRuleID.MatchString(field) {
+			break
+		}
+		ids = append(ids, field)
+	}
+	return ids
 }
 
 // nosemgrepIDs returns the rule ids a nosemgrep directive on the line names,
 // or nil when it carries none. A reason may follow "--"; ids precede it.
 func nosemgrepIDs(line string) []string {
-	_, after, found := strings.Cut(line, "nosemgrep:")
+	text, ok := lineComment(line)
+	if !ok {
+		return nil
+	}
+	_, after, found := strings.Cut(text, "nosemgrep:")
 	if !found {
 		return nil
 	}
@@ -203,13 +391,39 @@ func nosemgrepIDs(line string) []string {
 }
 
 // names reports whether ids contains want exactly.
+//
+// The ids are compared exactly rather than searched for as a substring: prose
+// explaining the convention mentions the id without suppressing anything, and a
+// substring match would also accept a different rule whose id merely starts
+// with this one (gosec.G101-10).
 func names(ids []string, want string) bool {
-	for _, id := range ids {
-		if id == want {
-			return true
+	return slices.Contains(ids, want)
+}
+
+// lineComment returns the text of a // comment on the line. Occurrences inside
+// a string literal are skipped — every URL fixture here contains one.
+func lineComment(line string) (string, bool) {
+	var quote byte
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		switch {
+		case quote != 0:
+			if c == '\\' {
+				i++
+			} else if c == quote {
+				quote = 0
+			}
+		case c == '"' || c == '`' || c == '\'':
+			quote = c
+		case c == '/' && i+1 < len(line) && line[i+1] == '/':
+			return strings.TrimSpace(line[i+2:]), true
 		}
 	}
-	return false
+	return "", false
+}
+
+func isCommentLine(line string) bool {
+	return strings.HasPrefix(strings.TrimSpace(line), "//")
 }
 
 func readLines(path string) ([]string, error) {
