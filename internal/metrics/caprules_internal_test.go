@@ -117,6 +117,7 @@ func TestCapRulesAreIndependent(t *testing.T) {
 	}
 
 	assert.Empty(t, configurableOTLPCapRules(Config{}))
+	assert.Empty(t, configurablePrometheusCapRules(Config{}))
 }
 
 // configurableOTLPCapRules drops the always-on rules, leaving the ones a
@@ -125,6 +126,20 @@ func configurableOTLPCapRules(cfg Config) []metricscap.Rule {
 	var rules []metricscap.Rule
 	for _, r := range otlpCapRules(cfg) {
 		if r.Key == semconv.NetworkPeerAddressKey {
+			continue
+		}
+		rules = append(rules, r)
+	}
+	return rules
+}
+
+// configurablePrometheusCapRules is configurableOTLPCapRules for the other
+// export path, so the "an empty Config installs nothing" half of the
+// invariant is asserted on both rather than only on the OTLP side.
+func configurablePrometheusCapRules(cfg Config) []metricscap.PrometheusRule {
+	var rules []metricscap.PrometheusRule
+	for _, r := range prometheusCapRules(cfg) {
+		if r.LabelName == NormalizePrometheusLabelName(string(semconv.NetworkPeerAddressKey)) {
 			continue
 		}
 		rules = append(rules, r)

@@ -323,7 +323,7 @@ to switch from the Prometheus pull model to OTLP push (useful for serverless
 deployments that cannot be scraped). See the
 [options reference](../README.md#using-the-sdk) for the full metrics option set.
 
-**Exemplars** are enabled automatically (OTel SDK default trace-based filter). When Prometheus is deployed with `--enable-feature=exemplar-storage` (included in [`k8s/infrastructure/base/prometheus.yaml`](../k8s/infrastructure/base/prometheus.yaml)), Grafana can navigate from a histogram bucket directly to the correlated trace in Tempo. The measurement context must contain an active sampled span; exemplar trace IDs are stored as exemplar metadata (`trace_id` / `span_id`), not as metric labels, so they do not create high-cardinality time series.
+**Exemplars** are enabled automatically (OTel SDK default trace-based filter). When Prometheus is deployed with `--enable-feature=exemplar-storage` (included in [`k8s/infrastructure/base/prometheus.yaml`](../k8s/infrastructure/base/prometheus.yaml)), Grafana can navigate from a histogram bucket directly to the correlated trace in Tempo. The measurement context must contain an active sampled span; exemplar trace IDs are stored as exemplar metadata (`trace_id` / `span_id`), not as metric labels, so they do not create high-cardinality time series. `trace_id` and `span_id` are also the only labels an exemplar carries: attributes an SDK view filters off a series are suppressed on the exemplar too, so neither a dropped attribute nor a key the reserved-label guard removed reaches the exposition, and the exemplar stays well inside the 128-rune limit OpenMetrics imposes on it.
 
 **Kubernetes pods** must opt in to scraping with the annotation:
 
