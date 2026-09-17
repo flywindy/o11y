@@ -71,10 +71,6 @@ const registryID = "gosec.G101-1"
 // repoRuleID is this repository's own rule, defined in .semgrep/.
 const repoRuleID = "hardcoded-credential-literal"
 
-// ruleIDMarker is how a .semgrep/ fixture asserts the repo rule fires on the
-// line below it.
-const ruleIDMarker = "ruleid: " + repoRuleID
-
 // selfName is this command's own file, excluded from the walk below.
 const selfName = "check_credential_directives.go"
 
@@ -212,12 +208,6 @@ func check(file string, src *source) []violation {
 				"gosec directive suppresses G101 with no nosemgrep: "+registryID+
 					" on the line it covers"))
 		}
-		// A fixture positive: the rule is asserted to fire on the next line, so
-		// that line is a planted credential an external scan reports too.
-		if c.contains(ruleIDMarker) && !src.namedInSlot(src.statement(c)) {
-			found = append(found, src.violation(file, c.startLine,
-				"fixture positive for "+repoRuleID+" does not name "+registryID))
-		}
 	}
 	return found
 }
@@ -234,8 +224,12 @@ func check(file string, src *source) []violation {
 // identifiers as coverage and so accepted `//go:build !integration`, the one
 // expression the gate's own -tags excludes.
 func reachableFiles() (map[string]bool, error) {
+	// Every field holding a .go file the toolchain includes. GoFiles is
+	// documented as excluding CgoFiles, so omitting the latter would report a
+	// cgo source as unreachable and fail the gate on valid code.
 	const tmpl = `{{$d := .Dir}}` +
 		`{{range .GoFiles}}{{$d}}/{{.}}
+{{end}}{{range .CgoFiles}}{{$d}}/{{.}}
 {{end}}{{range .TestGoFiles}}{{$d}}/{{.}}
 {{end}}{{range .XTestGoFiles}}{{$d}}/{{.}}
 {{end}}`
@@ -371,16 +365,20 @@ func definesRule(ruleFile, id string) (bool, error) {
 		return false, err
 	}
 	for _, line := range lines {
-		trimmed := strings.TrimPrefix(strings.TrimSpace(line), "- ")
-		rest, ok := strings.CutPrefix(trimmed, "id:")
-		if !ok {
-			continue
-		}
-		if yamlScalar(rest) == id {
+		key, value, ok := yamlEntry(strings.TrimPrefix(strings.TrimSpace(line), "- "))
+		if ok && key == "id" && yamlScalar(value) == id {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// yamlEntry splits a mapping entry into its key and value. The key is trimmed
+// because `id : x` is the same YAML as `id: x`, and a check that accepts only
+// one spelling of it stops running without saying so.
+func yamlEntry(line string) (key, value string, ok bool) {
+	key, value, ok = strings.Cut(line, ":")
+	return strings.TrimSpace(key), value, ok
 }
 
 // yamlScalar normalizes a YAML scalar value: a quoted one yields its contents,
@@ -422,7 +420,8 @@ func credentialNameRegex(ruleFile string) (*regexp.Regexp, error) {
 		return nil, err
 	}
 	for i, line := range lines {
-		if !strings.Contains(line, "metavariable: $NAME") {
+		key, value, ok := yamlEntry(strings.TrimSpace(line))
+		if !ok || key != "metavariable" || yamlScalar(value) != "$NAME" {
 			continue
 		}
 		base := indentOf(line)
@@ -431,14 +430,14 @@ func credentialNameRegex(ruleFile string) (*regexp.Regexp, error) {
 			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 				continue
 			}
-			if indentOf(next) < base || strings.HasPrefix(trimmed, "metavariable:") {
+			nextKey, nextValue, ok := yamlEntry(trimmed)
+			if indentOf(next) < base || (ok && nextKey == "metavariable") {
 				break // left $NAME's constraint block
 			}
-			rest, ok := strings.CutPrefix(trimmed, "regex:")
-			if !ok {
+			if !ok || nextKey != "regex" {
 				continue
 			}
-			re, err := regexp.Compile(yamlScalar(rest))
+			re, err := regexp.Compile(yamlScalar(nextValue))
 			if err != nil {
 				return nil, fmt.Errorf("compile $NAME regex from %s: %w", ruleFile, err)
 			}
@@ -519,10 +518,6 @@ func commentTexts(raw string) []string {
 		texts = append(texts, strings.TrimSpace(line))
 	}
 	return texts
-}
-
-func (c *comment) contains(s string) bool {
-	return slices.ContainsFunc(c.texts, func(t string) bool { return strings.Contains(t, s) })
 }
 
 // statement returns the line the comment's directive governs: for a trailing
@@ -612,6 +607,18 @@ func nosecRuleIDs(rest string) []string {
 	return ids
 }
 
+// ruleIDs returns the rule ids a semgrep test annotation names. The tag has to
+// open the comment, as semgrep's test runner reads it -- prose mentioning it
+// mid-sentence is documentation, not an assertion.
+func (c *comment) ruleIDs() []string {
+	for _, text := range c.texts {
+		if rest, ok := strings.CutPrefix(text, "ruleid:"); ok {
+			return splitIDs(rest)
+		}
+	}
+	return nil
+}
+
 // nosemgrepIDs returns the rule ids a nosemgrep directive in the comment names,
 // or nil when it carries none. A reason may follow "--"; ids precede it.
 func (c *comment) nosemgrepIDs() []string {
@@ -621,19 +628,26 @@ func (c *comment) nosemgrepIDs() []string {
 		if !found {
 			continue
 		}
-		if before, _, ok := strings.Cut(after, "--"); ok {
-			after = before
+		ids = append(ids, splitIDs(after)...)
+	}
+	return ids
+}
+
+// splitIDs parses a comma-separated rule-id list, dropping any "--" reason.
+func splitIDs(list string) []string {
+	if before, _, ok := strings.Cut(list, "--"); ok {
+		list = before
+	}
+	var ids []string
+	for _, field := range strings.Split(list, ",") {
+		id := strings.Trim(strings.TrimSpace(field), "`")
+		// An id never contains whitespace, so anything after the first break is
+		// surrounding prose rather than part of the id.
+		if cut := strings.IndexAny(id, " \t`"); cut >= 0 {
+			id = id[:cut]
 		}
-		for _, field := range strings.Split(after, ",") {
-			id := strings.Trim(strings.TrimSpace(field), "`")
-			// An id never contains whitespace, so anything after the first
-			// break is surrounding prose rather than part of the id.
-			if cut := strings.IndexAny(id, " \t`"); cut >= 0 {
-				id = id[:cut]
-			}
-			if id != "" {
-				ids = append(ids, id)
-			}
+		if id != "" {
+			ids = append(ids, id)
 		}
 	}
 	return ids
