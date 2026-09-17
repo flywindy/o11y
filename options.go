@@ -545,9 +545,9 @@ func WithDisableDefaultViews() Option {
 // http.request.method, http.route, and http.response.status_code to bound
 // cardinality; any other attributes attached to the record (for example via
 // o11ygin.WithMetricAttributesFn or otelhttp's WithMetricAttributesFn) are
-// dropped from the exported series and end up as exemplar labels, where the
-// OpenMetrics 128-rune cap quickly trips. Use this option to promote a small
-// set of caller-controlled keys (e.g. "app_name", "bot_name") onto the
+// dropped from the exported series, and on the Prometheus path from the
+// exemplar with it, so they are invisible to PromQL. Use this option to
+// promote a small set of caller-controlled keys (e.g. "app_name", "bot_name") onto the
 // series itself so they participate in PromQL aggregations.
 //
 // Cardinality is the caller's responsibility: every distinct value combination

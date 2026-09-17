@@ -202,6 +202,33 @@ adopters can plan their upgrades.
 
 ### Fixed
 
+- `metrics`: an attribute an SDK view dropped no longer comes back as an
+  OpenMetrics exemplar label. The OTel SDK routes every attribute a stream's
+  `AttributeFilter` rejects into the exemplar's `FilteredAttributes`, and
+  otelprom encodes those as exemplar labels. The reservoir that suppresses
+  them was attached only to the two default HTTP views and to the catch-all
+  stream, so on every integration histogram — MongoDB, Redis, Cassandra,
+  Elasticsearch, MinIO — the attributes the view filters out (`db.namespace`
+  and `network.transport` on the MongoDB stream, for instance) were exported
+  on the wire, and so was any key the reserved-key guard dropped, which is
+  the one thing that guard exists to prevent. Past client_golang's 128-rune
+  exemplar limit — trace and span IDs already cost 63 of it, so a long
+  database name is enough — the exporter drops the exemplar entirely and
+  hands the error to `otel.Handle`, costing the trace linkage on that stream
+  plus one handled error per scrape for as long as the series lives. The
+  guard is now composed onto every configured view, alongside the
+  reserved-key filter it belongs with, and a view that chose its own
+  exemplar reservoir keeps it. Prometheus path only, as the rest of the
+  reserved-key guard already was: on the OTLP path filtered attributes are a
+  legitimate part of an exemplar and are still exported.
+- `metrics`: a single attribute with an empty key no longer takes its whole
+  metric family off `/metrics` until the process restarts. `attribute.Set`
+  keeps such an attribute — a caller deriving a key from a value that turned
+  out to be empty is enough to produce one — and the Prometheus label namer
+  rejects it outright ("label name is empty"), which fails the gather for the
+  family; because aggregation is cumulative, it stays failed. An empty key is
+  now reserved like the other shapes the translator refuses, so it is dropped
+  and the rest of the datapoint is exported.
 - `mongo`: `db.client.operation.duration` no longer grows a new series for
   every MongoDB connection a process opens. otelmongo derives
   `network.peer.address` and `network.peer.port` from the driver's connection
