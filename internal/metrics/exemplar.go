@@ -21,14 +21,40 @@ import (
 // Prometheus exporter then encodes those as OpenMetrics exemplar labels,
 // where the client_golang validator rejects any exemplar whose combined
 // label runes exceed 128 (see ExemplarMaxRunes). With trace_id + span_id
-// already costing ~68 runes, even a couple of verbose attributes such as
-// server.address or url.scheme push past the cap and the entire /metrics
-// scrape fails. Dropping FilteredAttributes at the reservoir keeps
-// exemplar size constant and bounded.
+// already costing 63 runes, even a couple of verbose attributes such as
+// server.address or url.scheme push past the cap. otelprom's addExemplars
+// then hands the error to otel.Handle and exports the sample without its
+// exemplar, so the cost is the trace linkage plus one handled error per
+// scrape, for as long as the series lives. Dropping FilteredAttributes at
+// the reservoir keeps exemplar size constant and bounded.
+//
+// Suppressing them is also what keeps a key the reserved-key guard dropped
+// from reaching the exposition by the exemplar route (see
+// withReservedKeyFilter).
 func dropFilteredAttrsExemplarSelector(agg sdkmetric.Aggregation) exemplar.ReservoirProvider {
-	inner := sdkmetric.DefaultExemplarReservoirProviderSelector(agg)
-	return func(attrs attribute.Set) exemplar.Reservoir {
-		return droppedAttrReservoir{Reservoir: inner(attrs)}
+	return dropFilteredAttrs(nil)(agg)
+}
+
+// dropFilteredAttrs returns sel with FilteredAttributes suppressed on every
+// reservoir it hands out, leaving the rest of the reservoir's behaviour to
+// sel. A nil sel means the SDK's default selector, so this is also how a
+// stream that expressed no preference gets the guard.
+//
+// It composes rather than replaces for the same reason composeFilters does:
+// a view owns which reservoir its stream uses, but it does not get to decide
+// whether an attribute the SDK dropped may reappear on the wire. Wrapping a
+// selector that already drops them is a no-op, which is what the two default
+// HTTP views hit: they set this selector themselves because they are shared
+// with the OTLP path, where guardReservedKeys does not run.
+func dropFilteredAttrs(sel sdkmetric.ExemplarReservoirProviderSelector) sdkmetric.ExemplarReservoirProviderSelector {
+	if sel == nil {
+		sel = sdkmetric.DefaultExemplarReservoirProviderSelector
+	}
+	return func(agg sdkmetric.Aggregation) exemplar.ReservoirProvider {
+		inner := sel(agg)
+		return func(attrs attribute.Set) exemplar.Reservoir {
+			return droppedAttrReservoir{Reservoir: inner(attrs)}
+		}
 	}
 }
 

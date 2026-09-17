@@ -23,6 +23,7 @@ import (
 
 	"github.com/flywindy/o11y/internal/metrics"
 	"github.com/flywindy/o11y/internal/testutil"
+	"github.com/flywindy/o11y/internal/views"
 )
 
 // baseConfig returns the Prometheus-path Config the tests start from: a
@@ -1252,4 +1253,193 @@ func TestInitMeter_MongoPeerCapIgnoresOtherScopes(t *testing.T) {
 	body := testutil.ScrapeMetrics(t.Context(), t, addr)
 	assert.Contains(t, body, `network_peer_address="cass-59"`)
 	assert.NotContains(t, body, `network_peer_address="other"`)
+}
+
+// sampledSpanContext returns the sampled SpanContext the exemplar tests record
+// under. Exemplars are only offered for a measurement taken inside a sampled
+// span, so every exemplar assertion needs one.
+func sampledSpanContext(t *testing.T) trace.SpanContext {
+	t.Helper()
+	traceID, err := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	require.NoError(t, err)
+	spanID, err := trace.SpanIDFromHex("00f067aa0ba902b7")
+	require.NoError(t, err)
+	return trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    traceID,
+		SpanID:     spanID,
+		TraceFlags: trace.FlagsSampled,
+		Remote:     true,
+	})
+}
+
+// exemplarLineFor returns the OpenMetrics exemplar line attached to the first
+// sample of family, i.e. the part after the "# " separator. It fails the test
+// when the family carries no exemplar at all, which is what an exemplar the
+// exporter had to reject looks like on the wire.
+func exemplarLineFor(t *testing.T, body, family string) string {
+	t.Helper()
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, family) {
+			continue
+		}
+		_, exemplar, ok := strings.Cut(line, "# ")
+		if ok && strings.Contains(exemplar, "trace_id=") {
+			return exemplar
+		}
+	}
+	t.Fatalf("no exemplar found on %s; body=%s", family, body)
+	return ""
+}
+
+// TestInitMeter_ViewedInstrumentExemplarsCarryOnlyTraceLinkage pins that the
+// attributes a configured view drops never come back as exemplar labels.
+//
+// The SDK routes every attribute a stream's AttributeFilter rejects into the
+// exemplar's FilteredAttributes, and otelprom encodes those as OpenMetrics
+// exemplar labels. Two filters reject attributes on an integration stream: the
+// view's own allow-keys list, and the reserved-key guard the SDK composes onto
+// every stream. Without the drop-filtered-attributes reservoir selector on the
+// configured-view path both reappear on the wire — including a reserved key,
+// which the guard exists to keep out of the exposition entirely.
+func TestInitMeter_ViewedInstrumentExemplarsCarryOnlyTraceLinkage(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.RuntimeMetrics = false
+	// The integration views are what o11y.Init installs, and they are the
+	// streams that carry an AttributeFilter of their own.
+	cfg.ExtraViews = views.Mongo(cfg.HistogramBuckets)
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	ctx := trace.ContextWithSpanContext(context.Background(), sampledSpanContext(t))
+
+	hist, err := mp.Meter(views.MongoContribScope).
+		Float64Histogram("db.client.operation.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	// The attribute set otelmongo records, plus a reserved key a caller could
+	// smuggle in. The view keeps db.system.name, db.operation.name and the
+	// network.peer.* pair; db.namespace and network.transport are dropped by
+	// the view and service.name by the reserved-key guard.
+	hist.Record(ctx, 0.01, metric.WithAttributes(
+		semconv.DBSystemNameMongoDB,
+		semconv.DBOperationName("find"),
+		semconv.DBNamespace("chat"),
+		semconv.NetworkPeerAddress("mongo-0.mongo.svc.cluster.local"),
+		semconv.NetworkPeerPort(27017),
+		semconv.NetworkTransportTCP,
+		attribute.String("service.name", "evil"),
+	))
+
+	body := scrapeOpenMetrics(t.Context(), t, addr)
+	require.Contains(t, body, "db_client_operation_duration_seconds_bucket")
+
+	exemplar := exemplarLineFor(t, body, "db_client_operation_duration_seconds_bucket")
+	assert.Contains(t, exemplar, "span_id=", "trace linkage must survive")
+	for _, dropped := range []string{"db_namespace", "network_transport", "service_name"} {
+		assert.NotContainsf(t, exemplar, dropped,
+			"an attribute dropped by the view or by the reserved-key guard must not "+
+				"reappear as an exemplar label: %s", exemplar)
+	}
+}
+
+// TestInitMeter_IntegrationExemplarsStayUnderRuneCap is the
+// TestInitMeter_ExemplarsStayUnderRuneCap check for an integration stream.
+// client_golang rejects an exemplar whose label runes exceed 128; trace_id and
+// span_id already cost 63, so the attributes a view drops are what decide
+// whether the exemplar survives. A MongoDB database name long enough to push
+// the total past the cap must not cost the exemplar or an otel.Handle call.
+func TestInitMeter_IntegrationExemplarsStayUnderRuneCap(t *testing.T) {
+	captured := newCapturingErrorHandler()
+	prevHandler := otel.GetErrorHandler()
+	otel.SetErrorHandler(captured)
+	t.Cleanup(func() { otel.SetErrorHandler(prevHandler) })
+
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.RuntimeMetrics = false
+	// The integration views are what o11y.Init installs, and they are the
+	// streams that carry an AttributeFilter of their own.
+	cfg.ExtraViews = views.Mongo(cfg.HistogramBuckets)
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	ctx := trace.ContextWithSpanContext(context.Background(), sampledSpanContext(t))
+
+	hist, err := mp.Meter(views.MongoContribScope).
+		Float64Histogram("db.client.operation.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	hist.Record(ctx, 0.01, metric.WithAttributes(
+		semconv.DBSystemNameMongoDB,
+		semconv.DBOperationName("find"),
+		semconv.DBNamespace("chat-platform-production-eu-west-1-messages"),
+		semconv.NetworkPeerAddress("mongo-0.mongo.svc.cluster.local"),
+		semconv.NetworkPeerPort(27017),
+		semconv.NetworkTransportTCP,
+	))
+
+	body := scrapeOpenMetrics(t.Context(), t, addr)
+	require.Contains(t, body, "db_client_operation_duration_seconds_bucket")
+	assert.Contains(t, exemplarLineFor(t, body, "db_client_operation_duration_seconds_bucket"),
+		"span_id=", "the exemplar must survive a long dropped attribute")
+
+	for _, e := range captured.errors() {
+		assert.NotContainsf(t, e, "exemplar labels",
+			"otel error handler must not receive the 128-rune exemplar overflow "+
+				"for an integration stream: %s", e)
+	}
+}
+
+// TestInitMeter_EmptyAttributeKeyKeepsTheFamily pins that one attribute with
+// an empty key cannot take its whole metric family off /metrics.
+//
+// attribute.NewSet keeps an empty-key attribute, and the Prometheus label
+// namer rejects it ("label name is empty"), which fails the gather for the
+// whole family — and because aggregation is cumulative, it stays failed until
+// the process restarts. That is the failure mode the reserved-key guard
+// exists to prevent, so an empty key has to be reserved like any other key the
+// translator refuses.
+func TestInitMeter_EmptyAttributeKeyKeepsTheFamily(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.RuntimeMetrics = false
+
+	mp, closer, err := metrics.InitMeter(context.Background(), cfg)
+	require.NoError(t, err)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = closer(ctx)
+		_ = mp.Shutdown(ctx)
+	}()
+
+	counter, err := mp.Meter("app").Int64Counter("app_empty_key")
+	require.NoError(t, err)
+	counter.Add(context.Background(), 1, metric.WithAttributes(
+		attribute.String("", "unlabelled"),
+		attribute.String("outcome", "ok"),
+	))
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	require.Contains(t, body, "app_empty_key_total",
+		"an empty attribute key must not remove the family from /metrics")
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "app_empty_key_total{") {
+			assert.Contains(t, line, `outcome="ok"`, "the other attributes survive")
+			assert.NotContains(t, line, "unlabelled", "the empty-key attribute is dropped")
+		}
+	}
 }

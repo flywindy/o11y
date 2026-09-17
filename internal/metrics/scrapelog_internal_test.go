@@ -139,12 +139,14 @@ func TestIsReservedAttributeKey(t *testing.T) {
 		// a key with no alphanumerics normalizes to underscores only, which
 		// the translator refuses
 		"__name__", "__meta_kubernetes_pod__", "__", "...", "-", "_.-",
+		// The translator rejects an empty label name outright.
+		"",
 	}
 	for _, k := range reserved {
 		assert.Truef(t, IsReservedAttributeKey(attribute.Key(k)), "%q should be reserved", k)
 	}
 	notReserved := []string{
-		"http.route", "service.instance.id", "chat.room.id", "servicename", "",
+		"http.route", "service.instance.id", "chat.room.id", "servicename",
 		"otel.scope", "otel.scopes.name", "otel.library.name", "otelscope.name",
 		"level", "le.gacy", "quantiles",
 		"_name", "name__", "_name__x", "x__",

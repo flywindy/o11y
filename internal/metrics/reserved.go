@@ -84,7 +84,12 @@ func buildReservedPromLabels() map[byte][]string {
 func IsReservedAttributeKey(key attribute.Key) bool {
 	k := string(key)
 	if k == "" {
-		return false
+		// The Prometheus label namer rejects an empty name outright
+		// ("label name is empty"), which fails the gather for the whole
+		// family — permanently, since aggregation is cumulative. attribute.Set
+		// keeps an empty-key attribute, so one reaches the exporter whenever a
+		// caller derives a key from a value that turned out to be empty.
+		return true
 	}
 	// Two shapes the translator never turns into an exportable label:
 	//   - "__x__": the translator keeps the surrounding double underscores
@@ -252,8 +257,17 @@ func guardReservedKeys(configured []sdkmetric.View) []sdkmetric.View {
 }
 
 // withReservedKeyFilter wraps a configured view so every stream it returns
-// also drops reserved attribute keys, composed with the view's own filter.
-// Instruments the view does not match are left untouched.
+// also drops reserved attribute keys, composed with the view's own filter,
+// and so that no attribute either filter drops can come back as an exemplar
+// label. Instruments the view does not match are left untouched.
+//
+// The exemplar half is not optional: the SDK routes every attribute a stream's
+// AttributeFilter rejects into the exemplar's FilteredAttributes, and otelprom
+// encodes those as OpenMetrics exemplar labels. Without the guard a reserved
+// key reaches the exposition by that route — the very thing this filter
+// exists to prevent — and a long enough dropped value pushes the exemplar past
+// client_golang's 128-rune limit, which costs the exemplar and an otel.Handle
+// call on every scrape. The catch-all stream below carries the same pair.
 func withReservedKeyFilter(v sdkmetric.View) sdkmetric.View {
 	return func(inst sdkmetric.Instrument) (sdkmetric.Stream, bool) {
 		stream, ok := v(inst)
@@ -261,6 +275,7 @@ func withReservedKeyFilter(v sdkmetric.View) sdkmetric.View {
 			return stream, false
 		}
 		stream.AttributeFilter = composeFilters(stream.AttributeFilter, notReserved)
+		stream.ExemplarReservoirProviderSelector = dropFilteredAttrs(stream.ExemplarReservoirProviderSelector)
 		return stream, true
 	}
 }
