@@ -238,7 +238,8 @@ func checkFixture(file string, src *source, parsed *ast.File) ([]violation, erro
 				}
 			}
 		case *ast.KeyValueExpr:
-			// A composite-literal field: config{ProxyPassword: "proxypass"}.
+			// A composite-literal field, where the key names the credential and
+			// the value is the literal: a ProxyPassword or a ClientSecret.
 			if id, ok := v.Key.(*ast.Ident); ok &&
 				nameRe.MatchString(id.Name) && isStringLiteral(v.Value) {
 				report(v.Value.Pos(), id.Name)
