@@ -196,7 +196,9 @@ adopters can plan their upgrades.
   reachable here — this SDK uses OTLP/HTTP and starts no gRPC server — but
   which a scanner flags on the version either way. gRPC stays indirect; the
   explicit requirement exists only to hold the graph above the fixed
-  version, so a consumer that pinned it themselves can drop that pin.
+  version, so a consumer who pinned it themselves can drop that pin.
+  `go mod tidy` also lifts the indirect `golang.org/x/crypto` to v0.55.0
+  and `golang.org/x/text` to v0.41.0, which the newer gRPC requires.
 
 ### Fixed
 
