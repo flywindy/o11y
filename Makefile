@@ -1,5 +1,6 @@
 .PHONY: all test lint adr-check vuln examples bench cover fmt tidy clean help \
-        tools sast sast-gosec sast-semgrep sast-semgrep-test
+        tools sast sast-gosec sast-gosec-cred sast-semgrep sast-semgrep-test \
+        sast-directives
 
 # Force bash so the examples target can use process substitution / read -d ''.
 # The default /bin/sh on Debian / Ubuntu is dash, which lacks both features.
@@ -55,20 +56,36 @@ endif
 # rule fixtures whose whole purpose is to contain deliberate violations, so it
 # is excluded here the same way SEMGREP_FLAGS excludes it below.
 #
-# NOT wired into `sast` / CI yet: the first run against this repo surfaced 12
-# pre-existing findings unrelated to the credential-literal gap sast-semgrep
-# was added for (G115 int-overflow conversions, G404 weak RNG, G306 file
-# perms, G102 bind-all, plus two real G101 password-in-URL fixtures). Those
-# need a human triage pass (fix vs justified #nosec) before gosec can be a
-# blocking gate without either failing CI on unrelated findings or suppressing
+# Only the credential half is wired into `sast` / CI, as sast-gosec-cred. The
+# first run against this repo surfaced 12 pre-existing findings unrelated to
+# the credential-literal gap sast-semgrep was added for (G115 int-overflow
+# conversions, G404 weak RNG, G306 file perms, G102 bind-all). Those still
+# need a human triage pass (fix vs justified #nosec) before the rest of gosec
+# can block without either failing CI on unrelated findings or suppressing
 # them un-reviewed. `make sast-gosec` stays runnable on demand until then.
+#
+# The G101 count in that tally was two. By the time a gate was put on it the
+# class had reached eleven, all of them unannotated password-in-URL fixtures,
+# because nothing was watching it — which is the argument for gating a class
+# as soon as it is clean rather than waiting on the whole triage.
 GOSEC_FLAGS := -quiet -severity medium -confidence low -tests=true \
                -exclude-generated -exclude-dir=.semgrep
 
-# semgrep: only the repo-owned rules under .semgrep/ — no p/golang or
-# p/security-audit registry config yet, to keep this gate scoped to what it
-# was added for (see .semgrep/hardcoded-credentials.yml) rather than opening a
-# second, broader SAST-triage effort in the same change.
+# semgrep: only the repo-owned rules under .semgrep/ — no registry config, to
+# keep this gate scoped to what it was added for (see
+# .semgrep/hardcoded-credentials.yml) rather than opening a second, broader
+# SAST-triage effort in the same change.
+#
+# Adding one would not close the gap the directives here name anyway.
+# gosec.G101-1, the id every nosemgrep directive in this repo carries, is not
+# in the public registry: probed in CI on 2026-09-17 over the three files
+# holding credential fixtures, r/gosec.G101-1 resolved to zero rules (semgrep
+# prints "Nothing to scan" and exits 0, so that gate would have passed having
+# scanned nothing), while p/gosec, p/security-audit and p/golang ran 23, 30
+# and 42 rules for zero findings. Whatever reports that id is a logged-in or
+# vendor ruleset — every anonymous scan ends with "need more rules? semgrep
+# login". sast-directives enforces the convention instead, since the rule
+# itself cannot be run here.
 SEMGREP_FLAGS := --error --severity=WARNING --severity=ERROR --metrics=off \
                  --exclude=.semgrep --config=.semgrep/
 
@@ -109,10 +126,10 @@ tools: ## Install pinned SAST tooling (gosec, semgrep)
 	  exit 1; \
 	fi
 
-# Run the blocking SAST scans (repo-owned semgrep rules) plus the rule tests.
-# gosec is deliberately NOT included — see the note on GOSEC_FLAGS above; run
-# `make sast-gosec` directly to see its findings. Both remaining scans always
-# run (no fail-fast) so every category is reported in one pass.
+# Run the blocking SAST gates plus the rule tests. Only gosec's credential
+# rule is included; the rest of gosec is not — see the note on GOSEC_FLAGS
+# above, and run `make sast-gosec` directly to see its findings. Every scan
+# always runs (no fail-fast) so every category is reported in one pass.
 sast: ## Run the blocking SAST gates: semgrep rules, their fixtures, credential directives, gosec G101
 	@rc=0; s=PASS; t=PASS; d=PASS; c=PASS; \
 	$(MAKE) --no-print-directory sast-semgrep-test   || { rc=1; t=FAIL; }; \
