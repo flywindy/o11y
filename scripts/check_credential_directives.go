@@ -54,13 +54,16 @@ import (
 	"bufio"
 	"fmt"
 	"go/ast"
+	"go/build/constraint"
 	"go/parser"
 	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -80,21 +83,29 @@ const selfName = "check_credential_directives.go"
 // fixtureDir holds the semgrep rules and their fixtures.
 const fixtureDir = ".semgrep"
 
-// scannedBuildTags are the build constraints the credential gate is configured
-// for: `integration` is passed to gosec as -tags in GOSEC_CRED_FLAGS, and
-// `ignore` marks the standalone `go run` programs under scripts/, which are
-// never part of any build and cannot be handed to gosec anyway (they are two
-// package main files in one directory).
-//
-// gosec analyses only the files that satisfy the tags it is given, so a build
-// constraint nobody passed is a file the credential gate never reads -- and
-// the repo rule will not fire on a neutral identifier there either. A new tag
-// is therefore a silent hole, which is why an unknown one fails here instead
-// of waiting for an external scan to find what it hid.
-var scannedBuildTags = []string{"ignore", "integration"}
+// gosecTags are the build tags GOSEC_CRED_FLAGS passes to gosec.
+var gosecTags = []string{"integration"}
 
-// buildTagIdent matches one identifier in a //go:build expression.
-var buildTagIdent = regexp.MustCompile(`[A-Za-z0-9_.]+`)
+// gosecExempt lists the files gosec's package scan provably cannot read, with
+// the reason each is accepted anyway. Listing paths rather than a rule is
+// deliberate: `//go:build ignore` would otherwise be a way to put a file
+// outside the credential gate without anyone noticing.
+//
+// These two are standalone `go run` programs, never part of a build, and
+// being two package main files in one directory they cannot be handed to
+// gosec together. They are not uncovered: the repo's own semgrep rule and
+// this checker both read files rather than packages, so only gosec's
+// neutral-identifier URL class is missing for them.
+var gosecExempt = map[string]string{
+	"scripts/check_credential_directives.go": "//go:build ignore standalone program",
+	"scripts/check_integrations.go":          "//go:build ignore standalone program",
+}
+
+// unixGOOS are the GOOS values that satisfy the `unix` build tag.
+var unixGOOS = []string{
+	"aix", "android", "darwin", "dragonfly", "freebsd", "hurd", "illumos",
+	"ios", "linux", "netbsd", "openbsd", "solaris",
+}
 
 // nosecTag is gosec's suppression directive.
 const nosecTag = "#nosec"
@@ -164,7 +175,7 @@ func scan(root string) ([]violation, error) {
 		}
 		src := newSource(fset, parsed, lines)
 		found = append(found, check(path, src)...)
-		found = append(found, checkBuildTags(path, lines)...)
+		found = append(found, checkReachable(path, lines)...)
 
 		if filepath.Base(filepath.Dir(path)) == fixtureDir {
 			fixtureFound, err := checkFixture(path, src, parsed)
@@ -209,26 +220,84 @@ func check(file string, src *source) []violation {
 	return found
 }
 
-// checkBuildTags reports a //go:build constraint the credential gate is not
-// configured to scan. See scannedBuildTags for why that is a hole rather than
-// a detail.
-func checkBuildTags(file string, lines []string) []violation {
-	var found []violation
-	for i, line := range lines {
-		expr, ok := strings.CutPrefix(strings.TrimSpace(line), "//go:build ")
-		if !ok {
-			continue
-		}
-		for _, tag := range buildTagIdent.FindAllString(expr, -1) {
-			if slices.Contains(scannedBuildTags, tag) {
-				continue
-			}
-			found = append(found, violation{file, i + 1, line,
-				"build tag " + tag + " is not scanned by the credential gate — " +
-					"add it to -tags in GOSEC_CRED_FLAGS and to scannedBuildTags"})
+// checkReachable reports a Go file that gosec's package scan cannot read, so
+// the credential gate never sees it.
+//
+// Two ways a checked-in .go file falls outside `gosec ./...`:
+//
+//   - a build constraint that the configured -tags do not satisfy. The whole
+//     expression is evaluated, not just its identifiers: `//go:build
+//     !integration` mentions a tag the gate passes and is excluded by it
+//     exactly because it does.
+//   - a testdata/ directory, which the go tool ignores by definition
+//     (`go help packages`).
+//
+// Either way the repo rule will not fire on a neutral identifier there either,
+// and an unannotated credential leaves this checker nothing to inspect — so the
+// file is invisible to every local gate while an external scan still reads it.
+// Failing here turns that into a decision someone has to make.
+func checkReachable(file string, lines []string) []violation {
+	if _, ok := gosecExempt[filepath.ToSlash(filepath.Clean(file))]; ok {
+		return nil
+	}
+	for _, part := range strings.Split(filepath.ToSlash(filepath.Clean(file)), "/") {
+		if part == "testdata" {
+			return []violation{{file, 1, lines[0],
+				"testdata/ is ignored by the go tool, so gosec never reads this file — " +
+					"move it, or cover it another way and add it to gosecExempt"}}
 		}
 	}
-	return found
+	for i, line := range lines {
+		if !strings.HasPrefix(strings.TrimSpace(line), "//go:build ") {
+			continue
+		}
+		expr, err := constraint.Parse(strings.TrimSpace(line))
+		if err != nil {
+			return []violation{{file, i + 1, line, "unparsable build constraint: " + err.Error()}}
+		}
+		if !expr.Eval(tagSatisfied) {
+			return []violation{{file, i + 1, line,
+				"this build constraint is not satisfied by the credential gate's -tags, " +
+					"so gosec never reads this file — add the tag to GOSEC_CRED_FLAGS " +
+					"and gosecTags, or add the file to gosecExempt"}}
+		}
+		break // only the first //go:build line is the constraint
+	}
+	return nil
+}
+
+// tagSatisfied evaluates one build tag as the credential gate's gosec run
+// would see it. This program runs in the same job as that scan, so the host's
+// GOOS, GOARCH and toolchain version are the ones gosec gets.
+func tagSatisfied(tag string) bool {
+	switch {
+	case slices.Contains(gosecTags, tag):
+		return true
+	case tag == runtime.GOOS || tag == runtime.GOARCH:
+		return true
+	case tag == "unix":
+		return slices.Contains(unixGOOS, runtime.GOOS)
+	case strings.HasPrefix(tag, "go1."):
+		return goVersionAtLeast(tag)
+	}
+	return false
+}
+
+// goVersionAtLeast reports whether the running toolchain satisfies a go1.N
+// build tag. An unreadable version is treated as not satisfying it, so the
+// answer errs towards reporting a file as unreachable rather than hiding it.
+func goVersionAtLeast(tag string) bool {
+	want, err := strconv.Atoi(strings.TrimPrefix(tag, "go1."))
+	if err != nil {
+		return false
+	}
+	version := strings.TrimPrefix(runtime.Version(), "go1.")
+	minor, _, _ := strings.Cut(version, ".")
+	have, err := strconv.Atoi(minor)
+	if err != nil {
+		return false
+	}
+	return have >= want
 }
 
 // checkFixture requires the registry id on every credential-shaped binding in
@@ -300,25 +369,62 @@ func checkFixture(file string, src *source, parsed *ast.File) ([]violation, erro
 }
 
 // definesRule reports whether a semgrep rule file declares the given rule id.
+//
+// The scalar is normalized rather than compared to one serialization: `id: x`,
+// `id: "x"` and `id: x # note` are the same YAML, and a comparison that
+// accepts only the first would silently skip the fixture check on a rule file
+// whose formatting changed.
 func definesRule(ruleFile, id string) (bool, error) {
 	lines, err := readLines(ruleFile)
 	if err != nil {
 		return false, err
 	}
 	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		trimmed = strings.TrimPrefix(trimmed, "- ")
-		if trimmed == "id: "+id {
+		trimmed := strings.TrimPrefix(strings.TrimSpace(line), "- ")
+		rest, ok := strings.CutPrefix(trimmed, "id:")
+		if !ok {
+			continue
+		}
+		if yamlScalar(rest) == id {
 			return true, nil
 		}
 	}
 	return false, nil
 }
 
+// yamlScalar normalizes a YAML scalar value: a quoted one yields its contents,
+// a plain one is cut at an inline comment.
+func yamlScalar(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if quote := value[0]; quote == '"' || quote == '\'' {
+		if end := strings.IndexByte(value[1:], quote); end >= 0 {
+			return value[1 : 1+end]
+		}
+		return strings.Trim(value, string(quote))
+	}
+	if cut := strings.Index(value, " #"); cut >= 0 {
+		value = value[:cut]
+	}
+	return strings.TrimSpace(value)
+}
+
+// indentOf returns a line's leading-space count, YAML's block structure.
+func indentOf(line string) int {
+	return len(line) - len(strings.TrimLeft(line, " "))
+}
+
 // credentialNameRegex reads the $NAME metavariable-regex out of a semgrep rule
 // file. Parsed by hand rather than with a YAML library so this gate adds no
 // dependency; an extraction failure is an error rather than a skip, because a
 // silently empty pattern is the no-op gate this whole target exists to prevent.
+//
+// The search is bounded to the block $NAME's constraint opens. Reading on past
+// it would pick up the next metavariable's regex -- $VAL's, which matches
+// string literals rather than identifiers -- and the fixture check would then
+// quietly match nothing at all instead of raising the error promised above.
 func credentialNameRegex(ruleFile string) (*regexp.Regexp, error) {
 	lines, err := readLines(ruleFile)
 	if err != nil {
@@ -328,19 +434,26 @@ func credentialNameRegex(ruleFile string) (*regexp.Regexp, error) {
 		if !strings.Contains(line, "metavariable: $NAME") {
 			continue
 		}
+		base := indentOf(line)
 		for _, next := range lines[i+1:] {
 			trimmed := strings.TrimSpace(next)
-			if !strings.HasPrefix(trimmed, "regex:") {
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 				continue
 			}
-			expr := strings.TrimSpace(strings.TrimPrefix(trimmed, "regex:"))
-			expr = strings.Trim(expr, "'\"")
-			re, err := regexp.Compile(expr)
+			if indentOf(next) < base || strings.HasPrefix(trimmed, "metavariable:") {
+				break // left $NAME's constraint block
+			}
+			rest, ok := strings.CutPrefix(trimmed, "regex:")
+			if !ok {
+				continue
+			}
+			re, err := regexp.Compile(yamlScalar(rest))
 			if err != nil {
 				return nil, fmt.Errorf("compile $NAME regex from %s: %w", ruleFile, err)
 			}
 			return re, nil
 		}
+		return nil, fmt.Errorf("no regex in the $NAME constraint block of %s", ruleFile)
 	}
 	return nil, fmt.Errorf("no $NAME metavariable-regex found in %s", ruleFile)
 }
