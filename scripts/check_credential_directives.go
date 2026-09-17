@@ -97,6 +97,21 @@ var gosecExempt = map[string]string{
 	".semgrep/hardcoded-credentials.go": "semgrep rule fixture, covered by checkFixture",
 }
 
+// notFirstParty are directories whose contents this repo does not author, and
+// which `go list ./...` does not report either -- wildcard patterns skip a
+// vendor path element by definition (`go help packages`), and the rest hold
+// dependencies or build output. Walking them would report every file in them
+// as outside the census, failing the gate on code nobody here wrote.
+//
+// The list mirrors .semgrepignore, with one deliberate difference: .semgrep/ is
+// excluded there and walked here, because its fixtures are the files this gate
+// exists to check.
+var notFirstParty = []string{
+	"vendor", "node_modules", "build", "dist",
+	".venv", "venv", ".env",
+	".git", ".svn", ".hg",
+}
+
 // urlCredential matches a URL literal carrying a password in its userinfo,
 // the one credential shape whose identifier says nothing about it.
 var urlCredential = regexp.MustCompile(`(?i)[a-z][a-z0-9+.\-]*://[^/\s:@"` + "`" + `]+:[^/\s@"` + "`" + `]+@`)
@@ -147,7 +162,7 @@ func scan(root string) ([]violation, error) {
 			return err
 		}
 		if d.IsDir() {
-			if d.Name() == ".git" {
+			if slices.Contains(notFirstParty, d.Name()) {
 				return fs.SkipDir
 			}
 			return nil
@@ -395,7 +410,10 @@ func credentialNameRegex(ruleFile, id string) (*regexp.Regexp, error) {
 	if err != nil {
 		return nil, err
 	}
-	lo, hi, ok := ruleBlock(lines, id)
+	lo, hi, ok, err := ruleBlock(lines, id)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", ruleFile, err)
+	}
 	if !ok {
 		return nil, nil
 	}
@@ -417,6 +435,10 @@ func credentialNameRegex(ruleFile, id string) (*regexp.Regexp, error) {
 			if !ok || nextKey != "regex" {
 				continue
 			}
+			if isBlockScalar(nextValue) {
+				return nil, fmt.Errorf("the $NAME regex in %s is a YAML block scalar, "+
+					"which this reader does not support; write it inline", ruleFile)
+			}
 			re, err := regexp.Compile(yamlScalar(nextValue))
 			if err != nil {
 				return nil, fmt.Errorf("compile $NAME regex from %s: %w", ruleFile, err)
@@ -431,7 +453,11 @@ func credentialNameRegex(ruleFile, id string) (*regexp.Regexp, error) {
 // ruleBlock returns the line range of the rules-list item declaring the given
 // id. Items are recognized by the indent of the first one under `rules:`, so a
 // nested list (patterns, pattern-either) does not read as a new rule.
-func ruleBlock(lines []string, id string) (lo, hi int, ok bool) {
+//
+// An id this reader cannot resolve is an error, not a miss. Reporting "no such
+// rule" for one it simply could not read would skip the fixture check without
+// saying so, which is the failure this gate exists to prevent.
+func ruleBlock(lines []string, id string) (lo, hi int, ok bool, err error) {
 	rulesAt := -1
 	for i, line := range lines {
 		if key, _, ok := yamlEntry(strings.TrimSpace(line)); ok && key == "rules" {
@@ -440,7 +466,7 @@ func ruleBlock(lines []string, id string) (lo, hi int, ok bool) {
 		}
 	}
 	if rulesAt < 0 {
-		return 0, 0, false
+		return 0, 0, false, nil
 	}
 
 	itemIndent, starts := -1, []int{}
@@ -464,12 +490,19 @@ func ruleBlock(lines []string, id string) (lo, hi int, ok bool) {
 		}
 		for i := from; i < to; i++ {
 			key, value, ok := yamlEntry(strings.TrimPrefix(strings.TrimSpace(lines[i]), "- "))
-			if ok && key == "id" && yamlScalar(value) == id {
-				return from, to, true
+			if !ok || key != "id" {
+				continue
+			}
+			if isBlockScalar(value) {
+				return 0, 0, false, fmt.Errorf("rule id on line %d is a YAML block scalar, "+
+					"which this reader does not support; write it inline", i+1)
+			}
+			if yamlScalar(value) == id {
+				return from, to, true, nil
 			}
 		}
 	}
-	return 0, 0, false
+	return 0, 0, false, nil
 }
 
 // yamlEntry splits a mapping entry into its key and value. The key is trimmed
@@ -499,17 +532,46 @@ func yamlScalar(value string) string {
 	return strings.TrimSpace(value)
 }
 
+// isBlockScalar reports whether a value is a block-scalar header (`|` or `>`,
+// with optional chomping and indent indicators) rather than an inline scalar.
+//
+// The contents of such a scalar live on the following lines, so a reader that
+// takes the header gets the marker itself -- and `>-` compiles as a perfectly
+// valid regex that matches those two characters and no identifier at all. That
+// is the silent no-op this gate exists to prevent, so it is an error here
+// rather than something to half-support.
+func isBlockScalar(value string) bool {
+	value = strings.TrimSpace(value)
+	if cut := strings.Index(value, " #"); cut >= 0 {
+		value = strings.TrimSpace(value[:cut])
+	}
+	if value == "" || (value[0] != '|' && value[0] != '>') {
+		return false
+	}
+	for _, r := range value[1:] {
+		if !strings.ContainsRune("+-0123456789", r) {
+			return false
+		}
+	}
+	return true
+}
+
 // indentOf returns a line's leading-space count, YAML's block structure.
 func indentOf(line string) int {
 	return len(line) - len(strings.TrimLeft(line, " "))
 }
 
-// isStringLiteral reports whether e is a string literal, or a concatenation of
-// them ("sup3r-" + "secret" is as hard-coded as one literal).
+// isStringLiteral reports whether e is a non-empty string literal, or a
+// concatenation of them ("sup3r-" + "secret" is as hard-coded as one literal).
+//
+// Empty is excluded to match the rule's own $VAL regex, which requires at least
+// one character in every component. `password := ""` is an empty default, not a
+// planted credential, and demanding a suppression for it would be the gate
+// failing on ordinary code.
 func isStringLiteral(e ast.Expr) bool {
 	switch v := e.(type) {
 	case *ast.BasicLit:
-		return v.Kind == token.STRING
+		return v.Kind == token.STRING && len(v.Value) > 2
 	case *ast.BinaryExpr:
 		return v.Op == token.ADD && isStringLiteral(v.X) && isStringLiteral(v.Y)
 	}
