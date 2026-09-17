@@ -68,8 +68,17 @@ endif
 # class had reached eleven, all of them unannotated password-in-URL fixtures,
 # because nothing was watching it — which is the argument for gating a class
 # as soon as it is clean rather than waiting on the whole triage.
-GOSEC_FLAGS := -quiet -severity medium -confidence low -tests=true \
-               -exclude-generated -exclude-dir=.semgrep
+GOSEC_BASE_FLAGS := -quiet -severity medium -confidence low -tests=true \
+                    -exclude-dir=.semgrep
+GOSEC_FLAGS      := $(GOSEC_BASE_FLAGS) -exclude-generated
+
+# The credential gate keeps generated files in scope. -exclude-generated is
+# there so the untriaged classes above do not fail CI on code nobody edits, but
+# a credential in a checked-in generated file is still a credential on disk and
+# an external scan reports it like any other. It also cannot be annotated: a
+# #nosec there is erased by the next regeneration, so the only fix is at the
+# generator, which is the right place for the pressure to land.
+GOSEC_CRED_FLAGS := $(GOSEC_BASE_FLAGS) -include=G101
 
 # semgrep: only the repo-owned rules under .semgrep/ — no registry config, to
 # keep this gate scoped to what it was added for (see
@@ -171,7 +180,7 @@ sast-semgrep: ## semgrep: repo-owned rules under .semgrep/
 # gosec rule stays out: wiring those in is still the separate triage effort.
 sast-gosec-cred: ## gosec: hardcoded-credential findings only (G101), blocking
 	@test -x "$(GOSEC)" || { echo "gosec not installed — run 'make tools'"; exit 1; }
-	$(GOSEC) $(GOSEC_FLAGS) -include=G101 ./...
+	$(GOSEC) $(GOSEC_CRED_FLAGS) ./...
 
 # gosec.G101-1, the id an external scan reports, runs nowhere here — it is not
 # in the public semgrep registry at all (see SEMGREP_FLAGS). So the only thing

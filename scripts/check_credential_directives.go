@@ -40,6 +40,14 @@
 // is still a planted credential on disk. Rather than a second copy of the rule
 // that can drift from it, the check parses the fixture and reads the rule's own
 // $NAME regex out of the sibling .yml, so both key on the same identifiers.
+//
+// Comments come from go/parser rather than a line scan, because gosec honors a
+// block-form directive too. Verified against gosec v2.26.1 over a
+// password-in-URL fixture: `/* #nosec G101 */` above the declaration, the same
+// trailing it, and a multi-line block with the tag on its own line all suppress
+// the finding. A scan that recognizes only `//` sees none of them, and the
+// identifiers these fixtures use are not credential-shaped, so nothing else
+// here would fire either.
 package main
 
 import (
@@ -107,6 +115,7 @@ func main() {
 // every other gate excludes that directory, so it is the one place where a
 // missing directive is invisible until an external scan reads the file.
 func scan(root string) ([]violation, error) {
+	self := filepath.Join("scripts", selfName)
 	var found []violation
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -122,18 +131,26 @@ func scan(root string) ([]violation, error) {
 			return nil
 		}
 		// This file necessarily contains the patterns it searches for, in its
-		// own doc comment and in the text of the messages it prints.
-		if d.Name() == selfName {
+		// own doc comment and in the text of the messages it prints. Matched by
+		// path, not basename: a file of the same name in another package is
+		// ordinary source and must be checked like any other.
+		if filepath.Clean(path) == self {
 			return nil
 		}
 		lines, err := readLines(path)
 		if err != nil {
 			return err
 		}
-		found = append(found, check(path, lines)...)
+		fset := token.NewFileSet()
+		parsed, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", path, err)
+		}
+		src := newSource(fset, parsed, lines)
+		found = append(found, check(path, src)...)
 
 		if filepath.Base(filepath.Dir(path)) == fixtureDir {
-			fixtureFound, err := checkFixture(path, lines)
+			fixtureFound, err := checkFixture(path, src, parsed)
 			if err != nil {
 				return err
 			}
@@ -144,7 +161,7 @@ func scan(root string) ([]violation, error) {
 	return found, err
 }
 
-// check applies the three line-directive invariants to one file's lines.
+// check applies the three directive invariants to one file.
 //
 // They are deliberately one-directional. Naming the repo's rule, suppressing
 // gosec's, or asserting the repo's rule fires all mean the line is a
@@ -152,28 +169,24 @@ func scan(root string) ([]violation, error) {
 // id has to be named as well. The converse is not a violation: the URL
 // fixtures trip only the external rule, because their identifiers are not
 // credential-shaped, and name only that id.
-func check(file string, lines []string) []violation {
+func check(file string, src *source) []violation {
 	var found []violation
-	for i, line := range lines {
-		ids := nosemgrepIDs(line)
+	for _, c := range src.comments {
+		ids := c.nosemgrepIDs()
 		if names(ids, repoRuleID) && !names(ids, registryID) {
-			found = append(found, violation{file, i + 1, line,
-				"nosemgrep directive names " + repoRuleID + " but not " + registryID})
+			found = append(found, src.violation(file, c.startLine,
+				"nosemgrep directive names "+repoRuleID+" but not "+registryID))
 		}
-		if nosecCoversG101(line) {
-			if stmt := statementLine(lines, i); !namedInSlot(lines, stmt) {
-				found = append(found, violation{file, i + 1, line,
-					"gosec directive suppresses G101 with no nosemgrep: " + registryID +
-						" on the line it covers"})
-			}
+		if c.nosecCoversG101() && !src.namedInSlot(src.statement(c)) {
+			found = append(found, src.violation(file, c.startLine,
+				"gosec directive suppresses G101 with no nosemgrep: "+registryID+
+					" on the line it covers"))
 		}
 		// A fixture positive: the rule is asserted to fire on the next line, so
 		// that line is a planted credential an external scan reports too.
-		if strings.Contains(line, ruleIDMarker) {
-			if stmt := statementLine(lines, i); !namedInSlot(lines, stmt) {
-				found = append(found, violation{file, i + 1, line,
-					"fixture positive for " + repoRuleID + " does not name " + registryID})
-			}
+		if c.contains(ruleIDMarker) && !src.namedInSlot(src.statement(c)) {
+			found = append(found, src.violation(file, c.startLine,
+				"fixture positive for "+repoRuleID+" does not name "+registryID))
 		}
 	}
 	return found
@@ -186,7 +199,7 @@ func check(file string, lines []string) []violation {
 // there is one definition rather than two that drift. The value must be a string
 // literal: `password := lookup("GRAPH_PROXY_PASSWORD")` names an env var, it does
 // not hold a credential.
-func checkFixture(file string, lines []string) ([]violation, error) {
+func checkFixture(file string, src *source, parsed *ast.File) ([]violation, error) {
 	ruleFile := strings.TrimSuffix(file, ".go") + ".yml"
 	if _, err := os.Stat(ruleFile); err != nil {
 		return nil, nil // a .go without a sibling rule is not a fixture
@@ -196,20 +209,14 @@ func checkFixture(file string, lines []string) ([]violation, error) {
 		return nil, err
 	}
 
-	fset := token.NewFileSet()
-	parsed, err := parser.ParseFile(fset, file, nil, 0)
-	if err != nil {
-		return nil, fmt.Errorf("parse fixture %s: %w", file, err)
-	}
-
 	var found []violation
 	report := func(pos token.Pos, name string) {
-		line := fset.Position(pos).Line
-		if namedInSlot(lines, line-1) {
+		line := src.fset.Position(pos).Line
+		if src.namedInSlot(line) {
 			return
 		}
-		found = append(found, violation{file, line, lines[line-1],
-			"planted credential " + name + " does not name " + registryID})
+		found = append(found, src.violation(file, line,
+			"planted credential "+name+" does not name "+registryID))
 	}
 
 	ast.Inspect(parsed, func(n ast.Node) bool {
@@ -284,62 +291,137 @@ func isStringLiteral(e ast.Expr) bool {
 	return false
 }
 
-// statementLine returns the index of the line a directive at i governs: for a
-// comment on its own line, the next line that is neither blank nor a comment
-// (gosec honors a directive across a blank line); for a trailing comment, its
-// own line. It returns -1 when a trailing comment block governs nothing.
-func statementLine(lines []string, i int) int {
-	if !isCommentLine(lines[i]) {
-		return i
+// comment is one parsed Go comment, line or block, with the directive-bearing
+// text of each of its lines.
+type comment struct {
+	startLine int
+	endLine   int
+	trailing  bool // code precedes it on its first line
+	texts     []string
+}
+
+// source is a parsed file: its lines, its comments, and where each one sits.
+type source struct {
+	fset     *token.FileSet
+	lines    []string
+	comments []*comment
+	covered  map[int]bool // lines holding nothing but a comment
+}
+
+func newSource(fset *token.FileSet, parsed *ast.File, lines []string) *source {
+	s := &source{fset: fset, lines: lines, covered: map[int]bool{}}
+	for _, group := range parsed.Comments {
+		for _, c := range group.List {
+			pos := fset.Position(c.Pos())
+			before := ""
+			if pos.Line-1 < len(lines) {
+				line := lines[pos.Line-1]
+				before = line[:min(pos.Column-1, len(line))]
+			}
+			parsed := &comment{
+				startLine: pos.Line,
+				endLine:   fset.Position(c.End()).Line,
+				trailing:  strings.TrimSpace(before) != "",
+				texts:     commentTexts(c.Text),
+			}
+			s.comments = append(s.comments, parsed)
+			for l := parsed.startLine; l <= parsed.endLine; l++ {
+				if l == parsed.startLine && parsed.trailing {
+					continue
+				}
+				s.covered[l] = true
+			}
+		}
 	}
-	for j := i + 1; j < len(lines); j++ {
-		if isCommentLine(lines[j]) || strings.TrimSpace(lines[j]) == "" {
+	return s
+}
+
+// commentTexts returns a comment's text, one entry per line, with the markers
+// and indentation stripped. A block comment can carry its directive on any of
+// its lines -- gosec honors the multi-line form.
+func commentTexts(raw string) []string {
+	if after, ok := strings.CutPrefix(raw, "//"); ok {
+		return []string{strings.TrimSpace(after)}
+	}
+	inner := strings.TrimSuffix(strings.TrimPrefix(raw, "/*"), "*/")
+	var texts []string
+	for _, line := range strings.Split(inner, "\n") {
+		texts = append(texts, strings.TrimSpace(line))
+	}
+	return texts
+}
+
+func (c *comment) contains(s string) bool {
+	return slices.ContainsFunc(c.texts, func(t string) bool { return strings.Contains(t, s) })
+}
+
+// statement returns the line the comment's directive governs: for a trailing
+// comment its own line, otherwise the next line that is neither blank nor
+// comment (gosec honors a directive across a blank line). It returns -1 when a
+// comment at the end of a file governs nothing.
+func (s *source) statement(c *comment) int {
+	if c.trailing {
+		return c.startLine
+	}
+	for l := c.endLine + 1; l <= len(s.lines); l++ {
+		if s.covered[l] || strings.TrimSpace(s.lines[l-1]) == "" {
 			continue
 		}
-		return j
+		return l
 	}
 	return -1
 }
 
 // namedInSlot reports whether the registry id is named where semgrep would read
-// it for the statement at index stmt: trailing on that line, or on the comment
-// line directly above it. Binding the two directives to one statement is what
-// stops a suppression borrowing its neighbour's — semgrep honors a nosemgrep
-// comment only on the finding's own line or the one directly above.
-func namedInSlot(lines []string, stmt int) bool {
-	if stmt < 0 || stmt >= len(lines) {
+// it for the statement on the given line: in a comment trailing that line, or in
+// one ending on the line directly above it. Binding the two directives to one
+// statement is what stops a suppression borrowing its neighbour's -- semgrep
+// honors a nosemgrep comment only on the finding's own line or the one above.
+func (s *source) namedInSlot(stmt int) bool {
+	if stmt < 1 {
 		return false
 	}
-	if names(nosemgrepIDs(lines[stmt]), registryID) {
-		return true
+	for _, c := range s.comments {
+		inSlot := (c.trailing && c.startLine == stmt) || c.endLine == stmt-1
+		if inSlot && names(c.nosemgrepIDs(), registryID) {
+			return true
+		}
 	}
-	return stmt > 0 && names(nosemgrepIDs(lines[stmt-1]), registryID)
+	return false
 }
 
-// nosecCoversG101 reports whether a gosec directive on the line suppresses
-// G101 — by naming it, or by naming no rule at all, which suppresses every
+func (s *source) violation(file string, line int, why string) violation {
+	text := ""
+	if line >= 1 && line <= len(s.lines) {
+		text = s.lines[line-1]
+	}
+	return violation{file, line, text, why}
+}
+
+// nosecCoversG101 reports whether the comment is a gosec directive suppressing
+// G101 -- by naming it, or by naming no rule at all, which suppresses every
 // rule including this one.
 //
-// gosec honors the tag only at the start of a comment. Verified against gosec
-// v2.26.1 over a password-in-URL fixture: "// #nosec", "// #nosec -- reason"
-// and "// #nosec is not needed here" all suppress the finding, while
-// "// ... so it needs no #nosec." and "// see the note, #nosec G101" leave it
+// gosec honors the tag only at the start of a comment line. Verified against
+// gosec v2.26.1 over a password-in-URL fixture: "#nosec", "#nosec -- reason"
+// and "#nosec is not needed here" all suppress the finding, while
+// "... so it needs no #nosec." and "see the note, #nosec G101" leave it
 // reported. So prose that mentions the tag mid-sentence is not a directive,
 // and a directive that names nothing is a blanket one.
-func nosecCoversG101(line string) bool {
-	text, ok := lineComment(line)
-	if !ok {
-		return false
+func (c *comment) nosecCoversG101() bool {
+	for _, text := range c.texts {
+		rest, ok := strings.CutPrefix(text, nosecTag)
+		if !ok {
+			continue
+		}
+		if rest != "" && rest[0] != ' ' && rest[0] != '\t' && rest[0] != '-' {
+			continue // "#nosecurity", not a directive
+		}
+		if ids := nosecRuleIDs(rest); len(ids) == 0 || slices.Contains(ids, "G101") {
+			return true
+		}
 	}
-	rest, ok := strings.CutPrefix(text, nosecTag)
-	if !ok {
-		return false
-	}
-	if rest != "" && rest[0] != ' ' && rest[0] != '\t' && rest[0] != '-' {
-		return false // "#nosecurity", not a directive
-	}
-	ids := nosecRuleIDs(rest)
-	return len(ids) == 0 || slices.Contains(ids, "G101")
+	return false
 }
 
 // nosecRuleIDs returns the rule ids a gosec directive names. A reason may
@@ -360,31 +442,28 @@ func nosecRuleIDs(rest string) []string {
 	return ids
 }
 
-// nosemgrepIDs returns the rule ids a nosemgrep directive on the line names,
+// nosemgrepIDs returns the rule ids a nosemgrep directive in the comment names,
 // or nil when it carries none. A reason may follow "--"; ids precede it.
-func nosemgrepIDs(line string) []string {
-	text, ok := lineComment(line)
-	if !ok {
-		return nil
-	}
-	_, after, found := strings.Cut(text, "nosemgrep:")
-	if !found {
-		return nil
-	}
-	if before, _, ok := strings.Cut(after, "--"); ok {
-		after = before
-	}
-
+func (c *comment) nosemgrepIDs() []string {
 	var ids []string
-	for _, field := range strings.Split(after, ",") {
-		id := strings.Trim(strings.TrimSpace(field), "`")
-		// An id never contains whitespace, so anything after the first break
-		// is surrounding prose rather than part of the id.
-		if cut := strings.IndexAny(id, " \t`"); cut >= 0 {
-			id = id[:cut]
+	for _, text := range c.texts {
+		_, after, found := strings.Cut(text, "nosemgrep:")
+		if !found {
+			continue
 		}
-		if id != "" {
-			ids = append(ids, id)
+		if before, _, ok := strings.Cut(after, "--"); ok {
+			after = before
+		}
+		for _, field := range strings.Split(after, ",") {
+			id := strings.Trim(strings.TrimSpace(field), "`")
+			// An id never contains whitespace, so anything after the first
+			// break is surrounding prose rather than part of the id.
+			if cut := strings.IndexAny(id, " \t`"); cut >= 0 {
+				id = id[:cut]
+			}
+			if id != "" {
+				ids = append(ids, id)
+			}
 		}
 	}
 	return ids
@@ -398,32 +477,6 @@ func nosemgrepIDs(line string) []string {
 // with this one (gosec.G101-10).
 func names(ids []string, want string) bool {
 	return slices.Contains(ids, want)
-}
-
-// lineComment returns the text of a // comment on the line. Occurrences inside
-// a string literal are skipped — every URL fixture here contains one.
-func lineComment(line string) (string, bool) {
-	var quote byte
-	for i := 0; i < len(line); i++ {
-		c := line[i]
-		switch {
-		case quote != 0:
-			if c == '\\' {
-				i++
-			} else if c == quote {
-				quote = 0
-			}
-		case c == '"' || c == '`' || c == '\'':
-			quote = c
-		case c == '/' && i+1 < len(line) && line[i+1] == '/':
-			return strings.TrimSpace(line[i+2:]), true
-		}
-	}
-	return "", false
-}
-
-func isCommentLine(line string) bool {
-	return strings.HasPrefix(strings.TrimSpace(line), "//")
 }
 
 func readLines(path string) ([]string, error) {
