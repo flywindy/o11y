@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,8 +18,78 @@ import (
 // event.CommandStartedEvent.ConnectionID — without a container.
 type fakeMongod struct {
 	ln net.Listener
+
+	// hold delays replies to one command so several connections are in flight
+	// at once. See holdCommand.
+	hold *commandBarrier
 }
 
+// commandBarrier holds replies to one command until count of them are in
+// flight, then releases them together.
+type commandBarrier struct {
+	command string
+	count   int
+
+	mu      sync.Mutex
+	waiting int
+	release chan struct{}
+	opened  sync.Once
+}
+
+// barrierTimeout releases a barrier that never fills, so a wrong assumption
+// about pool behaviour fails the test's own assertion instead of hanging it.
+const barrierTimeout = 10 * time.Second
+
+// holdCommand makes the fake delay its reply to command until count of them
+// are in flight at once, then answer them together.
+//
+// This is what makes pool growth deterministic. The driver opens a new
+// connection only when every pooled one is busy, so a fake that answers
+// immediately lets a single connection serve concurrent commands in turn: how
+// many connections a test actually opens is then a function of goroutine
+// scheduling, and an assertion on that count is a latent flake. Holding the
+// replies keeps each connection checked out until the barrier opens, so the
+// pool has to grow to count connections.
+//
+// Call it before the first command. It does not hold the handshake, which each
+// new connection must complete before it can carry the held command.
+func (f *fakeMongod) holdCommand(command string, count int) {
+	f.hold = &commandBarrier{
+		command: command,
+		count:   count,
+		release: make(chan struct{}),
+	}
+}
+
+// wait blocks until the barrier for command opens. A command the barrier does
+// not name passes straight through.
+func (b *commandBarrier) wait(command string) {
+	if b == nil || b.count <= 0 || command != b.command {
+		return
+	}
+
+	b.mu.Lock()
+	b.waiting++
+	reached := b.waiting >= b.count
+	b.mu.Unlock()
+	if reached {
+		b.open()
+		return
+	}
+
+	select {
+	case <-b.release:
+	case <-time.After(barrierTimeout):
+		b.open()
+	}
+}
+
+// open releases every waiter, once.
+func (b *commandBarrier) open() {
+	b.opened.Do(func() { close(b.release) })
+}
+
+// startFakeMongod listens on a loopback port and serves until the test ends.
 func startFakeMongod(t *testing.T) *fakeMongod {
 	t.Helper()
 
@@ -40,25 +111,35 @@ func startFakeMongod(t *testing.T) *fakeMongod {
 	return f
 }
 
+// uri is the connection string for this fake.
 func (f *fakeMongod) uri() string { return "mongodb://" + f.ln.Addr().String() }
 
+// hostPort is the address the fake actually listens on, which is what the peer
+// attributes must resolve to.
 func (f *fakeMongod) hostPort() (string, int) {
 	addr := f.ln.Addr().(*net.TCPAddr)
 	return addr.IP.String(), addr.Port
 }
 
-func (f *fakeMongod) respond(cmd bsoncore.Document) bson.D {
+// commandName returns the command a wire message carries: the first key of the
+// command document, unwrapping the legacy $query envelope.
+func commandName(cmd bsoncore.Document) string {
 	elems, _ := cmd.Elements()
 	if len(elems) == 0 {
-		return bson.D{{Key: "ok", Value: 1.0}}
+		return ""
 	}
 	key := elems[0].Key()
 	if key == "$query" {
 		if sub, ok := elems[0].Value().DocumentOK(); ok {
-			return f.respond(sub)
+			return commandName(sub)
 		}
 	}
-	switch key {
+	return key
+}
+
+// respond answers hello as a writable primary and acknowledges everything else.
+func (f *fakeMongod) respond(cmd bsoncore.Document) bson.D {
+	switch commandName(cmd) {
 	case "isMaster", "ismaster", "hello":
 		return bson.D{
 			{Key: "ismaster", Value: true}, {Key: "isWritablePrimary", Value: true}, {Key: "helloOk", Value: true},
@@ -73,6 +154,7 @@ func (f *fakeMongod) respond(cmd bsoncore.Document) bson.D {
 	}
 }
 
+// serve answers one connection's wire messages until it closes.
 func (f *fakeMongod) serve(conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 
@@ -113,6 +195,8 @@ func (f *fakeMongod) serve(conn net.Conn) {
 		default:
 			return
 		}
+
+		f.hold.wait(commandName(cmd))
 
 		doc, _ := bson.Marshal(f.respond(cmd))
 		nextID++
@@ -157,6 +241,7 @@ func wireLen(n int) uint32 {
 	return uint32(n)
 }
 
+// header appends a 16-byte wire-protocol message header to dst.
 func header(dst []byte, length, reqID, respTo, opcode uint32) []byte {
 	dst = binary.LittleEndian.AppendUint32(dst, length)
 	dst = binary.LittleEndian.AppendUint32(dst, reqID)

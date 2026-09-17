@@ -2,6 +2,7 @@ package mongo
 
 import (
 	"context"
+	"maps"
 	"regexp"
 	"sync"
 	"testing"
@@ -21,6 +22,13 @@ import (
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
+// concurrentConnections is how many pings the fake holds at once, and so how
+// many distinct connections the driver is forced to open: a connection whose
+// reply is outstanding cannot be checked back in and reused, so the pool has to
+// grow to serve the next ping. Four is enough to show the collapse is real
+// without the assertion depending on goroutine scheduling.
+const concurrentConnections = 4
+
 // driverConnectionID matches the identifier the v2 driver builds in
 // x/mongo/driver/topology/connection.go: the server address followed by a
 // bracketed, signed, process-global connection counter.
@@ -34,32 +42,21 @@ var driverConnectionID = regexp.MustCompile(`^.+\[-\d+\]$`)
 // quietly reaching a metric label.
 func TestDriverConnectionIDFormat(t *testing.T) {
 	fake := startFakeMongod(t)
+	fake.holdCommand("ping", concurrentConnections)
 
-	var mu sync.Mutex
-	var ids []string
 	opts := options.Client().ApplyURI(fake.uri())
-	opts.SetMonitor(&event.CommandMonitor{
-		Succeeded: func(_ context.Context, evt *event.CommandSucceededEvent) {
-			mu.Lock()
-			defer mu.Unlock()
-			ids = append(ids, evt.ConnectionID)
-		},
-	})
+	ids := recordConnectionIDs(opts)
 
 	client := connectFake(t, opts)
-	pingConcurrently(t, client, 8)
+	pingConcurrently(t, client, concurrentConnections)
 
-	mu.Lock()
-	defer mu.Unlock()
-	require.NotEmpty(t, ids)
-
-	distinct := make(map[string]struct{}, len(ids))
-	for _, id := range ids {
+	distinct := ids.distinct()
+	require.NotEmpty(t, distinct)
+	for id := range distinct {
 		assert.Regexpf(t, driverConnectionID, id, "driver connection identifier changed shape: %q", id)
-		distinct[id] = struct{}{}
 	}
-	assert.Greater(t, len(distinct), 1,
-		"expected concurrent commands to span several connections; the fixture no longer exercises pool growth")
+	assert.GreaterOrEqual(t, len(distinct), concurrentConnections,
+		"the held pings must each occupy their own connection; the fixture no longer exercises pool growth")
 }
 
 // TestInstrument_PeerAddressBoundedAgainstRealDriver is the end-to-end form of
@@ -68,6 +65,7 @@ func TestDriverConnectionIDFormat(t *testing.T) {
 // port rather than a connection identifier and otelmongo's hardcoded 27017.
 func TestInstrument_PeerAddressBoundedAgainstRealDriver(t *testing.T) {
 	fake := startFakeMongod(t)
+	fake.holdCommand("ping", concurrentConnections)
 	host, port := fake.hostPort()
 
 	reader := sdkmetric.NewManualReader()
@@ -77,12 +75,18 @@ func TestInstrument_PeerAddressBoundedAgainstRealDriver(t *testing.T) {
 	)
 
 	opts := options.Client().ApplyURI(fake.uri())
+	// Registered before Instrument, so it is composed with o11y's monitor rather
+	// than replaced, and it observes the driver's own identifiers.
+	ids := recordConnectionIDs(opts)
 	cleanup, err := Instrument(opts, tracenoop.NewTracerProvider(), provider, propagation.TraceContext{})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cleanup(context.Background()) })
 
 	client := connectFake(t, opts)
-	pingConcurrently(t, client, 8)
+	pingConcurrently(t, client, concurrentConnections)
+
+	require.GreaterOrEqual(t, len(ids.distinct()), concurrentConnections,
+		"the collapse below is only meaningful if several real connections were used")
 
 	metric := findMetric(t, collectMongoMetrics(t, reader), "db.client.operation.duration")
 	histogram, ok := metric.Data.(metricdata.Histogram[float64])
@@ -116,6 +120,8 @@ func assertBoundedLabelValue(t *testing.T, attr attribute.KeyValue) {
 		"metric label %q carries a per-connection identifier", attr.Key)
 }
 
+// connectFake builds a driver client from opts and disconnects it at test end.
+// The driver does not dial until the first command.
 func connectFake(t *testing.T, opts *options.ClientOptions) *drivermongo.Client {
 	t.Helper()
 
@@ -125,8 +131,36 @@ func connectFake(t *testing.T, opts *options.ClientOptions) *drivermongo.Client 
 	return client
 }
 
-// pingConcurrently issues n pings at once so the driver has to grow its pool
-// past a single connection.
+// connectionIDRecorder collects the connection identifiers the driver reports,
+// so a test can assert how many real connections it actually used.
+type connectionIDRecorder struct {
+	mu  sync.Mutex
+	ids map[string]struct{}
+}
+
+// recordConnectionIDs installs a CommandMonitor on opts that records every
+// identifier the driver reports, and returns the recorder.
+func recordConnectionIDs(opts *options.ClientOptions) *connectionIDRecorder {
+	r := &connectionIDRecorder{ids: map[string]struct{}{}}
+	opts.SetMonitor(&event.CommandMonitor{
+		Succeeded: func(_ context.Context, evt *event.CommandSucceededEvent) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			r.ids[evt.ConnectionID] = struct{}{}
+		},
+	})
+	return r
+}
+
+// distinct returns a copy of the identifiers seen so far.
+func (r *connectionIDRecorder) distinct() map[string]struct{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return maps.Clone(r.ids)
+}
+
+// pingConcurrently issues n pings at once. Paired with fakeMongod.holdCommand
+// it forces the pool to open n connections; on its own it only permits that.
 func pingConcurrently(t *testing.T, client *drivermongo.Client, n int) {
 	t.Helper()
 
