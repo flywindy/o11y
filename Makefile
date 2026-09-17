@@ -113,11 +113,13 @@ tools: ## Install pinned SAST tooling (gosec, semgrep)
 # gosec is deliberately NOT included — see the note on GOSEC_FLAGS above; run
 # `make sast-gosec` directly to see its findings. Both remaining scans always
 # run (no fail-fast) so every category is reported in one pass.
-sast: ## Run repo-owned semgrep rules + their fixture tests (gosec: run separately, see sast-gosec)
-	@rc=0; s=PASS; t=PASS; \
-	$(MAKE) --no-print-directory sast-semgrep-test || { rc=1; t=FAIL; }; \
-	$(MAKE) --no-print-directory sast-semgrep      || { rc=1; s=FAIL; }; \
-	echo "==> SAST summary: semgrep=$$s rule-tests=$$t (gosec not included — run 'make sast-gosec')"; \
+sast: ## Run the blocking SAST gates: semgrep rules, their fixtures, credential directives, gosec G101
+	@rc=0; s=PASS; t=PASS; d=PASS; c=PASS; \
+	$(MAKE) --no-print-directory sast-semgrep-test   || { rc=1; t=FAIL; }; \
+	$(MAKE) --no-print-directory sast-semgrep        || { rc=1; s=FAIL; }; \
+	$(MAKE) --no-print-directory sast-directives     || { rc=1; d=FAIL; }; \
+	$(MAKE) --no-print-directory sast-gosec-cred     || { rc=1; c=FAIL; }; \
+	echo "==> SAST summary: semgrep=$$s directives=$$d gosec-G101=$$c rule-tests=$$t (full gosec not included — run 'make sast-gosec')"; \
 	exit $$rc
 
 sast-gosec: ## gosec: Go security static analysis (injection, weak crypto, unsafe code)
@@ -136,6 +138,45 @@ sast-semgrep: ## semgrep: repo-owned rules under .semgrep/
 # the fixture must be a sibling because semgrep's test runner matches by
 # basename and does not support a separate tests directory. Fixtures contain
 # deliberate violations, which is why SEMGREP_FLAGS excludes .semgrep above.
+# The hardcoded-credential half of gosec, split out so it can block while the
+# rest stays untriaged (see GOSEC_FLAGS). G101 is the class this repo already
+# writes directives for, and the class that had quietly grown from the 2
+# findings GOSEC_FLAGS records to 11 with nothing gating it. Every remaining
+# gosec rule stays out: wiring those in is still the separate triage effort.
+sast-gosec-cred: ## gosec: hardcoded-credential findings only (G101), blocking
+	@test -x "$(GOSEC)" || { echo "gosec not installed — run 'make tools'"; exit 1; }
+	$(GOSEC) $(GOSEC_FLAGS) -include=G101 ./...
+
+# nosemgrep matches a rule id by exact suffix, so a directive naming one id
+# never silences another. hardcoded-credential-literal is this repo's rule and
+# runs in CI; gosec.G101-1 is what an external scan reports and runs nowhere
+# here — it is not in the public semgrep registry at all, so no CI gate can
+# check it (p/gosec, p/security-audit and p/golang were all probed and report
+# nothing on the files carrying these fixtures). A line naming only the repo's
+# rule therefore looks correct in review and in CI, and is caught for the first
+# time outside this repo. That is what happened to internal/log/logr_test.go,
+# and this check is the only thing that can catch the next one.
+#
+# The invariant is asymmetric on purpose. Naming hardcoded-credential-literal
+# means this repo's rule fires on that line, so the line is a credential-shaped
+# declaration and an external scan reports it too: the registry id has to be
+# named as well. The converse is legitimate — the URL fixtures trip only the
+# external rule, because their identifiers are not credential-shaped, and name
+# only that id.
+#
+# .semgrep/ is excluded: its fixtures name gosec.G101-1 alone by design, so
+# hardcoded-credential-literal stays live for the rule's own assertions.
+sast-directives: ## Check credential nosemgrep directives name both rule ids
+	@bad=$$(grep -rn 'nosemgrep:' --include='*.go' --exclude-dir=.semgrep . \
+	          | grep 'hardcoded-credential-literal' \
+	          | grep -v 'gosec\.G101-1' || true); \
+	if [ -n "$$bad" ]; then \
+	  echo "a nosemgrep directive naming hardcoded-credential-literal must also name gosec.G101-1:" >&2; \
+	  printf '%s\n' "$$bad" >&2; \
+	  exit 1; \
+	fi; \
+	echo "==> credential nosemgrep directives: OK"
+
 sast-semgrep-test: ## Run the repo-owned semgrep rules against their fixtures
 	@command -v "$(SEMGREP)" >/dev/null 2>&1 || { echo "semgrep not installed — run 'make tools' (needs pipx), or: pipx install semgrep==$(SEMGREP_VERSION)"; exit 1; }
 	@rc=0; n=0; \
