@@ -62,6 +62,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -311,21 +312,65 @@ func checkReachable(file string, reachable map[string]bool, lines []string) []vi
 func checkURLLiterals(file string, src *source, parsed *ast.File) []violation {
 	var found []violation
 	reported := map[int]bool{}
-	ast.Inspect(parsed, func(n ast.Node) bool {
-		lit, ok := n.(*ast.BasicLit)
-		if !ok || lit.Kind != token.STRING || !urlCredential.MatchString(lit.Value) {
-			return true
-		}
-		line := src.fset.Position(lit.Pos()).Line
+	report := func(pos token.Pos) {
+		line := src.fset.Position(pos).Line
 		if src.namedInSlot(line) || reported[line] {
-			return true
+			return
 		}
 		reported[line] = true
 		found = append(found, src.violation(file, line,
 			"password in a URL does not name "+registryID))
-		return true
+	}
+
+	ast.Inspect(parsed, func(n ast.Node) bool {
+		expr, ok := n.(ast.Expr)
+		if !ok {
+			return true
+		}
+		// A concatenation is one value: "https://user:" + "pw@host" is the same
+		// URL as the whole literal, split. Folding it first is what stops the
+		// split being a way around this check; descending into the halves after
+		// folding would only re-test pieces that cannot match on their own.
+		value, ok := concatLiteral(expr)
+		if !ok {
+			return true
+		}
+		if urlCredential.MatchString(value) {
+			report(expr.Pos())
+		}
+		return false
 	})
 	return found
+}
+
+// concatLiteral returns the value of a string literal, or of a concatenation
+// built only from them, and reports whether e is one.
+func concatLiteral(e ast.Expr) (string, bool) {
+	switch v := e.(type) {
+	case *ast.BasicLit:
+		if v.Kind != token.STRING {
+			return "", false
+		}
+		unquoted, err := strconv.Unquote(v.Value)
+		if err != nil {
+			return v.Value, true // malformed literals are the parser's problem
+		}
+		return unquoted, true
+	case *ast.BinaryExpr:
+		if v.Op != token.ADD {
+			return "", false
+		}
+		left, ok := concatLiteral(v.X)
+		if !ok {
+			return "", false
+		}
+		right, ok := concatLiteral(v.Y)
+		if !ok {
+			return "", false
+		}
+		return left + right, true
+	}
+	return "", false
 }
 
 // checkFixture requires the registry id on every credential-shaped binding in
