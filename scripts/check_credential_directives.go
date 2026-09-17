@@ -93,9 +93,6 @@ var gosecExempt = map[string]string{
 	// class is missing for them.
 	"scripts/check_credential_directives.go": "//go:build ignore standalone program",
 	"scripts/check_integrations.go":          "//go:build ignore standalone program",
-	// A dot-directory, invisible to the go tool by definition. checkFixture
-	// parses it directly, which is the whole reason that check exists.
-	".semgrep/hardcoded-credentials.go": "semgrep rule fixture, covered by checkFixture",
 }
 
 // notFirstParty are directories whose contents this repo does not author, and
@@ -152,6 +149,9 @@ func main() {
 // every other gate excludes that directory, so it is the one place where a
 // missing directive is invisible until an external scan reads the file.
 func scan(root string) ([]violation, error) {
+	if err := assertRuleReadable(); err != nil {
+		return nil, err
+	}
 	self := filepath.Join("scripts", selfName)
 	reachable, err := reachableFiles()
 	if err != nil {
@@ -195,12 +195,16 @@ func scan(root string) ([]violation, error) {
 			found = append(found, checkReachable(path, reachable, lines)...)
 		}
 		// Files gosec's scan never reads, so its G101 cannot cover the one
-		// credential shape the repo rule is blind to.
-		if _, exempt := gosecExempt[filepath.ToSlash(filepath.Clean(path))]; exempt || isSelf {
+		// credential shape the repo rule is blind to. Every fixture is in that
+		// position, whichever rule it belongs to -- a planted credential in one
+		// is on disk like any other.
+		inFixtureDir := filepath.Base(filepath.Dir(path)) == fixtureDir
+		_, exempt := gosecExempt[filepath.ToSlash(filepath.Clean(path))]
+		if exempt || isSelf || inFixtureDir {
 			found = append(found, checkURLLiterals(path, src, parsed)...)
 		}
 
-		if filepath.Base(filepath.Dir(path)) == fixtureDir {
+		if inFixtureDir {
 			fixtureFound, err := checkFixture(path, src, parsed)
 			if err != nil {
 				return err
@@ -292,6 +296,13 @@ func checkReachable(file string, reachable map[string]bool, lines []string) []vi
 	if _, ok := gosecExempt[filepath.ToSlash(filepath.Clean(file))]; ok {
 		return nil
 	}
+	// The fixture directory is unreachable by construction -- a dot-directory
+	// is invisible to the go tool whatever it holds -- and this checker reads
+	// it directly instead, so reporting each file would be friction on the one
+	// workflow the rule tests exist to support: adding a rule and its fixture.
+	if filepath.Base(filepath.Dir(file)) == fixtureDir {
+		return nil
+	}
 	abs, err := filepath.Abs(file)
 	if err != nil || reachable[filepath.ToSlash(abs)] {
 		return nil
@@ -303,6 +314,37 @@ func checkReachable(file string, reachable map[string]bool, lines []string) []vi
 	return []violation{{file, 1, text,
 		"the go tool excludes this file from ./..., so gosec never reads it — " +
 			"check its build constraints and filename, or record it in gosecExempt"}}
+}
+
+// assertRuleReadable fails when no rule file declares the credential rule.
+//
+// Every check here is downstream of finding that rule, and "not found" is
+// otherwise indistinguishable from "this fixture belongs to another rule",
+// which is a legitimate skip. So a reader that cannot see the rule -- because
+// the YAML uses a spelling it does not recognize, or because the file moved --
+// would quietly check nothing and report OK. That has been the shape of five
+// findings on this file: a quoted value, a space before the colon, a block
+// scalar, a bare sequence marker, a quoted key. Each was one line to recognize;
+// this is the line that stops the next one being silent.
+func assertRuleReadable() error {
+	rules, err := filepath.Glob(filepath.Join(fixtureDir, "*.yml"))
+	if err != nil {
+		return fmt.Errorf("list rule files: %w", err)
+	}
+	for _, ruleFile := range rules {
+		lines, err := readLines(ruleFile)
+		if err != nil {
+			return err
+		}
+		if _, _, ok, err := ruleBlock(lines, repoRuleID); err != nil {
+			return fmt.Errorf("read %s: %w", ruleFile, err)
+		} else if ok {
+			return nil
+		}
+	}
+	return fmt.Errorf("no rule file under %s/ declares %s; every check here is "+
+		"downstream of that rule, so this reader can no longer see what it checks",
+		fixtureDir, repoRuleID)
 }
 
 // checkURLLiterals requires the registry id on every URL literal carrying a
@@ -558,12 +600,13 @@ func ruleBlock(lines []string, id string) (lo, hi int, ok bool, err error) {
 	return 0, 0, false, nil
 }
 
-// yamlEntry splits a mapping entry into its key and value. The key is trimmed
-// because `id : x` is the same YAML as `id: x`, and a check that accepts only
-// one spelling of it stops running without saying so.
+// yamlEntry splits a mapping entry into its key and value. The key goes through
+// the same normalization as a value, because `id : x`, `"id": x` and `id: x`
+// are the same YAML, and a reader that accepts only one spelling of the key
+// stops recognizing the rule without saying so.
 func yamlEntry(line string) (key, value string, ok bool) {
 	key, value, ok = strings.Cut(line, ":")
-	return strings.TrimSpace(key), value, ok
+	return yamlScalar(key), value, ok
 }
 
 // yamlScalar normalizes a YAML scalar value: a quoted one yields its contents,
