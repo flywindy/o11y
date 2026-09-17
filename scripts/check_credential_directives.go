@@ -54,16 +54,14 @@ import (
 	"bufio"
 	"fmt"
 	"go/ast"
-	"go/build/constraint"
 	"go/parser"
 	"go/token"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"slices"
-	"strconv"
 	"strings"
 )
 
@@ -86,26 +84,26 @@ const fixtureDir = ".semgrep"
 // gosecTags are the build tags GOSEC_CRED_FLAGS passes to gosec.
 var gosecTags = []string{"integration"}
 
-// gosecExempt lists the files gosec's package scan provably cannot read, with
-// the reason each is accepted anyway. Listing paths rather than a rule is
+// gosecExempt lists the files the toolchain excludes from `./...`, with the
+// reason each is accepted anyway. Listing paths rather than a rule is
 // deliberate: `//go:build ignore` would otherwise be a way to put a file
 // outside the credential gate without anyone noticing.
-//
-// These two are standalone `go run` programs, never part of a build, and
-// being two package main files in one directory they cannot be handed to
-// gosec together. They are not uncovered: the repo's own semgrep rule and
-// this checker both read files rather than packages, so only gosec's
-// neutral-identifier URL class is missing for them.
 var gosecExempt = map[string]string{
+	// Standalone `go run` programs, never part of a build, and being two
+	// package main files in one directory they cannot be handed to gosec
+	// together. Not uncovered: the repo's semgrep rule and this checker both
+	// read files rather than packages, so only gosec's neutral-identifier URL
+	// class is missing for them.
 	"scripts/check_credential_directives.go": "//go:build ignore standalone program",
 	"scripts/check_integrations.go":          "//go:build ignore standalone program",
+	// A dot-directory, invisible to the go tool by definition. checkFixture
+	// parses it directly, which is the whole reason that check exists.
+	".semgrep/hardcoded-credentials.go": "semgrep rule fixture, covered by checkFixture",
 }
 
-// unixGOOS are the GOOS values that satisfy the `unix` build tag.
-var unixGOOS = []string{
-	"aix", "android", "darwin", "dragonfly", "freebsd", "hurd", "illumos",
-	"ios", "linux", "netbsd", "openbsd", "solaris",
-}
+// urlCredential matches a URL literal carrying a password in its userinfo,
+// the one credential shape whose identifier says nothing about it.
+var urlCredential = regexp.MustCompile(`(?i)[a-z][a-z0-9+.\-]*://[^/\s:@"` + "`" + `]+:[^/\s@"` + "`" + `]+@`)
 
 // nosecTag is gosec's suppression directive.
 const nosecTag = "#nosec"
@@ -143,8 +141,12 @@ func main() {
 // missing directive is invisible until an external scan reads the file.
 func scan(root string) ([]violation, error) {
 	self := filepath.Join("scripts", selfName)
+	reachable, err := reachableFiles()
+	if err != nil {
+		return nil, err
+	}
 	var found []violation
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -175,7 +177,7 @@ func scan(root string) ([]violation, error) {
 		}
 		src := newSource(fset, parsed, lines)
 		found = append(found, check(path, src)...)
-		found = append(found, checkReachable(path, lines)...)
+		found = append(found, checkReachable(path, reachable, lines)...)
 
 		if filepath.Base(filepath.Dir(path)) == fixtureDir {
 			fixtureFound, err := checkFixture(path, src, parsed)
@@ -220,84 +222,64 @@ func check(file string, src *source) []violation {
 	return found
 }
 
-// checkReachable reports a Go file that gosec's package scan cannot read, so
-// the credential gate never sees it.
+// reachableFiles returns the absolute paths of the Go files the toolchain
+// includes under the credential gate's tags -- which is exactly what
+// `gosec ./...` reads.
 //
-// Two ways a checked-in .go file falls outside `gosec ./...`:
+// The go tool is asked rather than modelled. A file leaves `./...` through an
+// unsatisfied //go:build expression, an implicit constraint from a _GOOS or
+// _GOARCH filename, a testdata/ or dot-directory, or a rule nobody here
+// remembered; reimplementing those is how a coverage check ends up confidently
+// wrong, which an earlier version of this one was -- it read //go:build
+// identifiers as coverage and so accepted `//go:build !integration`, the one
+// expression the gate's own -tags excludes.
+func reachableFiles() (map[string]bool, error) {
+	const tmpl = `{{$d := .Dir}}` +
+		`{{range .GoFiles}}{{$d}}/{{.}}
+{{end}}{{range .TestGoFiles}}{{$d}}/{{.}}
+{{end}}{{range .XTestGoFiles}}{{$d}}/{{.}}
+{{end}}`
+	// #nosec G204 -- the tag list is a constant in this file, not input
+	cmd := exec.Command("go", "list", "-tags", strings.Join(gosecTags, ","), "-e", "-f", tmpl, "./...")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("go list: %w", err)
+	}
+	files := map[string]bool{}
+	for _, line := range strings.Split(string(out), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			files[line] = true
+		}
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("go list reported no Go files; the census would pass vacuously")
+	}
+	return files, nil
+}
+
+// checkReachable reports a Go file that gosec's scan cannot read, so the
+// credential gate never sees it.
 //
-//   - a build constraint that the configured -tags do not satisfy. The whole
-//     expression is evaluated, not just its identifiers: `//go:build
-//     !integration` mentions a tag the gate passes and is excluded by it
-//     exactly because it does.
-//   - a testdata/ directory, which the go tool ignores by definition
-//     (`go help packages`).
-//
-// Either way the repo rule will not fire on a neutral identifier there either,
-// and an unannotated credential leaves this checker nothing to inspect — so the
+// The repo rule will not fire on a neutral identifier there either, and an
+// unannotated credential leaves this checker nothing to inspect -- so such a
 // file is invisible to every local gate while an external scan still reads it.
-// Failing here turns that into a decision someone has to make.
-func checkReachable(file string, lines []string) []violation {
+// Reporting it turns that into a decision someone has to make: pass the tag,
+// move the file, or record it in gosecExempt with a reason.
+func checkReachable(file string, reachable map[string]bool, lines []string) []violation {
 	if _, ok := gosecExempt[filepath.ToSlash(filepath.Clean(file))]; ok {
 		return nil
 	}
-	for _, part := range strings.Split(filepath.ToSlash(filepath.Clean(file)), "/") {
-		if part == "testdata" {
-			return []violation{{file, 1, lines[0],
-				"testdata/ is ignored by the go tool, so gosec never reads this file — " +
-					"move it, or cover it another way and add it to gosecExempt"}}
-		}
+	abs, err := filepath.Abs(file)
+	if err != nil || reachable[filepath.ToSlash(abs)] {
+		return nil
 	}
-	for i, line := range lines {
-		if !strings.HasPrefix(strings.TrimSpace(line), "//go:build ") {
-			continue
-		}
-		expr, err := constraint.Parse(strings.TrimSpace(line))
-		if err != nil {
-			return []violation{{file, i + 1, line, "unparsable build constraint: " + err.Error()}}
-		}
-		if !expr.Eval(tagSatisfied) {
-			return []violation{{file, i + 1, line,
-				"this build constraint is not satisfied by the credential gate's -tags, " +
-					"so gosec never reads this file — add the tag to GOSEC_CRED_FLAGS " +
-					"and gosecTags, or add the file to gosecExempt"}}
-		}
-		break // only the first //go:build line is the constraint
+	text := ""
+	if len(lines) > 0 {
+		text = lines[0]
 	}
-	return nil
-}
-
-// tagSatisfied evaluates one build tag as the credential gate's gosec run
-// would see it. This program runs in the same job as that scan, so the host's
-// GOOS, GOARCH and toolchain version are the ones gosec gets.
-func tagSatisfied(tag string) bool {
-	switch {
-	case slices.Contains(gosecTags, tag):
-		return true
-	case tag == runtime.GOOS || tag == runtime.GOARCH:
-		return true
-	case tag == "unix":
-		return slices.Contains(unixGOOS, runtime.GOOS)
-	case strings.HasPrefix(tag, "go1."):
-		return goVersionAtLeast(tag)
-	}
-	return false
-}
-
-// goVersionAtLeast reports whether the running toolchain satisfies a go1.N
-// build tag. An unreadable version is treated as not satisfying it, so the
-// answer errs towards reporting a file as unreachable rather than hiding it.
-func goVersionAtLeast(tag string) bool {
-	want, err := strconv.Atoi(strings.TrimPrefix(tag, "go1."))
-	if err != nil {
-		return false
-	}
-	version := strings.TrimPrefix(runtime.Version(), "go1.")
-	minor, _, _ := strings.Cut(version, ".")
-	have, err := strconv.Atoi(minor)
-	if err != nil {
-		return false
-	}
-	return have >= want
+	return []violation{{file, 1, text,
+		"the go tool excludes this file from ./..., so gosec never reads it — " +
+			"check its build constraints and filename, or record it in gosecExempt"}}
 }
 
 // checkFixture requires the registry id on every credential-shaped binding in
@@ -361,6 +343,15 @@ func checkFixture(file string, src *source, parsed *ast.File) ([]violation, erro
 			if id, ok := v.Key.(*ast.Ident); ok &&
 				nameRe.MatchString(id.Name) && isStringLiteral(v.Value) {
 				report(v.Value.Pos(), id.Name)
+			}
+		case *ast.BasicLit:
+			// A password in a URL, wherever it sits. This is the one credential
+			// shape the rule's $NAME regex cannot see, because the identifier
+			// holding it says nothing -- `endpoint`, `target`, `addr`. In
+			// ordinary source gosec's G101 covers it, but every scanner excludes
+			// this directory, so here the check has to be its own.
+			if v.Kind == token.STRING && urlCredential.MatchString(v.Value) {
+				report(v.Pos(), "password in a URL")
 			}
 		}
 		return true
