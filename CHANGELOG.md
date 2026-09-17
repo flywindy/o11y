@@ -186,6 +186,18 @@ adopters can plan their upgrades.
   `OTEL_SERVICE_NAME` still seeds `service.name` and the identity options
   still override it.
 
+### Security
+
+- The indirect `google.golang.org/grpc` requirement moves from v1.82.1 to
+  v1.83.2, clearing GO-2026-6348 (heap exhaustion via HTTP/2 DATA frame
+  fragmentation), which govulncheck reported as reachable through the OTLP
+  log exporter's proto types, and GO-2026-6443 / GHSA-2v4p-qf9q-27wj (xDS
+  server crash on a missing `:authority`/`Host` header), which is not
+  reachable here — this SDK uses OTLP/HTTP and starts no gRPC server — but
+  which a scanner flags on the version either way. gRPC stays indirect; the
+  explicit requirement exists only to hold the graph above the fixed
+  version, so a consumer that pinned it themselves can drop that pin.
+
 ### Fixed
 
 - `mongo`: `db.client.operation.duration` no longer grows a new series for
