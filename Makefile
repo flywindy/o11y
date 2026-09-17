@@ -78,7 +78,17 @@ GOSEC_FLAGS      := $(GOSEC_BASE_FLAGS) -exclude-generated
 # an external scan reports it like any other. It also cannot be annotated: a
 # #nosec there is erased by the next regeneration, so the only fix is at the
 # generator, which is the right place for the pressure to land.
-GOSEC_CRED_FLAGS := $(GOSEC_BASE_FLAGS) -include=G101
+#
+# -tags integration is the second half of that: gosec analyses only the files
+# satisfying the tags it is given, so cassandra/integration_test.go (behind
+# //go:build integration, and listed under IgnoredGoFiles) was never read. The
+# repo rule does not fire on a neutral identifier there either, and there is no
+# suppression for sast-directives to inspect, so a credential in that file
+# class escaped every gate. scripts/ stays out: those are //go:build ignore
+# standalone programs, never part of a build, and two package main files in one
+# directory cannot be handed to gosec together. A new build tag is a new hole,
+# so check_credential_directives fails on one it does not know about.
+GOSEC_CRED_FLAGS := $(GOSEC_BASE_FLAGS) -include=G101 -tags integration
 
 # semgrep: only the repo-owned rules under .semgrep/ — no registry config, to
 # keep this gate scoped to what it was added for (see

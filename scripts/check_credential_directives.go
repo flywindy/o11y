@@ -80,6 +80,22 @@ const selfName = "check_credential_directives.go"
 // fixtureDir holds the semgrep rules and their fixtures.
 const fixtureDir = ".semgrep"
 
+// scannedBuildTags are the build constraints the credential gate is configured
+// for: `integration` is passed to gosec as -tags in GOSEC_CRED_FLAGS, and
+// `ignore` marks the standalone `go run` programs under scripts/, which are
+// never part of any build and cannot be handed to gosec anyway (they are two
+// package main files in one directory).
+//
+// gosec analyses only the files that satisfy the tags it is given, so a build
+// constraint nobody passed is a file the credential gate never reads -- and
+// the repo rule will not fire on a neutral identifier there either. A new tag
+// is therefore a silent hole, which is why an unknown one fails here instead
+// of waiting for an external scan to find what it hid.
+var scannedBuildTags = []string{"ignore", "integration"}
+
+// buildTagIdent matches one identifier in a //go:build expression.
+var buildTagIdent = regexp.MustCompile(`[A-Za-z0-9_.]+`)
+
 // nosecTag is gosec's suppression directive.
 const nosecTag = "#nosec"
 
@@ -148,6 +164,7 @@ func scan(root string) ([]violation, error) {
 		}
 		src := newSource(fset, parsed, lines)
 		found = append(found, check(path, src)...)
+		found = append(found, checkBuildTags(path, lines)...)
 
 		if filepath.Base(filepath.Dir(path)) == fixtureDir {
 			fixtureFound, err := checkFixture(path, src, parsed)
@@ -192,6 +209,28 @@ func check(file string, src *source) []violation {
 	return found
 }
 
+// checkBuildTags reports a //go:build constraint the credential gate is not
+// configured to scan. See scannedBuildTags for why that is a hole rather than
+// a detail.
+func checkBuildTags(file string, lines []string) []violation {
+	var found []violation
+	for i, line := range lines {
+		expr, ok := strings.CutPrefix(strings.TrimSpace(line), "//go:build ")
+		if !ok {
+			continue
+		}
+		for _, tag := range buildTagIdent.FindAllString(expr, -1) {
+			if slices.Contains(scannedBuildTags, tag) {
+				continue
+			}
+			found = append(found, violation{file, i + 1, line,
+				"build tag " + tag + " is not scanned by the credential gate — " +
+					"add it to -tags in GOSEC_CRED_FLAGS and to scannedBuildTags"})
+		}
+	}
+	return found
+}
+
 // checkFixture requires the registry id on every credential-shaped binding in
 // a rule fixture, positive or negative.
 //
@@ -203,6 +242,16 @@ func checkFixture(file string, src *source, parsed *ast.File) ([]violation, erro
 	ruleFile := strings.TrimSuffix(file, ".go") + ".yml"
 	if _, err := os.Stat(ruleFile); err != nil {
 		return nil, nil // a .go without a sibling rule is not a fixture
+	}
+	// Only the credential rule's own fixture. Another rule's fixture is not
+	// credential data, and demanding a $NAME regex of every rule would fail
+	// this gate the moment someone adds one written with a direct pattern.
+	defines, err := definesRule(ruleFile, repoRuleID)
+	if err != nil {
+		return nil, err
+	}
+	if !defines {
+		return nil, nil
 	}
 	nameRe, err := credentialNameRegex(ruleFile)
 	if err != nil {
@@ -248,6 +297,22 @@ func checkFixture(file string, src *source, parsed *ast.File) ([]violation, erro
 		return true
 	})
 	return found, nil
+}
+
+// definesRule reports whether a semgrep rule file declares the given rule id.
+func definesRule(ruleFile, id string) (bool, error) {
+	lines, err := readLines(ruleFile)
+	if err != nil {
+		return false, err
+	}
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		trimmed = strings.TrimPrefix(trimmed, "- ")
+		if trimmed == "id: "+id {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // credentialNameRegex reads the $NAME metavariable-regex out of a semgrep rule
