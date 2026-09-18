@@ -8,6 +8,7 @@ package nats
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/akira-core/instrumentation-go/otel-nats/otelnats"
@@ -15,6 +16,8 @@ import (
 	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/flywindy/o11y/internal/redact"
 )
 
 // MsgHandler is the callback signature for NATS subscriptions managed by this package.
@@ -152,10 +155,10 @@ func connect(ctx context.Context, url string, tp trace.TracerProvider, prop prop
 	// advisory. SDK callers pass obs.TracerProvider() / obs.Propagator, which
 	// are never nil, so this cannot fire on the supported path.
 	if tp == nil {
-		return nil, fmt.Errorf("nats connect %s: tracer provider must not be nil (pass obs.TracerProvider())", url)
+		return nil, fmt.Errorf("nats connect %s: tracer provider must not be nil (pass obs.TracerProvider())", redactedURLs(url))
 	}
 	if prop == nil {
-		return nil, fmt.Errorf("nats connect %s: propagator must not be nil (pass obs.Propagator)", url)
+		return nil, fmt.Errorf("nats connect %s: propagator must not be nil (pass obs.Propagator)", redactedURLs(url))
 	}
 	nc, err := otelnats.ConnectWithOptions(url, natsOpts,
 		otelnats.WithTracerProvider(tp),
@@ -163,7 +166,7 @@ func connect(ctx context.Context, url string, tp trace.TracerProvider, prop prop
 		otelnats.WithTracingEnabled(tracingDefault),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("nats connect %s: %w", url, err)
+		return nil, fmt.Errorf("nats connect %s: %w", redactedURLs(url), err)
 	}
 	return &Conn{
 		Conn: nc,
@@ -327,4 +330,25 @@ func (c *Conn) RequestMsg(ctx context.Context, msg *natsgo.Msg, timeout time.Dur
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	return c.RequestMsgWithContext(reqCtx, msg)
+}
+
+// redactedURLs renders the server list for an error message with any embedded
+// credentials removed.
+//
+// nats://user:pass@host is a working authentication mechanism, so an operator
+// may well configure one, and nats.go's own connect error does not name the
+// server — this facade is what puts it in the message. Reported through the
+// SDK's logging pattern, slog.Any("error", err), the password would then land
+// on stdout and in the OTLP log pipeline.
+//
+// Each entry is redacted on its own: nats.Connect takes a comma-separated list
+// (nats.go processUrlString), which redact.URL would otherwise parse as a
+// single URL. The split mirrors that function so an operator sees the list
+// they configured, minus the credentials.
+func redactedURLs(urls string) string {
+	parts := strings.Split(urls, ",")
+	for i, part := range parts {
+		parts[i] = redact.URL(strings.TrimSpace(part))
+	}
+	return strings.Join(parts, ",")
 }
