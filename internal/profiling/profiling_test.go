@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -164,16 +165,82 @@ func TestTruncatePyroscopeTagValue_PreservesUTF8(t *testing.T) {
 	assert.Equal(t, strings.Repeat("a", maxPyroscopeTagValueBytes-1), truncated)
 }
 
-func TestPyroscopeSlogAdapter_InfofUsesInfoLevel(t *testing.T) {
+// TestPyroscopeSlogAdapter_RedactsTheEndpointAndAuthHeaders pins that no
+// pyroscope log line can carry the profiling endpoint's credentials or a
+// configured auth header value.
+//
+// The messages are the ones pyroscope-go v1.3.0 actually produces. `uploading
+// at %s` is upstream/remote/remote.go:193 (Debugf) with the parsed ingest URL,
+// userinfo intact. `upload profile: %v` is :272 (Errorf) with the *url.Error
+// net/http returns, which masks the password and keeps the username — so the
+// error path leaks at ERROR level, not only at DEBUG.
+func TestPyroscopeSlogAdapter_RedactsTheEndpointAndAuthHeaders(t *testing.T) {
+	const (
+		endpoint = "http://alice:s3cretpw@pyroscope:4040"
+		token    = "Bearer glc_eyJvIjoiMTIzNDU2In0="
+	)
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	adapter := pyroscopeSlogAdapter{logger: logger}
+	adapter := newPyroscopeSlogAdapter(Config{
+		Logger:      logger,
+		Endpoint:    endpoint,
+		AuthHeaders: map[string]string{"Authorization": token},
+	})
+
+	adapter.Debugf("uploading at %s", endpoint+"/ingest?name=svc&spyName=gospy")
+	adapter.Errorf("upload profile: %v",
+		fmt.Errorf(`Post "http://alice:***@pyroscope:4040/ingest?name=svc": dial tcp: i/o timeout`)) //nolint:err113
+	adapter.Infof("sending Authorization header %s", token)
+
+	output := buf.String()
+	assert.NotContains(t, output, "s3cretpw", "the endpoint password must never reach a record")
+	assert.NotContains(t, output, "alice", "the endpoint username must never reach a record either")
+	assert.NotContains(t, output, "glc_eyJvIjoiMTIzNDU2In0=", "a configured auth header value is a secret")
+	assert.Contains(t, output, "pyroscope:4040", "the host stays, so the line still says where it was uploading")
+	assert.Contains(t, output, "name=svc", "and so does the rest of the URL")
+}
+
+// TestPyroscopeSlogAdapter_LevelsAndEmptyLoggerAreUnchanged covers the parts of
+// the adapter the redaction must not disturb: each method keeps its level, an
+// endpoint with no credentials is echoed as the operator wrote it, and a nil
+// logger is still a no-op rather than a panic.
+func TestPyroscopeSlogAdapter_LevelsAndEmptyLoggerAreUnchanged(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	adapter := newPyroscopeSlogAdapter(Config{Logger: logger, Endpoint: "http://pyroscope:4040"})
 
 	adapter.Infof("upload %s", "started")
+	adapter.Debugf("uploading at %s", "http://pyroscope:4040/ingest")
+	adapter.Errorf("upload profile: %s", "refused")
 
 	output := buf.String()
 	assert.Contains(t, output, `"level":"INFO"`)
 	assert.Contains(t, output, `"msg":"upload started"`)
+	assert.Contains(t, output, `"level":"DEBUG"`)
+	assert.Contains(t, output, `"msg":"uploading at http://pyroscope:4040/ingest"`)
+	assert.Contains(t, output, `"level":"ERROR"`)
+	assert.Contains(t, output, `"msg":"upload profile: refused"`)
+
+	empty := newPyroscopeSlogAdapter(Config{})
+	assert.NotPanics(t, func() {
+		empty.Infof("x")
+		empty.Debugf("x")
+		empty.Errorf("x")
+	})
+}
+
+// TestAuthHeaderSecrets_SortsAndDropsEmpties pins that the secret list a
+// pyroscope line is scrubbed against does not depend on map iteration order,
+// and that an empty header value is left out — redact.Secrets ignores it, and
+// carrying it would only obscure what the adapter is actually guarding.
+func TestAuthHeaderSecrets_SortsAndDropsEmpties(t *testing.T) {
+	assert.Nil(t, authHeaderSecrets(nil))
+	assert.Nil(t, authHeaderSecrets(map[string]string{}))
+	assert.Equal(t, []string{"aaa", "bbb"}, authHeaderSecrets(map[string]string{
+		"X-Scope-OrgID": "bbb",
+		"Authorization": "aaa",
+		"X-Empty":       "",
+	}))
 }
 
 // TestCloser_HonoursContextWhileStopBlocks pins that a Stop stalled on the
