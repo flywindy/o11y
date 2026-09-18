@@ -101,6 +101,11 @@ type SDK struct {
 	errorHandler *otelErrorHandler
 	logr         logr.Logger
 
+	// The configured endpoints and secrets Shutdown scrubs an exporter's
+	// error against, the same pair ErrorHandler and Logr already use.
+	diagnosticEndpoints []string
+	diagnosticSecrets   []string
+
 	shutdownOnce sync.Once
 	shutdownErr  error
 }
@@ -163,6 +168,7 @@ func (s *SDK) Shutdown(ctx context.Context) error {
 			err := fn(closerCtx)
 			cancel()
 			if err != nil {
+				err = s.redactError(err)
 				s.Logger.ErrorContext(ctx, "SDK component shutdown failed", slog.Any("error", err))
 				errs = append(errs, err)
 			}
@@ -171,6 +177,47 @@ func (s *SDK) Shutdown(ctx context.Context) error {
 	})
 	return s.shutdownErr
 }
+
+// redactError returns err with the configured endpoints' credentials and the
+// configured header values removed from its message, leaving the error chain
+// intact.
+//
+// An exporter's shutdown error is a net/http one, and net/http masks the
+// password in the URL it reports but keeps the username:
+//
+//	Post "http://alice:***@collector:4318/v1/traces": dial tcp: …
+//
+// The SDK redacts that same endpoint everywhere else it writes one — see
+// redact.URL, ErrorHandler and Logr — and its rule is that no "@" survives
+// into a record, which this message breaks.
+//
+// The returned error is redacted, not only the line Shutdown logs. The pattern
+// the guide documents is slog.Any("error", obs.Shutdown(ctx)) in the caller's
+// own defer, so scrubbing one record and handing the credential to the next
+// would leave the leak exactly where it was. Unwrap keeps errors.Is and
+// errors.As working against the exporter's real error, so a caller matching a
+// sentinel or reaching for *url.Error still can; only the message changes.
+func (s *SDK) redactError(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := redact.Secrets(redact.InText(err.Error(), s.diagnosticEndpoints...), s.diagnosticSecrets...)
+	if msg == err.Error() {
+		return err
+	}
+	return &redactedError{msg: msg, err: err}
+}
+
+// redactedError renders a redacted message while still unwrapping to the
+// error it was built from.
+type redactedError struct {
+	msg string
+	err error
+}
+
+func (e *redactedError) Error() string { return e.msg }
+
+func (e *redactedError) Unwrap() error { return e.err }
 
 // shutdownBudget derives the context one closer runs under: an even share
 // of the time left before ctx's deadline across the closers still to run,
@@ -571,6 +618,8 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		shutdowns:              shutdowns,
 		errorHandler:           errorHandler,
 		logr:                   newLogr(slog.New(stdoutHandler), diagnosticEndpoints, diagnosticSecrets(cfg)),
+		diagnosticEndpoints:    diagnosticEndpoints,
+		diagnosticSecrets:      diagnosticSecrets(cfg),
 	}, nil
 }
 

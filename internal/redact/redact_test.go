@@ -192,6 +192,8 @@ func TestURLAttribute(t *testing.T) {
 		},
 		{
 			name: "userinfo is replaced, the rest stays",
+			// #nosec G101 -- fabricated fixture URL, not a live credential
+			// nosemgrep: gosec.G101-1
 			raw:  "http://bob:hunter2@127.0.0.1:8080/orders?page=2",
 			want: "http://redacted@127.0.0.1:8080/orders?page=2",
 		},
@@ -227,6 +229,8 @@ func TestURLAttribute(t *testing.T) {
 		},
 		{
 			name: "userinfo and a signature together",
+			// #nosec G101 -- fabricated fixture URL, not a live credential
+			// nosemgrep: gosec.G101-1
 			raw:  "https://bob:hunter2@s3.example.com/b/k?Signature=abc",
 			want: "https://redacted@s3.example.com/b/k?Signature=%5Bredacted%5D",
 		},

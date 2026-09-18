@@ -373,7 +373,11 @@ func TestConnect_RejectsNilProviders(t *testing.T) {
 func TestConnect_ErrorsRedactTheServerCredentials(t *testing.T) {
 	tp, prop, _ := newTestProviders()
 	const (
-		url      = "nats://alice:s3cr3t@127.0.0.1:1"
+		// #nosec G101 -- fabricated fixture endpoint, not a live credential
+		// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+		url = "nats://alice:s3cr3t@127.0.0.1:1"
+		// #nosec G101 -- the same fixture password, to assert on its absence
+		// nosemgrep: hardcoded-credential-literal,gosec.G101-1
 		password = "s3cr3t"
 	)
 

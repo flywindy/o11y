@@ -202,6 +202,32 @@ adopters can plan their upgrades.
 
 ### Fixed
 
+- **Credentials no longer reach logs or spans through four paths that echoed a
+  configured endpoint.** The SDK's rule is that it never writes a
+  `scheme://user:pass@host` endpoint verbatim, because Go turns userinfo into a
+  Basic `Authorization` header and operators do configure them; these four sites
+  wrote one anyway.
+  - `profiling`: pyroscope-go formats the ingest URL into its own log messages
+    and redacts nothing — the password on every upload at DEBUG, and the
+    username (net/http masks only the password) on an upload failure at ERROR.
+    All three adapter methods now scrub the endpoint and the configured auth
+    header values.
+  - `nats`: `Connect`'s three error paths formatted the server list verbatim,
+    so a `nats://user:pass@host` password reached any caller logging the error.
+    nats.go's own error does not name the server; the facade added it. Each
+    entry of the comma-separated list is now redacted on its own.
+  - `resty`: the `url.full` span attribute recorded the outbound URL verbatim,
+    userinfo and presigned-URL signature included. It now follows semconv
+    v1.39.0 — userinfo replaced, and the values of `AWSAccessKeyId`,
+    `Signature`, `sig` and `X-Goog-Signature` replaced — matching what
+    otelhttp already did behind `o11yhttp.NewTransport`. Parameter order and
+    escaping are preserved, so the attribute still matches the upstream's
+    access log, and the request itself still authenticates.
+  - `Shutdown`: an exporter error is a net/http one, which masks the password
+    in the URL but keeps the username. Both the record `Shutdown` writes and
+    the error it returns are now scrubbed against the configured endpoints and
+    header values; the returned error still unwraps to the exporter's own, so
+    `errors.Is` and `errors.As` are unaffected.
 - `mongo`: `db.client.connection.count{state=idle}` no longer drifts below the
   pool's real size. The v2 driver creates a connection before it handshakes and,
   when the handshake fails, removes it with a `ConnectionClosed` event and no

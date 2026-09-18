@@ -176,8 +176,12 @@ func TestTruncatePyroscopeTagValue_PreservesUTF8(t *testing.T) {
 // error path leaks at ERROR level, not only at DEBUG.
 func TestPyroscopeSlogAdapter_RedactsTheEndpointAndAuthHeaders(t *testing.T) {
 	const (
+		// #nosec G101 -- fabricated fixture endpoint, not a live credential
+		// nosemgrep: hardcoded-credential-literal,gosec.G101-1
 		endpoint = "http://alice:s3cretpw@pyroscope:4040"
-		token    = "Bearer glc_eyJvIjoiMTIzNDU2In0="
+		// #nosec G101 -- fabricated fixture header value, not a live credential
+		// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+		token = "Bearer glc_eyJvIjoiMTIzNDU2In0="
 	)
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
