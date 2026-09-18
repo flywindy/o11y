@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 
@@ -13,6 +14,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
+
+	"github.com/flywindy/o11y/internal/redact"
 )
 
 const maxPyroscopeTagValueBytes = 1024
@@ -79,7 +82,7 @@ func Start(ctx context.Context, cfg Config) (func(context.Context) error, error)
 			pyroscope.ProfileInuseObjects,
 			pyroscope.ProfileInuseSpace,
 		},
-		Logger: pyroscopeSlogAdapter{logger: cfg.Logger},
+		Logger: newPyroscopeSlogAdapter(cfg),
 	})
 	if err != nil {
 		return nil, err
@@ -190,24 +193,82 @@ func cloneStringMap(in map[string]string) map[string]string {
 	return out
 }
 
+// pyroscopeSlogAdapter forwards pyroscope-go's logger calls to the SDK's
+// logger with the profiling endpoint's credentials, and the configured auth
+// header values, removed from every line.
+//
+// pyroscope formats the ingest URL into its own messages and redacts nothing:
+// `uploading at %s` on every upload (upstream/remote/remote.go:193, Debugf),
+// and the *url.Error behind a failed upload (:272, Errorf). The endpoint may
+// carry userinfo, because the SDK keeps honouring
+// http://user:pass@host profiling endpoints — see redact.URL — and o11y.go
+// redacts that same endpoint everywhere else it is logged. So the Debugf line
+// prints the password in full, and the Errorf one prints the username, since
+// net/http masks only the password when it builds the *url.Error.
+//
+// The scrub therefore runs on all three methods rather than the ones that look
+// risky today: the adapter has no say in what the upstream chooses to format
+// into a message, and a version bump could move the address onto any of them.
 type pyroscopeSlogAdapter struct {
-	logger *slog.Logger
+	logger   *slog.Logger
+	endpoint string
+	secrets  []string
 }
+
+// newPyroscopeSlogAdapter builds the adapter pyroscope logs through, carrying
+// the values that must never reach a record.
+func newPyroscopeSlogAdapter(cfg Config) pyroscopeSlogAdapter {
+	return pyroscopeSlogAdapter{
+		logger:   cfg.Logger,
+		endpoint: cfg.Endpoint,
+		secrets:  authHeaderSecrets(cfg.AuthHeaders),
+	}
+}
+
+// authHeaderSecrets returns the configured profiling auth header values, so
+// redact.Secrets can take them out of a line that echoes one. The values are
+// sorted to keep the result independent of map iteration order.
+func authHeaderSecrets(headers map[string]string) []string {
+	if len(headers) == 0 {
+		return nil
+	}
+	secrets := make([]string, 0, len(headers))
+	for _, value := range headers {
+		if value != "" {
+			secrets = append(secrets, value)
+		}
+	}
+	sort.Strings(secrets)
+	return secrets
+}
+
+// scrub renders one pyroscope log line with the endpoint's credentials and the
+// configured auth header values removed.
+func (a pyroscopeSlogAdapter) scrub(format string, args ...any) string {
+	return redact.Secrets(redact.InText(fmt.Sprintf(format, args...), a.endpoint), a.secrets...)
+}
+
+// logContext is the context these records carry. pyroscope calls the adapter
+// from its own collector and upload goroutines, which have no request context
+// of their own; Start's context is not reused because it would attach that one
+// call's span to every upload line for the life of the profiler, and is
+// usually cancelled long before they are written.
+func logContext() context.Context { return context.Background() }
 
 func (a pyroscopeSlogAdapter) Infof(format string, args ...interface{}) {
 	if a.logger != nil {
-		a.logger.Info(fmt.Sprintf(format, args...))
+		a.logger.InfoContext(logContext(), a.scrub(format, args...))
 	}
 }
 
 func (a pyroscopeSlogAdapter) Debugf(format string, args ...interface{}) {
 	if a.logger != nil {
-		a.logger.Debug(fmt.Sprintf(format, args...))
+		a.logger.DebugContext(logContext(), a.scrub(format, args...))
 	}
 }
 
 func (a pyroscopeSlogAdapter) Errorf(format string, args ...interface{}) {
 	if a.logger != nil {
-		a.logger.Error(fmt.Sprintf(format, args...))
+		a.logger.ErrorContext(logContext(), a.scrub(format, args...))
 	}
 }
