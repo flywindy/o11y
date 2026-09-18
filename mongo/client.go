@@ -108,6 +108,15 @@ func Connect(
 // opts.SetMonitor after Instrument replaces the composed monitor and drops o11y
 // instrumentation.
 //
+// Give each mongo.Client its own ClientOptions and its own Instrument call.
+// Instrument attaches one pool-metrics tracker to opts, and driver pool events
+// carry no pool identity — event.PoolEvent has only the server address, and its
+// ServiceID is set on PoolCleared in load-balanced deployments only — so two
+// clients built from one instrumented ClientOptions put two pools behind one
+// tracker with no way to tell their events apart. The counts stay bounded and
+// self-correcting (see liveConnections in pool_metrics.go), but a connection's
+// idle/used state can be attributed to the wrong pool while both are open.
+//
 // The returned cleanup function disables SDK-owned pool metrics handling for
 // these ClientOptions. Applications that build their own ClientOptions should
 // defer it near client.Disconnect, after the application's final metrics flush

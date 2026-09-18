@@ -147,6 +147,19 @@ connection still open. The driver emits `ConnectionReady`,
 `ConnectionCheckedOut` and `ConnectionClosed` once per connection, so a repeat
 under one ID is a second pool rather than a duplicate event.
 
+Counting bounds that case rather than removing it. Which pool a
+`ConnectionClosed` came from is not decidable from the event stream:
+`event.PoolEvent` carries the server address and nothing that identifies a pool
+(`ServiceID` names a mongos in a load-balanced deployment, and only on
+`PoolCleared`). A close of a connection that never became ready can therefore
+consume a ready entry the other pool owns, and a close of an idle connection
+can be booked against the other pool's checked-out entry. Both stay within one
+connection and heal: the count stops at zero, so a repeated misattribution
+cannot compound, and the gauges return to the truth as the pools drain — which
+is the property the counter lacked. Callers avoid the ambiguity entirely by
+giving each `mongo.Client` its own `Instrument` call, which `Instrument`'s doc
+comment now says.
+
 Implementation note: the merged Phase 2 implementation follows the synchronous
 instrument kinds in OTel semconv v1.39.0: `count`, `max`, `idle.min`, and
 `pending_requests` are `Int64UpDownCounter`, `timeouts` is `Int64Counter`, and
