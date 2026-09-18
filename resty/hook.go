@@ -16,6 +16,8 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/flywindy/o11y/internal/redact"
 )
 
 const (
@@ -402,6 +404,15 @@ func targetAttributes(target targetAttrs) []attribute.KeyValue {
 	return attrs
 }
 
+// targetFromURL derives the server and url.full attributes for one request.
+//
+// The URL goes through redact.URLAttribute rather than u.String(): an outbound
+// URL can carry userinfo, which Go turns into a Basic Authorization header, and
+// a presigned URL carries its signature in the query, and semconv v1.39.0 says
+// url.full SHOULD have both removed. otelhttp — the SDK's other client facade,
+// behind o11yhttp.NewTransport — already strips userinfo before it emits
+// url.full, so until now the same call was redacted through one facade and not
+// the other.
 func targetFromURL(u *url.URL) targetAttrs {
 	if u == nil {
 		return targetAttrs{}
@@ -420,5 +431,5 @@ func targetFromURL(u *url.URL) targetAttrs {
 			port = 443
 		}
 	}
-	return targetAttrs{fullURL: u.String(), host: host, port: port}
+	return targetAttrs{fullURL: redact.URLAttribute(u), host: host, port: port}
 }

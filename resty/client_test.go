@@ -108,6 +108,49 @@ func TestWrapRecordsComposedRestyURL(t *testing.T) {
 	assertAttr(t, spans[0], semconv.URLFullKey, ts.URL+"/orders/123?include=items")
 }
 
+// TestWrapRedactsCredentialsFromURLFull pins that the url.full span attribute
+// carries neither the request's userinfo nor a presigned URL's signature.
+//
+// A span attribute leaves the process exactly as a log record does. otelhttp,
+// the SDK's other client facade, already strips userinfo before emitting
+// url.full, so the same call used to be redacted through o11yhttp.NewTransport
+// and not through this one. semconv v1.39.0 asks for the query parameters too.
+func TestWrapRedactsCredentialsFromURLFull(t *testing.T) {
+	tp, mp, sr := testProviders()
+	var gotAuth string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	host := strings.TrimPrefix(ts.URL, "http://")
+	client := NewClient(tp, mp, propagation.TraceContext{})
+
+	resp, err := client.R().
+		SetQueryParam("Signature", "abc+def").
+		SetQueryParam("include", "items").
+		Get("http://bob:hunter2@" + host + "/orders")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode())
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	full := attrValue(t, spans[0], semconv.URLFullKey).AsString()
+
+	assert.NotContains(t, full, "hunter2", "the request's password must not reach url.full")
+	// The signature is checked in its encoded form: resty escapes the value
+	// into the query, so "abc+def" never appears literally and asserting on it
+	// would pass whether or not the redaction ran.
+	assert.NotContains(t, full, "abc%2Bdef", "nor the signature of a presigned URL")
+	assert.Contains(t, full, host, "the server still has to be identifiable")
+	assert.Contains(t, full, "include=items", "and the rest of the query is left alone")
+
+	// The redaction is for the attribute only: the request itself still
+	// authenticates, so clearing userinfo on the caller's URL would break it.
+	assert.NotEmpty(t, gotAuth, "userinfo must still reach the server as Basic auth")
+}
+
 func TestWrapIsIdempotent(t *testing.T) {
 	tp, mp, sr := testProviders()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -401,6 +444,19 @@ func endedClientSpans(sr *tracetest.SpanRecorder) []sdktrace.ReadOnlySpan {
 		}
 	}
 	return out
+}
+
+// attrValue returns the value span recorded for key, failing the test when the
+// attribute is absent.
+func attrValue(t *testing.T, span sdktrace.ReadOnlySpan, key attribute.Key) attribute.Value {
+	t.Helper()
+	for _, attr := range span.Attributes() {
+		if attr.Key == key {
+			return attr.Value
+		}
+	}
+	t.Fatalf("span %q has no %s attribute", span.Name(), key)
+	return attribute.Value{}
 }
 
 func assertAttr(t *testing.T, span sdktrace.ReadOnlySpan, key attribute.Key, want any) {

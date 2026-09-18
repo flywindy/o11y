@@ -1,9 +1,11 @@
 package redact_test
 
 import (
+	"net/url"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/flywindy/o11y/internal/redact"
 )
@@ -171,4 +173,80 @@ func TestSecrets(t *testing.T) {
 	assert.Equal(t, "plain", redact.Secrets("plain"))
 	assert.Equal(t, "plain", redact.Secrets("plain", ""))
 	assert.Equal(t, "", redact.Secrets("", "x"))
+}
+
+// TestURLAttribute pins what a url.full span attribute may carry. A span
+// attribute leaves the process exactly as a log record does, so semconv
+// v1.39.0's rule — redact userinfo, scrub the credential query parameters —
+// is the same safety property the rest of this package enforces.
+func TestURLAttribute(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "plain URL is untouched",
+			raw:  "https://api.example.com/orders?page=2&sort=asc",
+			want: "https://api.example.com/orders?page=2&sort=asc",
+		},
+		{
+			name: "userinfo is replaced, the rest stays",
+			raw:  "http://bob:hunter2@127.0.0.1:8080/orders?page=2",
+			want: "http://redacted@127.0.0.1:8080/orders?page=2",
+		},
+		{
+			name: "a username with no password is still userinfo",
+			raw:  "https://bob@api.example.com/orders",
+			want: "https://redacted@api.example.com/orders",
+		},
+		{
+			name: "the AWS presigned parameters semconv names are scrubbed",
+			raw:  "https://s3.example.com/b/k?AWSAccessKeyId=AKIAIOSFODNN7&Expires=1700000000&Signature=abc%2Bdef",
+			want: "https://s3.example.com/b/k?AWSAccessKeyId=%5Bredacted%5D&Expires=1700000000&Signature=%5Bredacted%5D",
+		},
+		{
+			name: "so are the short and Google forms, whatever their case",
+			raw:  "https://storage.example.com/o?sig=xyz&X-GOOG-SIGNATURE=abc&name=report",
+			want: "https://storage.example.com/o?sig=%5Bredacted%5D&X-GOOG-SIGNATURE=%5Bredacted%5D&name=report",
+		},
+		{
+			name: "parameter order and escaping are preserved",
+			raw:  "https://api.example.com/x?z=1&a=hello%20world&Signature=s",
+			want: "https://api.example.com/x?z=1&a=hello%20world&Signature=%5Bredacted%5D",
+		},
+		{
+			name: "a bare flag that happens to match a key has no value to scrub",
+			raw:  "https://api.example.com/x?sig&page=1",
+			want: "https://api.example.com/x?sig&page=1",
+		},
+		{
+			name: "a key that is not a credential keeps its value",
+			raw:  "https://api.example.com/x?signature_version=4",
+			want: "https://api.example.com/x?signature_version=4",
+		},
+		{
+			name: "userinfo and a signature together",
+			raw:  "https://bob:hunter2@s3.example.com/b/k?Signature=abc",
+			want: "https://redacted@s3.example.com/b/k?Signature=%5Bredacted%5D",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			u, err := url.Parse(tt.raw)
+			require.NoError(t, err)
+
+			got := redact.URLAttribute(u)
+
+			assert.Equal(t, tt.want, got)
+			assert.Equal(t, tt.raw, u.String(), "the caller's URL must not be modified")
+		})
+	}
+}
+
+// TestURLAttribute_NilIsEmpty pins that a caller with no URL gets an empty
+// attribute rather than a panic; the resty hook reaches targetFromURL before
+// resty has built a RawRequest on some paths.
+func TestURLAttribute_NilIsEmpty(t *testing.T) {
+	assert.Empty(t, redact.URLAttribute(nil))
 }

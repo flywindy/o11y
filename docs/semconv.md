@@ -106,7 +106,7 @@ Histogram boundaries use the SDK's configured latency buckets.
 | `http.route` | string | Resty only, opt-in through `resty.WithRouteFromContext` and `resty.WithMetricRouteEnabled(true)`. Must be a caller-supplied route template, never the raw URL path. Export cardinality is capped through `WithMaxUniqueRoutes`. |
 | `http.response.status_code` | int | Response-path metric label and span attribute. |
 | `http.request.resend_count` | int | Resty spans only; emitted on retry attempts after the first attempt. |
-| `url.full` | string | Resty spans only; full outbound URL. Do not put secrets in URLs. |
+| `url.full` | string | Resty spans only; the outbound URL with userinfo replaced by `redacted` and the values of `AWSAccessKeyId`, `Signature`, `sig` and `X-Goog-Signature` replaced by `[redacted]`, per semconv v1.39.0. Parameter order and escaping are otherwise preserved, so the attribute still matches the upstream's access log. Any other secret a caller puts in a URL is still recorded. |
 | `error.type` | string | Error-path metric label and span attribute. |
 | `resty.error.kind` | string | Resty spans only; SDK-owned closed enum: `client_canceled`, `client_timeout`, `server_timeout`, `tls`, `transport`, `protocol`, `unknown`. |
 | `resty.retry.exhausted` | bool | Resty spans only; set on the last failed attempt when resty's retry budget is exhausted. |
