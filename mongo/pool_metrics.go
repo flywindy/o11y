@@ -151,6 +151,9 @@ func newPoolMonitor(
 // because it is stable and readable across runs.
 var defaultPoolNameSeq atomic.Uint64
 
+// defaultPoolName returns the db.client.connection.pool.name label for a
+// client: WithPoolName when the caller set it, otherwise the first configured
+// host with a sequence number from defaultPoolNameSeq.
 func defaultPoolName(opts *options.ClientOptions, override string) string {
 	if override != "" {
 		return override
@@ -253,6 +256,12 @@ func (t *poolTracker) state(address string) *poolState {
 	return state
 }
 
+// setOptions emits the deltas that move db.client.connection.idle.min and
+// db.client.connection.max to the pool's configured sizes. It remembers the
+// sizes ConnectionPoolCreated reported so a later ConnectionPoolReady, which
+// the driver sends with no options, can restate them; an unbounded max
+// (MaxPoolSize 0) is taken off the gauge rather than reported as zero, since
+// the metric is meant to be absent when there is no limit.
 func (s *poolState) setOptions(ctx context.Context, metrics *poolMetrics, opts *event.MonitorPoolOptions) {
 	if opts == nil {
 		if s.seenCreated {
@@ -349,6 +358,10 @@ func (s *poolState) closeConnection(ctx context.Context, metrics *poolMetrics, c
 	s.addConnectionCount(ctx, metrics, -1, s.idleAddOpt)
 }
 
+// decrementPending takes one off db.client.connection.pending_requests for a
+// checkout that finished, either way it finished. It ignores an event with no
+// outstanding request behind it, so a checkout the tracker never saw start
+// cannot push the gauge negative.
 func (s *poolState) decrementPending(ctx context.Context, metrics *poolMetrics) {
 	if s.pending == 0 {
 		return
