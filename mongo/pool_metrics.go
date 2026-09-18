@@ -110,6 +110,7 @@ type poolState struct {
 	usedAddOpt  []metric.AddOption
 	idleAddOpt  []metric.AddOption
 	ready       liveConnections
+	livePools   int64
 	pending     int64
 	emittedMin  int64
 	emittedMax  int64
@@ -183,7 +184,10 @@ func (t *poolTracker) handle(evt *event.PoolEvent) {
 	t.mu.Lock()
 	state := t.state(evt.Address)
 	switch evt.Type {
-	case event.ConnectionPoolCreated, event.ConnectionPoolReady:
+	case event.ConnectionPoolCreated:
+		state.livePools++
+		state.setOptions(context.Background(), t.metrics, evt.PoolOptions)
+	case event.ConnectionPoolReady:
 		state.setOptions(context.Background(), t.metrics, evt.PoolOptions)
 	case event.ConnectionReady:
 		state.readyConnection(context.Background(), t.metrics, evt.ConnectionID)
@@ -209,8 +213,10 @@ func (t *poolTracker) handle(evt *event.PoolEvent) {
 		// Let the subsequent ConnectionClosed events reconcile counts so
 		// checked-out work remains visible and counters do not double-decrement.
 	case event.ConnectionPoolClosed:
-		state.closePool(context.Background(), t.metrics)
-		delete(t.pools, poolKey(evt.Address))
+		if state.poolClosed() {
+			state.closePool(context.Background(), t.metrics)
+			delete(t.pools, poolKey(evt.Address))
+		}
 	}
 	t.mu.Unlock()
 
@@ -416,6 +422,30 @@ func (s *poolState) decrementPending(ctx context.Context, metrics *poolMetrics) 
 	}
 	s.pending--
 	metrics.pending.Add(ctx, -1, s.poolAddOpt...)
+}
+
+// poolClosed records that one of the pools this state covers has closed, and
+// reports whether it was the last one — whether the caller should now unwind
+// the gauges and drop the state.
+//
+// More than one pool can share a state, since two clients built from one
+// instrumented ClientOptions put two pools at the same address behind one
+// tracker. Unwinding on the first ConnectionPoolClosed would take the surviving
+// pool's open connections off the gauges with the closing pool's, and nothing
+// would put them back: the driver emits ConnectionReady once per connection, so
+// a connection that is already open is never re-announced. The closing pool's
+// own connections still reconcile themselves, because ConnectionPoolClosed
+// precedes the ConnectionClosed events for the connections it drops.
+//
+// ConnectionPoolCreated and ConnectionPoolClosed are the one piece of
+// pool-level bookkeeping the event stream does supply exactly: the driver emits
+// each once per pool. A state that never saw ConnectionPoolCreated — metrics
+// attached to an already-running pool — closes on the first event, as before.
+func (s *poolState) poolClosed() bool {
+	if s.livePools > 0 {
+		s.livePools--
+	}
+	return s.livePools == 0
 }
 
 // closePool unwinds everything this state has on the gauges, so a pool the

@@ -160,6 +160,16 @@ is the property the counter lacked. Callers avoid the ambiguity entirely by
 giving each `mongo.Client` its own `Instrument` call, which `Instrument`'s doc
 comment now says.
 
+One piece of pool-level bookkeeping the event stream *does* supply exactly is
+how many pools exist: the driver emits `ConnectionPoolCreated` and
+`ConnectionPoolClosed` once each per pool. The state therefore counts its live
+pools and unwinds the gauges only when the last one closes. Unwinding on the
+first `ConnectionPoolClosed` would take the surviving pool's open connections
+off with the closing pool's, and nothing would put them back, since a
+connection that is already open is never re-announced. The closing pool's own
+connections still reconcile themselves, because `ConnectionPoolClosed` precedes
+the `ConnectionClosed` events for the connections it drops.
+
 Implementation note: the merged Phase 2 implementation follows the synchronous
 instrument kinds in OTel semconv v1.39.0: `count`, `max`, `idle.min`, and
 `pending_requests` are `Int64UpDownCounter`, `timeouts` is `Int64Counter`, and
