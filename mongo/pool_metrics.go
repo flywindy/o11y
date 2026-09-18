@@ -109,11 +109,11 @@ type poolState struct {
 	poolRecOpt  []metric.RecordOption
 	usedAddOpt  []metric.AddOption
 	idleAddOpt  []metric.AddOption
-	ready       map[int64]struct{}
+	ready       liveConnections
 	pending     int64
 	emittedMin  int64
 	emittedMax  int64
-	checkedOut  map[int64]struct{}
+	checkedOut  liveConnections
 	seenCreated bool
 	createdMin  uint64
 	createdMax  uint64
@@ -186,10 +186,9 @@ func (t *poolTracker) handle(evt *event.PoolEvent) {
 	case event.ConnectionPoolCreated, event.ConnectionPoolReady:
 		state.setOptions(context.Background(), t.metrics, evt.PoolOptions)
 	case event.ConnectionReady:
-		if state.readyConnection(context.Background(), t.metrics, evt.ConnectionID) {
-			recordCreateTime = true
-			createTimeSeconds = evt.Duration.Seconds()
-		}
+		state.readyConnection(context.Background(), t.metrics, evt.ConnectionID)
+		recordCreateTime = true
+		createTimeSeconds = evt.Duration.Seconds()
 	case event.ConnectionClosed:
 		state.closeConnection(context.Background(), t.metrics, evt.ConnectionID)
 	case event.ConnectionCheckOutStarted:
@@ -248,8 +247,8 @@ func (t *poolTracker) state(address string) *poolState {
 			poolRecOpt: []metric.RecordOption{poolOpt},
 			usedAddOpt: []metric.AddOption{usedOpt},
 			idleAddOpt: []metric.AddOption{idleOpt},
-			ready:      make(map[int64]struct{}),
-			checkedOut: make(map[int64]struct{}),
+			ready:      newLiveConnections(),
+			checkedOut: newLiveConnections(),
 		}
 		t.pools[key] = state
 	}
@@ -298,29 +297,67 @@ func (s *poolState) setOptions(ctx context.Context, metrics *poolMetrics, opts *
 	}
 }
 
-// readyConnection records that connectionID finished its handshake and joined
-// the pool as an idle connection. It reports whether this was the connection's
-// first ConnectionReady, so a repeated event neither double-counts the gauge
-// nor records the create-time histogram twice.
-func (s *poolState) readyConnection(ctx context.Context, metrics *poolMetrics, connectionID int64) bool {
-	if _, ok := s.ready[connectionID]; ok {
+// liveConnections counts a pool's connections by driver connection ID.
+//
+// The ID cannot be used as a unique key. The v2 driver numbers connections from
+// a counter held by the pool itself (x/mongo/driver/topology/pool.go,
+// `conn.driverConnectionID = atomic.AddInt64(&p.nextID, 1)`), so every pool
+// starts again at 1. One instrumented ClientOptions can back more than one
+// client — Instrument mutates the options and mongo.Connect may be called with
+// them again — and two pools at the same address then share a poolState and
+// report the same IDs. A set would drop the second pool's connection from the
+// gauges and let either pool's close take the shared entry off them; a count
+// per ID keeps both.
+//
+// The driver emits ConnectionReady, ConnectionCheckedOut and ConnectionClosed
+// once per connection, so a repeat under one ID is a second pool rather than a
+// duplicate event. total is maintained by add and remove alongside the map they
+// mutate, so the two cannot drift apart.
+type liveConnections struct {
+	byID  map[int64]int
+	total int64
+}
+
+// newLiveConnections returns an empty counter ready to use.
+func newLiveConnections() liveConnections {
+	return liveConnections{byID: make(map[int64]int)}
+}
+
+// add records one more live connection under connectionID.
+func (l *liveConnections) add(connectionID int64) {
+	l.byID[connectionID]++
+	l.total++
+}
+
+// remove drops one live connection under connectionID and reports whether
+// there was one to drop.
+func (l *liveConnections) remove(connectionID int64) bool {
+	n := l.byID[connectionID]
+	if n == 0 {
 		return false
 	}
-	s.ready[connectionID] = struct{}{}
-	s.addConnectionCount(ctx, metrics, 1, s.idleAddOpt)
+	if n == 1 {
+		delete(l.byID, connectionID)
+	} else {
+		l.byID[connectionID] = n - 1
+	}
+	l.total--
 	return true
 }
 
-// checkOutConnection moves connectionID from idle to used. A connection
-// already checked out is ignored, and the idle side moves only when there was
-// an idle connection to move: a checkout for a connection that never reported
-// ready would otherwise push the idle gauge negative.
+// readyConnection records that connectionID finished its handshake and joined
+// the pool as an idle connection.
+func (s *poolState) readyConnection(ctx context.Context, metrics *poolMetrics, connectionID int64) {
+	s.ready.add(connectionID)
+	s.addConnectionCount(ctx, metrics, 1, s.idleAddOpt)
+}
+
+// checkOutConnection moves connectionID from idle to used. The idle side moves
+// only when there was an idle connection to move: a checkout for a connection
+// that never reported ready would otherwise push the idle gauge negative.
 func (s *poolState) checkOutConnection(ctx context.Context, metrics *poolMetrics, connectionID int64) {
-	if _, ok := s.checkedOut[connectionID]; ok {
-		return
-	}
-	wasIdle := len(s.ready) > len(s.checkedOut)
-	s.checkedOut[connectionID] = struct{}{}
+	wasIdle := s.ready.total > s.checkedOut.total
+	s.checkedOut.add(connectionID)
 	s.addConnectionCount(ctx, metrics, 1, s.usedAddOpt)
 	if wasIdle {
 		s.addConnectionCount(ctx, metrics, -1, s.idleAddOpt)
@@ -330,10 +367,9 @@ func (s *poolState) checkOutConnection(ctx context.Context, metrics *poolMetrics
 // checkInConnection moves connectionID back from used to idle, ignoring a
 // connection this state never saw checked out.
 func (s *poolState) checkInConnection(ctx context.Context, metrics *poolMetrics, connectionID int64) {
-	if _, ok := s.checkedOut[connectionID]; !ok {
+	if !s.checkedOut.remove(connectionID) {
 		return
 	}
-	delete(s.checkedOut, connectionID)
 	s.addConnectionCount(ctx, metrics, -1, s.usedAddOpt)
 	s.addConnectionCount(ctx, metrics, 1, s.idleAddOpt)
 }
@@ -346,12 +382,10 @@ func (s *poolState) checkInConnection(ctx context.Context, metrics *poolMetrics,
 // ConnectionPoolClosed resets this state, so each later failure would drift the
 // gauge further.
 func (s *poolState) closeConnection(ctx context.Context, metrics *poolMetrics, connectionID int64) {
-	if _, ok := s.ready[connectionID]; !ok {
+	if !s.ready.remove(connectionID) {
 		return
 	}
-	delete(s.ready, connectionID)
-	if _, ok := s.checkedOut[connectionID]; ok {
-		delete(s.checkedOut, connectionID)
+	if s.checkedOut.remove(connectionID) {
 		s.addConnectionCount(ctx, metrics, -1, s.usedAddOpt)
 		return
 	}
@@ -375,10 +409,11 @@ func (s *poolState) decrementPending(ctx context.Context, metrics *poolMetrics) 
 // the state afterwards; a pool recreated at the same address starts again from
 // zero.
 func (s *poolState) closePool(ctx context.Context, metrics *poolMetrics) {
-	if used := int64(len(s.checkedOut)); used > 0 {
+	used := s.checkedOut.total
+	if used > 0 {
 		s.addConnectionCount(ctx, metrics, -used, s.usedAddOpt)
 	}
-	if idle := int64(len(s.ready) - len(s.checkedOut)); idle > 0 {
+	if idle := s.ready.total - used; idle > 0 {
 		s.addConnectionCount(ctx, metrics, -idle, s.idleAddOpt)
 	}
 	if s.pending > 0 {
