@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/big"
 	"os"
@@ -530,6 +531,66 @@ func TestShutdown_LaterClosersKeepALiveContext(t *testing.T) {
 	assert.ErrorIs(t, err, context.DeadlineExceeded, "the slow closer's own timeout is reported")
 	assert.True(t, sawLive, "the closer after a slow one still ran with a live context")
 	assert.NoError(t, ctx.Err(), "the caller's deadline itself was not exhausted")
+}
+
+// TestShutdown_RedactsCredentialsFromTheExporterError pins that neither the
+// record Shutdown writes nor the error it returns carries the endpoint's
+// credentials.
+//
+// net/http masks the password in the URL it reports and keeps the username:
+//
+//	Post "http://alice:***@collector:4318/v1/traces": dial tcp: …
+//
+// so an "@" survives into the message, which the SDK's own rule forbids. The
+// returned error matters as much as the logged one: the guide's pattern is
+// slog.Any("error", obs.Shutdown(ctx)) in the caller's defer, so leaving the
+// username on the return value would move the leak rather than remove it.
+func TestShutdown_RedactsCredentialsFromTheExporterError(t *testing.T) {
+	var buf bytes.Buffer
+	exportErr := fmt.Errorf(`Post "http://alice:***@collector:4318/v1/traces": dial tcp: i/o timeout`) //nolint:err113
+	sdk := &SDK{
+		Logger:              slog.New(slog.NewTextHandler(&buf, nil)),
+		diagnosticEndpoints: []string{"http://alice:s3cretpw@collector:4318"},
+		diagnosticSecrets:   []string{"glc_token"},
+		shutdowns: []func(context.Context) error{
+			func(context.Context) error { return exportErr },
+			func(context.Context) error {
+				return fmt.Errorf("metric exporter: header glc_token rejected") //nolint:err113
+			},
+		},
+	}
+
+	err := sdk.Shutdown(context.Background())
+
+	require.Error(t, err)
+	for _, where := range map[string]string{"the logged record": buf.String(), "the returned error": err.Error()} {
+		assert.NotContains(t, where, "alice", "the endpoint username must not survive")
+		assert.NotContains(t, where, "glc_token", "nor a configured header value")
+		assert.Contains(t, where, "collector:4318", "the collector still has to be identifiable")
+	}
+
+	assert.ErrorIs(t, err, exportErr,
+		"redaction rewrites the message, so the caller can still match the exporter's own error")
+}
+
+// TestShutdown_LeavesACleanErrorAlone pins that an error with nothing to
+// redact is returned as it stands, so a caller comparing error values — not
+// only matching with errors.Is — still sees the exporter's own error.
+func TestShutdown_LeavesACleanErrorAlone(t *testing.T) {
+	exportErr := errors.New("trace exporter: context deadline exceeded")
+	sdk := &SDK{
+		Logger:              slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+		diagnosticEndpoints: []string{"http://collector:4318"},
+		shutdowns:           []func(context.Context) error{func(context.Context) error { return exportErr }},
+	}
+
+	err := sdk.Shutdown(context.Background())
+
+	require.Error(t, err)
+	var wrapped *redactedError
+	assert.False(t, errors.As(err, &wrapped), "nothing needed redacting, so nothing was wrapped")
+	assert.ErrorIs(t, err, exportErr)
+	assert.Equal(t, exportErr.Error(), err.Error())
 }
 
 // TestShutdownSequence_DrainsTracesAndLogsBeforeMetrics pins the closer
