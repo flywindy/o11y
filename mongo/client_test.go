@@ -476,6 +476,72 @@ func TestInstrument_PoolMetricsBoundMisattributionAcrossPools(t *testing.T) {
 	assert.Equal(t, int64(0), idleCount(), "the gauge settles at zero once both pools are drained")
 }
 
+// TestInstrument_PoolMetricsKeepSurvivingPoolWhenOneClosed pins that closing
+// one of two pools that share a poolState leaves the other pool's connections
+// on the gauges.
+//
+// ConnectionPoolClosed precedes the ConnectionClosed events for the
+// connections the closing pool drops, so those reconcile themselves. Unwinding
+// the whole state on the first pool close would take the surviving pool's open
+// connections off with them, and nothing would put them back: the driver emits
+// ConnectionReady once per connection, so one that is already open is never
+// re-announced. The surviving pool's connections would read as zero until it
+// closed too.
+func TestInstrument_PoolMetricsKeepSurvivingPoolWhenOneClosed(t *testing.T) {
+	tp, prop, _ := newTestProviders()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithView(MetricViews(testHistogramBuckets)...),
+	)
+
+	opts := options.Client().ApplyURI("mongodb://mongo-a:27017")
+	cleanup, err := Instrument(opts, tp, provider, prop, WithPoolName("chat-mongo"))
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, cleanup(context.Background())) })
+
+	const addr = "mongo-a:27017"
+	baseAttrs := []attribute.KeyValue{
+		semconv.DBSystemNameMongoDB,
+		semconv.DBClientConnectionPoolName("chat-mongo"),
+		semconv.ServerAddress("mongo-a"),
+		semconv.ServerPort(27017),
+	}
+	idleCount := func() int64 {
+		rm := collectMongoMetrics(t, reader)
+		return int64MetricValue(t, findMetric(t, rm, "db.client.connection.count"),
+			appendAttribute(baseAttrs, semconv.DBClientConnectionStateIdle)...)
+	}
+	maxValue := func() int64 {
+		rm := collectMongoMetrics(t, reader)
+		return int64MetricValue(t, findMetric(t, rm, "db.client.connection.max"), baseAttrs...)
+	}
+
+	// Two pools at one address, each with its own connection 1.
+	poolOpts := &event.MonitorPoolOptions{MaxPoolSize: 12}
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolCreated, addr, 0, poolOpts)
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolCreated, addr, 0, poolOpts)
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, addr, 1, time.Millisecond, nil)
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, addr, 1, time.Millisecond, nil)
+	require.Equal(t, int64(2), idleCount())
+
+	// The first pool closes. Its connection has not been reported closed yet,
+	// so nothing comes off the gauge here.
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolClosed, addr, 0, nil)
+	assert.Equal(t, int64(2), idleCount(),
+		"the pool close itself takes nothing off; the connection closes that follow do")
+	assert.Equal(t, int64(12), maxValue(), "the surviving pool still has its limit")
+
+	// The closing pool's connection is reported closed, and only that one.
+	emitPoolEventWithReasonAndConnectionID(opts.PoolMonitor, event.ConnectionClosed, addr, 1, event.ReasonPoolClosed)
+	assert.Equal(t, int64(1), idleCount(), "the surviving pool's connection stays on the gauge")
+
+	// The surviving pool closes too, and now the state unwinds for good.
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolClosed, addr, 0, nil)
+	assert.Equal(t, int64(0), idleCount(), "the last pool close unwinds what is left")
+	assert.Equal(t, int64(0), maxValue(), "and takes the limit off with it")
+}
+
 // TestInstrument_PoolMetricsDefaultPoolNameAndOmitUnboundedMax verifies
 // fallback pool-name derivation and omission of unbounded max pool size.
 func TestInstrument_PoolMetricsDefaultPoolNameAndOmitUnboundedMax(t *testing.T) {

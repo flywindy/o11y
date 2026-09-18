@@ -216,7 +216,10 @@ adopters can plan their upgrades.
   driver connection ID rather than keyed by it, because the ID is only unique
   within one pool — two clients built from the same instrumented
   `*options.ClientOptions` share a tracker, and at one address their pools both
-  number their first connection 1. ADR 0014's count model is amended to match.
+  number their first connection 1. For the same reason the state counts its live
+  pools and unwinds the gauges only when the last one closes, so one client
+  disconnecting no longer drops another's open connections off the gauge. ADR
+  0014's count model is amended to match.
 - `metrics`: an attribute an SDK view dropped no longer comes back as an
   OpenMetrics exemplar label. The OTel SDK routes every attribute a stream's
   `AttributeFilter` rejects into the exemplar's `FilteredAttributes`, and
