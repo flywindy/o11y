@@ -108,13 +108,32 @@ go-redis's `PoolStats()`.
 
 | Metric | Type | Source (driver `event.PoolEvent` / options) |
 |---|---|---|
-| `db.client.connection.count` `{state=used\|idle}` | up-down counter | running counters: `ConnectionReady`−`ConnectionClosed` = total; `ConnectionCheckedOut`−`ConnectionCheckedIn` = used; idle = total−used |
+| `db.client.connection.count` `{state=used\|idle}` | up-down counter | the set of connections seen in `ConnectionReady` and not yet in `ConnectionClosed` = total; `ConnectionCheckedOut`−`ConnectionCheckedIn` = used; idle = total−used. See the amendment below on why a set rather than a counter. |
 | `db.client.connection.max` | up-down counter | `PoolOptions.MaxPoolSize` (from `ConnectionPoolCreated`/`Ready`); omit if 0 (unbounded) |
 | `db.client.connection.idle.min` | up-down counter | `PoolOptions.MinPoolSize` |
 | `db.client.connection.idle.max` | — | **omit**; MongoDB has no max-idle concept |
 | `db.client.connection.timeouts` | counter | count of `ConnectionCheckOutFailed` with `Reason == event.ReasonTimedOut` |
 | `db.client.connection.create_time` | histogram (s) | `ConnectionReady.Duration` |
 | `db.client.connection.pending_requests` | up-down counter | `ConnectionCheckOutStarted` − (`ConnectionCheckedOut` + `ConnectionCheckOutFailed`) |
+
+##### Amendment (2026-09-18): count only connections that became ready
+
+The count model above originally read `ConnectionReady` − `ConnectionClosed`,
+which treats the two events as a matched pair. They are not. The v2 driver
+creates a connection before it handshakes, and when the handshake fails it
+removes the connection — `x/mongo/driver/topology/pool.go`, `removeConnection`
+— with a `ConnectionClosed` event and no `ConnectionReady` before it. A plain
+counter therefore decrements for a connection it never counted, reporting
+fewer idle connections than the pool holds; and because only
+`ConnectionPoolClosed` resets the state, an auth outage, a TLS flap or a pool
+clear with a reconnect storm drives the gauge further from the truth for the
+life of the process.
+
+The tracker therefore keeps the set of connection IDs that reached
+`ConnectionReady` and unwinds a `ConnectionClosed` only for an ID in it. The
+total is the size of that set rather than a separate counter, so the two
+cannot drift apart. A repeated `ConnectionReady` for one ID is ignored, which
+also keeps the `create_time` histogram from recording it twice.
 
 Implementation note: the merged Phase 2 implementation follows the synchronous
 instrument kinds in OTel semconv v1.39.0: `count`, `max`, `idle.min`, and

@@ -3,6 +3,7 @@ package mongo
 import (
 	"context"
 	"maps"
+	"reflect"
 	"regexp"
 	"sync"
 	"testing"
@@ -33,6 +34,26 @@ const concurrentConnections = 4
 // x/mongo/driver/topology/connection.go: the server address followed by a
 // bracketed, signed, process-global connection counter.
 var driverConnectionID = regexp.MustCompile(`^.+\[-\d+\]$`)
+
+// TestDriverCommandMonitorShape pins the set of callbacks
+// event.CommandMonitor carries.
+//
+// withNormalizedConnectionIDs builds a fresh monitor and wires up the three
+// callbacks that exist today. A driver release that adds a fourth would leave
+// it nil on the returned monitor, so whatever otelmongo set there would be
+// dropped: that instrumentation would simply stop, with no error and nothing
+// else failing. TestDriverConnectionIDFormat guards the identifier's shape;
+// this guards the monitor's.
+func TestDriverCommandMonitorShape(t *testing.T) {
+	typ := reflect.TypeOf(event.CommandMonitor{})
+	names := make([]string, 0, typ.NumField())
+	for i := range typ.NumField() {
+		names = append(names, typ.Field(i).Name)
+	}
+	assert.Equal(t, []string{"Started", "Succeeded", "Failed"}, names,
+		"event.CommandMonitor's callbacks changed; withNormalizedConnectionIDs "+
+			"copies them one by one and has to be updated to match")
+}
 
 // TestDriverConnectionIDFormat pins the upstream shape this package normalizes
 // against. Synthetic fixtures cannot do that job: they were carrying a bare

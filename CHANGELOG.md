@@ -202,6 +202,20 @@ adopters can plan their upgrades.
 
 ### Fixed
 
+- `mongo`: `db.client.connection.count{state=idle}` no longer drifts below the
+  pool's real size. The v2 driver creates a connection before it handshakes and,
+  when the handshake fails, removes it with a `ConnectionClosed` event and no
+  `ConnectionReady` before it, so the tracker was taking one off a gauge nothing
+  had ever added to. Only `ConnectionPoolClosed` reset that state, so an auth
+  outage, a TLS flap or a pool clear with a reconnect storm moved the reported
+  idle count further from the truth for the life of the process — and an
+  operator sizing a pool from the gauge would have been reading a number that
+  only ever fell. The tracker now counts the connections it has seen reach
+  `ConnectionReady` and unwinds a close only for one of those, so a failed
+  handshake costs nothing and cannot be double-counted. A repeated
+  `ConnectionReady` for the same connection is ignored too, which keeps it out
+  of the `db.client.connection.create_time` histogram a second time. ADR 0014's
+  count model is amended to match.
 - `metrics`: an attribute an SDK view dropped no longer comes back as an
   OpenMetrics exemplar label. The OTel SDK routes every attribute a stream's
   `AttributeFilter` rejects into the exemplar's `FilteredAttributes`, and
