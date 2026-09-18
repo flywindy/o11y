@@ -3,6 +3,7 @@ package profiling
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -245,6 +246,46 @@ func TestAuthHeaderSecrets_SortsAndDropsEmpties(t *testing.T) {
 		"Authorization": "aaa",
 		"X-Empty":       "",
 	}))
+}
+
+// TestAuthHeaderSecrets_CoversTheEscapedForm pins that a value whose rendering
+// changes under %q is listed both ways, the same as diagnosticSecrets does for
+// the OTLP headers. redact.Secrets matches literally, so one form does not
+// cover the other; a value the escaping leaves alone is listed once.
+func TestAuthHeaderSecrets_CoversTheEscapedForm(t *testing.T) {
+	assert.Equal(t, []string{"tab\there", "tab\\there"}, authHeaderSecrets(map[string]string{
+		"Authorization": "tab\there",
+	}))
+	assert.Equal(t, []string{"plain"}, authHeaderSecrets(map[string]string{
+		"Authorization": "plain",
+	}), "a value %q leaves alone is not listed twice")
+}
+
+// TestPyroscopeSlogAdapter_RedactsAnEscapedAuthHeader pins the scrub reaching a
+// line that quotes the header value rather than printing it raw.
+func TestPyroscopeSlogAdapter_RedactsAnEscapedAuthHeader(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const token = "glc\tsecret"
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	adapter := newPyroscopeSlogAdapter(Config{
+		Logger:      logger,
+		AuthHeaders: map[string]string{"Authorization": token},
+	})
+
+	adapter.Errorf("upload profile: invalid header value %q", token)
+
+	// The record is decoded rather than matched against the raw buffer: the
+	// JSON handler escapes the backslash again, so a buffer-level assertion on
+	// the quoted form would miss whether the scrub ran at all.
+	var record struct {
+		Msg string `json:"msg"`
+	}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
+	assert.NotContains(t, record.Msg, `glc\tsecret`, "the quoted rendering is a form of the same secret")
+	assert.NotContains(t, record.Msg, token, "and so is the raw one")
+	assert.Contains(t, record.Msg, "invalid header value", "the rest of the line survives")
 }
 
 // TestCloser_HonoursContextWhileStopBlocks pins that a Stop stalled on the

@@ -215,8 +215,12 @@ type redactedError struct {
 	err error
 }
 
+// Error returns the redacted message, which is what every ordinary rendering
+// of the error — fmt, slog.Any, errors.Join — ends up printing.
 func (e *redactedError) Error() string { return e.msg }
 
+// Unwrap returns the exporter's own error, so errors.Is and errors.As reach
+// past the redaction to whatever the caller is matching on.
 func (e *redactedError) Unwrap() error { return e.err }
 
 // shutdownBudget derives the context one closer runs under: an even share

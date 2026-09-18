@@ -589,13 +589,6 @@ func isHTTPToken(s string) bool {
 	return true
 }
 
-// goEscaped returns v as strconv.Quote renders it between the quotes, the
-// form net/http and fmt's %q verb give a string in an error message.
-func goEscaped(v string) string {
-	q := strconv.Quote(v)
-	return q[1 : len(q)-1]
-}
-
 // diagnosticSecrets lists the header names and values the diagnostics must
 // never print: the names and values of WithOTLPHeaders and
 // WithProfilingAuthHeaders, and
@@ -618,7 +611,7 @@ func diagnosticSecrets(cfg *Config) []string {
 		// A rendering that quotes the value with %q escapes control and
 		// non-printable characters, so that form is listed too whenever
 		// it differs; a value the escaping leaves alone is added once.
-		for _, s := range []string{v, goEscaped(v)} {
+		for _, s := range []string{v, redact.GoEscaped(v)} {
 			s = strings.TrimSpace(s)
 			if s == "" {
 				continue

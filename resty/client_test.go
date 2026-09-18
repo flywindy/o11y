@@ -151,6 +151,61 @@ func TestWrapRedactsCredentialsFromURLFull(t *testing.T) {
 	assert.NotEmpty(t, gotAuth, "userinfo must still reach the server as Basic auth")
 }
 
+// TestRequestTarget_FailsClosedOnUnresolvableURLs pins that the fallbacks
+// taken before resty has built a RawRequest never put a raw URL on the span.
+//
+// finishError reads the target before RawRequest exists, so these paths run in
+// practice. Two shapes get past an IsAbs check while still carrying a
+// credential: a scheme-relative URL, where url.Parse sets User but reports the
+// URL as not absolute, and an opaque one, where the credential lands in Opaque
+// and User stays nil.
+func TestRequestTarget_FailsClosedOnUnresolvableURLs(t *testing.T) {
+	tests := []struct {
+		name   string
+		rawURL string
+		want   string
+	}{
+		{
+			name: "scheme-relative URL carries userinfo past IsAbs",
+			// #nosec G101 -- fabricated fixture URL, not a live credential
+			// nosemgrep: gosec.G101-1
+			rawURL: "//bob:hunter2@api.example.com/orders",
+			want:   "//redacted@api.example.com/orders",
+		},
+		{
+			name: "an opaque URL hides the credential from the parser",
+			// #nosec G101 -- fabricated fixture URL, not a live credential
+			// nosemgrep: gosec.G101-1
+			rawURL: "http:bob:hunter2@api.example.com",
+			want:   "[endpoint redacted]",
+		},
+		{
+			name:   "an ordinary relative path is left alone",
+			rawURL: "/orders/123?include=items",
+			want:   "/orders/123?include=items",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// A nil client is the no-base-URL fallback; req.RawRequest is nil
+			// because resty has not built one yet.
+			target := requestTarget(nil, &restyclient.Request{URL: tt.rawURL})
+
+			assert.NotContains(t, target.fullURL, "hunter2")
+			assert.Equal(t, tt.want, target.fullURL)
+		})
+	}
+}
+
+// TestRequestTarget_DropsAnUnparseableURL pins that a URL the parser rejects
+// contributes nothing: it could be hiding a credential in any position, and
+// there is no reading of it that says otherwise.
+func TestRequestTarget_DropsAnUnparseableURL(t *testing.T) {
+	target := requestTarget(nil, &restyclient.Request{URL: "http://%zz"})
+
+	assert.Empty(t, target.fullURL)
+}
+
 func TestWrapIsIdempotent(t *testing.T) {
 	tp, mp, sr := testProviders()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
