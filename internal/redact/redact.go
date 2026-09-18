@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -226,6 +227,11 @@ var credentialQueryKeys = map[string]struct{}{
 // Basic Authorization header, and a presigned URL carries its signature in the
 // query. semconv v1.39.0 says url.full SHOULD have both removed.
 //
+// The closed rule URL uses applies here too: a value is echoed only when every
+// "@" in it has been accounted for as something other than userinfo. An opaque
+// URL — "http:alice:secret@host", which url.Parse leaves in Opaque with User
+// nil — would otherwise render right back out with the credential in it.
+//
 // u is not modified. The caller's URL belongs to the request, which a client
 // may reuse across retries, so the copy is made here rather than left to every
 // call site to remember.
@@ -241,6 +247,9 @@ func URLAttribute(u *url.URL) string {
 		if scrubbed, changed := redactQuery(query); changed {
 			redacted.RawQuery = scrubbed
 		}
+	}
+	if strings.Contains(redacted.Opaque, "@") || strings.Contains(redacted.Host, "@") {
+		return redactedWhole
 	}
 	return redacted.String()
 }
@@ -279,4 +288,17 @@ func redactQuery(rawQuery string) (string, bool) {
 		changed = true
 	}
 	return builder.String(), changed
+}
+
+// GoEscaped returns v as strconv.Quote renders it between the quotes, the form
+// a value takes wherever something prints it with %q.
+//
+// A secret has to be listed in both forms: a caller that reports a value
+// verbatim and one that quotes it produce different text for the same
+// credential, and Secrets matches literally. It lives in this package rather
+// than beside one of its callers because "which renderings of a secret must be
+// matched" is the same question wherever a secret list is built.
+func GoEscaped(v string) string {
+	q := strconv.Quote(v)
+	return q[1 : len(q)-1]
 }

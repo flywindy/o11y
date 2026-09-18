@@ -226,16 +226,33 @@ func newPyroscopeSlogAdapter(cfg Config) pyroscopeSlogAdapter {
 }
 
 // authHeaderSecrets returns the configured profiling auth header values, so
-// redact.Secrets can take them out of a line that echoes one. The values are
-// sorted to keep the result independent of map iteration order.
+// redact.Secrets can take them out of a line that echoes one.
+//
+// Each value is listed in both its raw and its Go-escaped form, matching what
+// diagnosticSecrets does for the OTLP headers: Secrets matches literally, so a
+// caller that prints a value with %q produces text the raw form does not
+// cover. Nothing in the pinned pyroscope or net/http is known to quote a header
+// value — Go's own invalid-header error names the header, not what it held —
+// but this adapter's whole premise is that it does not get to choose what the
+// upstream formats into a message.
+//
+// The result is sorted to keep it independent of map iteration order.
 func authHeaderSecrets(headers map[string]string) []string {
 	if len(headers) == 0 {
 		return nil
 	}
-	secrets := make([]string, 0, len(headers))
+	seen := make(map[string]struct{}, len(headers)*2)
+	secrets := make([]string, 0, len(headers)*2)
 	for _, value := range headers {
-		if value != "" {
-			secrets = append(secrets, value)
+		for _, form := range []string{value, redact.GoEscaped(value)} {
+			if form == "" {
+				continue
+			}
+			if _, dup := seen[form]; dup {
+				continue
+			}
+			seen[form] = struct{}{}
+			secrets = append(secrets, form)
 		}
 	}
 	sort.Strings(secrets)
@@ -255,18 +272,26 @@ func (a pyroscopeSlogAdapter) scrub(format string, args ...any) string {
 // usually cancelled long before they are written.
 func logContext() context.Context { return context.Background() }
 
+// Infof records pyroscope's informational lines, which include its startup
+// banner and the auth-token deprecation warning, at INFO.
 func (a pyroscopeSlogAdapter) Infof(format string, args ...interface{}) {
 	if a.logger != nil {
 		a.logger.InfoContext(logContext(), a.scrub(format, args...))
 	}
 }
 
+// Debugf records pyroscope's per-upload and per-collector lines at DEBUG.
+// These are the noisy ones — one per upload interval — and the ones that
+// carry the ingest URL.
 func (a pyroscopeSlogAdapter) Debugf(format string, args ...interface{}) {
 	if a.logger != nil {
 		a.logger.DebugContext(logContext(), a.scrub(format, args...))
 	}
 }
 
+// Errorf records a failed upload or a recovered panic from pyroscope's own
+// goroutines at ERROR. The message may hold the *url.Error behind a failed
+// upload, which is why the scrub runs here and not only on Debugf.
 func (a pyroscopeSlogAdapter) Errorf(format string, args ...interface{}) {
 	if a.logger != nil {
 		a.logger.ErrorContext(logContext(), a.scrub(format, args...))

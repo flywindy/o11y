@@ -254,3 +254,43 @@ func TestURLAttribute(t *testing.T) {
 func TestURLAttribute_NilIsEmpty(t *testing.T) {
 	assert.Empty(t, redact.URLAttribute(nil))
 }
+
+// TestURLAttribute_FailsClosedOnUnaccountedCredentials pins that a URL whose
+// credentials url.Parse does not attribute to userinfo is replaced wholesale
+// rather than rendered back out.
+//
+// url.Parse only recognises userinfo in a hierarchical URL. Given an opaque
+// one it leaves the credential in Opaque with User nil, so replacing User
+// alone would emit the secret unchanged. This is the same closed rule
+// redact.URL applies, and it is why the span still carries server.address and
+// server.port separately: losing url.full does not lose the destination.
+func TestURLAttribute_FailsClosedOnUnaccountedCredentials(t *testing.T) {
+	for _, raw := range []string{
+		// #nosec G101 -- fabricated fixture URL, not a live credential
+		// nosemgrep: gosec.G101-1
+		"http:alice:secret@collector",
+		// #nosec G101 -- fabricated fixture URL, not a live credential
+		// nosemgrep: gosec.G101-1
+		"mailto:alice:secret@collector",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			u, err := url.Parse(raw)
+			require.NoError(t, err)
+			require.Nil(t, u.User, "the premise: the parser did not attribute this as userinfo")
+
+			got := redact.URLAttribute(u)
+
+			assert.NotContains(t, got, "secret")
+			assert.Equal(t, "[endpoint redacted]", got)
+		})
+	}
+}
+
+// TestGoEscaped covers the rendering a secret takes wherever something prints
+// it with %q, which is the second form every secret list has to carry.
+func TestGoEscaped(t *testing.T) {
+	assert.Equal(t, "plain", redact.GoEscaped("plain"))
+	assert.Equal(t, `tab\there`, redact.GoEscaped("tab\there"))
+	assert.Equal(t, `say \"hi\"`, redact.GoEscaped(`say "hi"`))
+	assert.Equal(t, `\x00`, redact.GoEscaped("\x00"))
+}

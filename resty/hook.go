@@ -358,6 +358,10 @@ func addRetryExhaustedEvent(ctx context.Context) {
 	}
 }
 
+// requestTarget derives the span's target attributes for one request, from
+// whichever of resty's URL forms is available at the point it is called.
+// finishError runs before resty has built a RawRequest, so the unresolved
+// forms below are reached in practice, not only in theory.
 func requestTarget(c *restyclient.Client, req *restyclient.Request) targetAttrs {
 	if req == nil {
 		return targetAttrs{}
@@ -370,24 +374,38 @@ func requestTarget(c *restyclient.Client, req *restyclient.Request) targetAttrs 
 		return targetFromURL(parsed)
 	}
 	if c == nil {
-		return targetAttrs{fullURL: rawURL}
+		return targetFromRawURL(rawURL)
 	}
 	base := c.BaseURL
 	if base == "" {
 		base = c.HostURL
 	}
 	if base == "" {
-		return targetAttrs{fullURL: rawURL}
+		return targetFromRawURL(rawURL)
 	}
 	baseURL, err := url.Parse(base)
 	if err != nil {
-		return targetAttrs{fullURL: rawURL}
+		return targetFromRawURL(rawURL)
 	}
 	rel, err := url.Parse(rawURL)
 	if err != nil {
 		return targetFromURL(baseURL)
 	}
 	return targetFromURL(baseURL.ResolveReference(rel))
+}
+
+// targetFromRawURL is the fallback for a request URL that could not be
+// resolved against a base. It redacts rather than recording the raw string:
+// a URL that url.Parse does not report as absolute can still carry userinfo —
+// "//user:pass@host/x" is scheme-relative, so IsAbs is false while User is set
+// — and a URL it cannot parse at all may be hiding a credential in any
+// position, so none of it reaches the span.
+func targetFromRawURL(rawURL string) targetAttrs {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return targetAttrs{}
+	}
+	return targetAttrs{fullURL: redact.URLAttribute(parsed)}
 }
 
 func targetAttributes(target targetAttrs) []attribute.KeyValue {
