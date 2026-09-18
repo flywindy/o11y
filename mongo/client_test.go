@@ -315,7 +315,7 @@ func TestInstrument_PoolMetricsIgnoreConnectionsThatNeverBecameReady(t *testing.
 	count, ok := findMetric(t, rm, "db.client.connection.count").Data.(metricdata.Sum[int64])
 	require.True(t, ok)
 	for _, dp := range count.DataPoints {
-		assert.NotEqualf(t, usedAttrs, dp.Attributes.ToSlice(),
+		assert.Falsef(t, attributesContain(dp.Attributes, usedAttrs...),
 			"nothing was ever checked out, so no used series should exist: %v", dp)
 	}
 
