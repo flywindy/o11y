@@ -212,10 +212,11 @@ adopters can plan their upgrades.
   operator sizing a pool from the gauge would have been reading a number that
   only ever fell. The tracker now counts the connections it has seen reach
   `ConnectionReady` and unwinds a close only for one of those, so a failed
-  handshake costs nothing and cannot be double-counted. A repeated
-  `ConnectionReady` for the same connection is ignored too, which keeps it out
-  of the `db.client.connection.create_time` histogram a second time. ADR 0014's
-  count model is amended to match.
+  handshake costs nothing and cannot be double-counted. Readiness is counted per
+  driver connection ID rather than keyed by it, because the ID is only unique
+  within one pool — two clients built from the same instrumented
+  `*options.ClientOptions` share a tracker, and at one address their pools both
+  number their first connection 1. ADR 0014's count model is amended to match.
 - `metrics`: an attribute an SDK view dropped no longer comes back as an
   OpenMetrics exemplar label. The OTel SDK routes every attribute a stream's
   `AttributeFilter` rejects into the exemplar's `FilteredAttributes`, and

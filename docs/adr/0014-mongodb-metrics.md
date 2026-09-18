@@ -108,7 +108,7 @@ go-redis's `PoolStats()`.
 
 | Metric | Type | Source (driver `event.PoolEvent` / options) |
 |---|---|---|
-| `db.client.connection.count` `{state=used\|idle}` | up-down counter | the set of connections seen in `ConnectionReady` and not yet in `ConnectionClosed` = total; `ConnectionCheckedOut`−`ConnectionCheckedIn` = used; idle = total−used. See the amendment below on why a set rather than a counter. |
+| `db.client.connection.count` `{state=used\|idle}` | up-down counter | the connections seen in `ConnectionReady` and not yet in `ConnectionClosed` = total; `ConnectionCheckedOut`−`ConnectionCheckedIn` = used; idle = total−used. See the amendment below on why readiness is tracked per connection rather than with a counter. |
 | `db.client.connection.max` | up-down counter | `PoolOptions.MaxPoolSize` (from `ConnectionPoolCreated`/`Ready`); omit if 0 (unbounded) |
 | `db.client.connection.idle.min` | up-down counter | `PoolOptions.MinPoolSize` |
 | `db.client.connection.idle.max` | — | **omit**; MongoDB has no max-idle concept |
@@ -129,11 +129,23 @@ fewer idle connections than the pool holds; and because only
 clear with a reconnect storm drives the gauge further from the truth for the
 life of the process.
 
-The tracker therefore keeps the set of connection IDs that reached
-`ConnectionReady` and unwinds a `ConnectionClosed` only for an ID in it. The
-total is the size of that set rather than a separate counter, so the two
-cannot drift apart. A repeated `ConnectionReady` for one ID is ignored, which
-also keeps the `create_time` histogram from recording it twice.
+The tracker therefore keeps, per driver connection ID, the number of
+connections that reached `ConnectionReady` and have not been closed, and
+unwinds a `ConnectionClosed` only for an ID it still holds. The total is
+maintained by the same two operations that mutate that map, so the two cannot
+drift apart.
+
+The ID is counted rather than used as a unique key because it is only unique
+within one driver pool: the pool numbers its connections from a counter of its
+own (`x/mongo/driver/topology/pool.go`, `nextID`), so every pool starts again
+at 1. `Instrument` mutates the `*options.ClientOptions` it is given, so a
+caller that passes the same options to `mongo.Connect` twice gets two pools
+behind one tracker, and at one address they share a state. Treating the ID as
+unique would drop the second pool's connection from the gauges and let either
+pool's close remove the shared entry, so the idle count could reach zero with a
+connection still open. The driver emits `ConnectionReady`,
+`ConnectionCheckedOut` and `ConnectionClosed` once per connection, so a repeat
+under one ID is a second pool rather than a duplicate event.
 
 Implementation note: the merged Phase 2 implementation follows the synchronous
 instrument kinds in OTel semconv v1.39.0: `count`, `max`, `idle.min`, and

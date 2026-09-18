@@ -327,6 +327,82 @@ func TestInstrument_PoolMetricsIgnoreConnectionsThatNeverBecameReady(t *testing.
 		"only the connections that became ready record a create time")
 }
 
+// TestInstrument_PoolMetricsCountTwoPoolsSharingConnectionIDs pins that two
+// driver pools at one address keep separate places on the gauges even though
+// they hand out the same connection IDs.
+//
+// The v2 driver numbers connections from a counter held by the pool
+// (x/mongo/driver/topology/pool.go, nextID), so every pool starts again at 1.
+// Instrument mutates the ClientOptions it is given, so a caller that passes
+// the same options to mongo.Connect twice gets two pools behind one tracker,
+// and at one address they share a poolState. Treating the ID as unique would
+// drop the second pool's connection and let either pool's close take the
+// shared entry off the gauge, so the idle count could reach zero with a
+// connection still open.
+func TestInstrument_PoolMetricsCountTwoPoolsSharingConnectionIDs(t *testing.T) {
+	tp, prop, _ := newTestProviders()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithView(MetricViews(testHistogramBuckets)...),
+	)
+
+	opts := options.Client().ApplyURI("mongodb://mongo-a:27017")
+	cleanup, err := Instrument(opts, tp, provider, prop, WithPoolName("chat-mongo"))
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, cleanup(context.Background())) })
+
+	const addr = "mongo-a:27017"
+	baseAttrs := []attribute.KeyValue{
+		semconv.DBSystemNameMongoDB,
+		semconv.DBClientConnectionPoolName("chat-mongo"),
+		semconv.ServerAddress("mongo-a"),
+		semconv.ServerPort(27017),
+	}
+	stateCount := func(state attribute.KeyValue) int64 {
+		rm := collectMongoMetrics(t, reader)
+		return int64MetricValue(t, findMetric(t, rm, "db.client.connection.count"),
+			appendAttribute(baseAttrs, state)...)
+	}
+	idleCount := func() int64 { return stateCount(semconv.DBClientConnectionStateIdle) }
+	usedCount := func() int64 { return stateCount(semconv.DBClientConnectionStateUsed) }
+
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolCreated, addr, 0, &event.MonitorPoolOptions{MaxPoolSize: 12})
+
+	// Both pools' first connection: the same ID, two live connections.
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, addr, 1, time.Millisecond, nil)
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, addr, 1, time.Millisecond, nil)
+	require.Equal(t, int64(2), idleCount(), "two pools each reporting connection 1 are two idle connections")
+
+	// Each pool checks its connection out.
+	for range 2 {
+		emitPoolEvent(opts.PoolMonitor, event.ConnectionCheckOutStarted, addr, 0, nil)
+		emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionCheckedOut, addr, 1, 0, nil)
+	}
+	assert.Equal(t, int64(2), usedCount(), "both connections are checked out")
+	assert.Equal(t, int64(0), idleCount(), "neither connection is idle while both are checked out")
+
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionCheckedIn, addr, 1, 0, nil)
+	assert.Equal(t, int64(1), usedCount(), "checking one in leaves the other checked out")
+	assert.Equal(t, int64(1), idleCount(), "the connection checked in is idle again")
+
+	// One pool closes its connection; the other's must survive.
+	emitPoolEventWithReasonAndConnectionID(opts.PoolMonitor, event.ConnectionClosed, addr, 1, event.ReasonError)
+	assert.Equal(t, int64(0), usedCount(), "the close unwinds the connection that was checked out")
+	assert.Equal(t, int64(1), idleCount(), "the other pool's connection is still open")
+
+	emitPoolEventWithReasonAndConnectionID(opts.PoolMonitor, event.ConnectionClosed, addr, 1, event.ReasonIdle)
+	assert.Equal(t, int64(0), idleCount(), "closing the last connection empties the gauge")
+
+	// Both connections handshook, so both recorded a create time.
+	rm := collectMongoMetrics(t, reader)
+	createTime, ok := findMetric(t, rm, "db.client.connection.create_time").Data.(metricdata.Histogram[float64])
+	require.True(t, ok)
+	require.Len(t, createTime.DataPoints, 1)
+	assert.Equal(t, uint64(2), createTime.DataPoints[0].Count,
+		"each pool's connection records its own create time")
+}
+
 // TestInstrument_PoolMetricsDefaultPoolNameAndOmitUnboundedMax verifies
 // fallback pool-name derivation and omission of unbounded max pool size.
 func TestInstrument_PoolMetricsDefaultPoolNameAndOmitUnboundedMax(t *testing.T) {
