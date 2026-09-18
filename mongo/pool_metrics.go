@@ -165,6 +165,10 @@ func defaultPoolName(opts *options.ClientOptions, override string) string {
 	return fmt.Sprintf("mongo-%d", seq)
 }
 
+// handle turns one driver pool event into metric deltas. Every gauge this
+// package owns is derived from the event stream rather than a snapshot,
+// because the v2 driver exposes no pool-stats call (ADR 0014); the per-address
+// poolState holds what that derivation needs to remember.
 func (t *poolTracker) handle(evt *event.PoolEvent) {
 	if evt == nil || t.disabled.Load() {
 		return
@@ -224,6 +228,8 @@ func (t *poolTracker) cleanup() error {
 	return nil
 }
 
+// state returns the poolState for address, creating it — with its
+// pre-built attribute sets — on first sight. The caller holds t.mu.
 func (t *poolTracker) state(address string) *poolState {
 	key := poolKey(address)
 	state, ok := t.pools[key]
@@ -296,6 +302,10 @@ func (s *poolState) readyConnection(ctx context.Context, metrics *poolMetrics, c
 	return true
 }
 
+// checkOutConnection moves connectionID from idle to used. A connection
+// already checked out is ignored, and the idle side moves only when there was
+// an idle connection to move: a checkout for a connection that never reported
+// ready would otherwise push the idle gauge negative.
 func (s *poolState) checkOutConnection(ctx context.Context, metrics *poolMetrics, connectionID int64) {
 	if _, ok := s.checkedOut[connectionID]; ok {
 		return
@@ -308,6 +318,8 @@ func (s *poolState) checkOutConnection(ctx context.Context, metrics *poolMetrics
 	}
 }
 
+// checkInConnection moves connectionID back from used to idle, ignoring a
+// connection this state never saw checked out.
 func (s *poolState) checkInConnection(ctx context.Context, metrics *poolMetrics, connectionID int64) {
 	if _, ok := s.checkedOut[connectionID]; !ok {
 		return
@@ -345,6 +357,10 @@ func (s *poolState) decrementPending(ctx context.Context, metrics *poolMetrics) 
 	metrics.pending.Add(ctx, -1, s.poolAddOpt...)
 }
 
+// closePool unwinds everything this state has on the gauges, so a pool the
+// driver closes leaves no series stuck at its last value. The tracker drops
+// the state afterwards; a pool recreated at the same address starts again from
+// zero.
 func (s *poolState) closePool(ctx context.Context, metrics *poolMetrics) {
 	if used := int64(len(s.checkedOut)); used > 0 {
 		s.addConnectionCount(ctx, metrics, -used, s.usedAddOpt)
