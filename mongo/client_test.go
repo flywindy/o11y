@@ -403,6 +403,79 @@ func TestInstrument_PoolMetricsCountTwoPoolsSharingConnectionIDs(t *testing.T) {
 		"each pool's connection records its own create time")
 }
 
+// TestInstrument_PoolMetricsBoundMisattributionAcrossPools pins the residual
+// error when two pools at one address share a poolState, and pins that it
+// cannot compound.
+//
+// Which pool a ConnectionClosed came from is not decidable from the event
+// stream: event.PoolEvent carries the server address and nothing identifying a
+// pool. A close of a connection that never became ready can therefore consume a
+// ready entry belonging to the other pool. The guarantee is that it stays
+// within one connection and heals — the count stops at zero, so every further
+// failed handshake under the same ID is ignored rather than taking one more off
+// the gauge. That bound is the whole difference from the counter this replaced,
+// where each failed handshake moved the gauge one further from the truth for
+// the life of the process.
+func TestInstrument_PoolMetricsBoundMisattributionAcrossPools(t *testing.T) {
+	tp, prop, _ := newTestProviders()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithView(MetricViews(testHistogramBuckets)...),
+	)
+
+	opts := options.Client().ApplyURI("mongodb://mongo-a:27017")
+	cleanup, err := Instrument(opts, tp, provider, prop, WithPoolName("chat-mongo"))
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, cleanup(context.Background())) })
+
+	const addr = "mongo-a:27017"
+	idleAttrs := []attribute.KeyValue{
+		semconv.DBSystemNameMongoDB,
+		semconv.DBClientConnectionPoolName("chat-mongo"),
+		semconv.ServerAddress("mongo-a"),
+		semconv.ServerPort(27017),
+		semconv.DBClientConnectionStateIdle,
+	}
+	idleCount := func() int64 {
+		rm := collectMongoMetrics(t, reader)
+		return int64MetricValue(t, findMetric(t, rm, "db.client.connection.count"), idleAttrs...)
+	}
+
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolCreated, addr, 0, &event.MonitorPoolOptions{MaxPoolSize: 12})
+
+	// Pool A's first connection is ready.
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionCreated, addr, 1, 0, nil)
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, addr, 1, time.Millisecond, nil)
+	require.Equal(t, int64(1), idleCount())
+
+	// Pool B's first connection has the same ID and fails its handshake. The
+	// close cannot be told apart from pool A's connection closing, so it is
+	// booked against pool A's entry: one connection's worth of error.
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionCreated, addr, 1, 0, nil)
+	emitPoolEventWithReasonAndConnectionID(opts.PoolMonitor, event.ConnectionClosed, addr, 1, event.ReasonError)
+	require.Equal(t, int64(0), idleCount(), "the misattributed close costs one connection")
+
+	// Pool B keeps failing. Each further failure must be free: the ready count
+	// is already zero, so there is nothing left to take off the gauge. This is
+	// the bound — the error cannot grow, and the gauge cannot go negative.
+	for attempt := range 5 {
+		emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionCreated, addr, 1, 0, nil)
+		emitPoolEventWithReasonAndConnectionID(opts.PoolMonitor, event.ConnectionClosed, addr, 1, event.ReasonError)
+		require.Equalf(t, int64(0), idleCount(),
+			"failed handshake %d must not take another connection off the gauge", attempt+2)
+	}
+
+	// Pool B finally connects, and both pools drain. The gauge comes back to
+	// the truth rather than staying skewed for the life of the process.
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, addr, 1, time.Millisecond, nil)
+	assert.Equal(t, int64(1), idleCount())
+	emitPoolEventWithReasonAndConnectionID(opts.PoolMonitor, event.ConnectionClosed, addr, 1, event.ReasonIdle)
+	assert.Equal(t, int64(0), idleCount())
+	emitPoolEventWithReasonAndConnectionID(opts.PoolMonitor, event.ConnectionClosed, addr, 1, event.ReasonIdle)
+	assert.Equal(t, int64(0), idleCount(), "the gauge settles at zero once both pools are drained")
+}
+
 // TestInstrument_PoolMetricsDefaultPoolNameAndOmitUnboundedMax verifies
 // fallback pool-name derivation and omission of unbounded max pool size.
 func TestInstrument_PoolMetricsDefaultPoolNameAndOmitUnboundedMax(t *testing.T) {

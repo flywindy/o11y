@@ -313,6 +313,20 @@ func (s *poolState) setOptions(ctx context.Context, metrics *poolMetrics, opts *
 // once per connection, so a repeat under one ID is a second pool rather than a
 // duplicate event. total is maintained by add and remove alongside the map they
 // mutate, so the two cannot drift apart.
+//
+// Counting bounds the residual error rather than removing it. Which pool a
+// ConnectionClosed came from is not decidable from the event stream —
+// event.PoolEvent carries the server address and nothing that identifies a
+// pool (ServiceID names a mongos in a load-balanced deployment, and only on
+// PoolCleared) — so a close of a connection that never became ready can consume
+// a ready entry another pool owns, and a close of an idle connection can be
+// booked against another pool's checked-out entry. Both stay within one
+// connection and heal: remove reports false once the count reaches zero, so a
+// repeated misattribution cannot compound, and the gauges return to the truth
+// as the pools drain. That is the property the old counter lacked, where every
+// failed handshake moved the gauge one further from the pool's real size for
+// the life of the process. Give each client its own Instrument call to avoid
+// the ambiguity entirely.
 type liveConnections struct {
 	byID  map[int64]int
 	total int64
