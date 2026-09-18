@@ -358,6 +358,8 @@ func writeTestKeyPair(t *testing.T, dir string) (certPath, keyPath string) {
 // error that names the option and the parser's reason but never the value,
 // and that only an endpoint an enabled OTLP exporter uses is checked.
 func TestValidateConfiguredEndpoints(t *testing.T) {
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: gosec.G101-1
 	const bad = "http://user:secret%zz@collector:4318"
 
 	err := validateConfiguredEndpoints(&Config{traceEnabled: true, otlpEndpoint: bad})

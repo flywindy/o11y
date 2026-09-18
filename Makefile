@@ -1,5 +1,6 @@
 .PHONY: all test lint adr-check vuln examples bench cover fmt tidy clean help \
-        tools sast sast-gosec sast-semgrep sast-semgrep-test
+        tools sast sast-gosec sast-gosec-cred sast-semgrep sast-semgrep-test \
+        sast-directives
 
 # Force bash so the examples target can use process substitution / read -d ''.
 # The default /bin/sh on Debian / Ubuntu is dash, which lacks both features.
@@ -55,20 +56,64 @@ endif
 # rule fixtures whose whole purpose is to contain deliberate violations, so it
 # is excluded here the same way SEMGREP_FLAGS excludes it below.
 #
-# NOT wired into `sast` / CI yet: the first run against this repo surfaced 12
-# pre-existing findings unrelated to the credential-literal gap sast-semgrep
-# was added for (G115 int-overflow conversions, G404 weak RNG, G306 file
-# perms, G102 bind-all, plus two real G101 password-in-URL fixtures). Those
-# need a human triage pass (fix vs justified #nosec) before gosec can be a
-# blocking gate without either failing CI on unrelated findings or suppressing
+# Only the credential half is wired into `sast` / CI, as sast-gosec-cred. The
+# first run against this repo surfaced 12 pre-existing findings unrelated to
+# the credential-literal gap sast-semgrep was added for (G115 int-overflow
+# conversions, G404 weak RNG, G306 file perms, G102 bind-all). Those still
+# need a human triage pass (fix vs justified #nosec) before the rest of gosec
+# can block without either failing CI on unrelated findings or suppressing
 # them un-reviewed. `make sast-gosec` stays runnable on demand until then.
-GOSEC_FLAGS := -quiet -severity medium -confidence low -tests=true \
-               -exclude-generated -exclude-dir=.semgrep
+#
+# The G101 count in that tally was two. By the time a gate was put on it the
+# class had reached eleven, all of them unannotated password-in-URL fixtures,
+# because nothing was watching it — which is the argument for gating a class
+# as soon as it is clean rather than waiting on the whole triage.
+GOSEC_BASE_FLAGS := -quiet -severity medium -confidence low -tests=true \
+                    -exclude-dir=.semgrep
+GOSEC_FLAGS      := $(GOSEC_BASE_FLAGS) -exclude-generated
 
-# semgrep: only the repo-owned rules under .semgrep/ — no p/golang or
-# p/security-audit registry config yet, to keep this gate scoped to what it
-# was added for (see .semgrep/hardcoded-credentials.yml) rather than opening a
-# second, broader SAST-triage effort in the same change.
+# The credential gate keeps generated files in scope. -exclude-generated is
+# there so the untriaged classes above do not fail CI on code nobody edits, but
+# a credential in a checked-in generated file is still a credential on disk and
+# an external scan reports it like any other. It also cannot be annotated: a
+# #nosec there is erased by the next regeneration, so the only fix is at the
+# generator, which is the right place for the pressure to land.
+#
+# -tags integration is the second half of that: gosec analyses only the files
+# satisfying the tags it is given, so cassandra/integration_test.go (behind
+# //go:build integration, and listed under IgnoredGoFiles) was never read. The
+# repo rule does not fire on a neutral identifier there either, and there is no
+# suppression for sast-directives to inspect, so a credential in that file
+# class escaped every gate. scripts/ stays out: those are //go:build ignore
+# standalone programs, never part of a build, and two package main files in one
+# directory cannot be handed to gosec together. A new build tag is a new hole,
+# so check_credential_directives fails on one it does not know about.
+GOSEC_CRED_FLAGS := $(GOSEC_BASE_FLAGS) -include=G101 -tags integration
+
+# semgrep: only the repo-owned rules under .semgrep/ — no registry config, to
+# keep this gate scoped to what it was added for (see
+# .semgrep/hardcoded-credentials.yml) rather than opening a second, broader
+# SAST-triage effort in the same change.
+#
+# Adding one would not close the gap the directives here name anyway.
+# gosec.G101-1, the id every nosemgrep directive in this repo carries, is not
+# in the public registry: probed in CI on 2026-09-17 over the three files
+# holding credential fixtures, r/gosec.G101-1 resolved to zero rules (semgrep
+# prints "Nothing to scan" and exits 0, so that gate would have passed having
+# scanned nothing), while p/gosec, p/security-audit and p/golang ran 23, 30
+# and 42 rules for zero findings, and every anonymous scan ends with "need
+# more rules? semgrep login".
+#
+# It is served to logged-in orgs: the deployment that reported this tree runs
+# Semgrep against an account, which is why the rule resolves for it and not
+# here. Reproducing it would need that account's SEMGREP_APP_TOKEN in this
+# repo's secrets, which is not a trade worth making for a gate — a scanning
+# credential is exactly the kind of value the rule itself exists to keep out
+# of a source tree. sast-directives enforces the convention instead.
+#
+# The directives do work there even though the rule cannot run here: semgrep
+# matches a nosemgrep id by suffix, so "gosec.G101-1" silences the finding
+# whatever namespace the full rule id carries in front of it.
 SEMGREP_FLAGS := --error --severity=WARNING --severity=ERROR --metrics=off \
                  --exclude=.semgrep --config=.semgrep/
 
@@ -109,15 +154,17 @@ tools: ## Install pinned SAST tooling (gosec, semgrep)
 	  exit 1; \
 	fi
 
-# Run the blocking SAST scans (repo-owned semgrep rules) plus the rule tests.
-# gosec is deliberately NOT included — see the note on GOSEC_FLAGS above; run
-# `make sast-gosec` directly to see its findings. Both remaining scans always
-# run (no fail-fast) so every category is reported in one pass.
-sast: ## Run repo-owned semgrep rules + their fixture tests (gosec: run separately, see sast-gosec)
-	@rc=0; s=PASS; t=PASS; \
-	$(MAKE) --no-print-directory sast-semgrep-test || { rc=1; t=FAIL; }; \
-	$(MAKE) --no-print-directory sast-semgrep      || { rc=1; s=FAIL; }; \
-	echo "==> SAST summary: semgrep=$$s rule-tests=$$t (gosec not included — run 'make sast-gosec')"; \
+# Run the blocking SAST gates plus the rule tests. Only gosec's credential
+# rule is included; the rest of gosec is not — see the note on GOSEC_FLAGS
+# above, and run `make sast-gosec` directly to see its findings. Every scan
+# always runs (no fail-fast) so every category is reported in one pass.
+sast: ## Run the blocking SAST gates: semgrep rules, their fixtures, credential directives, gosec G101
+	@rc=0; s=PASS; t=PASS; d=PASS; c=PASS; \
+	$(MAKE) --no-print-directory sast-semgrep-test   || { rc=1; t=FAIL; }; \
+	$(MAKE) --no-print-directory sast-semgrep        || { rc=1; s=FAIL; }; \
+	$(MAKE) --no-print-directory sast-directives     || { rc=1; d=FAIL; }; \
+	$(MAKE) --no-print-directory sast-gosec-cred     || { rc=1; c=FAIL; }; \
+	echo "==> SAST summary: semgrep=$$s directives=$$d gosec-G101=$$c rule-tests=$$t (full gosec not included — run 'make sast-gosec')"; \
 	exit $$rc
 
 sast-gosec: ## gosec: Go security static analysis (injection, weak crypto, unsafe code)
@@ -136,6 +183,25 @@ sast-semgrep: ## semgrep: repo-owned rules under .semgrep/
 # the fixture must be a sibling because semgrep's test runner matches by
 # basename and does not support a separate tests directory. Fixtures contain
 # deliberate violations, which is why SEMGREP_FLAGS excludes .semgrep above.
+# The hardcoded-credential half of gosec, split out so it can block while the
+# rest stays untriaged (see GOSEC_FLAGS). G101 is the class this repo already
+# writes directives for, and the class that had quietly grown from the 2
+# findings GOSEC_FLAGS records to 11 with nothing gating it. Every remaining
+# gosec rule stays out: wiring those in is still the separate triage effort.
+sast-gosec-cred: ## gosec: hardcoded-credential findings only (G101), blocking
+	@test -x "$(GOSEC)" || { echo "gosec not installed — run 'make tools'"; exit 1; }
+	$(GOSEC) $(GOSEC_CRED_FLAGS) ./...
+
+# gosec.G101-1, the id an external scan reports, runs nowhere here — it is not
+# in the public semgrep registry at all (see SEMGREP_FLAGS). So the only thing
+# this repo can enforce is that the id is named wherever a sibling scanner is
+# suppressed, which is what the script checks. Its doc comment carries the full
+# reasoning; a Go program rather than a shell recipe because the check needs to
+# look at neighbouring lines, and because an awk pipeline that errors mid-run
+# is exactly the silently-passing gate this whole target exists to prevent.
+sast-directives: ## Check credential suppressions carry the external rule id
+	$(GO) run ./scripts/check_credential_directives.go
+
 sast-semgrep-test: ## Run the repo-owned semgrep rules against their fixtures
 	@command -v "$(SEMGREP)" >/dev/null 2>&1 || { echo "semgrep not installed — run 'make tools' (needs pipx), or: pipx install semgrep==$(SEMGREP_VERSION)"; exit 1; }
 	@rc=0; n=0; \

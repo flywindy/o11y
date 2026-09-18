@@ -113,6 +113,8 @@ func TestLogr_RedactsEndpointCredentials(t *testing.T) {
 // slog.Attr values go through the same redaction.
 func TestLogr_RedactsEndpointCredentialsInValues(t *testing.T) {
 	logger, buf := newRecordingLogger(slog.LevelInfo)
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: gosec.G101-1
 	const endpoint = "http://svc:hunter2@collector:4318"
 	l := o11ylog.NewLogr(logger, nil, endpoint).WithValues("configured", endpoint)
 
@@ -137,6 +139,8 @@ func TestLogr_RedactsEndpointCredentialsInValues(t *testing.T) {
 // endpoint or a credential there too.
 func TestLogr_RedactsAttrKeys(t *testing.T) {
 	logger, buf := newRecordingLogger(slog.LevelInfo)
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: gosec.G101-1
 	const endpoint = "http://svc:hunter2@collector:4318"
 	l := o11ylog.NewLogrRedacting(logger, nil, o11ylog.Redaction{Endpoints: []string{endpoint}, Secrets: []string{"TopSecretToken"}})
 
@@ -154,6 +158,8 @@ func TestLogr_RedactsAttrKeys(t *testing.T) {
 // it is emitted as the "logger" attribute.
 func TestLogr_RedactsLoggerName(t *testing.T) {
 	logger, buf := newRecordingLogger(slog.LevelInfo)
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: gosec.G101-1
 	const endpoint = "http://svc:hunter2@collector:4318"
 	l := o11ylog.NewLogrRedacting(logger, nil, o11ylog.Redaction{Endpoints: []string{endpoint}, Secrets: []string{"TopSecretToken"}}).
 		WithName(endpoint).WithName("TopSecretToken")
@@ -173,6 +179,8 @@ func TestLogr_RedactsLoggerName(t *testing.T) {
 func TestLogr_RedactsPointerChains(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: gosec.G101-1
 	const endpoint = "http://svc:hunter2@collector:4318"
 	l := o11ylog.NewLogrRedacting(logger, nil, o11ylog.Redaction{Endpoints: []string{endpoint}, Secrets: []string{"TopSecretToken"}})
 
@@ -222,6 +230,8 @@ func TestLogr_ResolvesMarshalerValues(t *testing.T) {
 // slog.Any go through the same path.
 func TestLogr_RedactsMarshalerAndContainerValues(t *testing.T) {
 	logger, buf := newRecordingLogger(slog.LevelInfo)
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: gosec.G101-1
 	const endpoint = "http://svc:hunter2@collector:4318"
 	l := o11ylog.NewLogr(logger, nil, endpoint)
 
@@ -245,6 +255,8 @@ func TestLogr_RedactsMarshalerAndContainerValues(t *testing.T) {
 // be left alone.
 func TestLogr_RedactsTypedNestedContainers(t *testing.T) {
 	logger, buf := newRecordingLogger(slog.LevelInfo)
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: gosec.G101-1
 	const endpoint = "http://svc:hunter2@collector:4318"
 	type named string
 	l := o11ylog.NewLogr(logger, nil, endpoint)
@@ -274,6 +286,8 @@ func TestLogr_RedactsTypedNestedContainers(t *testing.T) {
 // configured secret in the message rather than in a key/value pair.
 func TestLogr_RedactsMessageText(t *testing.T) {
 	logger, buf := newRecordingLogger(slog.LevelInfo)
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: gosec.G101-1
 	const endpoint = "http://svc:hunter2@collector:4318"
 	l := o11ylog.NewLogrRedacting(logger, nil, o11ylog.Redaction{Endpoints: []string{endpoint}, Secrets: []string{"TopSecretToken"}})
 
@@ -340,6 +354,8 @@ func (e endpointValuer) LogValue() slog.Value { return slog.StringValue(e.url) }
 // that must stay what they are.
 func TestLogr_RedactsStructsStringersAndLogValuers(t *testing.T) {
 	logger, buf := newRecordingLogger(slog.LevelInfo)
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: gosec.G101-1
 	const endpoint = "http://svc:hunter2@collector:4318"
 	type inner struct{ Endpoint string }
 	type outer struct {
@@ -409,7 +425,13 @@ func TestLogr_SurvivesTypedNilAndPanickingValues(t *testing.T) {
 // values alike.
 func TestLogr_RedactsConfiguredSecrets(t *testing.T) {
 	logger, buf := newRecordingLogger(slog.LevelInfo)
-	const token = "BearerSecret%zz" // nosemgrep: hardcoded-credential-literal -- test fixture, the value the redaction must remove
+	// Fixture credential asserted absent from the redacted output below, not a
+	// live credential. Both ids are named because each scanner matches only its
+	// own: gosec.G101-1 is what an external scan reports,
+	// hardcoded-credential-literal is this repo's rule. gosec's native G101
+	// filters on entropy and does not reach this value, so it needs no #nosec.
+	// nosemgrep: gosec.G101-1, hardcoded-credential-literal
+	const token = "BearerSecret%zz"
 	l := o11ylog.NewLogrRedacting(logger, nil, o11ylog.Redaction{Secrets: []string{token, "k-1234567890"}})
 
 	l.Error(errors.New(`invalid URL escape "%zz" in `+token), "escape header value",
@@ -433,6 +455,8 @@ type endpointStringerless struct{ url string }
 // for the text rules to anchor on) is replaced by the same placeholder.
 func TestLogr_RedactsURLValues(t *testing.T) {
 	logger, buf := newRecordingLogger(slog.LevelInfo)
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: gosec.G101-1
 	const endpoint = "http://svc:hunter2@collector:4318/v1/traces"
 	u, err := url.Parse(endpoint)
 	require.NoError(t, err)
@@ -454,6 +478,8 @@ func TestLogr_RedactsURLValues(t *testing.T) {
 // into forever or passed through unredacted.
 func TestLogr_BoundsGroupNesting(t *testing.T) {
 	logger, buf := newRecordingLogger(slog.LevelInfo)
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: gosec.G101-1
 	const endpoint = "http://svc:hunter2@collector:4318"
 	l := o11ylog.NewLogr(logger, nil, endpoint)
 
