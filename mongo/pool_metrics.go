@@ -109,7 +109,7 @@ type poolState struct {
 	poolRecOpt  []metric.RecordOption
 	usedAddOpt  []metric.AddOption
 	idleAddOpt  []metric.AddOption
-	total       int64
+	ready       map[int64]struct{}
 	pending     int64
 	emittedMin  int64
 	emittedMax  int64
@@ -179,10 +179,10 @@ func (t *poolTracker) handle(evt *event.PoolEvent) {
 	case event.ConnectionPoolCreated, event.ConnectionPoolReady:
 		state.setOptions(context.Background(), t.metrics, evt.PoolOptions)
 	case event.ConnectionReady:
-		state.total++
-		state.addConnectionCount(context.Background(), t.metrics, 1, state.idleAddOpt)
-		recordCreateTime = true
-		createTimeSeconds = evt.Duration.Seconds()
+		if state.readyConnection(context.Background(), t.metrics, evt.ConnectionID) {
+			recordCreateTime = true
+			createTimeSeconds = evt.Duration.Seconds()
+		}
 	case event.ConnectionClosed:
 		state.closeConnection(context.Background(), t.metrics, evt.ConnectionID)
 	case event.ConnectionCheckOutStarted:
@@ -239,6 +239,7 @@ func (t *poolTracker) state(address string) *poolState {
 			poolRecOpt: []metric.RecordOption{poolOpt},
 			usedAddOpt: []metric.AddOption{usedOpt},
 			idleAddOpt: []metric.AddOption{idleOpt},
+			ready:      make(map[int64]struct{}),
 			checkedOut: make(map[int64]struct{}),
 		}
 		t.pools[key] = state
@@ -282,11 +283,24 @@ func (s *poolState) setOptions(ctx context.Context, metrics *poolMetrics, opts *
 	}
 }
 
+// readyConnection records that connectionID finished its handshake and joined
+// the pool as an idle connection. It reports whether this was the connection's
+// first ConnectionReady, so a repeated event neither double-counts the gauge
+// nor records the create-time histogram twice.
+func (s *poolState) readyConnection(ctx context.Context, metrics *poolMetrics, connectionID int64) bool {
+	if _, ok := s.ready[connectionID]; ok {
+		return false
+	}
+	s.ready[connectionID] = struct{}{}
+	s.addConnectionCount(ctx, metrics, 1, s.idleAddOpt)
+	return true
+}
+
 func (s *poolState) checkOutConnection(ctx context.Context, metrics *poolMetrics, connectionID int64) {
 	if _, ok := s.checkedOut[connectionID]; ok {
 		return
 	}
-	wasIdle := s.total > int64(len(s.checkedOut))
+	wasIdle := len(s.ready) > len(s.checkedOut)
 	s.checkedOut[connectionID] = struct{}{}
 	s.addConnectionCount(ctx, metrics, 1, s.usedAddOpt)
 	if wasIdle {
@@ -303,19 +317,24 @@ func (s *poolState) checkInConnection(ctx context.Context, metrics *poolMetrics,
 	s.addConnectionCount(ctx, metrics, 1, s.idleAddOpt)
 }
 
+// closeConnection unwinds whatever connectionID was counted as. A connection
+// the driver closes before it became ready was never counted — the v2 driver
+// emits ConnectionCreated then ConnectionClosed with no ConnectionReady when a
+// handshake fails — so there is nothing to take off either gauge. Decrementing
+// for it would report fewer connections than the pool holds, for good: only
+// ConnectionPoolClosed resets this state, so each later failure would drift the
+// gauge further.
 func (s *poolState) closeConnection(ctx context.Context, metrics *poolMetrics, connectionID int64) {
-	hadTotal := s.total > 0
-	if s.total > 0 {
-		s.total--
+	if _, ok := s.ready[connectionID]; !ok {
+		return
 	}
+	delete(s.ready, connectionID)
 	if _, ok := s.checkedOut[connectionID]; ok {
 		delete(s.checkedOut, connectionID)
 		s.addConnectionCount(ctx, metrics, -1, s.usedAddOpt)
 		return
 	}
-	if hadTotal && s.total >= int64(len(s.checkedOut)) {
-		s.addConnectionCount(ctx, metrics, -1, s.idleAddOpt)
-	}
+	s.addConnectionCount(ctx, metrics, -1, s.idleAddOpt)
 }
 
 func (s *poolState) decrementPending(ctx context.Context, metrics *poolMetrics) {
@@ -330,7 +349,7 @@ func (s *poolState) closePool(ctx context.Context, metrics *poolMetrics) {
 	if used := int64(len(s.checkedOut)); used > 0 {
 		s.addConnectionCount(ctx, metrics, -used, s.usedAddOpt)
 	}
-	if idle := s.total - int64(len(s.checkedOut)); idle > 0 {
+	if idle := int64(len(s.ready) - len(s.checkedOut)); idle > 0 {
 		s.addConnectionCount(ctx, metrics, -idle, s.idleAddOpt)
 	}
 	if s.pending > 0 {
