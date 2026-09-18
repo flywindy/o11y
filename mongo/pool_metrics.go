@@ -109,11 +109,12 @@ type poolState struct {
 	poolRecOpt  []metric.RecordOption
 	usedAddOpt  []metric.AddOption
 	idleAddOpt  []metric.AddOption
-	total       int64
+	ready       liveConnections
+	livePools   int64
 	pending     int64
 	emittedMin  int64
 	emittedMax  int64
-	checkedOut  map[int64]struct{}
+	checkedOut  liveConnections
 	seenCreated bool
 	createdMin  uint64
 	createdMax  uint64
@@ -151,6 +152,9 @@ func newPoolMonitor(
 // because it is stable and readable across runs.
 var defaultPoolNameSeq atomic.Uint64
 
+// defaultPoolName returns the db.client.connection.pool.name label for a
+// client: WithPoolName when the caller set it, otherwise the first configured
+// host with a sequence number from defaultPoolNameSeq.
 func defaultPoolName(opts *options.ClientOptions, override string) string {
 	if override != "" {
 		return override
@@ -165,6 +169,10 @@ func defaultPoolName(opts *options.ClientOptions, override string) string {
 	return fmt.Sprintf("mongo-%d", seq)
 }
 
+// handle turns one driver pool event into metric deltas. Every gauge this
+// package owns is derived from the event stream rather than a snapshot,
+// because the v2 driver exposes no pool-stats call (ADR 0014); the per-address
+// poolState holds what that derivation needs to remember.
 func (t *poolTracker) handle(evt *event.PoolEvent) {
 	if evt == nil || t.disabled.Load() {
 		return
@@ -176,11 +184,13 @@ func (t *poolTracker) handle(evt *event.PoolEvent) {
 	t.mu.Lock()
 	state := t.state(evt.Address)
 	switch evt.Type {
-	case event.ConnectionPoolCreated, event.ConnectionPoolReady:
+	case event.ConnectionPoolCreated:
+		state.livePools++
+		state.setOptions(context.Background(), t.metrics, evt.PoolOptions)
+	case event.ConnectionPoolReady:
 		state.setOptions(context.Background(), t.metrics, evt.PoolOptions)
 	case event.ConnectionReady:
-		state.total++
-		state.addConnectionCount(context.Background(), t.metrics, 1, state.idleAddOpt)
+		state.readyConnection(context.Background(), t.metrics, evt.ConnectionID)
 		recordCreateTime = true
 		createTimeSeconds = evt.Duration.Seconds()
 	case event.ConnectionClosed:
@@ -203,8 +213,10 @@ func (t *poolTracker) handle(evt *event.PoolEvent) {
 		// Let the subsequent ConnectionClosed events reconcile counts so
 		// checked-out work remains visible and counters do not double-decrement.
 	case event.ConnectionPoolClosed:
-		state.closePool(context.Background(), t.metrics)
-		delete(t.pools, poolKey(evt.Address))
+		if state.poolClosed() {
+			state.closePool(context.Background(), t.metrics)
+			delete(t.pools, poolKey(evt.Address))
+		}
 	}
 	t.mu.Unlock()
 
@@ -224,6 +236,8 @@ func (t *poolTracker) cleanup() error {
 	return nil
 }
 
+// state returns the poolState for address, creating it — with its
+// pre-built attribute sets — on first sight. The caller holds t.mu.
 func (t *poolTracker) state(address string) *poolState {
 	key := poolKey(address)
 	state, ok := t.pools[key]
@@ -239,13 +253,20 @@ func (t *poolTracker) state(address string) *poolState {
 			poolRecOpt: []metric.RecordOption{poolOpt},
 			usedAddOpt: []metric.AddOption{usedOpt},
 			idleAddOpt: []metric.AddOption{idleOpt},
-			checkedOut: make(map[int64]struct{}),
+			ready:      newLiveConnections(),
+			checkedOut: newLiveConnections(),
 		}
 		t.pools[key] = state
 	}
 	return state
 }
 
+// setOptions emits the deltas that move db.client.connection.idle.min and
+// db.client.connection.max to the pool's configured sizes. It remembers the
+// sizes ConnectionPoolCreated reported so a later ConnectionPoolReady, which
+// the driver sends with no options, can restate them; an unbounded max
+// (MaxPoolSize 0) is taken off the gauge rather than reported as zero, since
+// the metric is meant to be absent when there is no limit.
 func (s *poolState) setOptions(ctx context.Context, metrics *poolMetrics, opts *event.MonitorPoolOptions) {
 	if opts == nil {
 		if s.seenCreated {
@@ -282,42 +303,119 @@ func (s *poolState) setOptions(ctx context.Context, metrics *poolMetrics, opts *
 	}
 }
 
-func (s *poolState) checkOutConnection(ctx context.Context, metrics *poolMetrics, connectionID int64) {
-	if _, ok := s.checkedOut[connectionID]; ok {
-		return
+// liveConnections counts a pool's connections by driver connection ID.
+//
+// The ID cannot be used as a unique key. The v2 driver numbers connections from
+// a counter held by the pool itself (x/mongo/driver/topology/pool.go,
+// `conn.driverConnectionID = atomic.AddInt64(&p.nextID, 1)`), so every pool
+// starts again at 1. One instrumented ClientOptions can back more than one
+// client — Instrument mutates the options and mongo.Connect may be called with
+// them again — and two pools at the same address then share a poolState and
+// report the same IDs. A set would drop the second pool's connection from the
+// gauges and let either pool's close take the shared entry off them; a count
+// per ID keeps both.
+//
+// The driver emits ConnectionReady, ConnectionCheckedOut and ConnectionClosed
+// once per connection, so a repeat under one ID is a second pool rather than a
+// duplicate event. total is maintained by add and remove alongside the map they
+// mutate, so the two cannot drift apart.
+//
+// Counting bounds the residual error rather than removing it. Which pool a
+// ConnectionClosed came from is not decidable from the event stream —
+// event.PoolEvent carries the server address and nothing that identifies a
+// pool (ServiceID names a mongos in a load-balanced deployment, and only on
+// PoolCleared) — so a close of a connection that never became ready can consume
+// a ready entry another pool owns, and a close of an idle connection can be
+// booked against another pool's checked-out entry. Both stay within one
+// connection and heal: remove reports false once the count reaches zero, so a
+// repeated misattribution cannot compound, and the gauges return to the truth
+// as the pools drain. That is the property the old counter lacked, where every
+// failed handshake moved the gauge one further from the pool's real size for
+// the life of the process. Give each client its own Instrument call to avoid
+// the ambiguity entirely.
+type liveConnections struct {
+	byID  map[int64]int
+	total int64
+}
+
+// newLiveConnections returns an empty counter ready to use.
+func newLiveConnections() liveConnections {
+	return liveConnections{byID: make(map[int64]int)}
+}
+
+// add records one more live connection under connectionID.
+func (l *liveConnections) add(connectionID int64) {
+	l.byID[connectionID]++
+	l.total++
+}
+
+// remove drops one live connection under connectionID and reports whether
+// there was one to drop.
+func (l *liveConnections) remove(connectionID int64) bool {
+	n := l.byID[connectionID]
+	if n == 0 {
+		return false
 	}
-	wasIdle := s.total > int64(len(s.checkedOut))
-	s.checkedOut[connectionID] = struct{}{}
+	if n == 1 {
+		delete(l.byID, connectionID)
+	} else {
+		l.byID[connectionID] = n - 1
+	}
+	l.total--
+	return true
+}
+
+// readyConnection records that connectionID finished its handshake and joined
+// the pool as an idle connection.
+func (s *poolState) readyConnection(ctx context.Context, metrics *poolMetrics, connectionID int64) {
+	s.ready.add(connectionID)
+	s.addConnectionCount(ctx, metrics, 1, s.idleAddOpt)
+}
+
+// checkOutConnection moves connectionID from idle to used. The idle side moves
+// only when there was an idle connection to move: a checkout for a connection
+// that never reported ready would otherwise push the idle gauge negative.
+func (s *poolState) checkOutConnection(ctx context.Context, metrics *poolMetrics, connectionID int64) {
+	wasIdle := s.ready.total > s.checkedOut.total
+	s.checkedOut.add(connectionID)
 	s.addConnectionCount(ctx, metrics, 1, s.usedAddOpt)
 	if wasIdle {
 		s.addConnectionCount(ctx, metrics, -1, s.idleAddOpt)
 	}
 }
 
+// checkInConnection moves connectionID back from used to idle, ignoring a
+// connection this state never saw checked out.
 func (s *poolState) checkInConnection(ctx context.Context, metrics *poolMetrics, connectionID int64) {
-	if _, ok := s.checkedOut[connectionID]; !ok {
+	if !s.checkedOut.remove(connectionID) {
 		return
 	}
-	delete(s.checkedOut, connectionID)
 	s.addConnectionCount(ctx, metrics, -1, s.usedAddOpt)
 	s.addConnectionCount(ctx, metrics, 1, s.idleAddOpt)
 }
 
+// closeConnection unwinds whatever connectionID was counted as. A connection
+// the driver closes before it became ready was never counted — the v2 driver
+// emits ConnectionCreated then ConnectionClosed with no ConnectionReady when a
+// handshake fails — so there is nothing to take off either gauge. Decrementing
+// for it would report fewer connections than the pool holds, for good: only
+// ConnectionPoolClosed resets this state, so each later failure would drift the
+// gauge further.
 func (s *poolState) closeConnection(ctx context.Context, metrics *poolMetrics, connectionID int64) {
-	hadTotal := s.total > 0
-	if s.total > 0 {
-		s.total--
+	if !s.ready.remove(connectionID) {
+		return
 	}
-	if _, ok := s.checkedOut[connectionID]; ok {
-		delete(s.checkedOut, connectionID)
+	if s.checkedOut.remove(connectionID) {
 		s.addConnectionCount(ctx, metrics, -1, s.usedAddOpt)
 		return
 	}
-	if hadTotal && s.total >= int64(len(s.checkedOut)) {
-		s.addConnectionCount(ctx, metrics, -1, s.idleAddOpt)
-	}
+	s.addConnectionCount(ctx, metrics, -1, s.idleAddOpt)
 }
 
+// decrementPending takes one off db.client.connection.pending_requests for a
+// checkout that finished, either way it finished. It ignores an event with no
+// outstanding request behind it, so a checkout the tracker never saw start
+// cannot push the gauge negative.
 func (s *poolState) decrementPending(ctx context.Context, metrics *poolMetrics) {
 	if s.pending == 0 {
 		return
@@ -326,11 +424,40 @@ func (s *poolState) decrementPending(ctx context.Context, metrics *poolMetrics) 
 	metrics.pending.Add(ctx, -1, s.poolAddOpt...)
 }
 
+// poolClosed records that one of the pools this state covers has closed, and
+// reports whether it was the last one — whether the caller should now unwind
+// the gauges and drop the state.
+//
+// More than one pool can share a state, since two clients built from one
+// instrumented ClientOptions put two pools at the same address behind one
+// tracker. Unwinding on the first ConnectionPoolClosed would take the surviving
+// pool's open connections off the gauges with the closing pool's, and nothing
+// would put them back: the driver emits ConnectionReady once per connection, so
+// a connection that is already open is never re-announced. The closing pool's
+// own connections still reconcile themselves, because ConnectionPoolClosed
+// precedes the ConnectionClosed events for the connections it drops.
+//
+// ConnectionPoolCreated and ConnectionPoolClosed are the one piece of
+// pool-level bookkeeping the event stream does supply exactly: the driver emits
+// each once per pool. A state that never saw ConnectionPoolCreated — metrics
+// attached to an already-running pool — closes on the first event, as before.
+func (s *poolState) poolClosed() bool {
+	if s.livePools > 0 {
+		s.livePools--
+	}
+	return s.livePools == 0
+}
+
+// closePool unwinds everything this state has on the gauges, so a pool the
+// driver closes leaves no series stuck at its last value. The tracker drops
+// the state afterwards; a pool recreated at the same address starts again from
+// zero.
 func (s *poolState) closePool(ctx context.Context, metrics *poolMetrics) {
-	if used := int64(len(s.checkedOut)); used > 0 {
+	used := s.checkedOut.total
+	if used > 0 {
 		s.addConnectionCount(ctx, metrics, -used, s.usedAddOpt)
 	}
-	if idle := s.total - int64(len(s.checkedOut)); idle > 0 {
+	if idle := s.ready.total - used; idle > 0 {
 		s.addConnectionCount(ctx, metrics, -idle, s.idleAddOpt)
 	}
 	if s.pending > 0 {

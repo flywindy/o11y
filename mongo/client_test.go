@@ -249,6 +249,299 @@ func TestInstrument_ComposesExistingPoolMonitorAndRecordsPoolMetrics(t *testing.
 	assert.NoError(t, cleanup(context.Background()))
 }
 
+// TestInstrument_PoolMetricsIgnoreConnectionsThatNeverBecameReady pins that a
+// connection the driver closes before it ever became ready leaves the idle
+// gauge alone.
+//
+// The v2 driver creates a connection, and on a handshake failure removes it
+// (x/mongo/driver/topology/pool.go removeConnection) with a ConnectionClosed
+// event and no ConnectionReady in between. Counting that close would take one
+// off a gauge nothing had ever added to, and since only ConnectionPoolClosed
+// resets the state, every later handshake failure — an auth outage, a TLS
+// flap, a pool clear and reconnect storm — would drive the reported idle count
+// further below the pool's real size for the life of the process.
+func TestInstrument_PoolMetricsIgnoreConnectionsThatNeverBecameReady(t *testing.T) {
+	tp, prop, _ := newTestProviders()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithView(MetricViews(testHistogramBuckets)...),
+	)
+
+	opts := options.Client().ApplyURI("mongodb://mongo-a:27017")
+	cleanup, err := Instrument(opts, tp, provider, prop, WithPoolName("chat-mongo"))
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, cleanup(context.Background())) })
+
+	const addr = "mongo-a:27017"
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolCreated, addr, 0, &event.MonitorPoolOptions{MaxPoolSize: 12})
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, addr, 1, time.Millisecond, nil)
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, addr, 2, time.Millisecond, nil)
+
+	idleAttrs := []attribute.KeyValue{
+		semconv.DBSystemNameMongoDB,
+		semconv.DBClientConnectionPoolName("chat-mongo"),
+		semconv.ServerAddress("mongo-a"),
+		semconv.ServerPort(27017),
+		semconv.DBClientConnectionStateIdle,
+	}
+	usedAttrs := []attribute.KeyValue{
+		semconv.DBSystemNameMongoDB,
+		semconv.DBClientConnectionPoolName("chat-mongo"),
+		semconv.ServerAddress("mongo-a"),
+		semconv.ServerPort(27017),
+		semconv.DBClientConnectionStateUsed,
+	}
+	idleCount := func() int64 {
+		rm := collectMongoMetrics(t, reader)
+		return int64MetricValue(t, findMetric(t, rm, "db.client.connection.count"), idleAttrs...)
+	}
+	require.Equal(t, int64(2), idleCount(), "two ready connections are two idle connections")
+
+	// Two dials whose handshakes fail: created, then closed, never ready.
+	for _, id := range []int64{3, 4} {
+		emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionCreated, addr, id, 0, nil)
+		emitPoolEventWithReasonAndConnectionID(opts.PoolMonitor, event.ConnectionClosed, addr, id, event.ReasonError)
+		assert.Equalf(t, int64(2), idleCount(),
+			"a connection closed before it became ready (id %d) must not change the idle count", id)
+	}
+
+	// A connection that did become ready still decrements when it closes.
+	emitPoolEventWithReasonAndConnectionID(opts.PoolMonitor, event.ConnectionClosed, addr, 2, event.ReasonIdle)
+	assert.Equal(t, int64(1), idleCount(), "closing a ready connection decrements idle")
+
+	// Nothing was ever checked out, so the used series must not exist at all.
+	rm := collectMongoMetrics(t, reader)
+	count, ok := findMetric(t, rm, "db.client.connection.count").Data.(metricdata.Sum[int64])
+	require.True(t, ok)
+	for _, dp := range count.DataPoints {
+		assert.Falsef(t, attributesContain(dp.Attributes, usedAttrs...),
+			"nothing was ever checked out, so no used series should exist: %v", dp)
+	}
+
+	// The two failed handshakes must not have recorded a create time either.
+	createTime, ok := findMetric(t, rm, "db.client.connection.create_time").Data.(metricdata.Histogram[float64])
+	require.True(t, ok)
+	require.Len(t, createTime.DataPoints, 1)
+	assert.Equal(t, uint64(2), createTime.DataPoints[0].Count,
+		"only the connections that became ready record a create time")
+}
+
+// TestInstrument_PoolMetricsCountTwoPoolsSharingConnectionIDs pins that two
+// driver pools at one address keep separate places on the gauges even though
+// they hand out the same connection IDs.
+//
+// The v2 driver numbers connections from a counter held by the pool
+// (x/mongo/driver/topology/pool.go, nextID), so every pool starts again at 1.
+// Instrument mutates the ClientOptions it is given, so a caller that passes
+// the same options to mongo.Connect twice gets two pools behind one tracker,
+// and at one address they share a poolState. Treating the ID as unique would
+// drop the second pool's connection and let either pool's close take the
+// shared entry off the gauge, so the idle count could reach zero with a
+// connection still open.
+func TestInstrument_PoolMetricsCountTwoPoolsSharingConnectionIDs(t *testing.T) {
+	tp, prop, _ := newTestProviders()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithView(MetricViews(testHistogramBuckets)...),
+	)
+
+	opts := options.Client().ApplyURI("mongodb://mongo-a:27017")
+	cleanup, err := Instrument(opts, tp, provider, prop, WithPoolName("chat-mongo"))
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, cleanup(context.Background())) })
+
+	const addr = "mongo-a:27017"
+	baseAttrs := []attribute.KeyValue{
+		semconv.DBSystemNameMongoDB,
+		semconv.DBClientConnectionPoolName("chat-mongo"),
+		semconv.ServerAddress("mongo-a"),
+		semconv.ServerPort(27017),
+	}
+	stateCount := func(state attribute.KeyValue) int64 {
+		rm := collectMongoMetrics(t, reader)
+		return int64MetricValue(t, findMetric(t, rm, "db.client.connection.count"),
+			appendAttribute(baseAttrs, state)...)
+	}
+	idleCount := func() int64 { return stateCount(semconv.DBClientConnectionStateIdle) }
+	usedCount := func() int64 { return stateCount(semconv.DBClientConnectionStateUsed) }
+
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolCreated, addr, 0, &event.MonitorPoolOptions{MaxPoolSize: 12})
+
+	// Both pools' first connection: the same ID, two live connections.
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, addr, 1, time.Millisecond, nil)
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, addr, 1, time.Millisecond, nil)
+	require.Equal(t, int64(2), idleCount(), "two pools each reporting connection 1 are two idle connections")
+
+	// Each pool checks its connection out.
+	for range 2 {
+		emitPoolEvent(opts.PoolMonitor, event.ConnectionCheckOutStarted, addr, 0, nil)
+		emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionCheckedOut, addr, 1, 0, nil)
+	}
+	assert.Equal(t, int64(2), usedCount(), "both connections are checked out")
+	assert.Equal(t, int64(0), idleCount(), "neither connection is idle while both are checked out")
+
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionCheckedIn, addr, 1, 0, nil)
+	assert.Equal(t, int64(1), usedCount(), "checking one in leaves the other checked out")
+	assert.Equal(t, int64(1), idleCount(), "the connection checked in is idle again")
+
+	// One pool closes its connection; the other's must survive.
+	emitPoolEventWithReasonAndConnectionID(opts.PoolMonitor, event.ConnectionClosed, addr, 1, event.ReasonError)
+	assert.Equal(t, int64(0), usedCount(), "the close unwinds the connection that was checked out")
+	assert.Equal(t, int64(1), idleCount(), "the other pool's connection is still open")
+
+	emitPoolEventWithReasonAndConnectionID(opts.PoolMonitor, event.ConnectionClosed, addr, 1, event.ReasonIdle)
+	assert.Equal(t, int64(0), idleCount(), "closing the last connection empties the gauge")
+
+	// Both connections handshook, so both recorded a create time.
+	rm := collectMongoMetrics(t, reader)
+	createTime, ok := findMetric(t, rm, "db.client.connection.create_time").Data.(metricdata.Histogram[float64])
+	require.True(t, ok)
+	require.Len(t, createTime.DataPoints, 1)
+	assert.Equal(t, uint64(2), createTime.DataPoints[0].Count,
+		"each pool's connection records its own create time")
+}
+
+// TestInstrument_PoolMetricsBoundMisattributionAcrossPools pins the residual
+// error when two pools at one address share a poolState, and pins that it
+// cannot compound.
+//
+// Which pool a ConnectionClosed came from is not decidable from the event
+// stream: event.PoolEvent carries the server address and nothing identifying a
+// pool. A close of a connection that never became ready can therefore consume a
+// ready entry belonging to the other pool. The guarantee is that it stays
+// within one connection and heals — the count stops at zero, so every further
+// failed handshake under the same ID is ignored rather than taking one more off
+// the gauge. That bound is the whole difference from the counter this replaced,
+// where each failed handshake moved the gauge one further from the truth for
+// the life of the process.
+func TestInstrument_PoolMetricsBoundMisattributionAcrossPools(t *testing.T) {
+	tp, prop, _ := newTestProviders()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithView(MetricViews(testHistogramBuckets)...),
+	)
+
+	opts := options.Client().ApplyURI("mongodb://mongo-a:27017")
+	cleanup, err := Instrument(opts, tp, provider, prop, WithPoolName("chat-mongo"))
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, cleanup(context.Background())) })
+
+	const addr = "mongo-a:27017"
+	idleAttrs := []attribute.KeyValue{
+		semconv.DBSystemNameMongoDB,
+		semconv.DBClientConnectionPoolName("chat-mongo"),
+		semconv.ServerAddress("mongo-a"),
+		semconv.ServerPort(27017),
+		semconv.DBClientConnectionStateIdle,
+	}
+	idleCount := func() int64 {
+		rm := collectMongoMetrics(t, reader)
+		return int64MetricValue(t, findMetric(t, rm, "db.client.connection.count"), idleAttrs...)
+	}
+
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolCreated, addr, 0, &event.MonitorPoolOptions{MaxPoolSize: 12})
+
+	// Pool A's first connection is ready.
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionCreated, addr, 1, 0, nil)
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, addr, 1, time.Millisecond, nil)
+	require.Equal(t, int64(1), idleCount())
+
+	// Pool B's first connection has the same ID and fails its handshake. The
+	// close cannot be told apart from pool A's connection closing, so it is
+	// booked against pool A's entry: one connection's worth of error.
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionCreated, addr, 1, 0, nil)
+	emitPoolEventWithReasonAndConnectionID(opts.PoolMonitor, event.ConnectionClosed, addr, 1, event.ReasonError)
+	require.Equal(t, int64(0), idleCount(), "the misattributed close costs one connection")
+
+	// Pool B keeps failing. Each further failure must be free: the ready count
+	// is already zero, so there is nothing left to take off the gauge. This is
+	// the bound — the error cannot grow, and the gauge cannot go negative.
+	for attempt := range 5 {
+		emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionCreated, addr, 1, 0, nil)
+		emitPoolEventWithReasonAndConnectionID(opts.PoolMonitor, event.ConnectionClosed, addr, 1, event.ReasonError)
+		require.Equalf(t, int64(0), idleCount(),
+			"failed handshake %d must not take another connection off the gauge", attempt+2)
+	}
+
+	// Pool B finally connects, and both pools drain. The gauge comes back to
+	// the truth rather than staying skewed for the life of the process.
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, addr, 1, time.Millisecond, nil)
+	assert.Equal(t, int64(1), idleCount())
+	emitPoolEventWithReasonAndConnectionID(opts.PoolMonitor, event.ConnectionClosed, addr, 1, event.ReasonIdle)
+	assert.Equal(t, int64(0), idleCount())
+	emitPoolEventWithReasonAndConnectionID(opts.PoolMonitor, event.ConnectionClosed, addr, 1, event.ReasonIdle)
+	assert.Equal(t, int64(0), idleCount(), "the gauge settles at zero once both pools are drained")
+}
+
+// TestInstrument_PoolMetricsKeepSurvivingPoolWhenOneClosed pins that closing
+// one of two pools that share a poolState leaves the other pool's connections
+// on the gauges.
+//
+// ConnectionPoolClosed precedes the ConnectionClosed events for the
+// connections the closing pool drops, so those reconcile themselves. Unwinding
+// the whole state on the first pool close would take the surviving pool's open
+// connections off with them, and nothing would put them back: the driver emits
+// ConnectionReady once per connection, so one that is already open is never
+// re-announced. The surviving pool's connections would read as zero until it
+// closed too.
+func TestInstrument_PoolMetricsKeepSurvivingPoolWhenOneClosed(t *testing.T) {
+	tp, prop, _ := newTestProviders()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(
+		sdkmetric.WithReader(reader),
+		sdkmetric.WithView(MetricViews(testHistogramBuckets)...),
+	)
+
+	opts := options.Client().ApplyURI("mongodb://mongo-a:27017")
+	cleanup, err := Instrument(opts, tp, provider, prop, WithPoolName("chat-mongo"))
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, cleanup(context.Background())) })
+
+	const addr = "mongo-a:27017"
+	baseAttrs := []attribute.KeyValue{
+		semconv.DBSystemNameMongoDB,
+		semconv.DBClientConnectionPoolName("chat-mongo"),
+		semconv.ServerAddress("mongo-a"),
+		semconv.ServerPort(27017),
+	}
+	idleCount := func() int64 {
+		rm := collectMongoMetrics(t, reader)
+		return int64MetricValue(t, findMetric(t, rm, "db.client.connection.count"),
+			appendAttribute(baseAttrs, semconv.DBClientConnectionStateIdle)...)
+	}
+	maxValue := func() int64 {
+		rm := collectMongoMetrics(t, reader)
+		return int64MetricValue(t, findMetric(t, rm, "db.client.connection.max"), baseAttrs...)
+	}
+
+	// Two pools at one address, each with its own connection 1.
+	poolOpts := &event.MonitorPoolOptions{MaxPoolSize: 12}
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolCreated, addr, 0, poolOpts)
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolCreated, addr, 0, poolOpts)
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, addr, 1, time.Millisecond, nil)
+	emitPoolEventWithConnectionID(opts.PoolMonitor, event.ConnectionReady, addr, 1, time.Millisecond, nil)
+	require.Equal(t, int64(2), idleCount())
+
+	// The first pool closes. Its connection has not been reported closed yet,
+	// so nothing comes off the gauge here.
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolClosed, addr, 0, nil)
+	assert.Equal(t, int64(2), idleCount(),
+		"the pool close itself takes nothing off; the connection closes that follow do")
+	assert.Equal(t, int64(12), maxValue(), "the surviving pool still has its limit")
+
+	// The closing pool's connection is reported closed, and only that one.
+	emitPoolEventWithReasonAndConnectionID(opts.PoolMonitor, event.ConnectionClosed, addr, 1, event.ReasonPoolClosed)
+	assert.Equal(t, int64(1), idleCount(), "the surviving pool's connection stays on the gauge")
+
+	// The surviving pool closes too, and now the state unwinds for good.
+	emitPoolEvent(opts.PoolMonitor, event.ConnectionPoolClosed, addr, 0, nil)
+	assert.Equal(t, int64(0), idleCount(), "the last pool close unwinds what is left")
+	assert.Equal(t, int64(0), maxValue(), "and takes the limit off with it")
+}
+
 // TestInstrument_PoolMetricsDefaultPoolNameAndOmitUnboundedMax verifies
 // fallback pool-name derivation and omission of unbounded max pool size.
 func TestInstrument_PoolMetricsDefaultPoolNameAndOmitUnboundedMax(t *testing.T) {
@@ -693,6 +986,23 @@ func emitPoolEventWithConnectionID(
 		ConnectionID: connectionID,
 		Duration:     duration,
 		PoolOptions:  poolOptions,
+	})
+}
+
+// emitPoolEventWithReasonAndConnectionID emits a pool event carrying both a
+// connection ID and a reason, which is the shape the driver uses to report a
+// connection it closed and why.
+func emitPoolEventWithReasonAndConnectionID(
+	monitor *event.PoolMonitor,
+	eventType, address string,
+	connectionID int64,
+	reason string,
+) {
+	monitor.Event(&event.PoolEvent{
+		Type:         eventType,
+		Address:      address,
+		ConnectionID: connectionID,
+		Reason:       reason,
 	})
 }
 

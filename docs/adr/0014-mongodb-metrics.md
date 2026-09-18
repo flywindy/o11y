@@ -108,13 +108,67 @@ go-redis's `PoolStats()`.
 
 | Metric | Type | Source (driver `event.PoolEvent` / options) |
 |---|---|---|
-| `db.client.connection.count` `{state=used\|idle}` | up-down counter | running counters: `ConnectionReady`−`ConnectionClosed` = total; `ConnectionCheckedOut`−`ConnectionCheckedIn` = used; idle = total−used |
+| `db.client.connection.count` `{state=used\|idle}` | up-down counter | the connections seen in `ConnectionReady` and not yet in `ConnectionClosed` = total; `ConnectionCheckedOut`−`ConnectionCheckedIn` = used; idle = total−used. See the amendment below on why readiness is tracked per connection rather than with a counter. |
 | `db.client.connection.max` | up-down counter | `PoolOptions.MaxPoolSize` (from `ConnectionPoolCreated`/`Ready`); omit if 0 (unbounded) |
 | `db.client.connection.idle.min` | up-down counter | `PoolOptions.MinPoolSize` |
 | `db.client.connection.idle.max` | — | **omit**; MongoDB has no max-idle concept |
 | `db.client.connection.timeouts` | counter | count of `ConnectionCheckOutFailed` with `Reason == event.ReasonTimedOut` |
 | `db.client.connection.create_time` | histogram (s) | `ConnectionReady.Duration` |
 | `db.client.connection.pending_requests` | up-down counter | `ConnectionCheckOutStarted` − (`ConnectionCheckedOut` + `ConnectionCheckOutFailed`) |
+
+##### Amendment (2026-09-18): count only connections that became ready
+
+The count model above originally read `ConnectionReady` − `ConnectionClosed`,
+which treats the two events as a matched pair. They are not. The v2 driver
+creates a connection before it handshakes, and when the handshake fails it
+removes the connection — `x/mongo/driver/topology/pool.go`, `removeConnection`
+— with a `ConnectionClosed` event and no `ConnectionReady` before it. A plain
+counter therefore decrements for a connection it never counted, reporting
+fewer idle connections than the pool holds; and because only
+`ConnectionPoolClosed` resets the state, an auth outage, a TLS flap or a pool
+clear with a reconnect storm drives the gauge further from the truth for the
+life of the process.
+
+The tracker therefore keeps, per driver connection ID, the number of
+connections that reached `ConnectionReady` and have not been closed, and
+unwinds a `ConnectionClosed` only for an ID it still holds. The total is
+maintained by the same two operations that mutate that map, so the two cannot
+drift apart.
+
+The ID is counted rather than used as a unique key because it is only unique
+within one driver pool: the pool numbers its connections from a counter of its
+own (`x/mongo/driver/topology/pool.go`, `nextID`), so every pool starts again
+at 1. `Instrument` mutates the `*options.ClientOptions` it is given, so a
+caller that passes the same options to `mongo.Connect` twice gets two pools
+behind one tracker, and at one address they share a state. Treating the ID as
+unique would drop the second pool's connection from the gauges and let either
+pool's close remove the shared entry, so the idle count could reach zero with a
+connection still open. The driver emits `ConnectionReady`,
+`ConnectionCheckedOut` and `ConnectionClosed` once per connection, so a repeat
+under one ID is a second pool rather than a duplicate event.
+
+Counting bounds that case rather than removing it. Which pool a
+`ConnectionClosed` came from is not decidable from the event stream:
+`event.PoolEvent` carries the server address and nothing that identifies a pool
+(`ServiceID` names a mongos in a load-balanced deployment, and only on
+`PoolCleared`). A close of a connection that never became ready can therefore
+consume a ready entry the other pool owns, and a close of an idle connection
+can be booked against the other pool's checked-out entry. Both stay within one
+connection and heal: the count stops at zero, so a repeated misattribution
+cannot compound, and the gauges return to the truth as the pools drain — which
+is the property the counter lacked. Callers avoid the ambiguity entirely by
+giving each `mongo.Client` its own `Instrument` call, which `Instrument`'s doc
+comment now says.
+
+One piece of pool-level bookkeeping the event stream *does* supply exactly is
+how many pools exist: the driver emits `ConnectionPoolCreated` and
+`ConnectionPoolClosed` once each per pool. The state therefore counts its live
+pools and unwinds the gauges only when the last one closes. Unwinding on the
+first `ConnectionPoolClosed` would take the surviving pool's open connections
+off with the closing pool's, and nothing would put them back, since a
+connection that is already open is never re-announced. The closing pool's own
+connections still reconcile themselves, because `ConnectionPoolClosed` precedes
+the `ConnectionClosed` events for the connections it drops.
 
 Implementation note: the merged Phase 2 implementation follows the synchronous
 instrument kinds in OTel semconv v1.39.0: `count`, `max`, `idle.min`, and
