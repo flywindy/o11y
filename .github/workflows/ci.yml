@@ -117,12 +117,11 @@ jobs:
           govulncheck ./...
 
   sast:
-    # gosec is intentionally not run here yet — see the note on GOSEC_FLAGS in
-    # the Makefile. It surfaced 12 pre-existing findings unrelated to the
-    # credential-literal gap this job exists to catch; wiring it in as a
-    # blocking gate needs a human triage pass first (fix vs justified
-    # #nosec), tracked separately. `make sast-gosec` stays runnable locally.
-    name: sast (repo-owned semgrep rules)
+    # gosec's credential half (G101) now blocks here; the rest of gosec still
+    # does not — see the note on GOSEC_FLAGS in the Makefile. Those remaining
+    # findings (G115, G304/G703, G404, G306, G102) need a human triage pass
+    # first, tracked separately, and `make sast-gosec` stays runnable for it.
+    name: sast (semgrep rules, credential directives, gosec G101)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -140,12 +139,12 @@ jobs:
       # Installs the pinned SAST toolchain (gosec, semgrep) via the Makefile
       # so CI and local `make sast` stay in lockstep. pipx is preinstalled on
       # ubuntu-latest; add its bin dir to PATH for the semgrep scan step.
-      # gosec installs here too even though `make sast` below does not run it
-      # yet, so `make sast-gosec` works out of the box for anyone triaging it.
+      # `make sast` now runs gosec's G101 gate, so the gosec binary this
+      # installs is load-bearing here rather than only for local triage.
       - name: Install SAST tools
         run: |
           make tools
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: SAST (repo-owned semgrep rules, fail on medium+)
+      - name: SAST (semgrep rules, credential directives, gosec G101; fail on medium+)
         run: make sast
