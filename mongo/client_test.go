@@ -774,6 +774,9 @@ func emitPoolEventWithConnectionID(
 	})
 }
 
+// emitPoolEventWithReasonAndConnectionID emits a pool event carrying both a
+// connection ID and a reason, which is the shape the driver uses to report a
+// connection it closed and why.
 func emitPoolEventWithReasonAndConnectionID(
 	monitor *event.PoolMonitor,
 	eventType, address string,
