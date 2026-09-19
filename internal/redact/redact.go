@@ -49,7 +49,7 @@ func URL(raw string) string {
 	if raw == "" {
 		return raw
 	}
-	if !strings.Contains(raw, "@") && !credentialQueryParam.MatchString(raw) {
+	if !strings.Contains(raw, "@") && !hasCredentialQuery(raw) {
 		// No userinfo is possible without an "@" and no credential query
 		// parameter is present, so the common case skips parsing entirely and
 		// returns the operator's exact string.
@@ -238,21 +238,43 @@ var credentialQueryKeys = map[string]struct{}{
 	"x-goog-signature": {},
 }
 
-// credentialQueryParam matches the beginning of a credential query parameter
-// anywhere in a string: a "?" or "&", one of credentialQueryKeys, and the "="
-// that opens its value. The alternation is built from the map above so the two
-// cannot drift apart.
-var credentialQueryParam = regexp.MustCompile(`(?i)[?&](?:` + credentialQueryAlternation() + `)=`)
+// queryParam matches the beginning of any query parameter anywhere in a
+// string: a "?" or "&", the key, and the "=" that opens its value.
+//
+// It deliberately does not spell out the credential keys. A key is
+// percent-encoded text, and net/url decodes it before anything sees it
+// (url.parseQuery runs QueryUnescape on the key, not only the value), so
+// "?Sign%61ture=" is the parameter "Signature" to every server and to
+// url.Values. A pattern matching literal spellings would let that through
+// while redactQuery, which decodes, treats the same URL as a credential —
+// the two disagreeing is how an encoded key reached a log line. So the
+// pattern finds the keys and isCredentialQueryKey decides, once, for both.
+var queryParam = regexp.MustCompile(`[?&]([^&=?#\s"']*)=`)
 
-// credentialQueryAlternation renders credentialQueryKeys as a regexp
-// alternation, sorted so the pattern does not depend on map iteration order.
-func credentialQueryAlternation() string {
-	keys := make([]string, 0, len(credentialQueryKeys))
-	for key := range credentialQueryKeys {
-		keys = append(keys, regexp.QuoteMeta(key))
+// isCredentialQueryKey reports whether a raw query key, as it appears in a
+// URL, names one of credentialQueryKeys once decoded.
+//
+// A key that cannot be unescaped is compared as it stands: it decodes to
+// nothing a server would read as a known key, and guessing at it would only
+// risk mangling a parameter that is not a credential.
+func isCredentialQueryKey(rawKey string) bool {
+	decoded, err := url.QueryUnescape(rawKey)
+	if err != nil {
+		decoded = rawKey
 	}
-	sort.Strings(keys)
-	return strings.Join(keys, "|")
+	_, ok := credentialQueryKeys[strings.ToLower(decoded)]
+	return ok
+}
+
+// hasCredentialQuery reports whether text carries a credential query
+// parameter at all, whatever its value.
+func hasCredentialQuery(text string) bool {
+	for _, match := range queryParam.FindAllStringSubmatchIndex(text, -1) {
+		if isCredentialQueryKey(text[match[2]:match[3]]) {
+			return true
+		}
+	}
+	return false
 }
 
 // escapedOpaquePlaceholder is what redactQuery writes in place of a credential
@@ -278,7 +300,10 @@ var escapedOpaquePlaceholder = url.QueryEscape(opaquePlaceholder)
 // arriving with "Signature=%5Bredacted%5D" already carries "[redacted]" as its
 // signature, and a longer value with that prefix does not match.
 func unaccountedCredentialQuery(text string) bool {
-	for _, match := range credentialQueryParam.FindAllStringIndex(text, -1) {
+	for _, match := range queryParam.FindAllStringSubmatchIndex(text, -1) {
+		if !isCredentialQueryKey(text[match[2]:match[3]]) {
+			continue
+		}
 		value := text[match[1]:]
 		if end := strings.IndexAny(value, "&\"' \t\r\n"); end >= 0 {
 			value = value[:end]
@@ -333,9 +358,10 @@ func URLAttribute(u *url.URL) string {
 // The query is rewritten in place rather than through url.Values, whose Encode
 // sorts the parameters and re-escapes every value: url.full is meant to be the
 // URL that was requested, and reordering it would make a span attribute that no
-// longer matches the access log beside it. A parameter whose key cannot be
-// unescaped is left as it stands — it matches none of the known keys, and
-// guessing at it would only risk mangling a value that is not a credential.
+// longer matches the access log beside it. Which keys count is
+// isCredentialQueryKey's decision, shared with the rule InText applies to free
+// text, so a percent-encoded key cannot be a credential to one and not the
+// other.
 func redactQuery(rawQuery string) (string, bool) {
 	var (
 		builder strings.Builder
@@ -347,11 +373,7 @@ func redactQuery(rawQuery string) (string, bool) {
 			builder.WriteByte('&')
 		}
 		key, _, hasValue := strings.Cut(pair, "=")
-		decoded, err := url.QueryUnescape(key)
-		if err != nil {
-			decoded = key
-		}
-		if _, ok := credentialQueryKeys[strings.ToLower(decoded)]; !ok || !hasValue {
+		if !hasValue || !isCredentialQueryKey(key) {
 			builder.WriteString(pair)
 			continue
 		}
