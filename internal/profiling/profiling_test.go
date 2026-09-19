@@ -245,11 +245,34 @@ func TestPyroscopeSlogAdapter_LevelsAndEmptyLoggerAreUnchanged(t *testing.T) {
 func TestAuthHeaderSecrets_SortsAndDropsEmpties(t *testing.T) {
 	assert.Nil(t, authHeaderSecrets(nil))
 	assert.Nil(t, authHeaderSecrets(map[string]string{}))
-	assert.Equal(t, []string{"aaa", "bbb"}, authHeaderSecrets(map[string]string{
+	// Names are listed too, in the configured and the canonical MIME form,
+	// and a name survives an empty value — the name is the thing that might
+	// be the credential.
+	assert.Equal(t, []string{
+		"Authorization", "X-Empty", "X-Scope-OrgID", "X-Scope-Orgid", "aaa", "bbb",
+	}, authHeaderSecrets(map[string]string{
 		"X-Scope-OrgID": "bbb",
 		"Authorization": "aaa",
 		"X-Empty":       "",
 	}))
+}
+
+// TestAuthHeaderSecrets_CoversTheCanonicalName pins the form net/http actually
+// sends a header name as.
+//
+// Header.Set does not key by the name it was given — it keys by
+// textproto.CanonicalMIMEHeaderKey — so a credential supplied as a header name
+// reaches the server canonicalized, and the pinned uploader puts a failed
+// upload's whole response body into its ERROR line.
+func TestAuthHeaderSecrets_CoversTheCanonicalName(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header name, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const pastedAsAName = "x-secret-glc-token"
+
+	secrets := authHeaderSecrets(map[string]string{pastedAsAName: "1"})
+
+	assert.Contains(t, secrets, pastedAsAName, "the configured spelling")
+	assert.Contains(t, secrets, "X-Secret-Glc-Token", "and the one that goes on the wire")
 }
 
 // TestAuthHeaderSecrets_CoversTheEscapedForm pins that a value whose rendering
@@ -257,12 +280,12 @@ func TestAuthHeaderSecrets_SortsAndDropsEmpties(t *testing.T) {
 // the OTLP headers. redact.Secrets matches literally, so one form does not
 // cover the other; a value the escaping leaves alone is listed once.
 func TestAuthHeaderSecrets_CoversTheEscapedForm(t *testing.T) {
-	assert.Equal(t, []string{"tab\there", "tab\\there"}, authHeaderSecrets(map[string]string{
+	assert.Equal(t, []string{"Authorization", "tab\there", "tab\\there"}, authHeaderSecrets(map[string]string{
 		"Authorization": "tab\there",
 	}))
-	assert.Equal(t, []string{"plain"}, authHeaderSecrets(map[string]string{
+	assert.Equal(t, []string{"Authorization", "plain"}, authHeaderSecrets(map[string]string{
 		"Authorization": "plain",
-	}), "a value %q leaves alone is not listed twice")
+	}), "a value %q leaves alone is not listed twice, and neither is a name already canonical")
 }
 
 // TestPyroscopeSlogAdapter_RedactsAnEscapedAuthHeader pins the scrub reaching a

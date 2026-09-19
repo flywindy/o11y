@@ -225,36 +225,43 @@ func newPyroscopeSlogAdapter(cfg Config) pyroscopeSlogAdapter {
 	}
 }
 
-// authHeaderSecrets returns the configured profiling auth header values, so
+// authHeaderSecrets returns the configured profiling auth headers, so
 // redact.Secrets can take them out of a line that echoes one.
 //
-// Each value is listed in its raw form, in the form net/http actually puts on
-// the wire, and in the Go-escaped form of each — matching what
-// diagnosticSecrets does for the OTLP headers. Secrets matches literally, so a
-// caller that prints a value with %q produces text the raw form does not cover,
-// and a value configured with surrounding whitespace is sent without that: the
-// pinned uploader puts a failed upload's whole response body into its ERROR
-// line, so a server that echoes the header it received would print the wire
-// form, which the configured one does not match. Nothing in the pinned
-// pyroscope or net/http is known to quote a header value — Go's own
-// invalid-header error names the header, not what it held — but this adapter's
-// whole premise is that it does not get to choose what the upstream formats
-// into a message.
+// Names as well as values. A credential pasted into the wrong side of a header
+// configuration is still a credential, diagnosticSecrets already treats OTLP
+// header names that way, and the pinned uploader puts a failed upload's whole
+// response body into its ERROR line — so a server that reports the headers it
+// received can name one. The cost is that a line legitimately mentioning a
+// configured name loses it: with "Authorization" configured, pyroscope's
+// auth-token deprecation warning reads "set the [redacted] header manually".
+// That is the trade this package makes everywhere else.
+//
+// Each of those is listed in four renderings, matching diagnosticSecrets:
+//
+//   - as configured, because something may echo the configuration;
+//   - as net/http puts it on the wire, which for a value is trimmed
+//     (redact.HeaderWireValue) and for a name is the canonical MIME form
+//     (redact.HeaderWireName), because that is what a server receives;
+//   - and each of those as %q renders it, because redact.Secrets matches
+//     literally and a caller that quotes a value produces text the raw form
+//     does not cover.
+//
+// Nothing in the pinned pyroscope or net/http is known to quote a header value
+// — Go's own invalid-header error names the header, not what it held — but
+// this adapter's whole premise is that it does not get to choose what the
+// upstream formats into a message.
 //
 // The result is sorted to keep it independent of map iteration order.
 func authHeaderSecrets(headers map[string]string) []string {
 	if len(headers) == 0 {
 		return nil
 	}
-	seen := make(map[string]struct{}, len(headers)*4)
-	secrets := make([]string, 0, len(headers)*4)
-	for _, value := range headers {
-		wire := redact.HeaderWireValue(value)
-		forms := []string{
-			value, redact.GoEscaped(value),
-			wire, redact.GoEscaped(wire),
-		}
-		for _, form := range forms {
+	seen := make(map[string]struct{}, len(headers)*8)
+	secrets := make([]string, 0, len(headers)*8)
+	add := func(base string) {
+		wire := redact.HeaderWireValue(base)
+		for _, form := range []string{base, redact.GoEscaped(base), wire, redact.GoEscaped(wire)} {
 			if form == "" {
 				continue
 			}
@@ -264,6 +271,11 @@ func authHeaderSecrets(headers map[string]string) []string {
 			seen[form] = struct{}{}
 			secrets = append(secrets, form)
 		}
+	}
+	for name, value := range headers {
+		add(name)
+		add(redact.HeaderWireName(name))
+		add(value)
 	}
 	sort.Strings(secrets)
 	return secrets
