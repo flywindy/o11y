@@ -2,7 +2,6 @@
 package redact
 
 import (
-	"errors"
 	"fmt"
 	"net/url"
 	"reflect"
@@ -335,11 +334,14 @@ func Error(err error, endpoints, secrets []string) error {
 	if err == nil {
 		return nil
 	}
-	original := ErrorText(err)
+	original, rendered := renderError(err)
 	msg := Secrets(errorText(original, err, endpoints), secrets...)
-	if msg == original {
+	if rendered && msg == original {
 		return err
 	}
+	// A broken error is wrapped even when its placeholder needs no redaction.
+	// Returning it unchanged would hand the caller back the value whose Error
+	// method panics, and every caller here renders the result again.
 	return &redactedError{msg: msg, err: err}
 }
 
@@ -351,15 +353,80 @@ func Error(err error, endpoints, secrets []string) error {
 // url.full attribute would have carried — and substituting a redaction of the
 // parsed URL is precise where pattern-matching the message is guesswork.
 // Anything else falls back to InText's closed rule.
+//
+// Each URL is substituted in both the form it holds and the form %q renders it
+// as: url.Error.Error formats the field with %q, so a URL containing a quote or
+// a control character appears in the message only escaped, and replacing the
+// raw form alone would be a silent no-op.
+//
+// A URL the parser cannot account for takes the whole message with it. The
+// message quotes such a URL in full, and neither URLAttribute nor InText's "@"
+// rule can speak for what is inside it — a signed query carries its credential
+// with no "@" anywhere. The span keeps url.full, server.address and error.type,
+// so the request is still identifiable without it.
 func errorText(text string, err error, endpoints []string) string {
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) && urlErr.URL != "" {
-		if parsed, parseErr := url.Parse(urlErr.URL); parseErr == nil {
-			text = strings.ReplaceAll(text, urlErr.URL, URLAttribute(parsed))
+	for _, raw := range errorURLs(err) {
+		parsed, parseErr := url.Parse(raw)
+		if parseErr != nil {
+			return redactedWhole
+		}
+		redacted := URLAttribute(parsed)
+		text = strings.ReplaceAll(text, raw, redacted)
+		if escaped := GoEscaped(raw); escaped != raw {
+			text = strings.ReplaceAll(text, escaped, redacted)
 		}
 	}
 	return InText(text, endpoints...)
 }
+
+// errorURLs returns the URL of every *url.Error in err's chain.
+//
+// errors.As would stop at the first: net/http wraps a transport error in an
+// outer *url.Error, so a RoundTripper that performs a request of its own
+// leaves a second one nested inside, with its own URL quoted into the same
+// message. Both have to be accounted for.
+//
+// Nothing is called on a nil pointer along the way. errors.As reports a typed
+// nil as a match, and both (*url.Error).Unwrap and its Error method read a
+// field, so a chain holding one would otherwise panic here — in Shutdown, that
+// would skip every closer still to run.
+func errorURLs(err error) []string {
+	var urls []string
+	var walk func(error, int)
+	walk = func(e error, depth int) {
+		// The depth cap is for a chain that unwraps into itself; nothing in the
+		// SDK builds one, and an error from a dependency is not the SDK's to
+		// trust with an unbounded walk.
+		if e == nil || depth > maxErrorChainDepth {
+			return
+		}
+		if rv := reflect.ValueOf(e); rv.Kind() == reflect.Pointer && rv.IsNil() {
+			return
+		}
+		// The assertion is on this link only, deliberately: errors.As would
+		// jump to the first match in the whole chain and report a typed nil as
+		// one, which is the pair of behaviours this walk exists to avoid.
+		if urlErr, ok := e.(*url.Error); ok && urlErr.URL != "" { //nolint:errorlint // walking the chain link by link is the point
+			urls = append(urls, urlErr.URL)
+		}
+		// Likewise: this switches on the unwrap interfaces to take the next
+		// step, which is what errors.Is and errors.As do internally, not on a
+		// concrete error type.
+		switch unwrapper := e.(type) { //nolint:errorlint // dispatching on Unwrap, not on an error type
+		case interface{ Unwrap() error }:
+			walk(unwrapper.Unwrap(), depth+1)
+		case interface{ Unwrap() []error }:
+			for _, sub := range unwrapper.Unwrap() {
+				walk(sub, depth+1)
+			}
+		}
+	}
+	walk(err, 0)
+	return urls
+}
+
+// maxErrorChainDepth bounds the walk over an error chain the SDK did not build.
+const maxErrorChainDepth = 64
 
 // redactedError renders a redacted message while still unwrapping to the error
 // it was built from.
@@ -386,14 +453,24 @@ func (e *redactedError) Unwrap() error { return e.err }
 // error for the SDK's own output goes through both, and an error the SDK did
 // not construct is exactly the one that can be broken: Error, the logr sink and
 // the SDK's ErrorHandler all render through it.
-func ErrorText(err error) (text string) {
+func ErrorText(err error) string {
+	text, _ := renderError(err)
+	return text
+}
+
+// renderError renders err, reporting whether the error rendered itself or the
+// guard had to stand in for it. Error needs that apart from the text: a
+// placeholder can equal the redacted message while the error behind it is still
+// one whose Error method panics, and handing that back would move the crash to
+// the caller.
+func renderError(err error) (text string, rendered bool) {
 	if rv := reflect.ValueOf(err); rv.Kind() == reflect.Pointer && rv.IsNil() {
-		return fmt.Sprintf("<nil %T>", err)
+		return fmt.Sprintf("<nil %T>", err), false
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			text = fmt.Sprintf("[omitted: %T panicked while rendering]", err)
+			text, rendered = fmt.Sprintf("[omitted: %T panicked while rendering]", err), false
 		}
 	}()
-	return err.Error()
+	return err.Error(), true
 }

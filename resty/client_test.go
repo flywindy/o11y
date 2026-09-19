@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -263,6 +264,48 @@ func TestWrapRedactsCredentialsFromTheErrorSpan(t *testing.T) {
 	assert.Equal(t, "*resty.ResponseError", exceptionType,
 		"it is the error the hook was handed, unchanged")
 }
+
+// TestWrapRedactsANestedTransportError pins that a credential inside a URL the
+// SDK never saw — one a custom RoundTripper put in its own error — does not
+// reach either of the span's error fields.
+//
+// resty accepts a custom transport, and net/http wraps whatever it returns in
+// an outer *url.Error. The inner one carries its own URL, quoted into the same
+// message, and a signed query holds its credential with no "@" anywhere, so
+// neither substituting the outer URL nor the closed at-sign rule would catch
+// it. A URL that cannot be parsed takes the whole message with it; url.full,
+// server.address and error.type still identify the request.
+func TestWrapRedactsANestedTransportError(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.SetTransport(roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		// #nosec G101 -- fabricated fixture URL, not a live credential
+		// nosemgrep: gosec.G101-1
+		return nil, &url.Error{Op: "Get", URL: "https://inner/%zz?Signature=s3cret", Err: errors.New("dial")}
+	}))
+
+	_, err := client.R().Get("https://api.example.com/orders")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "s3cret", "the premise: the credential is in the error resty is handed")
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	span := spans[0]
+
+	assert.NotContains(t, span.Status().Description, "s3cret")
+	for _, event := range span.Events() {
+		for _, attr := range event.Attributes {
+			assert.NotContains(t, attr.Value.AsString(), "s3cret",
+				"no span event may carry it either")
+		}
+	}
+}
+
+// roundTripperFunc adapts a function to http.RoundTripper.
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+// RoundTrip implements http.RoundTripper.
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
 
 func TestWrapIsIdempotent(t *testing.T) {
 	tp, mp, sr := testProviders()

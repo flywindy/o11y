@@ -342,12 +342,80 @@ func TestErrorText_SurvivesABrokenError(t *testing.T) {
 }
 
 // TestError_SurvivesABrokenError pins that Error renders through the same guard
-// rather than calling the dependency's Error method itself.
+// rather than calling the dependency's Error method itself, and that it hands
+// back something the caller can render again.
+//
+// The second part is the one that matters. A placeholder can equal the redacted
+// message, so an "unchanged, return the original" shortcut would give the
+// caller back the very value whose Error method panics — and every caller here
+// renders the result: resty into the span's status description and its
+// exception event, Shutdown into its log record.
 func TestError_SurvivesABrokenError(t *testing.T) {
 	var typedNil *panickingError
-	assert.NotPanics(t, func() {
-		assert.Equal(t, typedNil, redact.Error(typedNil, nil, nil), "nothing to redact, so unchanged")
-		assert.NotNil(t, redact.Error(&panickingError{}, nil, nil))
+
+	for name, broken := range map[string]error{
+		"typed nil": typedNil,
+		"panicking": &panickingError{},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var got error
+			require.NotPanics(t, func() { got = redact.Error(broken, nil, nil) })
+			require.NotNil(t, got)
+
+			var text string
+			require.NotPanics(t, func() { text = got.Error() },
+				"the caller renders what Error hands back")
+			assert.NotEmpty(t, text)
+			assert.ErrorIs(t, got, broken, "the chain still reaches the original")
+		})
+	}
+}
+
+// TestError_RedactsEveryURLInTheChain pins the two ways a URL reaches an error
+// message that substituting the outermost one alone would miss.
+//
+// net/http wraps a transport error in an outer *url.Error, so a RoundTripper
+// that performs a request of its own leaves a second one nested inside with its
+// own URL. And url.Error.Error formats the field with %q, so a URL holding a
+// character the quoting escapes appears in the message only escaped.
+func TestError_RedactsEveryURLInTheChain(t *testing.T) {
+	t.Run("nested url.Error with an unparseable URL fails closed", func(t *testing.T) {
+		// #nosec G101 -- fabricated fixture URL, not a live credential
+		// nosemgrep: gosec.G101-1
+		inner := &url.Error{Op: "Get", URL: "https://host/%zz?Signature=s3cret", Err: errors.New("dial")}
+		outer := &url.Error{Op: "Get", URL: "https://host/x", Err: inner}
+
+		got := redact.Error(outer, nil, nil).Error()
+
+		assert.NotContains(t, got, "s3cret",
+			"a signed query carries its credential with no @, so the closed rule cannot catch it")
+		assert.Equal(t, "[endpoint redacted]", got)
+	})
+
+	t.Run("nested url.Error with a parseable URL is redacted, not discarded", func(t *testing.T) {
+		// #nosec G101 -- fabricated fixture URL, not a live credential
+		// nosemgrep: gosec.G101-1
+		inner := &url.Error{Op: "Get", URL: "https://host/y?Signature=s3cret", Err: errors.New("dial")}
+		outer := &url.Error{Op: "Get", URL: "https://host/x", Err: inner}
+
+		got := redact.Error(outer, nil, nil).Error()
+
+		assert.NotContains(t, got, "s3cret")
+		assert.Contains(t, got, "host/y", "the rest of the message survives")
+		assert.Contains(t, got, "dial")
+	})
+
+	t.Run("a URL that appears only in its quoted form is still replaced", func(t *testing.T) {
+		// #nosec G101 -- fabricated fixture URL, not a live credential
+		// nosemgrep: gosec.G101-1
+		const raw = "https://host/x?Signature=s3cret&note=\"q\""
+		wrapped := &url.Error{Op: "Get", URL: raw, Err: errors.New("dial")}
+		require.NotContains(t, wrapped.Error(), raw,
+			"the premise: %q escapes the quote, so the raw form is not in the message")
+
+		got := redact.Error(wrapped, nil, nil).Error()
+
+		assert.NotContains(t, got, "s3cret")
 	})
 }
 
