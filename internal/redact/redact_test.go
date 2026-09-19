@@ -698,3 +698,66 @@ func TestHeaderWireValue_MatchesWhatNetHTTPSends(t *testing.T) {
 		})
 	}
 }
+
+// TestCredentialQueryKeysAreDecodedBeforeComparison pins that a
+// percent-encoded credential key is recognised everywhere, not only where the
+// query is parsed.
+//
+// A query key is percent-encoded text and net/url decodes it before anything
+// reads it — `url.parseQuery` runs `QueryUnescape` on the key, not only on the
+// value — so `?Sign%61ture=` is the parameter `Signature` to every server and
+// to `url.Values`. `redactQuery` always decoded; the pattern that `URL`'s fast
+// path and `InText`'s rule were built on matched literal spellings, so the two
+// disagreed about the same URL and the encoded form went through both of them
+// untouched:
+//
+//	URL          = https://pyroscope:4040/ingest?Sign%61ture=s3cret
+//	URLAttribute = https://pyroscope:4040/ingest?Sign%61ture=%5Bredacted%5D
+//
+// One decision now serves both.
+func TestCredentialQueryKeysAreDecodedBeforeComparison(t *testing.T) {
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const encoded = "https://pyroscope:4040/ingest?Sign%61ture=s3cret&name=svc"
+
+	u, err := url.Parse(encoded)
+	require.NoError(t, err)
+	require.Equal(t, []string{"s3cret"}, u.Query()["Signature"],
+		"the premise: net/url decodes the key, so this is a Signature parameter")
+
+	t.Run("URL", func(t *testing.T) {
+		got := redact.URL(encoded)
+		assert.NotContains(t, got, "s3cret")
+		assert.Contains(t, got, "name=svc")
+	})
+
+	t.Run("InText", func(t *testing.T) {
+		got := redact.InText("uploading at " + encoded)
+		assert.NotContains(t, got, "s3cret")
+	})
+
+	t.Run("InText with the endpoint declared", func(t *testing.T) {
+		got := redact.InText(`parse "`+encoded+`": bad`, encoded)
+		assert.NotContains(t, got, "s3cret")
+	})
+
+	t.Run("URLAttribute", func(t *testing.T) {
+		got := redact.URLAttribute(u)
+		assert.NotContains(t, got, "s3cret")
+	})
+}
+
+// TestQueryKeysThatOnlyLookLikeCredentials pins the other side: the wider
+// pattern must not start failing closed on ordinary parameters.
+func TestQueryKeysThatOnlyLookLikeCredentials(t *testing.T) {
+	for _, raw := range []string{
+		"https://host/p?signature_version=4&name=svc",
+		"https://host/p?design=flat",
+		"https://host/p?a=1&b=2",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			assert.Equal(t, raw, redact.URL(raw), "nothing here is a credential key")
+			assert.Equal(t, "at "+raw, redact.InText("at "+raw))
+		})
+	}
+}
