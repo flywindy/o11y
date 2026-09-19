@@ -2,7 +2,10 @@
 package redact
 
 import (
+	"errors"
+	"fmt"
 	"net/url"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -103,16 +106,25 @@ func InText(text string, knownEndpoints ...string) string {
 		}
 		text = strings.ReplaceAll(text, endpoint, URL(endpoint))
 	}
-	text = urlUserinfo.ReplaceAllString(text, "${1}"+placeholder+"@")
-	// The check runs against a probe with this function's own placeholders
-	// stripped: a successful substitution leaves a "redacted@" behind, and
-	// counting that as an unaccounted-for "@" would discard every text it just
-	// made safe.
-	if strings.Contains(strings.ReplaceAll(text, placeholder+"@", ""), "@") {
+	// Substitutions go in as a sentinel first, so the check below counts only
+	// at-signs this function did not account for.
+	//
+	// Stripping "redacted@" from the finished text instead would strip the
+	// input's own: a message holding "//alice:redacted@host" — scheme-relative,
+	// so the pattern above does not match it — would lose the "@" that makes it
+	// fail the rule, and the credential beside it would be returned intact. The
+	// sentinel carries no "@" and is swapped back only after the rule has run.
+	text = urlUserinfo.ReplaceAllString(text, "${1}"+userinfoSentinel)
+	if strings.Contains(text, "@") {
 		return redactedWhole
 	}
-	return text
+	return strings.ReplaceAll(text, userinfoSentinel, placeholder+"@")
 }
+
+// userinfoSentinel stands in for a userinfo match while InText checks that no
+// unaccounted-for "@" survives. It carries no "@" of its own, and the NUL bytes
+// keep it from being confused with anything a URL or an error message can hold.
+const userinfoSentinel = "\x00userinfo\x00"
 
 // opaquePlaceholder replaces a secret Secrets was told about.
 const opaquePlaceholder = "[redacted]"
@@ -301,4 +313,87 @@ func redactQuery(rawQuery string) (string, bool) {
 func GoEscaped(v string) string {
 	q := strconv.Quote(v)
 	return q[1 : len(q)-1]
+}
+
+// Error returns err with credentials removed from its message, keeping the
+// error chain intact.
+//
+// An error travels further than the attribute beside it: a wrapped one is
+// rendered into a log line by whatever handles it, and into a span's
+// exception.message by RecordError. Redacting the attribute while returning
+// the credential in the error moves the leak rather than removing it.
+//
+// endpoints and secrets are the values the caller already knows are sensitive,
+// as InText and Secrets take them; either may be nil.
+//
+// err is returned unchanged when nothing needed redacting, so a caller
+// comparing error values — not only matching with errors.Is — is unaffected in
+// the ordinary case. Otherwise the result unwraps to err, so errors.Is and
+// errors.As still reach whatever the caller is matching on; only the rendered
+// message changes.
+func Error(err error, endpoints, secrets []string) error {
+	if err == nil {
+		return nil
+	}
+	original := ErrorText(err)
+	msg := Secrets(errorText(original, err, endpoints), secrets...)
+	if msg == original {
+		return err
+	}
+	return &redactedError{msg: msg, err: err}
+}
+
+// errorText renders err's message with its credentials removed.
+//
+// A *url.Error is handled through its own URL field rather than by matching the
+// rendered message. net/http builds that field with the password masked and the
+// username kept, and never touches the query, so it is exactly the value a
+// url.full attribute would have carried — and substituting a redaction of the
+// parsed URL is precise where pattern-matching the message is guesswork.
+// Anything else falls back to InText's closed rule.
+func errorText(text string, err error, endpoints []string) string {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.URL != "" {
+		if parsed, parseErr := url.Parse(urlErr.URL); parseErr == nil {
+			text = strings.ReplaceAll(text, urlErr.URL, URLAttribute(parsed))
+		}
+	}
+	return InText(text, endpoints...)
+}
+
+// redactedError renders a redacted message while still unwrapping to the error
+// it was built from.
+type redactedError struct {
+	msg string
+	err error
+}
+
+// Error returns the redacted message, which is what every ordinary rendering
+// of the error — fmt, slog.Any, errors.Join, RecordError — ends up printing.
+func (e *redactedError) Error() string { return e.msg }
+
+// Unwrap returns the error this was built from, so errors.Is and errors.As
+// reach past the redaction to whatever the caller is matching on.
+func (e *redactedError) Unwrap() error { return e.err }
+
+// ErrorText renders err for a diagnostic record without letting a broken error
+// value take the process down: a typed nil pointer is named rather than
+// dereferenced by its own Error method, and an Error method that panics is
+// recovered into a placeholder naming the type. A diagnostic is never worth a
+// crash.
+//
+// It lives beside the redaction because every path that renders an arbitrary
+// error for the SDK's own output goes through both, and an error the SDK did
+// not construct is exactly the one that can be broken: Error, the logr sink and
+// the SDK's ErrorHandler all render through it.
+func ErrorText(err error) (text string) {
+	if rv := reflect.ValueOf(err); rv.Kind() == reflect.Pointer && rv.IsNil() {
+		return fmt.Sprintf("<nil %T>", err)
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			text = fmt.Sprintf("[omitted: %T panicked while rendering]", err)
+		}
+	}()
+	return err.Error()
 }
