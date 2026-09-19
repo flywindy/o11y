@@ -424,3 +424,109 @@ func TestError_RedactsEveryURLInTheChain(t *testing.T) {
 type panickingError struct{}
 
 func (e *panickingError) Error() string { panic("boom") }
+
+// TestError_RedactsOverlappingNestedURLs pins the order the substitutions run
+// in. A nested *url.Error commonly holds the outer one's URL plus a query, so
+// replacing the outer first rewrites its prefix inside the inner occurrence
+// too — and the inner URL, no longer matching, keeps whatever its query
+// carried. Worse, the message then holds an accounted-for "redacted@", so the
+// closed rule sees nothing wrong with it.
+func TestError_RedactsOverlappingNestedURLs(t *testing.T) {
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: gosec.G101-1
+	const outerURL = "https://alice@host/x"
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: gosec.G101-1
+	const innerURL = outerURL + "?Signature=s3cret"
+	require.Contains(t, innerURL, outerURL, "the premise: one URL is a prefix of the other")
+
+	inner := &url.Error{Op: "Get", URL: innerURL, Err: errors.New("dial")}
+	outer := &url.Error{Op: "Get", URL: outerURL, Err: inner}
+
+	got := redact.Error(outer, nil, nil).Error()
+
+	assert.NotContains(t, got, "s3cret")
+	assert.NotContains(t, got, "alice")
+	assert.Contains(t, got, "host/x", "the rest of the message survives")
+}
+
+// TestInText_CountsRatherThanRewriting pins that text already holding this
+// package's placeholder — in either of the two shapes that have fooled this
+// check before — cannot talk it out of the closed rule.
+//
+// The rule is checked by counting at-signs against the matches that account for
+// them, so nothing the function emits can be mistaken for something the input
+// brought, and nothing the input brings can be mistaken for something the
+// function emitted.
+func TestInText_CountsRatherThanRewriting(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want string
+	}{
+		{
+			name: "a placeholder in the input is not evidence the input is safe",
+			// #nosec G101 -- fabricated fixture URL, not a live credential
+			// nosemgrep: gosec.G101-1
+			text: "uploading at //alice:redacted@pyroscope:4040/ingest",
+			want: "[endpoint redacted]",
+		},
+		{
+			name: "an unmatched at-sign beside a matched one still fails the rule",
+			// #nosec G101 -- fabricated fixture URL, not a live credential
+			// nosemgrep: gosec.G101-1
+			text: "http://alice:s3cret@host/a and //bob:pw@host/b",
+			want: "[endpoint redacted]",
+		},
+		{
+			// The NUL-delimited marker a previous implementation of this check
+			// substituted. Text carrying it had it swapped for a "redacted@"
+			// the check had never accounted for, which is what made a fixed
+			// marker the wrong mechanism rather than the wrong marker.
+			name: "a previous implementation's marker in the input is inert",
+			// #nosec G101 -- fabricated fixture text, not a live credential
+			// nosemgrep: gosec.G101-1
+			text: "http://alice:s3cret\x00userinfo\x00host",
+			want: "http://alice:s3cret\x00userinfo\x00host",
+		},
+		{
+			name: "two hierarchical URLs are both accounted for",
+			// #nosec G101 -- fabricated fixture URL, not a live credential
+			// nosemgrep: gosec.G101-1
+			text: "http://alice:s3cret@host/a and https://bob:pw@host/b",
+			want: "http://redacted@host/a and https://redacted@host/b",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := redact.InText(tt.text)
+
+			// The exact output is the assertion; a blanket "must not contain"
+			// would be wrong for the inert-marker case, where the text has no
+			// "@" at all and so declares no userinfo for the rule to act on —
+			// what matters there is that nothing is added to make it look like
+			// it did.
+			assert.Equal(t, tt.want, got)
+			assert.NotContains(t, got, "s3cret@", "no credential may survive as userinfo")
+		})
+	}
+}
+
+// TestError_SurvivesAPanickingUnwrap pins that a dependency's Unwrap is guarded
+// the same way its Error is. Shutdown reaches this, and a panic there would
+// skip every closer still to run.
+func TestError_SurvivesAPanickingUnwrap(t *testing.T) {
+	broken := panickingUnwrap{}
+
+	var got error
+	require.NotPanics(t, func() { got = redact.Error(broken, nil, nil) })
+	require.NotNil(t, got)
+	assert.Equal(t, "safe message", got.Error(), "the error rendered itself, so its own text stands")
+}
+
+// panickingUnwrap stands in for a dependency's error that renders cleanly but
+// whose Unwrap is broken — a shape the guard on Error alone does not cover.
+type panickingUnwrap struct{}
+
+func (panickingUnwrap) Error() string { return "safe message" }
+func (panickingUnwrap) Unwrap() error { panic("boom") }
