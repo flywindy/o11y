@@ -247,7 +247,9 @@ adopters can plan their upgrades.
     non-2xx response body into the error they return, so a server echoing the
     header it received named a string the configured form did not match. The
     profiling header list now covers names as well as values, as the OTLP one
-    already did.
+    already did. A configured header is also matched as a JSON document holds
+    it — `encoding/json` escapes `<`, `>` and `&` — since both backends are Go
+    programs that report an error in a JSON body.
   - `Shutdown` can no longer be held by an error from a dependency. The walk
     that finds the URLs in an error chain is now bounded by the number of
     errors it visits rather than by how deep it goes: once `Unwrap` returns a

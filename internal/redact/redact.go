@@ -2,11 +2,13 @@
 package redact
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/textproto"
 	"net/url"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -397,6 +399,46 @@ func redactQuery(rawQuery string) (string, bool) {
 func GoEscaped(v string) string {
 	q := strconv.Quote(v)
 	return q[1 : len(q)-1]
+}
+
+// JSONEscaped returns v as encoding/json renders it between the quotes, the
+// form a value takes in a JSON document written by a Go program.
+//
+// It is not GoEscaped with different punctuation. encoding/json escapes "<",
+// ">" and "&" as "\u003c", "\u003e" and "\u0026" by default — SetEscapeHTML
+// is on unless a caller turns it off — and renders a control byte as "\u0000"
+// where %q renders "\x00". A Pyroscope or OpenTelemetry Collector deployment
+// is a Go program, and both put an error into a JSON body, so a server echoing
+// back the header it received produces exactly this rendering of it.
+//
+// Marshalling a string cannot fail; v is returned unchanged if it somehow does.
+func JSONEscaped(v string) string {
+	encoded, err := json.Marshal(v)
+	if err != nil || len(encoded) < 2 {
+		return v
+	}
+	return string(encoded[1 : len(encoded)-1])
+}
+
+// Renderings returns the forms a secret can take in text the SDK may be asked
+// to scrub: as it stands, as %q renders it, and as a JSON document holds it.
+//
+// Secrets matches literally, so every rendering something might print has to be
+// listed separately. This is the one place that decides which — the two secret
+// lists in this SDK each used to expand a value themselves, and every round
+// that added a rendering to one and not the other left the pair disagreeing
+// about what counts as the same credential.
+//
+// Duplicates are dropped, so a value the escaping leaves alone is returned
+// once. Empty strings are not filtered here; the caller's own list does that.
+func Renderings(v string) []string {
+	forms := make([]string, 0, 3)
+	for _, form := range []string{v, GoEscaped(v), JSONEscaped(v)} {
+		if !slices.Contains(forms, form) {
+			forms = append(forms, form)
+		}
+	}
+	return forms
 }
 
 // HeaderWireValue returns v as net/http writes it into a request, which is the

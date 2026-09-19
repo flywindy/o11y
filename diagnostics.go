@@ -608,16 +608,18 @@ func diagnosticSecrets(cfg *Config) []string {
 	seen := make(map[string]struct{})
 	var out []string
 	add := func(v string) {
-		// A rendering that quotes the value with %q escapes control and
-		// non-printable characters, so that form is listed too whenever
-		// it differs; a value the escaping leaves alone is added once.
+		// redact.Renderings expands each form into the ways something may
+		// print it — as it stands, as %q renders it, and as a JSON document
+		// holds it, which is what a Go server writing a JSON error body
+		// produces. A value the escaping leaves alone is added once.
 		// The form net/http puts on the wire is listed as well: it trims
 		// surrounding whitespace as it writes a header, so a value echoed
 		// back by a server or named in an exporter's error is not the
 		// configured string. HeaderWireValue does that trimming rather than
 		// strings.TrimSpace, which also takes Unicode spaces net/http keeps.
-		wire := redact.HeaderWireValue(v)
-		for _, s := range []string{v, redact.GoEscaped(v), wire, redact.GoEscaped(wire)} {
+		forms := redact.Renderings(v)
+		forms = append(forms, redact.Renderings(redact.HeaderWireValue(v))...)
+		for _, s := range forms {
 			if s == "" {
 				continue
 			}

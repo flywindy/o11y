@@ -22,6 +22,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/flywindy/o11y/internal/redact"
 )
 
 // TestOTelErrorHandler_LogsOncePerWindow checks identical errors collapse to
@@ -708,4 +710,19 @@ func TestDiagnosticSecrets_CanonicalHeaderName(t *testing.T) {
 
 	assert.Contains(t, secrets, pastedAsAName, "the configured spelling")
 	assert.Contains(t, secrets, "X-Secret-Glc-Token", "and the one that goes on the wire")
+}
+
+// TestDiagnosticSecrets_CoversTheJSONForm pins the same for the OTLP header
+// list: a collector reporting a rejected header in a JSON body writes the
+// encoding/json rendering of it, and the exporter puts that body into the
+// error otelErrorHandler records.
+func TestDiagnosticSecrets_CoversTheJSONForm(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const token = "Bearer a<b&c>d"
+
+	secrets := diagnosticSecrets(&Config{otlpHeaders: map[string]string{"x-api-key": token}})
+
+	assert.Contains(t, secrets, token, "the configured form")
+	assert.Contains(t, secrets, redact.JSONEscaped(token), "and the form a JSON error body holds")
 }
