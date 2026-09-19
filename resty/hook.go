@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +17,8 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/flywindy/o11y/internal/redact"
 )
 
 const (
@@ -259,7 +262,11 @@ func (h *hook) finishError(req *restyclient.Request, state *requestState, err er
 	if statusCode > 0 {
 		metricAttrs = append(metricAttrs, semconv.HTTPResponseStatusCode(statusCode))
 	}
-	h.finish(req, state, codes.Error, err.Error(), err, attrs, metricAttrs)
+	// The span's status description and its exception event carry the error's
+	// text, and Go's client error is a *url.Error holding the request URL with
+	// the username and the query intact. Redacting url.full while recording
+	// that beside it would move the credential rather than remove it.
+	h.finish(req, state, codes.Error, redact.Error(err, nil, nil).Error(), err, attrs, metricAttrs)
 }
 
 // resolvedTarget prefers the fully resolved URL resty builds into RawRequest,
@@ -291,7 +298,7 @@ func (h *hook) finish(
 		state.span.SetAttributes(spanAttrs...)
 	}
 	if err != nil {
-		state.span.RecordError(err)
+		recordRedactedError(state.span, err)
 	}
 	if status != codes.Unset {
 		state.span.SetStatus(status, description)
@@ -356,6 +363,10 @@ func addRetryExhaustedEvent(ctx context.Context) {
 	}
 }
 
+// requestTarget derives the span's target attributes for one request, from
+// whichever of resty's URL forms is available at the point it is called.
+// finishError runs before resty has built a RawRequest, so the unresolved
+// forms below are reached in practice, not only in theory.
 func requestTarget(c *restyclient.Client, req *restyclient.Request) targetAttrs {
 	if req == nil {
 		return targetAttrs{}
@@ -368,24 +379,38 @@ func requestTarget(c *restyclient.Client, req *restyclient.Request) targetAttrs 
 		return targetFromURL(parsed)
 	}
 	if c == nil {
-		return targetAttrs{fullURL: rawURL}
+		return targetFromRawURL(rawURL)
 	}
 	base := c.BaseURL
 	if base == "" {
 		base = c.HostURL
 	}
 	if base == "" {
-		return targetAttrs{fullURL: rawURL}
+		return targetFromRawURL(rawURL)
 	}
 	baseURL, err := url.Parse(base)
 	if err != nil {
-		return targetAttrs{fullURL: rawURL}
+		return targetFromRawURL(rawURL)
 	}
 	rel, err := url.Parse(rawURL)
 	if err != nil {
 		return targetFromURL(baseURL)
 	}
 	return targetFromURL(baseURL.ResolveReference(rel))
+}
+
+// targetFromRawURL is the fallback for a request URL that could not be
+// resolved against a base. It redacts rather than recording the raw string:
+// a URL that url.Parse does not report as absolute can still carry userinfo —
+// "//user:pass@host/x" is scheme-relative, so IsAbs is false while User is set
+// — and a URL it cannot parse at all may be hiding a credential in any
+// position, so none of it reaches the span.
+func targetFromRawURL(rawURL string) targetAttrs {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return targetAttrs{}
+	}
+	return targetAttrs{fullURL: redact.URLAttribute(parsed)}
 }
 
 func targetAttributes(target targetAttrs) []attribute.KeyValue {
@@ -402,6 +427,15 @@ func targetAttributes(target targetAttrs) []attribute.KeyValue {
 	return attrs
 }
 
+// targetFromURL derives the server and url.full attributes for one request.
+//
+// The URL goes through redact.URLAttribute rather than u.String(): an outbound
+// URL can carry userinfo, which Go turns into a Basic Authorization header, and
+// a presigned URL carries its signature in the query, and semconv v1.39.0 says
+// url.full SHOULD have both removed. otelhttp — the SDK's other client facade,
+// behind o11yhttp.NewTransport — already strips userinfo before it emits
+// url.full, so until now the same call was redacted through one facade and not
+// the other.
 func targetFromURL(u *url.URL) targetAttrs {
 	if u == nil {
 		return targetAttrs{}
@@ -420,5 +454,40 @@ func targetFromURL(u *url.URL) targetAttrs {
 			port = 443
 		}
 	}
-	return targetAttrs{fullURL: u.String(), host: host, port: port}
+	return targetAttrs{fullURL: redact.URLAttribute(u), host: host, port: port}
+}
+
+// recordRedactedError records err as the span's exception event with its
+// credentials removed.
+//
+// span.RecordError cannot be used directly: it renders exception.message from
+// err.Error(), which for a Go client error is a *url.Error holding the request
+// URL — username and query kept, only the password masked. Passing it a
+// redacted wrapper would fix the message and break exception.type, which the
+// SDK derives with reflect.TypeOf, so the event is built here from the original
+// error's type and the redacted text.
+func recordRedactedError(span trace.Span, err error) {
+	span.AddEvent(semconv.ExceptionEventName, trace.WithAttributes(
+		semconv.ExceptionType(exceptionType(err)),
+		semconv.ExceptionMessage(redact.Error(err, nil, nil).Error()),
+	))
+}
+
+// exceptionType names err's type the way span.RecordError would have.
+//
+// It mirrors the pinned OTel SDK's typeStr (sdk/trace/span.go): a named type
+// is reported with its full import path, which is what semconv asks for and
+// what type-based grouping in a backend keys on. %T would report the short
+// package name instead, so an error type that is not a pointer would group
+// differently here than through every other RecordError in the process.
+func exceptionType(err error) string {
+	t := reflect.TypeOf(err)
+	if t == nil {
+		return ""
+	}
+	if t.PkgPath() == "" && t.Name() == "" {
+		// A pointer, or a builtin: neither has a path of its own to report.
+		return t.String()
+	}
+	return t.PkgPath() + "." + t.Name()
 }

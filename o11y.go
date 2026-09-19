@@ -101,6 +101,11 @@ type SDK struct {
 	errorHandler *otelErrorHandler
 	logr         logr.Logger
 
+	// The configured endpoints and secrets Shutdown scrubs an exporter's
+	// error against, the same pair ErrorHandler and Logr already use.
+	diagnosticEndpoints []string
+	diagnosticSecrets   []string
+
 	shutdownOnce sync.Once
 	shutdownErr  error
 }
@@ -163,6 +168,7 @@ func (s *SDK) Shutdown(ctx context.Context) error {
 			err := fn(closerCtx)
 			cancel()
 			if err != nil {
+				err = s.redactError(err)
 				s.Logger.ErrorContext(ctx, "SDK component shutdown failed", slog.Any("error", err))
 				errs = append(errs, err)
 			}
@@ -170,6 +176,27 @@ func (s *SDK) Shutdown(ctx context.Context) error {
 		s.shutdownErr = errors.Join(errs...)
 	})
 	return s.shutdownErr
+}
+
+// redactError returns err with the configured endpoints' credentials and the
+// configured header values removed from its message, leaving the error chain
+// intact.
+//
+// An exporter's shutdown error is a net/http one, and net/http masks the
+// password in the URL it reports but keeps the username:
+//
+//	Post "http://alice:***@collector:4318/v1/traces": dial tcp: …
+//
+// The SDK redacts that same endpoint everywhere else it writes one — see
+// redact.URL, ErrorHandler and Logr — and its rule is that no "@" survives
+// into a record, which this message breaks.
+//
+// The returned error is redacted, not only the line Shutdown logs. The pattern
+// the guide documents is slog.Any("error", obs.Shutdown(ctx)) in the caller's
+// own defer, so scrubbing one record and handing the credential to the next
+// would leave the leak exactly where it was.
+func (s *SDK) redactError(err error) error {
+	return redact.Error(err, s.diagnosticEndpoints, s.diagnosticSecrets)
 }
 
 // shutdownBudget derives the context one closer runs under: an even share
@@ -571,6 +598,8 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		shutdowns:              shutdowns,
 		errorHandler:           errorHandler,
 		logr:                   newLogr(slog.New(stdoutHandler), diagnosticEndpoints, diagnosticSecrets(cfg)),
+		diagnosticEndpoints:    diagnosticEndpoints,
+		diagnosticSecrets:      diagnosticSecrets(cfg),
 	}, nil
 }
 

@@ -589,13 +589,6 @@ func isHTTPToken(s string) bool {
 	return true
 }
 
-// goEscaped returns v as strconv.Quote renders it between the quotes, the
-// form net/http and fmt's %q verb give a string in an error message.
-func goEscaped(v string) string {
-	q := strconv.Quote(v)
-	return q[1 : len(q)-1]
-}
-
 // diagnosticSecrets lists the header names and values the diagnostics must
 // never print: the names and values of WithOTLPHeaders and
 // WithProfilingAuthHeaders, and
@@ -615,11 +608,18 @@ func diagnosticSecrets(cfg *Config) []string {
 	seen := make(map[string]struct{})
 	var out []string
 	add := func(v string) {
-		// A rendering that quotes the value with %q escapes control and
-		// non-printable characters, so that form is listed too whenever
-		// it differs; a value the escaping leaves alone is added once.
-		for _, s := range []string{v, goEscaped(v)} {
-			s = strings.TrimSpace(s)
+		// redact.Renderings expands each form into the ways something may
+		// print it — as it stands, as %q renders it, and as a JSON document
+		// holds it, which is what a Go server writing a JSON error body
+		// produces. A value the escaping leaves alone is added once.
+		// The form net/http puts on the wire is listed as well: it trims
+		// surrounding whitespace as it writes a header, so a value echoed
+		// back by a server or named in an exporter's error is not the
+		// configured string. HeaderWireValue does that trimming rather than
+		// strings.TrimSpace, which also takes Unicode spaces net/http keeps.
+		forms := redact.Renderings(v)
+		forms = append(forms, redact.Renderings(redact.HeaderWireValue(v))...)
+		for _, s := range forms {
 			if s == "" {
 				continue
 			}
@@ -630,15 +630,22 @@ func diagnosticSecrets(cfg *Config) []string {
 			out = append(out, s)
 		}
 	}
+	// addName also lists the form net/http stores a header name under:
+	// Header.Set keys by textproto.CanonicalMIMEHeaderKey, so a name is sent
+	// canonicalized rather than as configured.
+	addName := func(v string) {
+		add(v)
+		add(redact.HeaderWireName(v))
+	}
 	// Names as well as values: a credential pasted in as a header name
 	// reaches net/http, whose "invalid header field name" error echoes it
 	// through the export error the ErrorHandler records.
 	for k, v := range cfg.otlpHeaders {
-		add(k)
+		addName(k)
 		add(v)
 	}
 	for k, v := range cfg.profilingAuthHeaders {
-		add(k)
+		addName(k)
 		add(v)
 	}
 	for _, name := range otlpHeaderEnvVars {
@@ -655,14 +662,40 @@ func diagnosticSecrets(cfg *Config) []string {
 			}
 			// The exporter reports a name that fails to unescape on its own
 			// ("key", k), the same way it reports a value, and a credential
-			// pasted into the wrong side of the "=" is still a credential.
+			// pasted into the wrong side of the "=" is still a credential —
+			// so both parts get both sets of forms.
 			for _, part := range []string{k, v} {
-				add(part)
-				if unescaped, err := url.PathUnescape(strings.TrimSpace(part)); err == nil {
-					add(unescaped)
+				for _, form := range headerEnvForms(part) {
+					addName(form)
 				}
 			}
 		}
 	}
 	return out
+}
+
+// headerEnvForms returns the renderings an OTEL_EXPORTER_OTLP_HEADERS fragment
+// can take by the time something reports it.
+//
+// The pinned exporter does not send what the variable holds. Its parser trims
+// the name, and for the value unescapes first and trims after — in that order
+// (otlptracehttp internal/envconfig, stringToHeader) — with strings.TrimSpace,
+// which takes Unicode spaces net/http would have kept. So a value written as
+// "%C2%A0BearerSecret%C2%A0" is sent as "BearerSecret", a string neither the
+// configured text nor redact.HeaderWireValue of it matches, and the exporter
+// puts a non-2xx response body into the error it returns ("body: %s"), where a
+// collector echoing the header it received would name exactly that form.
+//
+// Both orders are covered for both parts because which side of the "=" holds
+// the credential is not knowable here.
+func headerEnvForms(part string) []string {
+	forms := []string{part, strings.TrimSpace(part)}
+	for _, candidate := range []string{part, strings.TrimSpace(part)} {
+		unescaped, err := url.PathUnescape(candidate)
+		if err != nil {
+			continue
+		}
+		forms = append(forms, unescaped, strings.TrimSpace(unescaped))
+	}
+	return forms
 }

@@ -202,6 +202,59 @@ adopters can plan their upgrades.
 
 ### Fixed
 
+- **Credentials no longer reach logs or spans through four paths that echoed a
+  configured endpoint.** The SDK's rule is that it never writes a
+  `scheme://user:pass@host` endpoint verbatim, because Go turns userinfo into a
+  Basic `Authorization` header and operators do configure them; these four sites
+  wrote one anyway.
+  - `profiling`: pyroscope-go formats the ingest URL into its own log messages
+    and redacts nothing — the password on every upload at DEBUG, and the
+    username (net/http masks only the password) on an upload failure at ERROR.
+    All three adapter methods now scrub the endpoint and the configured auth
+    header values.
+  - `nats`: `Connect`'s three error paths formatted the server list verbatim,
+    so a `nats://user:pass@host` password reached any caller logging the error.
+    nats.go's own error does not name the server; the facade added it. Each
+    entry of the comma-separated list is now redacted on its own.
+  - `resty`: the `url.full` span attribute recorded the outbound URL verbatim,
+    userinfo and presigned-URL signature included. It now follows semconv
+    v1.39.0 — userinfo replaced, and the values of `AWSAccessKeyId`,
+    `Signature`, `sig` and `X-Goog-Signature` replaced — matching what
+    otelhttp already did behind `o11yhttp.NewTransport`. Parameter order and
+    escaping are preserved, so the attribute still matches the upstream's
+    access log, and the request itself still authenticates.
+  - `Shutdown`: an exporter error is a net/http one, which masks the password
+    in the URL but keeps the username. Both the record `Shutdown` writes and
+    the error it returns are now scrubbed against the configured endpoints and
+    header values; the returned error still unwraps to the exporter's own, so
+    `errors.Is` and `errors.As` are unaffected.
+  - A **presigned** endpoint is covered too, not only a `user:pass@host` one.
+    A signature travels in the query, so such a URL has no `@` for the
+    userinfo rule to hold on to. `WithProfilingEndpoint` was the case that
+    showed it: pyroscope's uploader appends `/ingest` and re-encodes the query
+    before logging the URL, so the configured endpoint is no longer a
+    substring to substitute, and `?Signature=…` reached a DEBUG line on every
+    upload and an ERROR line on every failure. Endpoint redaction now replaces
+    the values of `AWSAccessKeyId`, `Signature`, `sig` and `X-Goog-Signature`
+    wherever the endpoint is recognised, and a log line holding a credential
+    query parameter the SDK did not redact itself is replaced wholesale.
+  - A configured header is now also matched in the form it is actually sent
+    as, not only as it was written. net/http trims a value's surrounding
+    whitespace and keys a name by its canonical MIME form, and the OTLP
+    exporter unescapes an `OTEL_EXPORTER_OTLP_HEADERS` value before trimming
+    it — so `" Bearer …"`, `x-api-key` and `%C2%A0Secret%C2%A0` reach the
+    server as `Bearer …`, `X-Api-Key` and `Secret`. Both exporters put a
+    non-2xx response body into the error they return, so a server echoing the
+    header it received named a string the configured form did not match. The
+    profiling header list now covers names as well as values, as the OTLP one
+    already did. A configured header is also matched as a JSON document holds
+    it — `encoding/json` escapes `<`, `>` and `&` — since both backends are Go
+    programs that report an error in a JSON body.
+  - `Shutdown` can no longer be held by an error from a dependency. The walk
+    that finds the URLs in an error chain is now bounded by the number of
+    errors it visits rather than by how deep it goes: once `Unwrap` returns a
+    slice, an error holding itself twice branches in two at every step, so a
+    depth cap alone bounded nothing.
 - `mongo`: `db.client.connection.count{state=idle}` no longer drifts below the
   pool's real size. The v2 driver creates a connection before it handshakes and,
   when the handshake fails, removes it with a `ConnectionClosed` event and no

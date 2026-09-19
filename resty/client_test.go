@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -106,6 +108,245 @@ func TestWrapRecordsComposedRestyURL(t *testing.T) {
 	spans := endedClientSpans(sr)
 	require.Len(t, spans, 1)
 	assertAttr(t, spans[0], semconv.URLFullKey, ts.URL+"/orders/123?include=items")
+}
+
+// TestWrapRedactsCredentialsFromURLFull pins that the url.full span attribute
+// carries neither the request's userinfo nor a presigned URL's signature.
+//
+// A span attribute leaves the process exactly as a log record does. otelhttp,
+// the SDK's other client facade, already strips userinfo before emitting
+// url.full, so the same call used to be redacted through o11yhttp.NewTransport
+// and not through this one. semconv v1.39.0 asks for the query parameters too.
+func TestWrapRedactsCredentialsFromURLFull(t *testing.T) {
+	tp, mp, sr := testProviders()
+	var gotAuth string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	host := strings.TrimPrefix(ts.URL, "http://")
+	client := NewClient(tp, mp, propagation.TraceContext{})
+
+	resp, err := client.R().
+		SetQueryParam("Signature", "abc+def").
+		SetQueryParam("include", "items").
+		Get("http://bob:hunter2@" + host + "/orders")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode())
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	full := attrValue(t, spans[0], semconv.URLFullKey).AsString()
+
+	assert.NotContains(t, full, "hunter2", "the request's password must not reach url.full")
+	// The signature is checked in its encoded form: resty escapes the value
+	// into the query, so "abc+def" never appears literally and asserting on it
+	// would pass whether or not the redaction ran.
+	assert.NotContains(t, full, "abc%2Bdef", "nor the signature of a presigned URL")
+	assert.Contains(t, full, host, "the server still has to be identifiable")
+	assert.Contains(t, full, "include=items", "and the rest of the query is left alone")
+
+	// The redaction is for the attribute only: the request itself still
+	// authenticates, so clearing userinfo on the caller's URL would break it.
+	assert.NotEmpty(t, gotAuth, "userinfo must still reach the server as Basic auth")
+}
+
+// TestRequestTarget_FailsClosedOnUnresolvableURLs pins that the fallbacks
+// taken before resty has built a RawRequest never put a raw URL on the span.
+//
+// finishError reads the target before RawRequest exists, so these paths run in
+// practice. Two shapes get past an IsAbs check while still carrying a
+// credential: a scheme-relative URL, where url.Parse sets User but reports the
+// URL as not absolute, and an opaque one, where the credential lands in Opaque
+// and User stays nil.
+func TestRequestTarget_FailsClosedOnUnresolvableURLs(t *testing.T) {
+	tests := []struct {
+		name   string
+		rawURL string
+		want   string
+	}{
+		{
+			name: "scheme-relative URL carries userinfo past IsAbs",
+			// #nosec G101 -- fabricated fixture URL, not a live credential
+			// nosemgrep: gosec.G101-1
+			rawURL: "//bob:hunter2@api.example.com/orders",
+			want:   "//redacted@api.example.com/orders",
+		},
+		{
+			name: "an opaque URL hides the credential from the parser",
+			// #nosec G101 -- fabricated fixture URL, not a live credential
+			// nosemgrep: gosec.G101-1
+			rawURL: "http:bob:hunter2@api.example.com",
+			want:   "[endpoint redacted]",
+		},
+		{
+			name:   "an ordinary relative path is left alone",
+			rawURL: "/orders/123?include=items",
+			want:   "/orders/123?include=items",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// A nil client is the no-base-URL fallback; req.RawRequest is nil
+			// because resty has not built one yet.
+			target := requestTarget(nil, &restyclient.Request{URL: tt.rawURL})
+
+			assert.NotContains(t, target.fullURL, "hunter2")
+			assert.Equal(t, tt.want, target.fullURL)
+		})
+	}
+}
+
+// TestRequestTarget_DropsAnUnparseableURL pins that a URL the parser rejects
+// contributes nothing: it could be hiding a credential in any position, and
+// there is no reading of it that says otherwise.
+func TestRequestTarget_DropsAnUnparseableURL(t *testing.T) {
+	target := requestTarget(nil, &restyclient.Request{URL: "http://%zz"})
+
+	assert.Empty(t, target.fullURL)
+}
+
+// TestWrapRedactsCredentialsFromTheErrorSpan pins that a failed request does
+// not export through the span's error fields what url.full had removed.
+//
+// Go's client error is a *url.Error holding the request URL: net/http masks the
+// password there but keeps the username and the whole query. That text reaches
+// the span twice — as the status description and as exception.message — so
+// redacting only the attribute would move the credential rather than remove it.
+func TestWrapRedactsCredentialsFromTheErrorSpan(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+
+	// Port 1 refuses immediately, so the failure is a transport error whose
+	// *url.Error carries the request URL.
+	_, err := client.R().
+		SetQueryParam("Signature", "abc+def").
+		Get("http://bob:hunter2@127.0.0.1:1/orders")
+	require.Error(t, err)
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	span := spans[0]
+
+	assert.NotContains(t, span.Status().Description, "bob",
+		"the username survives net/http's masking, so the SDK has to remove it")
+	assert.NotContains(t, span.Status().Description, "abc%2Bdef",
+		"and so does a presigned URL's signature")
+	assert.Contains(t, span.Status().Description, "127.0.0.1:1",
+		"the server still has to be identifiable")
+
+	var exception sdktrace.Event
+	for _, event := range span.Events() {
+		if event.Name == semconv.ExceptionEventName {
+			exception = event
+		}
+	}
+	require.Equal(t, semconv.ExceptionEventName, exception.Name, "the error is still recorded as an exception")
+
+	var message, exceptionType string
+	for _, attr := range exception.Attributes {
+		switch attr.Key {
+		case semconv.ExceptionMessageKey:
+			message = attr.Value.AsString()
+		case semconv.ExceptionTypeKey:
+			exceptionType = attr.Value.AsString()
+		}
+	}
+	assert.NotContains(t, message, "bob")
+	assert.NotContains(t, message, "abc%2Bdef")
+	// The regression to catch is the exception being recorded as a redaction
+	// wrapper. The hook is handed resty's own *resty.ResponseError — not the
+	// *url.Error that Get returns to the caller — and the redaction still
+	// reaches the *url.Error inside it through errors.As.
+	assert.NotContains(t, exceptionType, "redact",
+		"the exception must not be recorded as the redaction wrapper's type")
+	assert.Equal(t, "*resty.ResponseError", exceptionType,
+		"it is the error the hook was handed, unchanged")
+
+}
+
+// TestWrapRedactsANestedTransportError pins that a credential inside a URL the
+// SDK never saw — one a custom RoundTripper put in its own error — does not
+// reach either of the span's error fields.
+//
+// resty accepts a custom transport, and net/http wraps whatever it returns in
+// an outer *url.Error. The inner one carries its own URL, quoted into the same
+// message, and a signed query holds its credential with no "@" anywhere, so
+// neither substituting the outer URL nor the closed at-sign rule would catch
+// it. A URL that cannot be parsed takes the whole message with it; url.full,
+// server.address and error.type still identify the request.
+func TestWrapRedactsANestedTransportError(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.SetTransport(roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		// #nosec G101 -- fabricated fixture URL, not a live credential
+		// nosemgrep: gosec.G101-1
+		return nil, &url.Error{Op: "Get", URL: "https://inner/%zz?Signature=s3cret", Err: errors.New("dial")}
+	}))
+
+	_, err := client.R().Get("https://api.example.com/orders")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "s3cret", "the premise: the credential is in the error resty is handed")
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	span := spans[0]
+
+	assert.NotContains(t, span.Status().Description, "s3cret")
+	for _, event := range span.Events() {
+		for _, attr := range event.Attributes {
+			assert.NotContains(t, attr.Value.AsString(), "s3cret",
+				"no span event may carry it either")
+		}
+	}
+}
+
+// roundTripperFunc adapts a function to http.RoundTripper.
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+// RoundTrip implements http.RoundTripper.
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// TestExceptionType_MatchesTheSDKRendering pins that the exception type this
+// package records is the one span.RecordError would have recorded.
+//
+// Building the event by hand was necessary to keep the type while redacting the
+// message, but it put the naming in this package's hands. The OTel SDK reports
+// a named type with its full import path, which is what semconv asks for and
+// what a backend groups on; %T reports the short package name instead. A
+// pointer type renders the same either way, so a named non-pointer error — the
+// shape a caller's own OnBeforeRequest hook can return — is what separates them.
+func TestExceptionType_MatchesTheSDKRendering(t *testing.T) {
+	for _, err := range []error{
+		namedError{},          // a named non-pointer type: the case %T gets wrong
+		&namedError{},         // a pointer to it
+		errors.New("builtin"), // an unexported stdlib type
+		&url.Error{Op: "Get"}, // the shape the client path actually produces
+	} {
+		t.Run(sdkExceptionType(err), func(t *testing.T) {
+			assert.Equal(t, sdkExceptionType(err), exceptionType(err))
+		})
+	}
+}
+
+// namedError is a named, non-pointer error type, the shape whose rendering
+// differs between %T and the SDK's.
+type namedError struct{}
+
+// Error implements error.
+func (namedError) Error() string { return "named" }
+
+// sdkExceptionType reproduces the pinned OTel SDK's typeStr
+// (sdk/trace/span.go), so the assertion is against the upstream rule rather
+// than against a copy of this package's own implementation.
+func sdkExceptionType(i any) string {
+	t := reflect.TypeOf(i)
+	if t.PkgPath() == "" && t.Name() == "" {
+		return t.String()
+	}
+	return fmt.Sprintf("%s.%s", t.PkgPath(), t.Name())
 }
 
 func TestWrapIsIdempotent(t *testing.T) {
@@ -401,6 +642,19 @@ func endedClientSpans(sr *tracetest.SpanRecorder) []sdktrace.ReadOnlySpan {
 		}
 	}
 	return out
+}
+
+// attrValue returns the value span recorded for key, failing the test when the
+// attribute is absent.
+func attrValue(t *testing.T, span sdktrace.ReadOnlySpan, key attribute.Key) attribute.Value {
+	t.Helper()
+	for _, attr := range span.Attributes() {
+		if attr.Key == key {
+			return attr.Value
+		}
+	}
+	t.Fatalf("span %q has no %s attribute", span.Name(), key)
+	return attribute.Value{}
 }
 
 func assertAttr(t *testing.T, span sdktrace.ReadOnlySpan, key attribute.Key, want any) {

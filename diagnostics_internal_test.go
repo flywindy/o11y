@@ -9,8 +9,10 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/big"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -20,6 +22,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/flywindy/o11y/internal/redact"
 )
 
 // TestOTelErrorHandler_LogsOncePerWindow checks identical errors collapse to
@@ -532,6 +536,68 @@ func TestShutdown_LaterClosersKeepALiveContext(t *testing.T) {
 	assert.NoError(t, ctx.Err(), "the caller's deadline itself was not exhausted")
 }
 
+// TestShutdown_RedactsCredentialsFromTheExporterError pins that neither the
+// record Shutdown writes nor the error it returns carries the endpoint's
+// credentials.
+//
+// net/http masks the password in the URL it reports and keeps the username:
+//
+//	Post "http://alice:***@collector:4318/v1/traces": dial tcp: …
+//
+// so an "@" survives into the message, which the SDK's own rule forbids. The
+// returned error matters as much as the logged one: the guide's pattern is
+// slog.Any("error", obs.Shutdown(ctx)) in the caller's defer, so leaving the
+// username on the return value would move the leak rather than remove it.
+func TestShutdown_RedactsCredentialsFromTheExporterError(t *testing.T) {
+	var buf bytes.Buffer
+	exportErr := fmt.Errorf(`Post "http://alice:***@collector:4318/v1/traces": dial tcp: i/o timeout`) //nolint:err113
+	sdk := &SDK{
+		Logger:              slog.New(slog.NewTextHandler(&buf, nil)),
+		diagnosticEndpoints: []string{"http://alice:s3cretpw@collector:4318"},
+		diagnosticSecrets:   []string{"glc_token"},
+		shutdowns: []func(context.Context) error{
+			func(context.Context) error { return exportErr },
+			func(context.Context) error {
+				return fmt.Errorf("metric exporter: header glc_token rejected") //nolint:err113
+			},
+		},
+	}
+
+	err := sdk.Shutdown(context.Background())
+
+	require.Error(t, err)
+	for _, where := range map[string]string{"the logged record": buf.String(), "the returned error": err.Error()} {
+		assert.NotContains(t, where, "alice", "the endpoint username must not survive")
+		assert.NotContains(t, where, "glc_token", "nor a configured header value")
+		assert.Contains(t, where, "collector:4318", "the collector still has to be identifiable")
+	}
+
+	assert.ErrorIs(t, err, exportErr,
+		"redaction rewrites the message, so the caller can still match the exporter's own error")
+}
+
+// TestShutdown_LeavesACleanErrorAlone pins that an error with nothing to
+// redact is returned as it stands, so a caller comparing error values — not
+// only matching with errors.Is — still sees the exporter's own error.
+func TestShutdown_LeavesACleanErrorAlone(t *testing.T) {
+	exportErr := errors.New("trace exporter: context deadline exceeded")
+	sdk := &SDK{
+		Logger:              slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+		diagnosticEndpoints: []string{"http://collector:4318"},
+		shutdowns:           []func(context.Context) error{func(context.Context) error { return exportErr }},
+	}
+
+	err := sdk.Shutdown(context.Background())
+
+	require.Error(t, err)
+	var joined interface{ Unwrap() []error }
+	require.ErrorAs(t, err, &joined, "Shutdown joins its closers' errors")
+	require.Len(t, joined.Unwrap(), 1)
+	assert.Equal(t, exportErr, joined.Unwrap()[0],
+		"nothing needed redacting, so the exporter's own error is passed through unwrapped")
+	assert.Equal(t, exportErr.Error(), err.Error())
+}
+
 // TestShutdownSequence_DrainsTracesAndLogsBeforeMetrics pins the closer
 // order: a batch that fails during the tracer's or logger's final flush is
 // counted on the export-failure Recorder, and only a meter provider that
@@ -584,4 +650,79 @@ func TestShutdown_DisabledPillarsDoNotShareTheDeadline(t *testing.T) {
 	want, _ := ctx.Deadline()
 	require.NoError(t, sdk.Shutdown(ctx))
 	assert.Equal(t, want, got, "the only closer runs under the caller's own deadline")
+}
+
+// TestDiagnosticSecrets_WireForm pins that a configured header value is listed
+// as net/http sends it as well as as it was written.
+//
+// Header.Set stores the configured string untouched and the write path trims
+// surrounding whitespace, so a server or an exporter that reports the header it
+// received names a string redact.Secrets would not otherwise match.
+func TestDiagnosticSecrets_WireForm(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const padded = "\tBearer configured-secret\t"
+
+	secrets := diagnosticSecrets(&Config{otlpHeaders: map[string]string{"x-api-key": padded}})
+
+	assert.Contains(t, secrets, "Bearer configured-secret", "the form that goes on the wire")
+	assert.Contains(t, secrets, padded, "and the form it was configured as")
+}
+
+// TestDiagnosticSecrets_ExporterNormalizedEnvValue pins the form the pinned
+// exporter actually sends for an environment-configured header.
+//
+// stringToHeader unescapes the value and then applies strings.TrimSpace, in
+// that order — and strings.TrimSpace takes Unicode spaces net/http would have
+// kept, so HeaderWireValue's ASCII trim does not produce it either. The list
+// therefore held the encoded form and the decoded-but-padded form, and not the
+// one that goes out. The exporter puts a non-2xx response body into the error
+// it returns, so a collector echoing the header it received names exactly that.
+func TestDiagnosticSecrets_ExporterNormalizedEnvValue(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const configured = "authorization=%C2%A0BearerSecret%C2%A0"
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", configured)
+	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "")
+
+	// What the exporter sends, derived the way it derives it rather than
+	// spelled out, so this fails if the pinned parser ever changes.
+	_, rawValue, ok := strings.Cut(configured, "=")
+	require.True(t, ok)
+	unescaped, err := url.PathUnescape(rawValue)
+	require.NoError(t, err)
+	sent := strings.TrimSpace(unescaped)
+	require.Equal(t, "BearerSecret", sent, "the premise: neither the configured nor the ASCII-trimmed form")
+
+	assert.Contains(t, diagnosticSecrets(&Config{}), sent)
+}
+
+// TestDiagnosticSecrets_CanonicalHeaderName pins the form net/http stores a
+// configured header name under. Header.Set keys by
+// textproto.CanonicalMIMEHeaderKey, so a credential pasted in as a name
+// reaches the collector canonicalized.
+func TestDiagnosticSecrets_CanonicalHeaderName(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header name, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const pastedAsAName = "x-secret-glc-token"
+
+	secrets := diagnosticSecrets(&Config{otlpHeaders: map[string]string{pastedAsAName: "1"}})
+
+	assert.Contains(t, secrets, pastedAsAName, "the configured spelling")
+	assert.Contains(t, secrets, "X-Secret-Glc-Token", "and the one that goes on the wire")
+}
+
+// TestDiagnosticSecrets_CoversTheJSONForm pins the same for the OTLP header
+// list: a collector reporting a rejected header in a JSON body writes the
+// encoding/json rendering of it, and the exporter puts that body into the
+// error otelErrorHandler records.
+func TestDiagnosticSecrets_CoversTheJSONForm(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const token = "Bearer a<b&c>d"
+
+	secrets := diagnosticSecrets(&Config{otlpHeaders: map[string]string{"x-api-key": token}})
+
+	assert.Contains(t, secrets, token, "the configured form")
+	assert.Contains(t, secrets, redact.JSONEscaped(token), "and the form a JSON error body holds")
 }
