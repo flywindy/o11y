@@ -23,14 +23,16 @@ const placeholder = "redacted"
 // attribute to userinfo.
 const redactedWhole = "[endpoint redacted]"
 
-// URL returns raw with any embedded userinfo replaced, so an endpoint can be
-// logged without leaking the credentials it carries.
+// URL returns raw with any embedded credential replaced, so an endpoint can be
+// logged without leaking what it carries.
 //
 // A URL of the form scheme://user:password@host is a working authentication
 // mechanism: Go's http.Client turns userinfo into a Basic Authorization header,
 // and Pyroscope ingest accepts it. The SDK therefore has to keep honouring such
 // endpoints while never writing one verbatim to stdout or the OTLP log
-// pipeline, both of which carry the record out of the process.
+// pipeline, both of which carry the record out of the process. A presigned
+// endpoint carries its credential in the query instead, so credentialQueryKeys
+// is handled on the same terms.
 //
 // The contract is deliberately one-sided: a value is echoed only when every
 // "@" in it has been positively accounted for as something other than
@@ -38,30 +40,26 @@ const redactedWhole = "[endpoint redacted]"
 // credential could be hiding in a position url.Parse does not treat as
 // userinfo — is replaced wholesale, because the cost of a less useful log line
 // is far below the cost of printing a secret.
+//
+// The redaction itself is URLAttribute's, applied to the parsed value rather
+// than restated here: a span attribute and a log line are the same problem, and
+// the last time the two carried separate copies of this logic one of them was
+// missing the opaque-URL check.
 func URL(raw string) string {
-	if raw == "" || !strings.Contains(raw, "@") {
-		// No userinfo is possible without an "@", so the common case skips
-		// parsing entirely and returns the operator's exact string.
+	if raw == "" {
+		return raw
+	}
+	if !strings.Contains(raw, "@") && !credentialQueryParam.MatchString(raw) {
+		// No userinfo is possible without an "@" and no credential query
+		// parameter is present, so the common case skips parsing entirely and
+		// returns the operator's exact string.
 		return raw
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return redactedWhole
 	}
-	if u.User != nil {
-		u.User = url.User(placeholder)
-		return u.String()
-	}
-	// No userinfo was parsed, yet the value contains "@". url.Parse only
-	// recognises userinfo in a hierarchical URL ("scheme://user:pass@host");
-	// given an opaque one ("scheme:user:pass@host") it leaves the credential
-	// in Opaque, where returning raw would print it in full.
-	if strings.Contains(u.Opaque, "@") || strings.Contains(u.Host, "@") {
-		return redactedWhole
-	}
-	// Every remaining "@" sits in the path, query, or fragment — positions the
-	// parser has attributed, and which userinfo cannot occupy.
-	return raw
+	return URLAttribute(u)
 }
 
 // urlUserinfo matches the userinfo of a hierarchical URL anywhere in a string:
@@ -93,6 +91,12 @@ var urlUserinfo = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/@\s"']+@`)
 //	userinfo cannot exist without an "@", so if no "@" survives, no
 //	credential survives.
 //
+// A presigned URL carries its credential in the query rather than the userinfo,
+// so it has no "@" for that rule to hold on to. It gets a rule of its own on
+// the same terms: a credential query parameter is accepted only where this
+// package wrote its value, and anything else takes the message with it. See
+// unaccountedCredentialQuery.
+//
 // The known endpoints and the pattern above run first because they keep the
 // common cases readable. Whatever they leave behind is checked against that
 // rule, and text that fails it is replaced wholesale rather than reasoned
@@ -120,6 +124,12 @@ func InText(text string, knownEndpoints ...string) string {
 	// "redacted@" the check never accounted for. Counting compares the text
 	// against itself and introduces nothing, so there is no collision to have.
 	if strings.Count(text, "@") != len(urlUserinfo.FindAllStringIndex(text, -1)) {
+		return redactedWhole
+	}
+	// The second closed rule, for the credential a presigned URL carries in its
+	// query instead of its userinfo. Such a URL has no "@" at all, so the rule
+	// above passes it through untouched.
+	if unaccountedCredentialQuery(text) {
 		return redactedWhole
 	}
 	return urlUserinfo.ReplaceAllString(text, "${1}"+placeholder+"@")
@@ -228,6 +238,58 @@ var credentialQueryKeys = map[string]struct{}{
 	"x-goog-signature": {},
 }
 
+// credentialQueryParam matches the beginning of a credential query parameter
+// anywhere in a string: a "?" or "&", one of credentialQueryKeys, and the "="
+// that opens its value. The alternation is built from the map above so the two
+// cannot drift apart.
+var credentialQueryParam = regexp.MustCompile(`(?i)[?&](?:` + credentialQueryAlternation() + `)=`)
+
+// credentialQueryAlternation renders credentialQueryKeys as a regexp
+// alternation, sorted so the pattern does not depend on map iteration order.
+func credentialQueryAlternation() string {
+	keys := make([]string, 0, len(credentialQueryKeys))
+	for key := range credentialQueryKeys {
+		keys = append(keys, regexp.QuoteMeta(key))
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, "|")
+}
+
+// escapedOpaquePlaceholder is what redactQuery writes in place of a credential
+// query value, and therefore the only value unaccountedCredentialQuery accepts.
+var escapedOpaquePlaceholder = url.QueryEscape(opaquePlaceholder)
+
+// unaccountedCredentialQuery reports whether text holds a credential query
+// parameter this package did not redact itself.
+//
+// It is InText's closed rule for presigned URLs, and it is a separate rule
+// because the "@" one cannot speak for them: a signature travels in the query,
+// so a URL carrying one has no "@" anywhere and passes the userinfo check
+// untouched. That is how a signed profiling endpoint reached a log line — the
+// uploader appends "/ingest" and re-encodes the query before formatting the URL
+// into its message, so the configured endpoint is no longer a substring for
+// InText to substitute, and nothing else looked at the query.
+//
+// Each value is read to the first character that cannot appear unescaped inside
+// one — "&", whitespace, or a quote — and compared against the placeholder
+// redactQuery writes. Reading short is safe: it can only make a value differ
+// from the placeholder, which fails closed. Nothing can be forged past it
+// either, because the only accepted value is the placeholder in full: text
+// arriving with "Signature=%5Bredacted%5D" already carries "[redacted]" as its
+// signature, and a longer value with that prefix does not match.
+func unaccountedCredentialQuery(text string) bool {
+	for _, match := range credentialQueryParam.FindAllStringIndex(text, -1) {
+		value := text[match[1]:]
+		if end := strings.IndexAny(value, "&\"' \t\r\n"); end >= 0 {
+			value = value[:end]
+		}
+		if value != escapedOpaquePlaceholder {
+			return true
+		}
+	}
+	return false
+}
+
 // URLAttribute returns u rendered for a url.full span attribute: userinfo
 // replaced, and the values of the credential-bearing query parameters above
 // replaced, with the rest of the URL left intact so the span still identifies
@@ -314,6 +376,29 @@ func GoEscaped(v string) string {
 	return q[1 : len(q)-1]
 }
 
+// HeaderWireValue returns v as net/http writes it into a request, which is the
+// form a server sees and may echo back.
+//
+// A configured header value is not necessarily sent verbatim: Header.Set stores
+// it untouched, but the write path trims leading and trailing ASCII whitespace
+// (net/http/header.go writeSubset, via textproto.TrimString). So an
+// Authorization header configured as " Bearer token " goes out as
+// "Bearer token", and a response or an error that quotes what it received holds
+// a string neither the configured value nor its Go-escaped form matches.
+//
+// Trimming is the whole transformation. writeSubset also rewrites CR and LF as
+// spaces, but a request header holding either never reaches it: Transport
+// validates every value with httpguts.ValidHeaderFieldValue first and fails the
+// request with "invalid header field value for %q", which names the header
+// rather than what it held.
+//
+// It lives beside GoEscaped for the same reason: which renderings of a secret
+// must be matched is the same question wherever a secret list is built, and the
+// two lists in this SDK should not answer it differently.
+func HeaderWireValue(v string) string {
+	return strings.Trim(v, " \t\r\n")
+}
+
 // Error returns err with credentials removed from its message, keeping the
 // error chain intact.
 //
@@ -396,16 +481,22 @@ func errorText(text string, err error, endpoints []string) string {
 // nil as a match, and both (*url.Error).Unwrap and its Error method read a
 // field, so a chain holding one would otherwise panic here — in Shutdown, that
 // would skip every closer still to run.
+//
+// The walk is bounded by the number of errors it visits in total, not by how
+// deep it goes. A depth cap alone is no bound at all once Unwrap returns a
+// slice: an error whose Unwrap() []error holds itself twice branches in two at
+// every step, so a cap of n permits on the order of 2^n visits. Shutdown calls
+// this synchronously, ahead of the closers still to run, so an error from a
+// dependency must not be able to hold it there.
 func errorURLs(err error) []string {
 	var urls []string
-	var walk func(error, int)
-	walk = func(e error, depth int) {
-		// The depth cap is for a chain that unwraps into itself; nothing in the
-		// SDK builds one, and an error from a dependency is not the SDK's to
-		// trust with an unbounded walk.
-		if e == nil || depth > maxErrorChainDepth {
+	budget := maxErrorChainVisits
+	var walk func(error)
+	walk = func(e error) {
+		if e == nil || budget <= 0 {
 			return
 		}
+		budget--
 		if rv := reflect.ValueOf(e); rv.Kind() == reflect.Pointer && rv.IsNil() {
 			return
 		}
@@ -420,19 +511,21 @@ func errorURLs(err error) []string {
 		// concrete error type.
 		switch unwrapper := e.(type) { //nolint:errorlint // dispatching on Unwrap, not on an error type
 		case interface{ Unwrap() error }:
-			walk(unwrapped(unwrapper.Unwrap), depth+1)
+			walk(unwrapped(unwrapper.Unwrap))
 		case interface{ Unwrap() []error }:
 			for _, sub := range unwrappedAll(unwrapper.Unwrap) {
-				walk(sub, depth+1)
+				walk(sub)
 			}
 		}
 	}
-	walk(err, 0)
+	walk(err)
 	return urls
 }
 
-// maxErrorChainDepth bounds the walk over an error chain the SDK did not build.
-const maxErrorChainDepth = 64
+// maxErrorChainVisits bounds the total number of errors the walk over a chain
+// the SDK did not build will visit. It is generous next to any chain a real
+// error carries, and finite next to one that unwraps into itself.
+const maxErrorChainVisits = 1024
 
 // redactedError renders a redacted message while still unwrapping to the error
 // it was built from.

@@ -611,8 +611,13 @@ func diagnosticSecrets(cfg *Config) []string {
 		// A rendering that quotes the value with %q escapes control and
 		// non-printable characters, so that form is listed too whenever
 		// it differs; a value the escaping leaves alone is added once.
-		for _, s := range []string{v, redact.GoEscaped(v)} {
-			s = strings.TrimSpace(s)
+		// The form net/http puts on the wire is listed as well: it trims
+		// surrounding whitespace as it writes a header, so a value echoed
+		// back by a server or named in an exporter's error is not the
+		// configured string. HeaderWireValue does that trimming rather than
+		// strings.TrimSpace, which also takes Unicode spaces net/http keeps.
+		wire := redact.HeaderWireValue(v)
+		for _, s := range []string{v, redact.GoEscaped(v), wire, redact.GoEscaped(wire)} {
 			if s == "" {
 				continue
 			}

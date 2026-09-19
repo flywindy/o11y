@@ -2,8 +2,11 @@ package redact_test
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -530,3 +533,168 @@ type panickingUnwrap struct{}
 
 func (panickingUnwrap) Error() string { return "safe message" }
 func (panickingUnwrap) Unwrap() error { panic("boom") }
+
+// TestURL_RedactsASignedQuery pins that redact.URL applies the same
+// credential-query rule URLAttribute does.
+//
+// The two used to be separate copies of one rule, and the copy in URL only knew
+// about userinfo. So an endpoint configured as a presigned URL was returned
+// verbatim by the very function whose job is to make an endpoint safe to log —
+// including by InText, which substitutes URL(endpoint) wherever it finds the
+// configured value.
+func TestURL_RedactsASignedQuery(t *testing.T) {
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const signed = "https://pyroscope:4040/ingest?Signature=s3cret&name=svc"
+
+	got := redact.URL(signed)
+
+	assert.NotContains(t, got, "s3cret")
+	assert.Contains(t, got, "name=svc", "the rest of the query is not a credential")
+}
+
+// TestURL_LeavesAnOrdinaryEndpointExactlyAsConfigured pins the other half: the
+// new check must not start rewriting endpoints that carry nothing.
+func TestURL_LeavesAnOrdinaryEndpointExactlyAsConfigured(t *testing.T) {
+	const plain = "http://collector:4318/v1/traces?compression=gzip"
+
+	assert.Equal(t, plain, redact.URL(plain))
+}
+
+// TestInText_FailsClosedOnASignedURLItCannotAccountFor pins InText's second
+// closed rule.
+//
+// The first rule holds on "@", which a presigned URL does not have: its
+// credential is a query value. The case that found this is a signed profiling
+// endpoint — pyroscope's uploader appends "/ingest" and re-encodes the query
+// before formatting the URL into "uploading at %s", so the configured endpoint
+// is no longer a substring for InText to substitute, and the signature reached
+// a DEBUG line on every upload and an ERROR line on every failure.
+func TestInText_FailsClosedOnASignedURLItCannotAccountFor(t *testing.T) {
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const endpoint = "https://pyroscope:4040?Signature=s3cret"
+	// What the uploader actually formats: path joined, query re-encoded, so
+	// the configured string does not appear.
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const line = "uploading at https://pyroscope:4040/ingest?Signature=s3cret&from=1&name=svc"
+	require.NotContains(t, line, endpoint, "the premise: the endpoint is not a substring of the message")
+
+	got := redact.InText(line, endpoint)
+
+	assert.NotContains(t, got, "s3cret")
+	assert.Equal(t, "[endpoint redacted]", got)
+}
+
+// TestInText_AcceptsACredentialQueryItRedactedItself pins that the rule does
+// not now discard a message InText legitimately made safe: where the configured
+// endpoint *is* a substring, URL replaces the signature and the result must
+// still read.
+func TestInText_AcceptsACredentialQueryItRedactedItself(t *testing.T) {
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const endpoint = "https://pyroscope:4040/ingest?Signature=s3cret&name=svc"
+
+	got := redact.InText("uploading at "+endpoint, endpoint)
+
+	assert.NotContains(t, got, "s3cret")
+	assert.Contains(t, got, "uploading at https://pyroscope:4040/ingest?Signature=")
+	assert.Contains(t, got, "name=svc")
+}
+
+// TestInText_DoesNotTrustAForgedCredentialPlaceholder pins that the accepted
+// form is the placeholder in full.
+//
+// The rule accepts a credential query parameter whose value is exactly what
+// redactQuery writes. A value that merely starts with it is a different value,
+// and the round that introduced a fixed sentinel into this package learned what
+// happens when input can dress itself up as the function's own output.
+func TestInText_DoesNotTrustAForgedCredentialPlaceholder(t *testing.T) {
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const forged = "uploading at https://host/ingest?Signature=%5Bredacted%5Ds3cret"
+
+	got := redact.InText(forged)
+
+	assert.NotContains(t, got, "s3cret")
+	assert.Equal(t, "[endpoint redacted]", got)
+}
+
+// cyclicMultiError unwraps into itself twice, the shape that turns a depth cap
+// into no cap at all.
+type cyclicMultiError struct{ subs []error }
+
+func (e *cyclicMultiError) Error() string   { return "cyclic" }
+func (e *cyclicMultiError) Unwrap() []error { return e.subs }
+
+// TestError_TerminatesOnACyclicMultiError pins that the walk over an error
+// chain is bounded by the errors it visits, not by how deep it goes.
+//
+// A depth cap alone bounds nothing once Unwrap returns a slice: an error
+// holding itself twice branches in two at every step, so a cap of 64 permits
+// on the order of 2^65 visits. SDK.Shutdown calls this synchronously, ahead of
+// the closers still to run, so an error from a dependency must not be able to
+// hold it there. Before the fix this test does not fail — it hangs.
+func TestError_TerminatesOnACyclicMultiError(t *testing.T) {
+	cyclic := &cyclicMultiError{}
+	cyclic.subs = []error{cyclic, cyclic}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = redact.Error(cyclic, nil, nil)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("redact.Error did not return: the walk over the chain is unbounded")
+	}
+}
+
+// TestHeaderWireValue covers the form net/http actually sends, which is the
+// third rendering of a secret every secret list has to carry.
+//
+// Header.Set stores a value untouched, but the write path replaces CR and LF
+// with spaces and trims surrounding ASCII whitespace, so a server that echoes
+// the header it received reports a string the configured value does not match.
+func TestHeaderWireValue(t *testing.T) {
+	assert.Equal(t, "Bearer token", redact.HeaderWireValue(" Bearer token "))
+	assert.Equal(t, "Bearer token", redact.HeaderWireValue("\tBearer token\t"))
+	assert.Equal(t, "Bearer token", redact.HeaderWireValue("\r\nBearer token\r\n"))
+	assert.Equal(t, "Bearer token", redact.HeaderWireValue("Bearer token"))
+	assert.Empty(t, redact.HeaderWireValue("   "))
+}
+
+// TestHeaderWireValue_MatchesWhatNetHTTPSends pins the claim the function is
+// built on against net/http itself, rather than against a reading of it: the
+// value a server receives is HeaderWireValue's, not the configured string.
+//
+// The cases are the ones a request can actually carry. A value holding CR or LF
+// is rejected by Transport before anything is written, so there is no wire form
+// of it to match.
+func TestHeaderWireValue_MatchesWhatNetHTTPSends(t *testing.T) {
+	for _, configured := range []string{
+		" Bearer token ",
+		"\tBearer token\t",
+		"Bearer token",
+	} {
+		t.Run(redact.GoEscaped(configured), func(t *testing.T) {
+			var received string
+			srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				received = r.Header.Get("Authorization")
+			}))
+			defer srv.Close()
+
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
+			require.NoError(t, err)
+			req.Header.Set("Authorization", configured)
+			resp, err := srv.Client().Do(req)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+
+			assert.Equal(t, received, redact.HeaderWireValue(configured))
+		})
+	}
+}
