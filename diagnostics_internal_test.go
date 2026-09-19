@@ -587,9 +587,11 @@ func TestShutdown_LeavesACleanErrorAlone(t *testing.T) {
 	err := sdk.Shutdown(context.Background())
 
 	require.Error(t, err)
-	var wrapped *redactedError
-	assert.False(t, errors.As(err, &wrapped), "nothing needed redacting, so nothing was wrapped")
-	assert.ErrorIs(t, err, exportErr)
+	var joined interface{ Unwrap() []error }
+	require.ErrorAs(t, err, &joined, "Shutdown joins its closers' errors")
+	require.Len(t, joined.Unwrap(), 1)
+	assert.Equal(t, exportErr, joined.Unwrap()[0],
+		"nothing needed redacting, so the exporter's own error is passed through unwrapped")
 	assert.Equal(t, exportErr.Error(), err.Error())
 }
 

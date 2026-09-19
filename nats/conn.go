@@ -166,7 +166,13 @@ func connect(ctx context.Context, url string, tp trace.TracerProvider, prop prop
 		otelnats.WithTracingEnabled(tracingDefault),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("nats connect %s: %w", redactedURLs(url), err)
+		// The upstream error is redacted as well as wrapped: a malformed
+		// server URL makes nats.go return net/url's parse error, which
+		// quotes the URL verbatim — credentials and all — so redacting
+		// only the one this facade adds would leave the other in place.
+		// redact.Error keeps the chain, so errors.Is and errors.As still
+		// reach nats.go's own error.
+		return nil, fmt.Errorf("nats connect %s: %w", redactedURLs(url), redact.Error(err, nil, nil))
 	}
 	return &Conn{
 		Conn: nc,
@@ -348,7 +354,24 @@ func (c *Conn) RequestMsg(ctx context.Context, msg *natsgo.Msg, timeout time.Dur
 func redactedURLs(urls string) string {
 	parts := strings.Split(urls, ",")
 	for i, part := range parts {
-		parts[i] = redact.URL(strings.TrimSpace(part))
+		parts[i] = redactServerURL(strings.TrimSpace(part))
 	}
 	return strings.Join(parts, ",")
+}
+
+// redactServerURL redacts one entry of the server list.
+//
+// An entry with no scheme is normalised before redacting, because nats.go does
+// the same: parseServerURL prepends the connection scheme to anything without
+// "://", so "token@localhost" becomes "nats://token@localhost" and that
+// userinfo is an authentication token. url.Parse on the raw form puts the whole
+// thing in Path, where redact.URL correctly concludes that no userinfo is
+// possible there and echoes the entry — token included. The scheme is taken
+// back off the result so the message still shows what the operator configured.
+func redactServerURL(entry string) string {
+	if strings.Contains(entry, "://") {
+		return redact.URL(entry)
+	}
+	const scheme = "nats://"
+	return strings.TrimPrefix(redact.URL(scheme+entry), scheme)
 }

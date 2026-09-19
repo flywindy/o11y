@@ -3,6 +3,7 @@ package resty
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -261,7 +262,11 @@ func (h *hook) finishError(req *restyclient.Request, state *requestState, err er
 	if statusCode > 0 {
 		metricAttrs = append(metricAttrs, semconv.HTTPResponseStatusCode(statusCode))
 	}
-	h.finish(req, state, codes.Error, err.Error(), err, attrs, metricAttrs)
+	// The span's status description and its exception event carry the error's
+	// text, and Go's client error is a *url.Error holding the request URL with
+	// the username and the query intact. Redacting url.full while recording
+	// that beside it would move the credential rather than remove it.
+	h.finish(req, state, codes.Error, redact.Error(err, nil, nil).Error(), err, attrs, metricAttrs)
 }
 
 // resolvedTarget prefers the fully resolved URL resty builds into RawRequest,
@@ -293,7 +298,7 @@ func (h *hook) finish(
 		state.span.SetAttributes(spanAttrs...)
 	}
 	if err != nil {
-		state.span.RecordError(err)
+		recordRedactedError(state.span, err)
 	}
 	if status != codes.Unset {
 		state.span.SetStatus(status, description)
@@ -450,4 +455,20 @@ func targetFromURL(u *url.URL) targetAttrs {
 		}
 	}
 	return targetAttrs{fullURL: redact.URLAttribute(u), host: host, port: port}
+}
+
+// recordRedactedError records err as the span's exception event with its
+// credentials removed.
+//
+// span.RecordError cannot be used directly: it renders exception.message from
+// err.Error(), which for a Go client error is a *url.Error holding the request
+// URL — username and query kept, only the password masked. Passing it a
+// redacted wrapper would fix the message and break exception.type, which the
+// SDK derives with reflect.TypeOf, so the event is built here from the original
+// error's type and the redacted text.
+func recordRedactedError(span trace.Span, err error) {
+	span.AddEvent(semconv.ExceptionEventName, trace.WithAttributes(
+		semconv.ExceptionType(fmt.Sprintf("%T", err)),
+		semconv.ExceptionMessage(redact.Error(err, nil, nil).Error()),
+	))
 }

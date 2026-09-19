@@ -1,6 +1,7 @@
 package redact_test
 
 import (
+	"errors"
 	"net/url"
 	"testing"
 
@@ -294,3 +295,64 @@ func TestGoEscaped(t *testing.T) {
 	assert.Equal(t, `say \"hi\"`, redact.GoEscaped(`say "hi"`))
 	assert.Equal(t, `\x00`, redact.GoEscaped("\x00"))
 }
+
+// TestInText_DoesNotTrustAPreExistingPlaceholder pins that text which already
+// contains this package's own placeholder cannot talk InText out of its closed
+// rule.
+//
+// The scheme-relative form is the one that matters: the userinfo pattern
+// anchors on "://" and does not match it, so nothing is substituted, and a
+// check that stripped "redacted@" from the finished text would strip the
+// input's own — leaving no "@" to fail on and returning the credential beside
+// it verbatim.
+func TestInText_DoesNotTrustAPreExistingPlaceholder(t *testing.T) {
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: gosec.G101-1
+	const message = "uploading at //alice:redacted@pyroscope:4040/ingest"
+
+	got := redact.InText(message)
+
+	assert.NotContains(t, got, "alice", "a placeholder in the input is not evidence the input is safe")
+	assert.Equal(t, "[endpoint redacted]", got)
+}
+
+// TestInText_StillRendersItsOwnSubstitutions pins the other half: a hierarchical
+// URL the pattern does match is still rendered readably, rather than being
+// discarded by the same rule.
+func TestInText_StillRendersItsOwnSubstitutions(t *testing.T) {
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: gosec.G101-1
+	const message = "uploading at http://alice:s3cret@pyroscope:4040/ingest?name=svc"
+
+	got := redact.InText(message)
+
+	assert.Equal(t, "uploading at http://redacted@pyroscope:4040/ingest?name=svc", got)
+}
+
+// TestErrorText_SurvivesABrokenError pins that rendering an error the SDK did
+// not construct cannot take the process down. A diagnostic is never worth a
+// crash, and Error is reached from Shutdown, where a panic would also skip
+// every closer still to run.
+func TestErrorText_SurvivesABrokenError(t *testing.T) {
+	var typedNil *panickingError
+	assert.Equal(t, "<nil *redact_test.panickingError>", redact.ErrorText(typedNil))
+	assert.Equal(t, "[omitted: *redact_test.panickingError panicked while rendering]",
+		redact.ErrorText(&panickingError{}))
+	assert.Equal(t, "ordinary", redact.ErrorText(errors.New("ordinary")))
+}
+
+// TestError_SurvivesABrokenError pins that Error renders through the same guard
+// rather than calling the dependency's Error method itself.
+func TestError_SurvivesABrokenError(t *testing.T) {
+	var typedNil *panickingError
+	assert.NotPanics(t, func() {
+		assert.Equal(t, typedNil, redact.Error(typedNil, nil, nil), "nothing to redact, so unchanged")
+		assert.NotNil(t, redact.Error(&panickingError{}, nil, nil))
+	})
+}
+
+// panickingError stands in for a dependency's error whose Error method is
+// broken — a shape the SDK cannot rule out in a third-party exporter.
+type panickingError struct{}
+
+func (e *panickingError) Error() string { panic("boom") }

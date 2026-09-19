@@ -206,6 +206,64 @@ func TestRequestTarget_DropsAnUnparseableURL(t *testing.T) {
 	assert.Empty(t, target.fullURL)
 }
 
+// TestWrapRedactsCredentialsFromTheErrorSpan pins that a failed request does
+// not export through the span's error fields what url.full had removed.
+//
+// Go's client error is a *url.Error holding the request URL: net/http masks the
+// password there but keeps the username and the whole query. That text reaches
+// the span twice — as the status description and as exception.message — so
+// redacting only the attribute would move the credential rather than remove it.
+func TestWrapRedactsCredentialsFromTheErrorSpan(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+
+	// Port 1 refuses immediately, so the failure is a transport error whose
+	// *url.Error carries the request URL.
+	_, err := client.R().
+		SetQueryParam("Signature", "abc+def").
+		Get("http://bob:hunter2@127.0.0.1:1/orders")
+	require.Error(t, err)
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	span := spans[0]
+
+	assert.NotContains(t, span.Status().Description, "bob",
+		"the username survives net/http's masking, so the SDK has to remove it")
+	assert.NotContains(t, span.Status().Description, "abc%2Bdef",
+		"and so does a presigned URL's signature")
+	assert.Contains(t, span.Status().Description, "127.0.0.1:1",
+		"the server still has to be identifiable")
+
+	var exception sdktrace.Event
+	for _, event := range span.Events() {
+		if event.Name == semconv.ExceptionEventName {
+			exception = event
+		}
+	}
+	require.Equal(t, semconv.ExceptionEventName, exception.Name, "the error is still recorded as an exception")
+
+	var message, exceptionType string
+	for _, attr := range exception.Attributes {
+		switch attr.Key {
+		case semconv.ExceptionMessageKey:
+			message = attr.Value.AsString()
+		case semconv.ExceptionTypeKey:
+			exceptionType = attr.Value.AsString()
+		}
+	}
+	assert.NotContains(t, message, "bob")
+	assert.NotContains(t, message, "abc%2Bdef")
+	// The regression to catch is the exception being recorded as a redaction
+	// wrapper. The hook is handed resty's own *resty.ResponseError — not the
+	// *url.Error that Get returns to the caller — and the redaction still
+	// reaches the *url.Error inside it through errors.As.
+	assert.NotContains(t, exceptionType, "redact",
+		"the exception must not be recorded as the redaction wrapper's type")
+	assert.Equal(t, "*resty.ResponseError", exceptionType,
+		"it is the error the hook was handed, unchanged")
+}
+
 func TestWrapIsIdempotent(t *testing.T) {
 	tp, mp, sr := testProviders()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

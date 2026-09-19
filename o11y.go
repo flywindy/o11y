@@ -194,34 +194,10 @@ func (s *SDK) Shutdown(ctx context.Context) error {
 // The returned error is redacted, not only the line Shutdown logs. The pattern
 // the guide documents is slog.Any("error", obs.Shutdown(ctx)) in the caller's
 // own defer, so scrubbing one record and handing the credential to the next
-// would leave the leak exactly where it was. Unwrap keeps errors.Is and
-// errors.As working against the exporter's real error, so a caller matching a
-// sentinel or reaching for *url.Error still can; only the message changes.
+// would leave the leak exactly where it was.
 func (s *SDK) redactError(err error) error {
-	if err == nil {
-		return nil
-	}
-	msg := redact.Secrets(redact.InText(err.Error(), s.diagnosticEndpoints...), s.diagnosticSecrets...)
-	if msg == err.Error() {
-		return err
-	}
-	return &redactedError{msg: msg, err: err}
+	return redact.Error(err, s.diagnosticEndpoints, s.diagnosticSecrets)
 }
-
-// redactedError renders a redacted message while still unwrapping to the
-// error it was built from.
-type redactedError struct {
-	msg string
-	err error
-}
-
-// Error returns the redacted message, which is what every ordinary rendering
-// of the error — fmt, slog.Any, errors.Join — ends up printing.
-func (e *redactedError) Error() string { return e.msg }
-
-// Unwrap returns the exporter's own error, so errors.Is and errors.As reach
-// past the redaction to whatever the caller is matching on.
-func (e *redactedError) Unwrap() error { return e.err }
 
 // shutdownBudget derives the context one closer runs under: an even share
 // of the time left before ctx's deadline across the closers still to run,
