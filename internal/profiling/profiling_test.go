@@ -498,3 +498,52 @@ func TestPyroscopeSlogAdapter_RedactsAnEchoedWireHeader(t *testing.T) {
 	assert.NotContains(t, record.Msg, "glc_token", "the echoed wire form is the same secret")
 	assert.Contains(t, record.Msg, "failed to upload: (401)", "the rest of the line survives")
 }
+
+// TestAuthHeaderSecrets_CoversTheJSONForm pins the rendering a Go server
+// produces when it puts a received header into a JSON error body.
+//
+// encoding/json escapes "<", ">" and "&" by default, so none of the raw, %q or
+// wire forms matches it — and pyroscope puts a failed upload's whole response
+// body into its ERROR line.
+func TestAuthHeaderSecrets_CoversTheJSONForm(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const token = "Bearer a<b&c>d"
+
+	secrets := authHeaderSecrets(map[string]string{"Authorization": token})
+
+	assert.Contains(t, secrets, token, "the configured form")
+	assert.Contains(t, secrets, `Bearer a\u003cb\u0026c\u003ed`, "and the form a JSON error body holds")
+}
+
+// TestPyroscopeSlogAdapter_RedactsAJSONEchoedHeader is the same end to end:
+// the uploader reports a non-200 as "failed to upload: (%d) '%s'" with the
+// response body, so a JSON body echoing the header reaches an ERROR record.
+func TestPyroscopeSlogAdapter_RedactsAJSONEchoedHeader(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const token = "Bearer a<b&c>d"
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	adapter := newPyroscopeSlogAdapter(Config{
+		Logger:      logger,
+		AuthHeaders: map[string]string{"Authorization": token},
+	})
+
+	body, err := json.Marshal(struct {
+		Error string `json:"error"`
+	}{Error: "rejected Authorization: " + token})
+	require.NoError(t, err)
+	require.NotContains(t, string(body), token, "the premise: the raw form is not in the body")
+
+	adapter.Errorf("upload profile: %v",
+		fmt.Errorf("failed to upload: (401) '%s'", string(body))) //nolint:err113
+
+	var record struct {
+		Msg string `json:"msg"`
+	}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
+	assert.NotContains(t, record.Msg, "a<b&c>d", "the raw form")
+	assert.NotContains(t, record.Msg, redact.JSONEscaped(token), "and the JSON one")
+	assert.Contains(t, record.Msg, "failed to upload: (401)", "the rest of the line survives")
+}

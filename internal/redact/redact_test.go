@@ -1,6 +1,7 @@
 package redact_test
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -760,4 +761,68 @@ func TestQueryKeysThatOnlyLookLikeCredentials(t *testing.T) {
 			assert.Equal(t, "at "+raw, redact.InText("at "+raw))
 		})
 	}
+}
+
+// TestJSONEscaped covers the rendering a secret takes in a JSON document, the
+// third form every secret list has to carry.
+//
+// It is not GoEscaped with different punctuation. encoding/json escapes "<",
+// ">" and "&" as <, > and & unless a caller turns SetEscapeHTML
+// off, and renders a control byte as \u0000 where %q renders \x00. A Pyroscope
+// or OpenTelemetry Collector deployment is a Go program putting an error into a
+// JSON body, so this is what a server echoing a received header produces.
+func TestJSONEscaped(t *testing.T) {
+	assert.Equal(t, `plain`, redact.JSONEscaped("plain"))
+	assert.Equal(t, `tok\u003cen\u0026more\u003e`, redact.JSONEscaped("tok<en&more>"))
+	assert.Equal(t, `say \"hi\"`, redact.JSONEscaped(`say "hi"`))
+	assert.Equal(t, `a\tb`, redact.JSONEscaped("a\tb"))
+	assert.Equal(t, `\u0000`, redact.JSONEscaped("\x00"), "%q would render this as \\x00")
+}
+
+// TestJSONEscaped_MatchesWhatAGoServerWrites pins the function against
+// encoding/json itself rather than against a reading of it, the same way the
+// wire form is pinned against net/http.
+func TestJSONEscaped_MatchesWhatAGoServerWrites(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const token = "Bearer a<b&c>d"
+
+	body, err := json.Marshal(struct {
+		Error string `json:"error"`
+	}{Error: "rejected Authorization: " + token})
+	require.NoError(t, err)
+	require.NotContains(t, string(body), token, "the premise: the raw form is not in the body")
+
+	assert.Contains(t, string(body), redact.JSONEscaped(token))
+}
+
+// TestRenderings pins the one place that decides which forms of a secret are
+// listed, and that a value the escaping leaves alone is listed once.
+func TestRenderings(t *testing.T) {
+	assert.Equal(t, []string{"plain"}, redact.Renderings("plain"))
+	assert.Equal(t, []string{
+		"tok<en&more>", `tok\u003cen\u0026more\u003e`,
+	}, redact.Renderings("tok<en&more>"), "%q leaves these alone, JSON does not")
+	assert.Equal(t, []string{
+		"a\tb", `a\tb`,
+	}, redact.Renderings("a\tb"), "%q and JSON agree here, so it is listed twice, not three times")
+}
+
+// TestSecrets_RedactsAJSONEscapedValue is the end-to-end shape: a credential
+// echoed back inside a Go server's JSON error body, scrubbed with the list
+// Renderings built.
+func TestSecrets_RedactsAJSONEscapedValue(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const token = "Bearer a<b&c>d"
+
+	body, err := json.Marshal(struct {
+		Error string `json:"error"`
+	}{Error: "rejected Authorization: " + token})
+	require.NoError(t, err)
+
+	got := redact.Secrets(string(body), redact.Renderings(token)...)
+
+	assert.NotContains(t, got, `a\u003cb\u0026c\u003ed`)
+	assert.Contains(t, got, "rejected Authorization:", "the rest of the body survives")
 }

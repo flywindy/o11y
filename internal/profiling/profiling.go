@@ -243,9 +243,10 @@ func newPyroscopeSlogAdapter(cfg Config) pyroscopeSlogAdapter {
 //   - as net/http puts it on the wire, which for a value is trimmed
 //     (redact.HeaderWireValue) and for a name is the canonical MIME form
 //     (redact.HeaderWireName), because that is what a server receives;
-//   - and each of those as %q renders it, because redact.Secrets matches
-//     literally and a caller that quotes a value produces text the raw form
-//     does not cover.
+//   - and each of those as %q and as a JSON document render it
+//     (redact.Renderings), because redact.Secrets matches literally and a
+//     caller that quotes a value, or a Go server that puts it in a JSON error
+//     body, produces text the raw form does not cover.
 //
 // Nothing in the pinned pyroscope or net/http is known to quote a header value
 // — Go's own invalid-header error names the header, not what it held — but
@@ -260,8 +261,9 @@ func authHeaderSecrets(headers map[string]string) []string {
 	seen := make(map[string]struct{}, len(headers)*8)
 	secrets := make([]string, 0, len(headers)*8)
 	add := func(base string) {
-		wire := redact.HeaderWireValue(base)
-		for _, form := range []string{base, redact.GoEscaped(base), wire, redact.GoEscaped(wire)} {
+		forms := redact.Renderings(base)
+		forms = append(forms, redact.Renderings(redact.HeaderWireValue(base))...)
+		for _, form := range forms {
 			if form == "" {
 				continue
 			}
