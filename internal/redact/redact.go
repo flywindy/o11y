@@ -3,6 +3,7 @@ package redact
 
 import (
 	"fmt"
+	"net/textproto"
 	"net/url"
 	"reflect"
 	"regexp"
@@ -419,6 +420,21 @@ func GoEscaped(v string) string {
 // two lists in this SDK should not answer it differently.
 func HeaderWireValue(v string) string {
 	return strings.Trim(v, " \t\r\n")
+}
+
+// HeaderWireName returns a header name as net/http stores and sends it.
+//
+// Header.Set does not key by the name it was given: it keys by
+// textproto.CanonicalMIMEHeaderKey(name), so "x-api-key" goes out as
+// "X-Api-Key". A name that holds a byte which cannot appear in a header name
+// is stored and sent unchanged.
+//
+// It matters for the same reason names are in a secret list at all — a
+// credential pasted into the wrong side of a header configuration is still a
+// credential, and a server or an exporter that reports the header it received
+// names the canonical form, not the configured one.
+func HeaderWireName(name string) string {
+	return textproto.CanonicalMIMEHeaderKey(name)
 }
 
 // Error returns err with credentials removed from its message, keeping the

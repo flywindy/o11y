@@ -238,11 +238,16 @@ adopters can plan their upgrades.
     the values of `AWSAccessKeyId`, `Signature`, `sig` and `X-Goog-Signature`
     wherever the endpoint is recognised, and a log line holding a credential
     query parameter the SDK did not redact itself is replaced wholesale.
-  - A configured header value is now also matched in the form net/http puts on
-    the wire, which trims surrounding whitespace, so a value configured as
-    `" Bearer …"` is still redacted where a server echoes back what it
-    received — pyroscope puts a failed upload's whole response body into its
-    ERROR line.
+  - A configured header is now also matched in the form it is actually sent
+    as, not only as it was written. net/http trims a value's surrounding
+    whitespace and keys a name by its canonical MIME form, and the OTLP
+    exporter unescapes an `OTEL_EXPORTER_OTLP_HEADERS` value before trimming
+    it — so `" Bearer …"`, `x-api-key` and `%C2%A0Secret%C2%A0` reach the
+    server as `Bearer …`, `X-Api-Key` and `Secret`. Both exporters put a
+    non-2xx response body into the error they return, so a server echoing the
+    header it received named a string the configured form did not match. The
+    profiling header list now covers names as well as values, as the OTLP one
+    already did.
   - `Shutdown` can no longer be held by an error from a dependency. The walk
     that finds the URLs in an error chain is now bounded by the number of
     errors it visits rather than by how deep it goes: once `Unwrap` returns a

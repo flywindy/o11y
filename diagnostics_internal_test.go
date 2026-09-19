@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -664,4 +665,47 @@ func TestDiagnosticSecrets_WireForm(t *testing.T) {
 
 	assert.Contains(t, secrets, "Bearer configured-secret", "the form that goes on the wire")
 	assert.Contains(t, secrets, padded, "and the form it was configured as")
+}
+
+// TestDiagnosticSecrets_ExporterNormalizedEnvValue pins the form the pinned
+// exporter actually sends for an environment-configured header.
+//
+// stringToHeader unescapes the value and then applies strings.TrimSpace, in
+// that order — and strings.TrimSpace takes Unicode spaces net/http would have
+// kept, so HeaderWireValue's ASCII trim does not produce it either. The list
+// therefore held the encoded form and the decoded-but-padded form, and not the
+// one that goes out. The exporter puts a non-2xx response body into the error
+// it returns, so a collector echoing the header it received names exactly that.
+func TestDiagnosticSecrets_ExporterNormalizedEnvValue(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const configured = "authorization=%C2%A0BearerSecret%C2%A0"
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", configured)
+	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "")
+
+	// What the exporter sends, derived the way it derives it rather than
+	// spelled out, so this fails if the pinned parser ever changes.
+	_, rawValue, ok := strings.Cut(configured, "=")
+	require.True(t, ok)
+	unescaped, err := url.PathUnescape(rawValue)
+	require.NoError(t, err)
+	sent := strings.TrimSpace(unescaped)
+	require.Equal(t, "BearerSecret", sent, "the premise: neither the configured nor the ASCII-trimmed form")
+
+	assert.Contains(t, diagnosticSecrets(&Config{}), sent)
+}
+
+// TestDiagnosticSecrets_CanonicalHeaderName pins the form net/http stores a
+// configured header name under. Header.Set keys by
+// textproto.CanonicalMIMEHeaderKey, so a credential pasted in as a name
+// reaches the collector canonicalized.
+func TestDiagnosticSecrets_CanonicalHeaderName(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header name, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const pastedAsAName = "x-secret-glc-token"
+
+	secrets := diagnosticSecrets(&Config{otlpHeaders: map[string]string{pastedAsAName: "1"}})
+
+	assert.Contains(t, secrets, pastedAsAName, "the configured spelling")
+	assert.Contains(t, secrets, "X-Secret-Glc-Token", "and the one that goes on the wire")
 }
