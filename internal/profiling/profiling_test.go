@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
+	"path"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +19,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
+
+	"github.com/flywindy/o11y/internal/redact"
 )
 
 type fakeProfiler struct {
@@ -391,4 +395,83 @@ func TestCloser_ReleasesSlotEvenWhenStopFails(t *testing.T) {
 	require.NoError(t, second(context.Background()))
 	assert.Equal(t, 1, healthy.stopCalls, "the replacement profiler must be stopped exactly once")
 	assert.Equal(t, 1, failing.stopCalls, "the failed closer must not be re-invoked")
+}
+
+// TestPyroscopeSlogAdapter_RedactsASignedEndpoint pins the adapter against what
+// the pinned uploader actually formats for a presigned endpoint.
+//
+// remote.uploadProfile appends "/ingest" to the path and rebuilds the query
+// with url.Values.Encode before logging "uploading at %s", so the configured
+// endpoint is not a substring of the message and there is nothing for InText to
+// substitute. The signature travels in the query, so there is no "@" either —
+// the rule that covers a userinfo endpoint passes this straight through. Both
+// the per-upload DEBUG line and the failed-upload ERROR line carried it.
+func TestPyroscopeSlogAdapter_RedactsASignedEndpoint(t *testing.T) {
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const endpoint = "https://pyroscope:4040?Signature=s3cretsig"
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	adapter := newPyroscopeSlogAdapter(Config{Logger: logger, Endpoint: endpoint})
+
+	// Exactly what remote.uploadProfile builds: path joined, query re-encoded.
+	u, err := url.Parse(endpoint)
+	require.NoError(t, err)
+	q := u.Query()
+	q.Set("name", "svc")
+	u.Path = path.Join(u.Path, "ingest")
+	u.RawQuery = q.Encode()
+	require.NotContains(t, u.String(), endpoint, "the premise: the configured endpoint is not a substring")
+
+	adapter.Debugf("uploading at %s", u.String())
+	adapter.Errorf("upload profile: %v",
+		fmt.Errorf("Post %q: dial tcp: i/o timeout", u.String())) //nolint:err113
+
+	assert.NotContains(t, buf.String(), "s3cretsig", "a signature is a credential like any other")
+}
+
+// TestAuthHeaderSecrets_CoversTheWireForm pins that a value configured with
+// surrounding whitespace is listed as net/http sends it.
+//
+// Header.Set stores the configured string untouched, but the write path trims
+// it, so a server that echoes the header it received reports the trimmed form —
+// and the pinned uploader puts a failed upload's whole response body into its
+// ERROR line. redact.Secrets matches literally, so the configured form does not
+// cover it.
+func TestAuthHeaderSecrets_CoversTheWireForm(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const padded = " Bearer glc_token "
+
+	secrets := authHeaderSecrets(map[string]string{"Authorization": padded})
+
+	assert.Contains(t, secrets, padded, "the configured form is still listed")
+	assert.Contains(t, secrets, "Bearer glc_token", "and so is the form that goes on the wire")
+}
+
+// TestPyroscopeSlogAdapter_RedactsAnEchoedWireHeader pins the same through the
+// adapter: pyroscope reports a non-200 upload as
+// "failed to upload: (%d) '%s'" with the response body, so a server that echoes
+// the header it received puts the wire form of the token into an ERROR record.
+func TestPyroscopeSlogAdapter_RedactsAnEchoedWireHeader(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const padded = "\tBearer glc_token\t"
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	adapter := newPyroscopeSlogAdapter(Config{
+		Logger:      logger,
+		AuthHeaders: map[string]string{"Authorization": padded},
+	})
+
+	adapter.Errorf("upload profile: %v",
+		fmt.Errorf("failed to upload: (401) 'rejected Authorization: %s'", //nolint:err113
+			redact.HeaderWireValue(padded)))
+
+	var record struct {
+		Msg string `json:"msg"`
+	}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
+	assert.NotContains(t, record.Msg, "glc_token", "the echoed wire form is the same secret")
+	assert.Contains(t, record.Msg, "failed to upload: (401)", "the rest of the line survives")
 }

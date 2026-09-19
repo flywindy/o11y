@@ -228,6 +228,26 @@ adopters can plan their upgrades.
     the error it returns are now scrubbed against the configured endpoints and
     header values; the returned error still unwraps to the exporter's own, so
     `errors.Is` and `errors.As` are unaffected.
+  - A **presigned** endpoint is covered too, not only a `user:pass@host` one.
+    A signature travels in the query, so such a URL has no `@` for the
+    userinfo rule to hold on to. `WithProfilingEndpoint` was the case that
+    showed it: pyroscope's uploader appends `/ingest` and re-encodes the query
+    before logging the URL, so the configured endpoint is no longer a
+    substring to substitute, and `?Signature=…` reached a DEBUG line on every
+    upload and an ERROR line on every failure. Endpoint redaction now replaces
+    the values of `AWSAccessKeyId`, `Signature`, `sig` and `X-Goog-Signature`
+    wherever the endpoint is recognised, and a log line holding a credential
+    query parameter the SDK did not redact itself is replaced wholesale.
+  - A configured header value is now also matched in the form net/http puts on
+    the wire, which trims surrounding whitespace, so a value configured as
+    `" Bearer …"` is still redacted where a server echoes back what it
+    received — pyroscope puts a failed upload's whole response body into its
+    ERROR line.
+  - `Shutdown` can no longer be held by an error from a dependency. The walk
+    that finds the URLs in an error chain is now bounded by the number of
+    errors it visits rather than by how deep it goes: once `Unwrap` returns a
+    slice, an error holding itself twice branches in two at every step, so a
+    depth cap alone bounded nothing.
 - `mongo`: `db.client.connection.count{state=idle}` no longer drifts below the
   pool's real size. The v2 driver creates a connection before it handshakes and,
   when the handshake fails, removes it with a `ConnectionClosed` event and no

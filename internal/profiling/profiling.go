@@ -228,23 +228,33 @@ func newPyroscopeSlogAdapter(cfg Config) pyroscopeSlogAdapter {
 // authHeaderSecrets returns the configured profiling auth header values, so
 // redact.Secrets can take them out of a line that echoes one.
 //
-// Each value is listed in both its raw and its Go-escaped form, matching what
-// diagnosticSecrets does for the OTLP headers: Secrets matches literally, so a
-// caller that prints a value with %q produces text the raw form does not
-// cover. Nothing in the pinned pyroscope or net/http is known to quote a header
-// value — Go's own invalid-header error names the header, not what it held —
-// but this adapter's whole premise is that it does not get to choose what the
-// upstream formats into a message.
+// Each value is listed in its raw form, in the form net/http actually puts on
+// the wire, and in the Go-escaped form of each — matching what
+// diagnosticSecrets does for the OTLP headers. Secrets matches literally, so a
+// caller that prints a value with %q produces text the raw form does not cover,
+// and a value configured with surrounding whitespace is sent without that: the
+// pinned uploader puts a failed upload's whole response body into its ERROR
+// line, so a server that echoes the header it received would print the wire
+// form, which the configured one does not match. Nothing in the pinned
+// pyroscope or net/http is known to quote a header value — Go's own
+// invalid-header error names the header, not what it held — but this adapter's
+// whole premise is that it does not get to choose what the upstream formats
+// into a message.
 //
 // The result is sorted to keep it independent of map iteration order.
 func authHeaderSecrets(headers map[string]string) []string {
 	if len(headers) == 0 {
 		return nil
 	}
-	seen := make(map[string]struct{}, len(headers)*2)
-	secrets := make([]string, 0, len(headers)*2)
+	seen := make(map[string]struct{}, len(headers)*4)
+	secrets := make([]string, 0, len(headers)*4)
 	for _, value := range headers {
-		for _, form := range []string{value, redact.GoEscaped(value)} {
+		wire := redact.HeaderWireValue(value)
+		forms := []string{
+			value, redact.GoEscaped(value),
+			wire, redact.GoEscaped(wire),
+		}
+		for _, form := range forms {
 			if form == "" {
 				continue
 			}

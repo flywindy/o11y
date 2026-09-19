@@ -648,3 +648,20 @@ func TestShutdown_DisabledPillarsDoNotShareTheDeadline(t *testing.T) {
 	require.NoError(t, sdk.Shutdown(ctx))
 	assert.Equal(t, want, got, "the only closer runs under the caller's own deadline")
 }
+
+// TestDiagnosticSecrets_WireForm pins that a configured header value is listed
+// as net/http sends it as well as as it was written.
+//
+// Header.Set stores the configured string untouched and the write path trims
+// surrounding whitespace, so a server or an exporter that reports the header it
+// received names a string redact.Secrets would not otherwise match.
+func TestDiagnosticSecrets_WireForm(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const padded = "\tBearer configured-secret\t"
+
+	secrets := diagnosticSecrets(&Config{otlpHeaders: map[string]string{"x-api-key": padded}})
+
+	assert.Contains(t, secrets, "Bearer configured-secret", "the form that goes on the wire")
+	assert.Contains(t, secrets, padded, "and the form it was configured as")
+}
