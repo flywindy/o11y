@@ -105,25 +105,25 @@ func InText(text string, knownEndpoints ...string) string {
 		}
 		text = strings.ReplaceAll(text, endpoint, URL(endpoint))
 	}
-	// Substitutions go in as a sentinel first, so the check below counts only
-	// at-signs this function did not account for.
+	// The rule is checked by counting, not by rewriting and looking again.
 	//
-	// Stripping "redacted@" from the finished text instead would strip the
-	// input's own: a message holding "//alice:redacted@host" — scheme-relative,
-	// so the pattern above does not match it — would lose the "@" that makes it
-	// fail the rule, and the credential beside it would be returned intact. The
-	// sentinel carries no "@" and is swapped back only after the rule has run.
-	text = urlUserinfo.ReplaceAllString(text, "${1}"+userinfoSentinel)
-	if strings.Contains(text, "@") {
+	// Each match of the pattern above ends at an "@" and cannot contain one, so
+	// the number of matches is exactly the number of at-signs this function can
+	// account for. Any other "@" is one it cannot, and the text goes wholesale.
+	//
+	// Two earlier forms of this check were talked out of the rule by their own
+	// output. Stripping "redacted@" from the finished text stripped the input's
+	// own as readily, so a message holding "//alice:redacted@host" — which the
+	// pattern does not match, being scheme-relative — lost the "@" that made it
+	// fail. Substituting a fixed sentinel instead moved the collision rather
+	// than removing it: text already holding that sentinel had it swapped for a
+	// "redacted@" the check never accounted for. Counting compares the text
+	// against itself and introduces nothing, so there is no collision to have.
+	if strings.Count(text, "@") != len(urlUserinfo.FindAllStringIndex(text, -1)) {
 		return redactedWhole
 	}
-	return strings.ReplaceAll(text, userinfoSentinel, placeholder+"@")
+	return urlUserinfo.ReplaceAllString(text, "${1}"+placeholder+"@")
 }
-
-// userinfoSentinel stands in for a userinfo match while InText checks that no
-// unaccounted-for "@" survives. It carries no "@" of its own, and the NUL bytes
-// keep it from being confused with anything a URL or an error message can hold.
-const userinfoSentinel = "\x00userinfo\x00"
 
 // opaquePlaceholder replaces a secret Secrets was told about.
 const opaquePlaceholder = "[redacted]"
@@ -365,7 +365,13 @@ func Error(err error, endpoints, secrets []string) error {
 // with no "@" anywhere. The span keeps url.full, server.address and error.type,
 // so the request is still identifiable without it.
 func errorText(text string, err error, endpoints []string) string {
-	for _, raw := range errorURLs(err) {
+	urls := errorURLs(err)
+	// Longest first. A nested *url.Error commonly holds the outer one's URL
+	// plus a query, so replacing the outer first would rewrite its prefix
+	// inside the inner occurrence too — and the inner URL, no longer matching,
+	// would keep whatever its query carried.
+	sort.Slice(urls, func(i, j int) bool { return len(urls[i]) > len(urls[j]) })
+	for _, raw := range urls {
 		parsed, parseErr := url.Parse(raw)
 		if parseErr != nil {
 			return redactedWhole
@@ -414,9 +420,9 @@ func errorURLs(err error) []string {
 		// concrete error type.
 		switch unwrapper := e.(type) { //nolint:errorlint // dispatching on Unwrap, not on an error type
 		case interface{ Unwrap() error }:
-			walk(unwrapper.Unwrap(), depth+1)
+			walk(unwrapped(unwrapper.Unwrap), depth+1)
 		case interface{ Unwrap() []error }:
-			for _, sub := range unwrapper.Unwrap() {
+			for _, sub := range unwrappedAll(unwrapper.Unwrap) {
 				walk(sub, depth+1)
 			}
 		}
@@ -473,4 +479,30 @@ func renderError(err error) (text string, rendered bool) {
 		}
 	}()
 	return err.Error(), true
+}
+
+// unwrapped calls an Unwrap method the SDK did not write, and reports no next
+// link if it panics.
+//
+// renderError guards the Error method for the same reason, and a dependency's
+// Unwrap is a second way into the same crash: from Shutdown a panic here would
+// skip every closer still to run. Only the broken branch of the walk stops —
+// the links already collected stand.
+func unwrapped(unwrap func() error) (next error) {
+	defer func() {
+		if r := recover(); r != nil {
+			next = nil
+		}
+	}()
+	return unwrap()
+}
+
+// unwrappedAll is unwrapped for the multi-error form.
+func unwrappedAll(unwrap func() []error) (next []error) {
+	defer func() {
+		if r := recover(); r != nil {
+			next = nil
+		}
+	}()
+	return unwrap()
 }

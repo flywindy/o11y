@@ -3,9 +3,9 @@ package resty
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -468,7 +468,26 @@ func targetFromURL(u *url.URL) targetAttrs {
 // error's type and the redacted text.
 func recordRedactedError(span trace.Span, err error) {
 	span.AddEvent(semconv.ExceptionEventName, trace.WithAttributes(
-		semconv.ExceptionType(fmt.Sprintf("%T", err)),
+		semconv.ExceptionType(exceptionType(err)),
 		semconv.ExceptionMessage(redact.Error(err, nil, nil).Error()),
 	))
+}
+
+// exceptionType names err's type the way span.RecordError would have.
+//
+// It mirrors the pinned OTel SDK's typeStr (sdk/trace/span.go): a named type
+// is reported with its full import path, which is what semconv asks for and
+// what type-based grouping in a backend keys on. %T would report the short
+// package name instead, so an error type that is not a pointer would group
+// differently here than through every other RecordError in the process.
+func exceptionType(err error) string {
+	t := reflect.TypeOf(err)
+	if t == nil {
+		return ""
+	}
+	if t.PkgPath() == "" && t.Name() == "" {
+		// A pointer, or a builtin: neither has a path of its own to report.
+		return t.String()
+	}
+	return t.PkgPath() + "." + t.Name()
 }

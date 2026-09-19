@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -263,6 +264,7 @@ func TestWrapRedactsCredentialsFromTheErrorSpan(t *testing.T) {
 		"the exception must not be recorded as the redaction wrapper's type")
 	assert.Equal(t, "*resty.ResponseError", exceptionType,
 		"it is the error the hook was handed, unchanged")
+
 }
 
 // TestWrapRedactsANestedTransportError pins that a credential inside a URL the
@@ -306,6 +308,46 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 // RoundTrip implements http.RoundTripper.
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// TestExceptionType_MatchesTheSDKRendering pins that the exception type this
+// package records is the one span.RecordError would have recorded.
+//
+// Building the event by hand was necessary to keep the type while redacting the
+// message, but it put the naming in this package's hands. The OTel SDK reports
+// a named type with its full import path, which is what semconv asks for and
+// what a backend groups on; %T reports the short package name instead. A
+// pointer type renders the same either way, so a named non-pointer error — the
+// shape a caller's own OnBeforeRequest hook can return — is what separates them.
+func TestExceptionType_MatchesTheSDKRendering(t *testing.T) {
+	for _, err := range []error{
+		namedError{},          // a named non-pointer type: the case %T gets wrong
+		&namedError{},         // a pointer to it
+		errors.New("builtin"), // an unexported stdlib type
+		&url.Error{Op: "Get"}, // the shape the client path actually produces
+	} {
+		t.Run(sdkExceptionType(err), func(t *testing.T) {
+			assert.Equal(t, sdkExceptionType(err), exceptionType(err))
+		})
+	}
+}
+
+// namedError is a named, non-pointer error type, the shape whose rendering
+// differs between %T and the SDK's.
+type namedError struct{}
+
+// Error implements error.
+func (namedError) Error() string { return "named" }
+
+// sdkExceptionType reproduces the pinned OTel SDK's typeStr
+// (sdk/trace/span.go), so the assertion is against the upstream rule rather
+// than against a copy of this package's own implementation.
+func sdkExceptionType(i any) string {
+	t := reflect.TypeOf(i)
+	if t.PkgPath() == "" && t.Name() == "" {
+		return t.String()
+	}
+	return fmt.Sprintf("%s.%s", t.PkgPath(), t.Name())
+}
 
 func TestWrapIsIdempotent(t *testing.T) {
 	tp, mp, sr := testProviders()
