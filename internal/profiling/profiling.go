@@ -221,7 +221,7 @@ func newPyroscopeSlogAdapter(cfg Config) pyroscopeSlogAdapter {
 	return pyroscopeSlogAdapter{
 		logger:   cfg.Logger,
 		endpoint: cfg.Endpoint,
-		secrets:  authHeaderSecrets(cfg.AuthHeaders),
+		secrets:  authHeaderSecrets(cfg.Endpoint, cfg.AuthHeaders),
 	}
 }
 
@@ -254,15 +254,10 @@ func newPyroscopeSlogAdapter(cfg Config) pyroscopeSlogAdapter {
 // upstream formats into a message.
 //
 // The result is sorted to keep it independent of map iteration order.
-func authHeaderSecrets(headers map[string]string) []string {
-	if len(headers) == 0 {
-		return nil
-	}
+func authHeaderSecrets(endpoint string, headers map[string]string) []string {
 	seen := make(map[string]struct{}, len(headers)*8)
 	secrets := make([]string, 0, len(headers)*8)
-	add := func(base string) {
-		forms := redact.Renderings(base)
-		forms = append(forms, redact.Renderings(redact.HeaderWireValue(base))...)
+	add := func(forms []string) {
 		for _, form := range forms {
 			if form == "" {
 				continue
@@ -275,9 +270,21 @@ func authHeaderSecrets(headers map[string]string) []string {
 		}
 	}
 	for name, value := range headers {
-		add(name)
-		add(redact.HeaderWireName(name))
-		add(value)
+		add(redact.HeaderNameForms(name))
+		add(redact.HeaderValueForms(value))
+	}
+	// The endpoint's own userinfo is a credential the SDK never configured as a
+	// header and yet sends as one: http.Client derives
+	// "Authorization: Basic base64(user:pass)" from it. The base64 contains
+	// neither the username nor the password as a substring, so nothing else in
+	// this list would match a server that echoed the header back.
+	if basic := redact.BasicAuthHeader(endpoint); basic != "" {
+		add(redact.HeaderValueForms(basic))
+		// Also without the scheme, for a report that names only the token.
+		add(redact.HeaderValueForms(strings.TrimPrefix(basic, "Basic ")))
+	}
+	if len(secrets) == 0 {
+		return nil
 	}
 	sort.Strings(secrets)
 	return secrets

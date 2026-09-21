@@ -249,7 +249,18 @@ adopters can plan their upgrades.
     profiling header list now covers names as well as values, as the OTLP one
     already did. A configured header is also matched as a JSON document holds
     it — `encoding/json` escapes `<`, `>` and `&` — since both backends are Go
-    programs that report an error in a JSON body.
+    programs that report an error in a JSON body, and in the forms HTTP/2 uses:
+    names lowercased, and a `Cookie` value split and rejoined with `"; "`.
+  - The `Authorization: Basic …` header that `http.Client` derives from an
+    endpoint's userinfo is now redacted too. It is the credential in a form no
+    other entry held — the base64 contains neither the username nor the
+    password as a substring — so a server echoing back the header it received
+    defeated every other rendering.
+  - An opaque endpoint whose payload could be a `user:pass` pair is replaced
+    wholesale. `url.Parse` attributes nothing in one, so `http:alice:secret`
+    carried no userinfo and no `@` for the existing rule to catch. A
+    scheme-less `host:port` is still echoed: its payload is a single token and
+    cannot be a pair.
   - `Shutdown` can no longer be held by an error from a dependency. The walk
     that finds the URLs in an error chain is now bounded by the number of
     errors it visits rather than by how deep it goes: once `Unwrap` returns a

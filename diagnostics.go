@@ -607,18 +607,7 @@ func isHTTPToken(s string) bool {
 func diagnosticSecrets(cfg *Config) []string {
 	seen := make(map[string]struct{})
 	var out []string
-	add := func(v string) {
-		// redact.Renderings expands each form into the ways something may
-		// print it — as it stands, as %q renders it, and as a JSON document
-		// holds it, which is what a Go server writing a JSON error body
-		// produces. A value the escaping leaves alone is added once.
-		// The form net/http puts on the wire is listed as well: it trims
-		// surrounding whitespace as it writes a header, so a value echoed
-		// back by a server or named in an exporter's error is not the
-		// configured string. HeaderWireValue does that trimming rather than
-		// strings.TrimSpace, which also takes Unicode spaces net/http keeps.
-		forms := redact.Renderings(v)
-		forms = append(forms, redact.Renderings(redact.HeaderWireValue(v))...)
+	addForms := func(forms []string) {
 		for _, s := range forms {
 			if s == "" {
 				continue
@@ -630,13 +619,16 @@ func diagnosticSecrets(cfg *Config) []string {
 			out = append(out, s)
 		}
 	}
-	// addName also lists the form net/http stores a header name under:
-	// Header.Set keys by textproto.CanonicalMIMEHeaderKey, so a name is sent
-	// canonicalized rather than as configured.
-	addName := func(v string) {
-		add(v)
-		add(redact.HeaderWireName(v))
-	}
+	// redact.HeaderValueForms and HeaderNameForms expand a configured header
+	// into every way something between this SDK and the collector may render
+	// it: as configured; as net/http actually sends it, which trims a value,
+	// canonicalizes a name over HTTP/1.1, lowercases it over HTTP/2 and
+	// rejoins a Cookie; and each of those as %q and as a JSON document hold
+	// them, which is what a Go server writing a JSON error body produces.
+	// They live in redact so this list and the profiling one cannot answer
+	// that question differently — they have disagreed three times already.
+	add := func(v string) { addForms(redact.HeaderValueForms(v)) }
+	addName := func(v string) { addForms(redact.HeaderNameForms(v)) }
 	// Names as well as values: a credential pasted in as a header name
 	// reaches net/http, whose "invalid header field name" error echoes it
 	// through the export error the ErrorHandler records.
