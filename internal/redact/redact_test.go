@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"html"
 	"net/http"
 	"net/http/httptest"
@@ -1634,4 +1635,72 @@ func TestSecrets_RefusesASecretThatIsThePlaceholder(t *testing.T) {
 	assert.Equal(t, "server echoed [redacted]",
 		redact.Secrets("server echoed "+ordinary, ordinary),
 		"and an ordinary secret still produces the placeholder rather than losing the line")
+}
+
+// TestError_RefusesACredentialStillInTheText pins the post-condition that
+// backs every secret list: after all the replacing, a credential the RFCs
+// define is one nothing accounted for, and the text goes.
+//
+// It exists because two rounds of review found a credential no caller could
+// have named — one net/http derived from a redirect's Location, one resty's
+// digest transport signed on a copy of the request — and a list cannot be
+// extended to cover a value it never sees.
+func TestError_RefusesACredentialStillInTheText(t *testing.T) {
+	// #nosec G101 -- fabricated fixture credential, not a live one
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	unlisted := base64.StdEncoding.EncodeToString([]byte("alice:newsecret"))
+	require.NotContains(t, unlisted, "newsecret", "the premise: base64 hides it from every literal match")
+
+	t.Run("a Basic credential nothing listed", func(t *testing.T) {
+		err := errors.New(`proxy rejected header "Basic ` + unlisted + `"`)
+		assert.Equal(t, "[message redacted]", redact.Error(err, nil, nil).Error())
+	})
+
+	t.Run("one the caller did list is replaced, not refused", func(t *testing.T) {
+		err := errors.New(`proxy rejected header "Basic ` + unlisted + `"`)
+		got := redact.Error(err, nil, redact.HeaderValueForms("Basic "+unlisted)).Error()
+		assert.NotContains(t, got, unlisted)
+		assert.Contains(t, got, "proxy rejected header", "the line survives")
+	})
+
+	t.Run("a Digest credential, which can never be listed", func(t *testing.T) {
+		// #nosec G101 -- fabricated fixture credential, not a live one
+		// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+		digest := `Digest username="alice", realm="r", nonce="n", uri="/orders", ` +
+			`response="41f1670a364ebe0a76bb4740d8b68f45", qop=auth, nc=00000001, cnonce="6ca020a1"`
+		err := fmt.Errorf("proxy rejected header %q", digest)
+		require.Contains(t, err.Error(), `response=\"41f1`,
+			"the premise: %q escapes the quotes, so the rule has to read past the escaping")
+		assert.Equal(t, "[message redacted]", redact.Error(err, nil, nil).Error())
+	})
+
+	t.Run("prose about authentication is not a credential", func(t *testing.T) {
+		for _, message := range []string{
+			"Basic authentication failed",
+			"server requires Digest or Basic auth",
+			"Digest response required but not supplied",
+		} {
+			err := errors.New(message)
+			assert.Equal(t, message, redact.Error(err, nil, nil).Error(), message)
+		}
+	})
+}
+
+// TestHeaderSecrets_ListsTheNameAsWellAsTheValue pins the sibling property the
+// profiling and diagnostic lists already had: a credential pasted into the
+// name side of a header configuration is still a credential, and net/http
+// quotes an unusable name straight back — `invalid header field name "…"`.
+func TestHeaderSecrets_ListsTheNameAsWellAsTheValue(t *testing.T) {
+	header := http.Header{}
+	// #nosec G101 -- fabricated fixture header name, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	pastedAsName := "BearerSecret" + "\n" + "Token"
+	header[pastedAsName] = []string{"v"}
+	require.True(t, redact.CredentialHeaderName(pastedAsName), "the premise: the name reads as a credential's")
+
+	secrets := redact.HeaderSecrets(header)
+
+	assert.Contains(t, secrets, pastedAsName, "the name as configured")
+	assert.Contains(t, secrets, redact.GoEscaped(pastedAsName),
+		"and as an error that quotes it renders it")
 }

@@ -1387,3 +1387,124 @@ func TestWrapRedactsTheSerializedFormOfAJarCookie(t *testing.T) {
 		}
 	}
 }
+
+// TestWrapRefusesACredentialASameHostRedirectIntroduced pins the case that
+// disproved this package's earlier reasoning.
+//
+// The rule added a round before assumed net/http reuses the first hop's
+// Authorization on a same-host redirect. It does not: the header it derived
+// for that hop lives on a fork inside send, and makeHeadersCopier captured the
+// initial request's headers before that fork existed (client.go:604). So a
+// same-host Location carrying different userinfo produces a *second*
+// credential, which no list here has ever seen.
+func TestWrapRefusesACredentialASameHostRedirectIntroduced(t *testing.T) {
+	tp, mp, sr := testProviders()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			// #nosec G101 -- fabricated fixture credential, not a live one
+			// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+			http.Redirect(w, r, "http://alice:newsecret@"+r.Host+"/final", http.StatusFound)
+		}
+	}))
+	defer srv.Close()
+
+	newBasic := base64.StdEncoding.EncodeToString([]byte("alice:newsecret"))
+	oldBasic := base64.StdEncoding.EncodeToString([]byte("alice:oldpass"))
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	transport := http.DefaultTransport
+	client.SetTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/final" {
+			return nil, fmt.Errorf("proxy rejected header %q", r.Header.Get("Authorization"))
+		}
+		return transport.RoundTrip(r)
+	}))
+
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	_, err := client.R().Get("http://alice:oldpass@" + strings.TrimPrefix(srv.URL, "http://") + "/start")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), newBasic,
+		"the premise: the credential on the wire is the Location's, not the request's")
+	require.NotContains(t, err.Error(), oldBasic,
+		"and the first hop's derived header was not carried over")
+
+	spans := endedClientSpans(sr)
+	require.NotEmpty(t, spans)
+	span := spans[len(spans)-1]
+
+	assert.NotContains(t, span.Status().Description, newBasic)
+	for _, event := range span.Events() {
+		for _, attr := range event.Attributes {
+			assert.NotContains(t, attr.Value.AsString(), newBasic)
+		}
+	}
+}
+
+// TestWrapRefusesADigestCredential pins the credential resty signs on a copy
+// of the request. digestTransport clones the request, sets Authorization on
+// the clone and performs the second round trip with it, so req.RawRequest
+// never carries it and the response hash is not something any list could hold.
+func TestWrapRefusesADigestCredential(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.SetTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			return nil, fmt.Errorf("proxy rejected header %q", auth)
+		}
+		return &http.Response{
+			StatusCode: http.StatusUnauthorized,
+			Header:     http.Header{"Www-Authenticate": []string{`Digest realm="r", nonce="n", qop="auth"`}},
+			Body:       http.NoBody,
+			Request:    r,
+		}, nil
+	}))
+	// After SetTransport: SetDigestAuth wraps whatever transport is installed.
+	// #nosec G101 -- fabricated fixture credential, not a live one
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	client.SetDigestAuth("alice", "hunter2")
+
+	_, err := client.R().Get("https://api.example.com/orders")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "response=",
+		"the premise: the digest response reaches the error")
+
+	spans := endedClientSpans(sr)
+	require.NotEmpty(t, spans)
+	span := spans[len(spans)-1]
+
+	assert.Equal(t, "[message redacted]", span.Status().Description)
+	for _, event := range span.Events() {
+		for _, attr := range event.Attributes {
+			assert.NotContains(t, attr.Value.AsString(), "response=")
+		}
+	}
+}
+
+// TestWrapRedactsACredentialPastedIntoAHeaderName pins the name side of a
+// header configuration, which resty's secret list covered for values only
+// while the profiling and diagnostic lists already covered both.
+func TestWrapRedactsACredentialPastedIntoAHeaderName(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+
+	// A name net/http cannot send, so it quotes it back verbatim — and
+	// Header.Set stores such a name unchanged, since canonicalization gives up
+	// on a byte that cannot appear in one.
+	// #nosec G101 -- fabricated fixture header name, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	pastedAsName := "BearerSecret" + "\n" + "Token"
+
+	_, err := client.R().SetHeader(pastedAsName, "v").Get("https://api.example.com/orders")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "BearerSecret",
+		"the premise: the name is in the error the hook is handed")
+
+	spans := endedClientSpans(sr)
+	require.NotEmpty(t, spans)
+	span := spans[len(spans)-1]
+
+	assert.NotContains(t, span.Status().Description, "BearerSecret")
+	assert.Contains(t, span.Status().Description, "invalid header field name",
+		"the diagnosis survives: it is the name that goes, not the line")
+}

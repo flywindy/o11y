@@ -465,6 +465,9 @@ func Secrets(text string, secrets ...string) string {
 			return redactedMessage
 		}
 	}
+	if holdsUnaccountedCredential(text) {
+		return redactedMessage
+	}
 	return text
 }
 
@@ -487,6 +490,61 @@ func holdsPlaceholder(text string) bool {
 	}
 	return false
 }
+
+// holdsUnaccountedCredential reports whether text still carries an HTTP
+// credential after everything this package could replace has been replaced.
+//
+// It is a post-condition rather than another list, and it exists because the
+// lists keep being one source short. Two rounds of review found a credential
+// that no caller could have named: net/http derives a fresh Basic header from
+// a redirect's Location — for a same-host redirect too, because the header it
+// derived for the first hop lives on a fork inside send and is not among the
+// headers makeHeadersCopier carries over (client.go:604) — and resty's digest
+// transport signs a copy of the request that no caller ever sees. Whatever
+// else those have in common, the credential lands in the message in a form
+// the RFCs define, so that is what is checked.
+//
+// Only schemes with structure to recognise are refused. A Basic credential is
+// base64 of "user:pass" (RFC 7617), so a token that decodes and holds a colon
+// is one — "Basic authentication failed" is not, because "authentication" is
+// not valid base64. A Digest credential carries a response parameter (RFC
+// 7616), which is a hash of the password and can never be listed, so any is
+// refused. Bearer has no such structure — a token is any string — so this
+// cannot tell "Bearer eyJ…" from "Bearer token required" and does not try;
+// a bearer token is covered by the caller's list, where it can be named.
+func holdsUnaccountedCredential(text string) bool {
+	// The readings, not only the text: an error that quotes a header with %q
+	// escapes the quotes inside a Digest credential, and an escaping is how a
+	// character a rule holds on to goes missing — the lesson the closed rules
+	// here learned three rounds running.
+	views, converged := decodedViews(text)
+	if !converged {
+		return true
+	}
+	for _, reading := range append([]string{text}, views...) {
+		for _, match := range basicCredential.FindAllStringSubmatch(reading, -1) {
+			decoded, err := base64.StdEncoding.DecodeString(match[1])
+			if err == nil && strings.Contains(string(decoded), ":") {
+				return true
+			}
+		}
+		if digestCredential.MatchString(reading) {
+			return true
+		}
+	}
+	return false
+}
+
+// basicCredential matches the RFC 7617 form: the scheme name, a space, and a
+// base64 token. Whether the token really is one is decided by decoding it.
+var basicCredential = regexp.MustCompile(`(?i)\bBasic\s+([A-Za-z0-9+/]{8,}={0,2})`)
+
+// digestCredential matches the RFC 7616 form closely enough to be sure: the
+// scheme name followed, within one header's worth of text, by the response
+// parameter and a value long enough to be the hash it carries. The quote is
+// optional because an error that renders the header with %q escapes it, and
+// the value shape keeps prose about digest responses from matching.
+var digestCredential = regexp.MustCompile(`(?i)\bDigest\s+[^\n]{0,400}?response=[\\"]{0,2}[A-Za-z0-9+/=]{8,}`)
 
 // redactedMessage replaces a whole message that was holding a secret in a form
 // this package can recognise but cannot rewrite. It is not redactedWhole: that
@@ -1155,17 +1213,26 @@ func HeaderSecrets(h http.Header, alsoNames ...string) []string {
 		if _, named := also[lower]; !named && !CredentialHeaderName(name) {
 			continue
 		}
+		// The name as well as the value, matching what the profiling and
+		// diagnostic lists do. A credential pasted into the wrong side of a
+		// header configuration is still a credential, and net/http reports one
+		// back: an invalid name reaches the caller quoted, in
+		// `invalid header field name "…"`. The cost is the one authHeaderSecrets
+		// already documents — a line legitimately naming a credential-carrying
+		// header loses that name.
+		forms := HeaderNameForms(name)
 		for _, value := range values {
-			for _, form := range HeaderValueForms(value) {
-				if form == "" {
-					continue
-				}
-				if _, dup := seen[form]; dup {
-					continue
-				}
-				seen[form] = struct{}{}
-				secrets = append(secrets, form)
+			forms = append(forms, HeaderValueForms(value)...)
+		}
+		for _, form := range forms {
+			if form == "" {
+				continue
 			}
+			if _, dup := seen[form]; dup {
+				continue
+			}
+			seen[form] = struct{}{}
+			secrets = append(secrets, form)
 		}
 	}
 	sort.Strings(secrets)
@@ -1209,6 +1276,12 @@ func Error(err error, endpoints, secrets []string) error {
 	original, rendered := renderError(err)
 	text, derived := errorText(original, err, endpoints, secrets)
 	msg := Secrets(text, append(append([]string(nil), secrets...), derived...)...)
+	// Secrets returns early when it was given nothing, and an error can carry a
+	// credential no caller could have listed, so the post-condition is asked
+	// here as well rather than only inside it.
+	if holdsUnaccountedCredential(msg) {
+		msg = redactedMessage
+	}
 	if rendered && msg == original {
 		return err
 	}
@@ -1304,12 +1377,18 @@ const maskedPassword = "***"
 // full. So the URL must also be one the caller named — same scheme, same host,
 // same user — which a redirect to another host is not.
 //
-// Restricting it that way loses nothing on a same-host redirect, because
-// net/http does not derive a second header there: it copies the original
-// Authorization when the destination host matches (shouldCopyHeaderOnRedirect),
-// and send only derives one when that header is empty. A credential the caller
-// could not name is therefore a credential net/http built from a URL the
-// caller never had.
+// It is still not enough on its own, and the reason is worth writing down
+// because the comment here used to claim the opposite. A same-host redirect
+// with different userinfo derives a *new* Basic too: the header net/http built
+// for the first hop lives on a fork inside send and is not among the headers
+// makeHeadersCopier carries over — that copier captures the initial request's
+// own headers, before send ever forked (client.go:604) — so there is nothing to
+// copy, and send derives afresh from the Location. shouldCopyHeaderOnRedirect
+// governs a header the *caller* set, not one derived from a URL.
+//
+// This rule therefore accounts for the common case and no more. What catches
+// the rest is holdsUnaccountedCredential, which asks of the finished text the
+// question no list can answer: is there still a credential in it?
 func basicFromUserinfo(u *url.URL, endpoints, secrets []string) (forms []string, accounted bool) {
 	password, set := u.User.Password()
 	if set && password == maskedPassword {

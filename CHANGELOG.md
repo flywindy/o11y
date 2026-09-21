@@ -353,6 +353,26 @@ adopters can plan their upgrades.
     the same line. Such a message is now replaced wholesale — the third
     collision this rule has had with its own output, after the `redacted@`
     strip and the sentinel swap.
+  - A credential **no list could have held** is now refused by a
+    post-condition rather than chased with another list. After everything this
+    package can replace has been replaced, text still carrying an HTTP
+    credential the RFCs define — a `Basic` token that decodes to something
+    holding a colon (RFC 7617), or a `Digest` credential with its `response`
+    parameter (RFC 7616) — is one nothing accounted for, and the message is
+    replaced wholesale. It catches two cases no secret list can reach: the
+    Basic header `net/http` derives from a redirect's `Location` (for a
+    **same-host** redirect too — the header derived for the first hop lives on
+    a fork inside `send` and is not among the headers `makeHeadersCopier`
+    carries over, so there is nothing to reuse and a second one is derived),
+    and the `Authorization: Digest …` resty's digest transport signs on a copy
+    of the request that no caller ever sees. Prose is not refused: "Basic
+    authentication failed" holds no valid base64, and `Bearer` is deliberately
+    not checked, having no structure that separates a token from a sentence.
+  - `resty` lists a credential-carrying header's **name** as well as its value,
+    which the profiling and diagnostic lists already did. `net/http` quotes an
+    unusable name straight back — `invalid header field name "…"` — so a
+    credential pasted into the name side of a header configuration reached the
+    span.
   - `Shutdown` can no longer be held by an error from a dependency. The walk
     that finds the URLs in an error chain is now bounded by the number of
     errors it visits rather than by how deep it goes: once `Unwrap` returns a
