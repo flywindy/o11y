@@ -754,6 +754,34 @@ func TestDiagnosticSecrets_EnvFragmentsGetValueFormsToo(t *testing.T) {
 	assert.Contains(t, secrets, onTheWire, "and the form an HTTP/2 collector receives")
 }
 
+// TestDiagnosticSecrets_EnvCookieWithAnEscapedSeparator pins the harder
+// ordering: the separator has to be unescaped before the Cookie normalization
+// can see it at all.
+//
+// The exporter unescapes an environment value and then trims it, so a Cookie
+// written as "session=T%3Btenant=x" is sent with a real ";" — and an HTTP/2
+// collector then receives it rejoined with "; ". The list only reaches that
+// spelling because headerEnvForms decodes first and each decoded form is then
+// expanded through HeaderValueForms; a value-forms pass over the raw fragment
+// alone would find no separator to normalize.
+func TestDiagnosticSecrets_EnvCookieWithAnEscapedSeparator(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const configured = "Cookie=session=S3cretToken%3Btenant=x"
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", configured)
+	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "")
+
+	_, escaped, ok := strings.Cut(configured, "=")
+	require.True(t, ok)
+	require.NotContains(t, escaped, ";", "the premise: the raw fragment has no separator")
+	decoded, err := url.PathUnescape(escaped)
+	require.NoError(t, err)
+	onTheWire := redact.CookieWireValue(decoded)
+	require.Equal(t, "session=S3cretToken; tenant=x", onTheWire)
+
+	assert.Contains(t, diagnosticSecrets(&Config{}), onTheWire)
+}
+
 // TestDiagnosticSecrets_CoversEndpointDerivedBasicAuth pins that the OTLP and
 // profiling endpoints get the same treatment authHeaderSecrets gives the
 // profiling one.
