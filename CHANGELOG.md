@@ -494,8 +494,9 @@ adopters can plan their upgrades.
   it also pins `db.client.operation.duration` (redis, mongo, cassandra,
   elasticsearch), `db.client.connection.create_time` (redis, mongo, cassandra)
   and `minio.client.operation.duration`. An operator tuning HTTP buckets was
-  silently reshaping the datastore histograms, where the same boundaries are an
-  order of magnitude too coarse. All four places now name every instrument, and
+  silently reshaping the datastore histograms, which tend to live at the low
+  end of an HTTP-shaped set where the boundaries are worth most. All four
+  places now name every instrument, and
   say that `WithDisableDefaultViews` drops the HTTP views only — the datastore
   views keep these boundaries. No behaviour changed.
 - **Docs**: `gin.error.type` and `pyroscope.profile.id` have catalog entries in

@@ -350,11 +350,13 @@ histogram the SDK installs a view for, which is more than the HTTP pair:
 | `minio.client.operation.duration` | `minio` |
 
 The default set (`DefaultLatencyBuckets()`, `[0.005 … 10]` seconds) is shaped
-for HTTP request latency, and a datastore operation is an order of magnitude
-faster: a Redis `GET` lands in the first bucket either way. Widening the
-buckets for a slow HTTP endpoint therefore makes every datastore histogram
-coarser too — check the datastore panels after changing them, not only the
-HTTP ones. There is no per-signal form of the option and no way to add a view
+for HTTP request latency. Datastore operations tend to sit at the low end of
+it, where the boundaries are closest together and therefore worth most, so
+widening the buckets for a slow HTTP endpoint takes resolution from the range
+those histograms live in. Where exactly they sit is a question about the
+deployment — a network hop, a loaded server or a large value all move it — so
+read the datastore panels after changing these, rather than assuming the
+effect from the HTTP ones. There is no per-signal form of the option and no way to add a view
 through `Init`, so a service that needs different boundaries for one of these
 histograms has to build its own MeterProvider. Keeping the default everywhere
 is also what makes cross-service P99 comparisons hold.
