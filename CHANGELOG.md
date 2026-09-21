@@ -277,6 +277,33 @@ adopters can plan their upgrades.
     carried no userinfo and no `@` for the existing rule to catch. A
     scheme-less `host:port` is still echoed: its payload is a single token and
     cannot be a pair.
+  - `resty` spans no longer carry a credential the **caller** configured,
+    either. `SetAuthToken`, `SetBasicAuth`, a `Cookie`, or an `Authorization`
+    header set directly are handed to a transport this SDK does not own, and a
+    proxy wrapper, an auth middleware or a retry logger that names the header it
+    was given reports one in an error — a value that is not a URL, so no URL
+    redaction had anything to act on. The span's status description and
+    `exception.message` are now scrubbed against the credentials configured on
+    the request *and* on the client, including the header a client that sets its
+    own `HeaderAuthorizationKey` puts its token in.
+  - A secret is now recognised in the escapings **composed**, not only applied
+    one at a time. A server that HTML-escapes the header value it echoes and
+    then writes that string into a JSON error body produces `tok\u0026amp;en`
+    for `tok&en`, which matches none of the three single renderings. Those
+    compositions are listed, and a secret escaped more deeply than the list
+    goes now costs the line rather than the value: what cannot be replaced in
+    place — the replacement would have to be written into text that does not
+    contain it — is replaced by `[message redacted]`.
+  - The decoded readings a redaction decides on are now complete or refused.
+    Entities nest one layer per pass, so a URL escaped past the decoder's
+    budget still read as `&amp;Signature` when the budget ran out — an ordinary
+    parameter named `amp;Signature` to every rule, which let the signature
+    through in full. Text still decoding at the bound is now replaced
+    wholesale, and the same applies to an opaque endpoint's payload: `%253A` is
+    an escaped `%3A` is a `:`, so `http:alice%253Asecret%2540host` held neither
+    delimiter after the single unescape it used to get. The escapes `%q` writes
+    joined the decoders too, so the readings cover the three renderings this
+    SDK says a secret can arrive in rather than two of them.
   - `Shutdown` can no longer be held by an error from a dependency. The walk
     that finds the URLs in an error chain is now bounded by the number of
     errors it visits rather than by how deep it goes: once `Unwrap` returns a

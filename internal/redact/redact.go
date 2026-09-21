@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"net/http"
 	"net/textproto"
 	"net/url"
 	"reflect"
@@ -162,7 +163,15 @@ func InText(text string, knownEndpoints ...string) string {
 	//
 	// One decoder per encoding covers the whole family of spellings it can
 	// produce, which is the difference between this and enumerating them.
-	for _, decoded := range decodedViews(text) {
+	views, converged := decodedViews(text)
+	if !converged {
+		// The text was still decoding where the budget ran out, so those views
+		// are a prefix of its readings. Deciding on a prefix is deciding about a
+		// text that is still encoded, which is the thing this loop exists to
+		// refuse.
+		return redactedWhole
+	}
+	for _, decoded := range views {
 		if decoded == text {
 			continue
 		}
@@ -177,32 +186,50 @@ func InText(text string, knownEndpoints ...string) string {
 }
 
 // decodedViews returns the readings of text that an escaping on the way here
-// could have hidden an anchor behind.
+// could have hidden an anchor behind, and reports whether that set is complete.
 //
-// The two that matter are the ones a Go server produces when it puts a URL
-// into an error page or an error document: encoding/json escapes, and HTML
-// entities. Each is one decoder covering every spelling its own encoding
+// The three that matter are the renderings Renderings lists, because they are
+// the ones a Go program produces when it puts a value into an error page, an
+// error document, or a %q: HTML entities, encoding/json's escapes, and
+// strconv's. Each is one decoder covering every spelling its own encoding
 // admits — &amp;, &#38; and &#x26; are all one call — rather than a pattern
 // listing them.
 //
-// Both are applied together and repeatedly, to a fixed point. An entity can
+// They are applied together and repeatedly, to a fixed point. An entity can
 // nest ("&amp;amp;Signature" needs two passes, and so does "&amp;commat;") and
-// the encodings can be layered, so a single pass of each would answer about a
-// text that is still half encoded. Every intermediate reading is returned, not
-// only the last: the rules are asked about each, and what is visible at one
-// step can be gone by the next.
-func decodedViews(text string) []string {
-	var views []string
+// the encodings compose — a value escaped into an HTML page that is then
+// quoted into a JSON body carries both — so a single pass of each would answer
+// about a text that is still half encoded. Every intermediate reading is
+// returned, not only the last: the rules are asked about each, and what is
+// visible at one step can be gone by the next.
+//
+// converged is false when the budget ran out while the text was still
+// decoding. The views are then a prefix of this text's readings rather than
+// all of them, and the only safe thing a caller can do with a prefix is refuse
+// the text: nine nested HTML escapes of a signed URL still read as
+// "&amp;Signature" after the eighth pass, which is an ordinary parameter named
+// "amp;Signature" to every rule here, and the signature came through in full.
+func decodedViews(text string) (views []string, converged bool) {
 	seen := text
 	for range maxDecodePasses {
-		next := html.UnescapeString(jsonUnescaped(seen))
+		next := decodeOnce(seen)
 		if next == seen {
-			break
+			return views, true
 		}
 		seen = next
 		views = append(views, seen)
 	}
-	return views
+	// The budget is spent. Whether that was enough is not something the loop
+	// above can answer — it stops either way — so one more decode asks it.
+	return views, decodeOnce(seen) == seen
+}
+
+// decodeOnce takes one step towards a reading of text, undoing one layer of
+// each encoding the SDK's own renderings use. The order is the reverse of the
+// order a program applies them in: a value is escaped for its document last,
+// so that escaping is the first to come off.
+func decodeOnce(text string) string {
+	return goUnescaped(jsonUnescaped(html.UnescapeString(text)))
 }
 
 // maxDecodePasses bounds that loop. Entities nest — "&amp;amp;Signature" is two
@@ -241,6 +268,72 @@ func jsonUnescaped(text string) string {
 	return b.String()
 }
 
+// goUnescaped returns text with the escape sequences strconv.Quote writes
+// replaced by the characters they stand for, leaving everything else as it is.
+//
+// It is here for the reason jsonUnescaped is: GoEscaped is one of the forms
+// Renderings says a secret can arrive in, so it has to be one of the readings
+// the closed rules are asked about. Leaving it out made the decoders cover two
+// of the three renderings this package names, and a value quoted with %q into
+// a message that is then escaped again hid its anchors behind the one they
+// missed.
+//
+// Like jsonUnescaped it is total and is not a decoder for a whole quoted
+// string: the text is a log line that merely contains a quoted fragment, and a
+// malformed or unknown escape is left exactly as it stands, so failing to
+// decode leaves the rules looking at the text they would have looked at
+// anyway. The octal form is deliberately absent — strconv never writes it, and
+// "\100" is a shape ordinary text reaches by accident.
+func goUnescaped(text string) string {
+	if !strings.Contains(text, `\`) {
+		return text
+	}
+	var b strings.Builder
+	b.Grow(len(text))
+	for i := 0; i < len(text); {
+		if text[i] != '\\' || i+2 > len(text) {
+			b.WriteByte(text[i])
+			i++
+			continue
+		}
+		if c, ok := goSimpleEscapes[text[i+1]]; ok {
+			b.WriteByte(c)
+			i += 2
+			continue
+		}
+		digits := 0
+		switch text[i+1] {
+		case 'x':
+			digits = 2
+		case 'u':
+			digits = 4
+		case 'U':
+			digits = 8
+		}
+		if digits > 0 && i+2+digits <= len(text) {
+			if r, err := strconv.ParseUint(text[i+2:i+2+digits], 16, 32); err == nil {
+				if text[i+1] == 'x' {
+					b.WriteByte(byte(r))
+				} else {
+					b.WriteRune(rune(r))
+				}
+				i += 2 + digits
+				continue
+			}
+		}
+		b.WriteByte(text[i])
+		i++
+	}
+	return b.String()
+}
+
+// goSimpleEscapes is the one-character half of that table, as strconv.Quote
+// writes them.
+var goSimpleEscapes = map[byte]byte{
+	'a': 7, 'b': 8, 'f': 12, 'n': 10, 'r': 13, 't': 9, 'v': 11,
+	'\\': '\\', '"': '"', '\'': '\'',
+}
+
 // opaquePlaceholder replaces a secret Secrets was told about.
 const opaquePlaceholder = "[redacted]"
 
@@ -273,7 +366,48 @@ func Secrets(text string, secrets ...string) string {
 			ordered = append(ordered, secret)
 		}
 	}
+	if len(ordered) == 0 {
+		return text
+	}
 	sort.SliceStable(ordered, func(i, j int) bool { return len(ordered[i]) > len(ordered[j]) })
+	text = replaceSecrets(text, ordered)
+	// What is left is what the list could not match literally, and an escaping
+	// is how a secret gets there: the renderings above are composed only to
+	// renderingDepth, and nothing bounds how deeply a server may escape what it
+	// echoes.
+	//
+	// So the same closed rule InText applies to an endpoint applies here to a
+	// secret. The readings of the remaining text are asked the question the
+	// replacement just asked of the text itself, and a reading that answers yes
+	// is a secret this function was told about and did not remove. It cannot be
+	// written back — the replacement would have to go into text that does not
+	// contain it — so the text goes instead.
+	//
+	// The question is the replacement rather than a substring search on purpose:
+	// a short secret is replaced only where it stands as a whole token, and
+	// asking a decoded view anything stricter would give up a message for a "1"
+	// that the text itself was allowed to keep.
+	views, converged := decodedViews(text)
+	if !converged {
+		return redactedMessage
+	}
+	for _, view := range views {
+		if replaceSecrets(view, ordered) != view {
+			return redactedMessage
+		}
+	}
+	return text
+}
+
+// redactedMessage replaces a whole message that was holding a secret in a form
+// this package can recognise but cannot rewrite. It is not redactedWhole: that
+// one stands in for an endpoint inside a line, and this one is the line.
+const redactedMessage = "[message redacted]"
+
+// replaceSecrets replaces each of ordered, longest first, in text. The order
+// is the caller's to establish; it is what lets a whole "k=v,k2=v2" string and
+// its parts both be listed without the parts breaking the whole.
+func replaceSecrets(text string, ordered []string) string {
 	for _, secret := range ordered {
 		if len(secret) < shortSecretLen {
 			text = replaceWholeToken(text, secret)
@@ -494,11 +628,28 @@ func opaqueMayHoldCredentials(opaque string) bool {
 	// A payload that will not unescape is refused rather than reasoned about:
 	// it is not a shape anything in this SDK produces, and guessing costs more
 	// than a redacted log line.
-	decoded, err := url.PathUnescape(opaque)
-	if err != nil {
-		return true
+	//
+	// One unescape is a step towards a reading of the payload, not the reading:
+	// "%253A" is an escaped "%3A" is an escaped ":", so
+	// "http:alice%253Asecret%2540host" holds neither character after one pass and
+	// both after two. It is decoded to a fixed point for the same reason
+	// decodedViews is, and a payload still decoding when the budget runs out is
+	// refused — what it stopped on says nothing about what is left.
+	seen := opaque
+	for range maxDecodePasses {
+		decoded, err := url.PathUnescape(seen)
+		if err != nil {
+			return true
+		}
+		if decoded == seen {
+			return false
+		}
+		if strings.ContainsAny(decoded, ":@") {
+			return true
+		}
+		seen = decoded
 	}
-	return strings.ContainsAny(decoded, ":@")
+	return true
 }
 
 // redactQuery replaces the values of credentialQueryKeys in a raw query
@@ -594,17 +745,50 @@ func HTMLEscaped(v string) string {
 // that added a rendering to one and not the other left the pair disagreeing
 // about what counts as the same credential.
 //
+// The escapings compose, so the forms do too. A server that HTML-escapes the
+// header value it echoes and then puts that string in a JSON error body has
+// written neither the HTML form nor the JSON one but the JSON rendering of the
+// HTML one: "tok&en" arrives as "tok\u0026amp;en", which matches nothing a
+// list of the three single escapings holds. Every composition up to
+// renderingDepth is returned for that reason.
+//
+// The depth is a bound on legibility, not the safety property. A secret
+// escaped more deeply than this is still caught — Secrets asks decodedViews
+// about what it could not replace and gives up the whole text — but it costs
+// the line rather than the value, so the compositions worth listing are
+// listed.
+//
 // Duplicates are dropped, so a value the escaping leaves alone is returned
 // once. Empty strings are not filtered here; the caller's own list does that.
 func Renderings(v string) []string {
-	forms := make([]string, 0, 4)
-	for _, form := range []string{v, GoEscaped(v), JSONEscaped(v), HTMLEscaped(v)} {
-		if !slices.Contains(forms, form) {
-			forms = append(forms, form)
+	forms := []string{v}
+	frontier := []string{v}
+	for range renderingDepth {
+		var next []string
+		for _, base := range frontier {
+			for _, render := range []func(string) string{GoEscaped, JSONEscaped, HTMLEscaped} {
+				form := render(base)
+				if slices.Contains(forms, form) {
+					continue
+				}
+				forms = append(forms, form)
+				next = append(next, form)
+			}
 		}
+		if len(next) == 0 {
+			break
+		}
+		frontier = next
 	}
 	return forms
 }
+
+// renderingDepth is how many of those escapings may be composed in a listed
+// form. Two covers what a deployment actually produces — a value escaped for
+// its document and quoted once on the way there — and the closure does not
+// terminate on its own, because escaping an escaped value escapes its
+// backslashes again.
+const renderingDepth = 2
 
 // HeaderWireValue returns v as net/http writes it into a request, which is the
 // form a server sees and may echo back.
@@ -703,7 +887,17 @@ func BasicAuthHeader(rawURL string) string {
 		return ""
 	}
 	password, _ := u.User.Password()
-	return "Basic " + base64.StdEncoding.EncodeToString([]byte(u.User.Username()+":"+password))
+	return BasicAuthValue(u.User.Username(), password)
+}
+
+// BasicAuthValue returns the Authorization value a username and password are
+// sent as. It is BasicAuthHeader's second half, exported separately because a
+// client library can be told the pair directly rather than through a URL —
+// resty's SetBasicAuth is one — and the credential that reaches the wire is the
+// same string either way. Deriving it in two places is how the two ended up
+// covered in one list and not the other.
+func BasicAuthValue(username, password string) string {
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(username+":"+password))
 }
 
 // HeaderValueForms returns every rendering of a configured header value that
@@ -722,6 +916,101 @@ func HeaderValueForms(value string) []string {
 		forms = append(forms, Renderings(base)...)
 	}
 	return forms
+}
+
+// credentialHeaders are the headers whose value is a credential by definition
+// rather than by convention: HTTP says what each of these carries.
+var credentialHeaders = map[string]struct{}{
+	"authorization":       {},
+	"proxy-authorization": {},
+	"cookie":              {},
+	"set-cookie":          {},
+}
+
+// credentialHeaderMarkers are the words a deployment puts in the name of a
+// header it invented to carry one. The list is short and its entries are
+// substrings, so "X-Api-Key", "x-amz-security-token" and "X-Goog-Signature"
+// are all covered without any of them being named.
+var credentialHeaderMarkers = []string{
+	"auth", "cookie", "credential", "key", "passwd", "password",
+	"secret", "session", "signature", "token",
+}
+
+// CredentialHeaderName reports whether a header of this name carries a
+// credential.
+//
+// The rule is on the name and not on the value, which is the whole of its
+// design. What a token looks like is not something this package is willing to
+// guess — every value-shaped rule it has tried has been talked out of its
+// answer by an encoding — whereas what a header is *for* is written in its
+// name by whoever configured it.
+//
+// The two errors it can make are not symmetric. Accepting a name that holds
+// nothing secret costs a value in a diagnostic line, which is the trade this
+// package makes everywhere. Refusing one that does costs a rotation. So the
+// markers are substrings and the list is generous.
+func CredentialHeaderName(name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	if lower == "" {
+		return false
+	}
+	if _, ok := credentialHeaders[lower]; ok {
+		return true
+	}
+	for _, marker := range credentialHeaderMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// HeaderSecrets returns the values in h that CredentialHeaderName accepts, in
+// every form HeaderValueForms lists, plus the values under any of alsoNames —
+// for a client that lets the caller choose which header its token goes in.
+//
+// A request's own headers are a source of secrets in their own right, separate
+// from the ones the SDK was configured with: a caller that sets a bearer token
+// on its HTTP client has handed a credential to a transport this SDK does not
+// own, and a proxy wrapper, an auth middleware or a retry logger that names the
+// header it was given reports it in an error. Nothing in a URL redaction sees
+// such a value — it is not a URL — so it has to be named.
+//
+// The result is sorted, because ranging over an http.Header is not ordered and
+// a secret list that changes order between calls makes a test that pins it
+// flake rather than fail.
+func HeaderSecrets(h http.Header, alsoNames ...string) []string {
+	if len(h) == 0 {
+		return nil
+	}
+	also := make(map[string]struct{}, len(alsoNames))
+	for _, name := range alsoNames {
+		if lower := strings.ToLower(strings.TrimSpace(name)); lower != "" {
+			also[lower] = struct{}{}
+		}
+	}
+	var secrets []string
+	seen := make(map[string]struct{})
+	for name, values := range h {
+		lower := strings.ToLower(name)
+		if _, named := also[lower]; !named && !CredentialHeaderName(name) {
+			continue
+		}
+		for _, value := range values {
+			for _, form := range HeaderValueForms(value) {
+				if form == "" {
+					continue
+				}
+				if _, dup := seen[form]; dup {
+					continue
+				}
+				seen[form] = struct{}{}
+				secrets = append(secrets, form)
+			}
+		}
+	}
+	sort.Strings(secrets)
+	return secrets
 }
 
 // HeaderNameForms returns the renderings of a configured header name: as
