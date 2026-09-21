@@ -595,6 +595,11 @@ func jarSecrets(jar http.CookieJar, rawURLs []string) []string {
 			}
 			secrets = append(secrets, redact.HeaderValueForms(cookie.Value)...)
 			secrets = append(secrets, redact.HeaderValueForms(cookie.Name+"="+cookie.Value)...)
+			// And the form AddCookie actually sends, which drops the bytes a
+			// cookie cannot carry: a jar accepts a value net/http will not send
+			// verbatim, and what reaches the wire then matches neither of the two
+			// above.
+			secrets = append(secrets, redact.CookieRequestForms(cookie.Name, cookie.Value, cookie.Quoted)...)
 		}
 	}
 	return secrets
@@ -642,9 +647,14 @@ func configuredSecrets(scheme, token string, user *restyclient.User, cookies []*
 		add(user.Password)
 	}
 	for _, cookie := range cookies {
-		if cookie != nil {
-			add(cookie.Value)
+		if cookie == nil {
+			continue
 		}
+		add(cookie.Value)
+		// The same sanitisation applies here: resty hands these to AddCookie
+		// like any other, so a configured value holding a byte a cookie cannot
+		// carry goes out as something the configured form does not match.
+		secrets = append(secrets, redact.CookieRequestForms(cookie.Name, cookie.Value, cookie.Quoted)...)
 	}
 	return secrets
 }

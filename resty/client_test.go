@@ -1325,3 +1325,65 @@ func TestWrapRedactsACookieTheJarAddedToARedirect(t *testing.T) {
 		}
 	}
 }
+
+// TestWrapRedactsTheSerializedFormOfAJarCookie pins the form a cookie takes on
+// the wire rather than the form the jar holds.
+//
+// A jar accepts a value net/http will not send verbatim: AddCookie drops every
+// byte a cookie value cannot carry, so "sec\nret" in the jar leaves as
+// "session=secret". Neither the stored value nor "name=value" matches that, so
+// an error naming the Cookie header reported a credential no list held.
+//
+// The cookie is scoped to the path the redirect leads to, so it is not on the
+// request resty holds — otherwise the header secrets read from that request
+// would cover the sanitised form and the test would pass either way.
+func TestWrapRedactsTheSerializedFormOfAJarCookie(t *testing.T) {
+	tp, mp, sr := testProviders()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			http.Redirect(w, r, "/final", http.StatusFound)
+		}
+	}))
+	defer srv.Close()
+
+	// #nosec G101 -- fabricated fixture credential, not a live one
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const held, sent = "sec\nret", "secret"
+	jar, err := cookiejar.New(nil)
+	require.NoError(t, err)
+	base, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+	jar.SetCookies(base, []*http.Cookie{{Name: "session", Value: held, Path: "/final"}})
+
+	startURL, err := url.Parse(srv.URL + "/start")
+	require.NoError(t, err)
+	require.Empty(t, jar.Cookies(startURL),
+		"the premise: the cookie is not on the request resty holds")
+
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.GetClient().Jar = jar
+	transport := http.DefaultTransport
+	client.SetTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/final" {
+			return nil, fmt.Errorf("proxy rejected cookie %q", r.Header.Get("Cookie"))
+		}
+		return transport.RoundTrip(r)
+	}))
+
+	_, err = client.R().Get(srv.URL + "/start")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "session="+sent,
+		"the premise: what went on the wire is the sanitised value, not the stored one")
+
+	spans := endedClientSpans(sr)
+	require.NotEmpty(t, spans)
+	span := spans[len(spans)-1]
+
+	assert.NotContains(t, span.Status().Description, sent)
+	for _, event := range span.Events() {
+		for _, attr := range event.Attributes {
+			assert.NotContains(t, attr.Value.AsString(), sent)
+		}
+	}
+}

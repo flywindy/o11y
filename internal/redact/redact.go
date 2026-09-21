@@ -930,6 +930,66 @@ func CookieWireValue(value string) string {
 	return strings.Join(fields, "; ")
 }
 
+// CookieRequestForms returns the forms a cookie takes once net/http has put it
+// on a request, which is what a server, a proxy or a transport sees.
+//
+// A cookie is not sent as it is held. Request.AddCookie writes
+// "name=sanitizedValue", dropping from the value every byte a cookie cannot
+// carry and quoting it when it holds a space or a comma, and replacing CR and
+// LF in the name with "-". A jar accepts what it is given, so a value holding
+// one of those bytes reaches the wire as a string that matches neither the
+// value as stored nor "name=value" — and an error naming the Cookie header
+// then reports a credential no list held.
+//
+// quoted is the cookie's own flag, which a jar preserves and AddCookie honours.
+//
+// The sanitisation is reimplemented here rather than driven through AddCookie
+// because that function logs "net/http: invalid byte …" to the standard
+// logger, and a redaction must not write anywhere on its way to deciding what
+// may be written. It is pinned against net/http's own output by a test.
+func CookieRequestForms(name, value string, quoted bool) []string {
+	onTheWire := cookieValueOnTheWire(value, quoted)
+	if onTheWire == "" {
+		return nil
+	}
+	forms := HeaderValueForms(onTheWire)
+	return append(forms, HeaderValueForms(cookieNameOnTheWire(name)+"="+onTheWire)...)
+}
+
+// cookieNameSanitizer mirrors net/http's, which is the whole of what
+// sanitizeCookieName does (cookie.go:442).
+var cookieNameSanitizer = strings.NewReplacer("\n", "-", "\r", "-")
+
+// cookieNameOnTheWire is net/http's sanitizeCookieName.
+func cookieNameOnTheWire(name string) string {
+	return cookieNameSanitizer.Replace(name)
+}
+
+// cookieValueOnTheWire is net/http's sanitizeCookieValue (cookie.go:460): every
+// byte a cookie value cannot carry is dropped, and what is left is quoted when
+// it holds a space or a comma, or when the cookie said it was quoted.
+func cookieValueOnTheWire(value string, quoted bool) string {
+	cleaned := make([]byte, 0, len(value))
+	for i := 0; i < len(value); i++ {
+		if b := value[i]; validCookieValueByte(b) {
+			cleaned = append(cleaned, b)
+		}
+	}
+	if len(cleaned) == 0 {
+		return ""
+	}
+	sanitized := string(cleaned)
+	if strings.ContainsAny(sanitized, " ,") || quoted {
+		return `"` + sanitized + `"`
+	}
+	return sanitized
+}
+
+// validCookieValueByte is net/http's (cookie.go:471).
+func validCookieValueByte(b byte) bool {
+	return 0x20 <= b && b < 0x7f && b != '"' && b != ';' && b != '\\'
+}
+
 // BasicAuthHeader returns the Authorization value net/http derives from a URL's
 // userinfo, or "" when the URL carries none.
 //
