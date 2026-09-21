@@ -811,3 +811,38 @@ func TestDiagnosticSecrets_CoversEndpointDerivedBasicAuth(t *testing.T) {
 		assert.NotContains(t, s, "pr0filePass")
 	}
 }
+
+// TestProfilingStartFailureText pins that the warning Init writes when
+// profiling fails to start is given the same secrets as every other redaction
+// site in the SDK.
+//
+// It used to be given none — only the endpoint — which made it the one place a
+// configured header value, or the Basic credential an endpoint's userinfo
+// becomes, could be echoed. Neither has structure for InText's rules to find,
+// so nothing but an explicit secret list can catch them.
+func TestProfilingStartFailureText(t *testing.T) {
+	// #nosec G101 -- fabricated fixture values, not live credentials
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const endpoint = "http://alice:pr0fileP4ss@pyroscope:4040"
+	// #nosec G101 -- fabricated fixture values, not live credentials
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const token = "Bearer glc_st4rtToken"
+	cfg := &Config{
+		profilingEndpoint:    endpoint,
+		profilingAuthHeaders: map[string]string{"Authorization": token},
+	}
+
+	derived := redact.BasicAuthHeader(endpoint)
+	require.NotEmpty(t, derived)
+	require.NotContains(t, derived, "pr0fileP4ss", "the premise: the Basic form hides the password")
+
+	//nolint:err113 // a fabricated upstream message, not a sentinel
+	err := fmt.Errorf("start pyroscope: rejected %s and %s", token, derived)
+
+	got := profilingStartFailureText(cfg, err)
+
+	assert.NotContains(t, got, "glc_st4rtToken", "a configured header value")
+	assert.NotContains(t, got, strings.TrimPrefix(derived, "Basic "),
+		"and the credential the endpoint's userinfo becomes")
+	assert.Contains(t, got, "start pyroscope:", "the rest of the message survives")
+}
