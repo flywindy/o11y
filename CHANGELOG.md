@@ -304,6 +304,23 @@ adopters can plan their upgrades.
     delimiter after the single unescape it used to get. The escapes `%q` writes
     joined the decoders too, so the readings cover the three renderings this
     SDK says a secret can arrive in rather than two of them.
+  - A percent-encoded credential is now read as one. `url.Parse` leaves an
+    opaque URL's payload escaped, so a transport error repeating
+    `alice%3Asecret%40host` carried a reversible `alice:secret@host` with no
+    `:` or `@` for either closed rule to hold on to. Percent-decoding joined
+    the readings a redaction is decided on, alongside the HTML, JSON and `%q`
+    ones.
+  - A credential a **redirect** introduced is refused rather than echoed.
+    `net/http` derives `Authorization: Basic …` from userinfo for every hop, so
+    a `Location` carrying `user:pass@host` puts a credential on the wire that
+    the request never held — and by the time the error arrives, `net/http` has
+    masked that password as `***`, so the header cannot be computed. A message
+    naming one is given up whole unless the caller's own secret list holds a
+    Basic for that username; `url.full`, `server.address` and `error.type`
+    still identify the request. Where a URL in the chain does still carry its
+    password — a custom transport's own error carries a URL this SDK never had
+    — the derived header is computed and replaced instead, so the message
+    survives.
   - `Shutdown` can no longer be held by an error from a dependency. The walk
     that finds the URLs in an error chain is now bounded by the number of
     errors it visits rather than by how deep it goes: once `Unwrap` returns a

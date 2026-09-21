@@ -1396,3 +1396,79 @@ func TestBasicAuthValue(t *testing.T) {
 		"the URL path and the pair path must produce one string, not two")
 	assert.NotContains(t, value, "hunter2", "which is why it has to be listed: it holds neither half")
 }
+
+// TestInText_DecodesPercentEscapes pins the fourth decoder.
+//
+// Percent-encoding is not a rendering of a secret but a rendering of a URL, and
+// net/url produces it without being asked: an opaque payload keeps its escapes,
+// so an error repeating "alice%3Asecret%40host" carries a reversible
+// credential with no ":" or "@" for either closed rule to hold on to.
+func TestInText_DecodesPercentEscapes(t *testing.T) {
+	// #nosec G101 -- fabricated fixture payload, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const escaped = "cannot dial opaque target alice%3Asecret%40host"
+
+	require.NotContains(t, escaped, "@", "the premise: no at-sign for the closed rule to count")
+	require.Contains(t, escaped, "secret", "and the credential is in the line as it stands")
+
+	assert.Equal(t, "[endpoint redacted]", redact.InText(escaped))
+
+	const harmless = `Post "https://collector:4318/v1/traces?tenant=a%2Bb": dial tcp: refused`
+	assert.Equal(t, harmless, redact.InText(harmless),
+		"an escape that decodes to nothing either rule cares about costs the line nothing")
+}
+
+// TestError_RefusesACredentialItCannotName pins the redirect case.
+//
+// net/http derives "Authorization: Basic base64(user:pass)" from a URL's
+// userinfo for every hop (client.go:246), so a Location carrying one puts a
+// credential on the wire that the request never held. By the time the error
+// arrives the password is masked (stripPassword writes "***"), so that header
+// cannot be computed here — and a transport that names the header it was given
+// has put it in the message. The only thing that can speak for it is the
+// caller's own list, and without one the message is given up whole.
+func TestError_RefusesACredentialItCannotName(t *testing.T) {
+	// #nosec G101 -- fabricated fixture credential, not a live one
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	basic := base64.StdEncoding.EncodeToString([]byte("alice:hunter2"))
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	redirected := &url.Error{
+		Op:  "Get",
+		URL: "http://alice:***@target/final",
+		Err: errors.New(`proxy rejected header "Basic ` + basic + `"`),
+	}
+	require.Contains(t, redirected.Error(), basic, "the premise: the derived header is in the message")
+	require.NotContains(t, redirected.Error(), "hunter2",
+		"and the password it was built from is not, so nothing here can compute it")
+
+	assert.Equal(t, "[endpoint redacted]", redact.Error(redirected, nil, nil).Error())
+
+	named := redact.Error(redirected, nil, redact.HeaderValueForms("Basic "+basic)).Error()
+	assert.NotContains(t, named, basic, "a caller that named it has it replaced")
+	assert.Contains(t, named, "target/final", "and keeps the rest of the message")
+}
+
+// TestError_ScrubsTheBasicItCanCompute is the other side of that rule: where a
+// URL in the chain still carries its password — a custom transport's own error
+// carries a URL this SDK never had — the derived header is computed here rather
+// than refused, so the message survives with the credential gone.
+func TestError_ScrubsTheBasicItCanCompute(t *testing.T) {
+	// #nosec G101 -- fabricated fixture credential, not a live one
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	basic := base64.StdEncoding.EncodeToString([]byte("bob:hunter2"))
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	wrapped := &url.Error{
+		Op:  "Get",
+		URL: "http://bob:hunter2@host/x",
+		Err: errors.New(`proxy rejected header "Basic ` + basic + `"`),
+	}
+	require.Contains(t, wrapped.Error(), basic, "the premise: the derived header is in the message")
+
+	got := redact.Error(wrapped, nil, nil).Error()
+
+	assert.NotContains(t, got, basic, "nothing named it, and it was computed rather than guessed")
+	assert.NotContains(t, got, "hunter2")
+	assert.Contains(t, got, "host/x", "the rest of the message survives")
+}
