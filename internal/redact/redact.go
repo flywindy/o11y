@@ -68,10 +68,18 @@ func URL(raw string) string {
 
 // urlUserinfo matches the userinfo of a hierarchical URL anywhere in a string:
 // a scheme, "://", then everything up to the first "@". Userinfo cannot contain
-// an unencoded "/" or "@", so stopping at the first one keeps the match inside
-// a single URL. It is a best-effort tidier, not the safety property — see
-// InText.
-var urlUserinfo = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/@\s"']+@`)
+// an unencoded "/", "?", "#" or "@", so stopping at the first of those keeps
+// the match inside the authority of a single URL. It is a best-effort tidier,
+// not the safety property — see InText.
+//
+// The query and fragment delimiters matter as much as the slash. Without them
+// the pattern read "https://collector?notify=ops@example.com" — an ordinary URL
+// whose query happens to hold an email address — as userinfo running to that
+// "@", and rewrote it to "https://redacted@example.com": a different URL,
+// naming a host that was never contacted. A line the rules cannot account for
+// is replaced wholesale and says so; one quietly rewritten into a plausible
+// falsehood does not.
+var urlUserinfo = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/@?#\s"']+@`)
 
 // InText returns text with credentials removed, for text that is about to be
 // logged.
@@ -176,9 +184,33 @@ func InText(text string, knownEndpoints ...string) string {
 // entities. Each is one decoder covering every spelling its own encoding
 // admits — &amp;, &#38; and &#x26; are all one call — rather than a pattern
 // listing them.
+//
+// Both are applied together and repeatedly, to a fixed point. An entity can
+// nest ("&amp;amp;Signature" needs two passes, and so does "&amp;commat;") and
+// the encodings can be layered, so a single pass of each would answer about a
+// text that is still half encoded. Every intermediate reading is returned, not
+// only the last: the rules are asked about each, and what is visible at one
+// step can be gone by the next.
 func decodedViews(text string) []string {
-	return []string{jsonUnescaped(text), html.UnescapeString(text)}
+	var views []string
+	seen := text
+	for range maxDecodePasses {
+		next := html.UnescapeString(jsonUnescaped(seen))
+		if next == seen {
+			break
+		}
+		seen = next
+		views = append(views, seen)
+	}
+	return views
 }
+
+// maxDecodePasses bounds that loop. Entities nest — "&amp;amp;Signature" is two
+// passes from "&Signature", and "&amp;commat;" two from "@" — and the encodings
+// mix, so one pass is not a reading of the text but one step towards it.
+// Nothing the SDK produces nests at all; the cap is there because the text
+// comes from somewhere else.
+const maxDecodePasses = 8
 
 // jsonUnescaped returns text with its \uXXXX escapes replaced by the characters
 // they stand for, leaving everything else exactly as it is.

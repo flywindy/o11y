@@ -1133,3 +1133,59 @@ func TestSecrets_RedactsAnHTMLEscapedValue(t *testing.T) {
 	assert.NotContains(t, got, html.EscapeString(token))
 	assert.Contains(t, got, "rejected Authorization:", "the rest of the page survives")
 }
+
+// TestInText_FailsClosedOnNestedEntities pins that one decode is a step
+// towards a reading of the text, not the reading.
+//
+// "&amp;amp;Signature" is two passes from "&Signature", and "&amp;commat;" two
+// from "@". A single decode left the first still reading as the key
+// "amp;Signature" and the second still holding no at-sign, so both rules agreed
+// with themselves about a text that was still half encoded.
+func TestInText_FailsClosedOnNestedEntities(t *testing.T) {
+	// #nosec G101 -- fabricated fixture values, not live credentials
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const nestedQuery = "body: https://pyroscope:4040/ingest?tenant=t&amp;amp;Signature=S3cretSig"
+	// #nosec G101 -- fabricated fixture values, not live credentials
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const nestedUserinfo = "body: https://alice:pa55word&amp;commat;pyroscope:4040/ingest"
+
+	require.NotContains(t, html.UnescapeString(nestedQuery), "&Signature",
+		"the premise: one decode is not enough for the query case")
+	require.NotContains(t, html.UnescapeString(nestedUserinfo), "@",
+		"nor for the userinfo one")
+
+	gotQuery := redact.InText(nestedQuery)
+	assert.NotContains(t, gotQuery, "S3cretSig")
+	assert.Equal(t, "[endpoint redacted]", gotQuery)
+
+	gotUserinfo := redact.InText(nestedUserinfo)
+	assert.NotContains(t, gotUserinfo, "pa55word")
+	assert.Equal(t, "[endpoint redacted]", gotUserinfo)
+}
+
+// TestInText_DoesNotRewriteAnAtSignInAQuery pins that the userinfo pattern
+// stops at the query and fragment delimiters.
+//
+// Without them it read "https://collector?notify=ops@example.com" as userinfo
+// running to that at-sign and produced "https://redacted@example.com" — a
+// different URL, naming a host that was never contacted. The line is replaced
+// wholesale now instead: the at-sign is one the rules cannot account for, and
+// saying so is better than quietly rewriting the text into a plausible
+// falsehood.
+func TestInText_DoesNotRewriteAnAtSignInAQuery(t *testing.T) {
+	const clean = "https://collector?notify=ops@example.com"
+
+	got := redact.InText(clean)
+
+	assert.NotContains(t, got, "redacted@example.com",
+		"the host must not be rewritten into one that was never contacted")
+	assert.Equal(t, "[endpoint redacted]", got)
+}
+
+// TestInText_LeavesAFragmentBearingURLAlone pins the same boundary on the
+// fragment side, where nothing needs redacting at all.
+func TestInText_LeavesAFragmentBearingURLAlone(t *testing.T) {
+	const line = "see https://docs.example.com/guide#section-2 for details"
+
+	assert.Equal(t, line, redact.InText(line))
+}
