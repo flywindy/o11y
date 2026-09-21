@@ -408,6 +408,7 @@ func Secrets(text string, secrets ...string) string {
 	// the third did not, and a fourth would have had to remember to.
 	ordered := make([]string, 0, len(secrets))
 	seen := make(map[string]struct{}, len(secrets))
+	collides := false
 	for _, secret := range secrets {
 		if secret == "" {
 			continue
@@ -417,9 +418,25 @@ func Secrets(text string, secrets ...string) string {
 		}
 		seen[secret] = struct{}{}
 		ordered = append(ordered, secret)
+		if secret == opaquePlaceholder {
+			collides = true
+		}
 	}
 	if len(ordered) == 0 {
 		return text
+	}
+	// A secret that is already the string this function replaces secrets with
+	// cannot be replaced: the substitution is a no-op, the decoded readings see
+	// no change either, and the value is returned looking exactly like a
+	// redaction that worked. A reader cannot tell the difference; someone who
+	// knows the configuration can.
+	//
+	// It is the third collision of this kind on this rule — the first stripped
+	// its own "redacted@" out of a line, the second swapped in a sentinel the
+	// text already held — and the answer is the one the others reached: the
+	// text goes rather than being rewritten into something untrue.
+	if collides && holdsPlaceholder(text) {
+		return redactedMessage
 	}
 	sort.SliceStable(ordered, func(i, j int) bool { return len(ordered[i]) > len(ordered[j]) })
 	text = replaceSecrets(text, ordered)
@@ -449,6 +466,26 @@ func Secrets(text string, secrets ...string) string {
 		}
 	}
 	return text
+}
+
+// holdsPlaceholder reports whether text, or any reading of it, carries the
+// string Secrets replaces a secret with. It is asked only when a caller has
+// named that string as a secret of its own, and a text the decoder cannot
+// finish is refused on the same terms as everywhere else here.
+func holdsPlaceholder(text string) bool {
+	if strings.Contains(text, opaquePlaceholder) {
+		return true
+	}
+	views, converged := decodedViews(text)
+	if !converged {
+		return true
+	}
+	for _, view := range views {
+		if strings.Contains(view, opaquePlaceholder) {
+			return true
+		}
+	}
+	return false
 }
 
 // redactedMessage replaces a whole message that was holding a secret in a form

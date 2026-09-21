@@ -347,6 +347,12 @@ adopters can plan their upgrades.
     stored value nor `name=value` matches. The sanitisation is reimplemented
     (driving `AddCookie` would write "invalid byte" lines to the standard
     logger from inside a redaction) and pinned against `net/http`'s own output.
+  - A configured credential that is *itself* `[redacted]` no longer passes
+    through as though it had been scrubbed. Replacing it was a no-op, and the
+    value came back indistinguishable from the genuine redaction beside it in
+    the same line. Such a message is now replaced wholesale — the third
+    collision this rule has had with its own output, after the `redacted@`
+    strip and the sentinel swap.
   - `Shutdown` can no longer be held by an error from a dependency. The walk
     that finds the URLs in an error chain is now bounded by the number of
     errors it visits rather than by how deep it goes: once `Unwrap` returns a

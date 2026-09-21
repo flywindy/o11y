@@ -1604,3 +1604,34 @@ func TestCookieRequestForms_MatchesWhatNetHTTPSends(t *testing.T) {
 	assert.Nil(t, redact.CookieRequestForms("session", "\n\r", false),
 		"a value that sanitises away is not a secret to list")
 }
+
+// TestSecrets_RefusesASecretThatIsThePlaceholder pins the third collision this
+// rule has had with its own output.
+//
+// A secret that is already the string secrets are replaced with cannot be
+// replaced: the substitution is a no-op, the decoded readings see no change,
+// and the value comes back looking exactly like a redaction that worked —
+// indistinguishable from the genuine "[redacted]" beside it in the same line.
+func TestSecrets_RefusesASecretThatIsThePlaceholder(t *testing.T) {
+	// #nosec G101 -- fabricated fixture credential, not a live one
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const collides = "[redacted]"
+
+	assert.Equal(t, "[message redacted]",
+		redact.Secrets("server echoed "+collides+" as the token", collides))
+
+	assert.Equal(t, "[message redacted]",
+		redact.Secrets(`{"error":"server echoed &#91;redacted&#93; as the token"}`, collides),
+		"a reading of the text carries it just as the text does")
+
+	assert.Equal(t, "no credential here",
+		redact.Secrets("no credential here", collides),
+		"a line that does not hold it is not given up for it")
+
+	// #nosec G101 -- fabricated fixture credential, not a live one
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const ordinary = "Bearer s3cret-token"
+	assert.Equal(t, "server echoed [redacted]",
+		redact.Secrets("server echoed "+ordinary, ordinary),
+		"and an ordinary secret still produces the placeholder rather than losing the line")
+}
