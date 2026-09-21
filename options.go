@@ -471,9 +471,13 @@ func WithRuntimeMetrics(enabled bool) Option {
 //     pools;
 //   - minio.client.operation.duration.
 //
-// A datastore's latency profile is not an HTTP service's — a Redis GET lives
-// in the first bucket of an HTTP-shaped set — so an override chosen for HTTP
-// makes the datastore histograms coarser, not merely different. There is no
+// A datastore's latency profile is usually not an HTTP service's: its
+// operations tend to sit at the low end of an HTTP-shaped set, where a
+// boundary is worth more, so an override chosen for a slow HTTP endpoint can
+// take resolution from exactly the range a datastore histogram lives in. How
+// much is a question about the deployment — a network hop, a loaded server or
+// a large value moves it — so read the datastore panels after changing these,
+// rather than assuming the effect from the HTTP ones. There is no
 // per-signal form of this option and no way to add a view through Init, so a
 // service that needs different boundaries for one of these has to build its
 // own MeterProvider.
