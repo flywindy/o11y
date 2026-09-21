@@ -1445,8 +1445,72 @@ func TestError_RefusesACredentialItCannotName(t *testing.T) {
 	assert.Equal(t, "[endpoint redacted]", redact.Error(redirected, nil, nil).Error())
 
 	named := redact.Error(redirected, nil, redact.HeaderValueForms("Basic "+basic)).Error()
-	assert.NotContains(t, named, basic, "a caller that named it has it replaced")
-	assert.Contains(t, named, "target/final", "and keeps the rest of the message")
+	assert.Equal(t, "[endpoint redacted]", named,
+		"naming a Basic for that username is not enough on its own: a redirect to "+
+			"another host reuses the username and changes the password")
+
+	accounted := redact.Error(
+		redirected,
+		[]string{"http://alice:hunter2@target"},
+		redact.HeaderValueForms("Basic "+basic),
+	).Error()
+	assert.NotContains(t, accounted, basic, "a caller that named the URL and the credential has it replaced")
+	assert.Contains(t, accounted, "target/final", "and keeps the rest of the message")
+}
+
+// TestError_RefusesACrossHostRedirectWithTheSameUser pins the hole the
+// username-only version of that rule left.
+//
+// net/http strips the Authorization header on a redirect to another host and
+// derives a fresh one from the Location's userinfo, so "alice:oldpass" on the
+// request and "alice:newsecret" on the Location produce two different
+// credentials with one username. Asking only whether a Basic for "alice" was
+// listed answered yes about a credential nothing here had ever seen.
+//
+// Nothing is lost on a same-host redirect, where net/http copies the original
+// header rather than deriving a second one.
+func TestError_RefusesACrossHostRedirectWithTheSameUser(t *testing.T) {
+	// #nosec G101 -- fabricated fixture credentials, not live ones
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	oldBasic := base64.StdEncoding.EncodeToString([]byte("alice:oldpass"))
+	// #nosec G101 -- fabricated fixture credentials, not live ones
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	newBasic := base64.StdEncoding.EncodeToString([]byte("alice:newsecret"))
+	require.NotEqual(t, oldBasic, newBasic, "the premise: one username, two credentials")
+
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	redirected := &url.Error{
+		Op:  "Get",
+		URL: "http://alice:***@elsewhere/final",
+		Err: errors.New(`proxy rejected header "Basic ` + newBasic + `"`),
+	}
+
+	got := redact.Error(
+		redirected,
+		[]string{"http://alice:oldpass@original"},
+		redact.HeaderValueForms("Basic "+oldBasic),
+	).Error()
+
+	assert.NotContains(t, got, newBasic)
+	assert.Equal(t, "[endpoint redacted]", got,
+		"the host does not match the endpoint the caller named, so nothing here can speak for it")
+}
+
+// TestInText_KeepsARedactedQueryFollowedByAFragment pins that a fragment is not
+// part of a query value. Reading through the "#" made this package's own
+// output — "Signature=%5Bredacted%5D#section" — look like a signature it had
+// never seen, and the whole diagnostic was given up over it.
+func TestInText_KeepsARedactedQueryFollowedByAFragment(t *testing.T) {
+	const text = `uploading at https://pyroscope:4040/ingest?Signature=%5Bredacted%5D#section name=svc`
+
+	assert.Equal(t, text, redact.InText(text))
+
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const unredacted = `uploading at https://pyroscope:4040/ingest?Signature=s3cret#section`
+	assert.Equal(t, "[endpoint redacted]", redact.InText(unredacted),
+		"reading short still fails closed on a value that is not the placeholder")
 }
 
 // TestError_ScrubsTheBasicItCanCompute is the other side of that rule: where a

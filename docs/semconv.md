@@ -134,8 +134,11 @@ therefore does not put its value on the span. Text holding a credential the
 rules can recognise but cannot rewrite in place is replaced wholesale, and so is
 a message naming the `Authorization` header `net/http` derived from a redirect's
 `Location` — that password reaches the SDK masked, so the header cannot be
-computed or matched. `url.full`, `server.address` and `error.type` still
-identify such a request.
+computed or matched, and reusing the request's own username does not account
+for it. `url.full`, `server.address` and `error.type` still identify such a
+request. Cookies the client's jar added to a redirected request are read from
+the jar and replaced in place, so such a message keeps everything but the
+cookie.
 
 ---
 

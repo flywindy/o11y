@@ -53,6 +53,10 @@ type requestState struct {
 	// for the same reason.
 	secrets       []string
 	authHeaderKey string
+	// jar is the client's cookie jar, for the cookies net/http adds to a
+	// request it built itself. A redirect's request is not the one resty
+	// holds, so the jar is the only place those cookies can be read from.
+	jar http.CookieJar
 }
 
 type targetAttrs struct {
@@ -121,6 +125,7 @@ func (h *hook) beforeRequest(c *restyclient.Client, req *restyclient.Request) er
 		target:        requestTarget(c, req),
 		secrets:       clientSecrets(c),
 		authHeaderKey: c.HeaderAuthorizationKey,
+		jar:           clientJar(c),
 	}
 	ctx = context.WithValue(ctx, stateKey{}, state)
 	state.ctx = ctx
@@ -276,7 +281,8 @@ func (h *hook) finishError(req *restyclient.Request, state *requestState, err er
 	// the username and the query intact. Redacting url.full while recording
 	// that beside it would move the credential rather than remove it.
 	h.finish(req, state, codes.Error,
-		redact.Error(err, nil, requestSecrets(req, state)).Error(), err, attrs, metricAttrs)
+		redact.Error(err, requestURLs(req), requestSecrets(req, state, err)).Error(),
+		err, attrs, metricAttrs)
 }
 
 // resolvedTarget prefers the fully resolved URL resty builds into RawRequest,
@@ -308,7 +314,7 @@ func (h *hook) finish(
 		state.span.SetAttributes(spanAttrs...)
 	}
 	if err != nil {
-		recordRedactedError(state.span, err, requestSecrets(req, state))
+		recordRedactedError(state.span, err, requestURLs(req), requestSecrets(req, state, err))
 	}
 	if status != codes.Unset {
 		state.span.SetStatus(status, description)
@@ -476,10 +482,10 @@ func targetFromURL(u *url.URL) targetAttrs {
 // redacted wrapper would fix the message and break exception.type, which the
 // SDK derives with reflect.TypeOf, so the event is built here from the original
 // error's type and the redacted text.
-func recordRedactedError(span trace.Span, err error, secrets []string) {
+func recordRedactedError(span trace.Span, err error, endpoints, secrets []string) {
 	span.AddEvent(semconv.ExceptionEventName, trace.WithAttributes(
 		semconv.ExceptionType(exceptionType(err)),
-		semconv.ExceptionMessage(redact.Error(err, nil, secrets).Error()),
+		semconv.ExceptionMessage(redact.Error(err, endpoints, secrets).Error()),
 	))
 }
 
@@ -503,7 +509,7 @@ func recordRedactedError(span trace.Span, err error, secrets []string) {
 // The client's half is in state, resolved in beforeRequest: resty hands the
 // invoking client to no other hook, and Client.Clone shares the hook slice, so
 // a client captured at Wrap time would be the wrong one.
-func requestSecrets(req *restyclient.Request, state *requestState) []string {
+func requestSecrets(req *restyclient.Request, state *requestState, err error) []string {
 	var (
 		secrets []string
 		authKey string
@@ -521,7 +527,77 @@ func requestSecrets(req *restyclient.Request, state *requestState) []string {
 		header = req.RawRequest.Header
 	}
 	secrets = append(secrets, redact.HeaderSecrets(header, authKey)...)
-	return append(secrets, configuredSecrets(req.AuthScheme, req.Token, req.UserInfo, req.Cookies)...)
+	secrets = append(secrets, configuredSecrets(req.AuthScheme, req.Token, req.UserInfo, req.Cookies)...)
+	if state != nil {
+		secrets = append(secrets, jarSecrets(state.jar, append(requestURLs(req), redact.ErrorURLs(err)...))...)
+	}
+	return secrets
+}
+
+// requestURLs names the URL this request resolved to, for the endpoint
+// argument redact.Error takes. Naming it is what lets a credential net/http
+// derived from *this* URL be told apart from one it derived from a redirect's
+// Location, which is a URL the caller never had.
+func requestURLs(req *restyclient.Request) []string {
+	raw := resolvedRawURL(req)
+	if raw == "" {
+		return nil
+	}
+	return []string{raw}
+}
+
+// resolvedRawURL prefers the URL resty built into RawRequest, for the same
+// reason resolvedTarget does: a relative URL carries no userinfo until it has
+// been resolved against the client's base.
+func resolvedRawURL(req *restyclient.Request) string {
+	if req == nil {
+		return ""
+	}
+	if req.RawRequest != nil && req.RawRequest.URL != nil {
+		return req.RawRequest.URL.String()
+	}
+	return req.URL
+}
+
+// clientJar returns the cookie jar the invoking client will send from, read at
+// the one moment resty hands the client over.
+func clientJar(c *restyclient.Client) http.CookieJar {
+	if c == nil {
+		return nil
+	}
+	if hc := c.GetClient(); hc != nil {
+		return hc.Jar
+	}
+	return nil
+}
+
+// jarSecrets returns the cookies the jar would send to each of these URLs, in
+// the forms something may report them.
+//
+// net/http builds its own request for a redirect and fills its Cookie header
+// from the jar — including a cookie the redirect response itself set — so a
+// session cookie can reach the wire without ever appearing on the request
+// resty holds. Asking the jar about the URLs the error names is what closes
+// that: by the time an error arrives the jar holds exactly what was sent.
+func jarSecrets(jar http.CookieJar, rawURLs []string) []string {
+	if jar == nil {
+		return nil
+	}
+	var secrets []string
+	for _, raw := range rawURLs {
+		parsed, err := url.Parse(raw)
+		if err != nil || parsed.Host == "" {
+			continue
+		}
+		for _, cookie := range jar.Cookies(parsed) {
+			if cookie == nil || cookie.Value == "" {
+				continue
+			}
+			secrets = append(secrets, redact.HeaderValueForms(cookie.Value)...)
+			secrets = append(secrets, redact.HeaderValueForms(cookie.Name+"="+cookie.Value)...)
+		}
+	}
+	return secrets
 }
 
 // clientSecrets returns the credentials configured on the invoking client, the
@@ -591,11 +667,7 @@ func urlDerivedSecrets(req *restyclient.Request) []string {
 	if req == nil {
 		return nil
 	}
-	raw := req.URL
-	if req.RawRequest != nil && req.RawRequest.URL != nil {
-		raw = req.RawRequest.URL.String()
-	}
-	basic := redact.BasicAuthHeader(raw)
+	basic := redact.BasicAuthHeader(resolvedRawURL(req))
 	if basic == "" {
 		return nil
 	}

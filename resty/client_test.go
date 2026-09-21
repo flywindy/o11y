@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"reflect"
@@ -1210,4 +1211,117 @@ func TestWrapRefusesACredentialARedirectIntroduced(t *testing.T) {
 		}
 	}
 	assert.NotEmpty(t, host, "the request is still identifiable without its message")
+}
+
+// TestWrapRefusesACrossHostRedirectReusingTheUsername pins the hole that the
+// first version of the redirect rule left: it asked only whether a Basic for
+// that username had been listed, and the original request's own credential
+// answered yes for a different one.
+//
+// net/http strips the Authorization header on a redirect to another host
+// (shouldCopyHeaderOnRedirect) and derives a fresh one from the Location, so
+// "alice:oldpass" on the request and "alice:newsecret" on the Location are two
+// credentials with one username.
+func TestWrapRefusesACrossHostRedirectReusingTheUsername(t *testing.T) {
+	tp, mp, sr := testProviders()
+
+	final := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer final.Close()
+	start := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// #nosec G101 -- fabricated fixture credential, not a live one
+		// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+		http.Redirect(w, r, "http://alice:newsecret@"+final.Listener.Addr().String()+"/final", http.StatusFound)
+	}))
+	defer start.Close()
+
+	newBasic := base64.StdEncoding.EncodeToString([]byte("alice:newsecret"))
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	base := http.DefaultTransport
+	client.SetTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/final" {
+			return nil, fmt.Errorf("proxy rejected header %q", r.Header.Get("Authorization"))
+		}
+		return base.RoundTrip(r)
+	}))
+
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	_, err := client.R().Get("http://alice:oldpass@" + start.Listener.Addr().String() + "/start")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), newBasic,
+		"the premise: the credential on the wire is the one the Location introduced")
+
+	spans := endedClientSpans(sr)
+	require.NotEmpty(t, spans)
+	span := spans[len(spans)-1]
+
+	assert.NotContains(t, span.Status().Description, newBasic)
+	for _, event := range span.Events() {
+		for _, attr := range event.Attributes {
+			assert.NotContains(t, attr.Value.AsString(), newBasic)
+		}
+	}
+}
+
+// TestWrapRedactsACookieTheJarAddedToARedirect pins the credential that never
+// touches the request this package holds.
+//
+// net/http builds its own request for a redirect and fills its Cookie header
+// from the client's jar — including a cookie the redirect response itself set
+// — so a session cookie reaches the wire without appearing on resty's request
+// at all. The jar is asked about the URLs the error names, which is where the
+// cookies that were actually sent can be read from.
+func TestWrapRedactsACookieTheJarAddedToARedirect(t *testing.T) {
+	tp, mp, sr := testProviders()
+
+	// #nosec G101 -- fabricated fixture credential, not a live one
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const sessionCookie = "s3ssion-c00kie"
+	// The cookie is scoped to the path the redirect leads to, so it is
+	// reachable only through the URL the error names — asking the jar about
+	// the request resty holds returns nothing. That is what makes this test
+	// load-bearing for the part of the fix that walks the error's URLs; a
+	// cookie on "/" would have been found either way.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			http.SetCookie(w, &http.Cookie{Name: "session", Value: sessionCookie, Path: "/final"})
+			http.Redirect(w, r, "/final", http.StatusFound)
+		}
+	}))
+	defer srv.Close()
+
+	jar, err := cookiejar.New(nil)
+	require.NoError(t, err)
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.GetClient().Jar = jar
+	base := http.DefaultTransport
+	client.SetTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/final" {
+			return nil, fmt.Errorf("proxy rejected cookie %q", r.Header.Get("Cookie"))
+		}
+		return base.RoundTrip(r)
+	}))
+
+	_, err = client.R().Get(srv.URL + "/start")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), sessionCookie,
+		"the premise: the cookie went on the wire and the error names it")
+
+	startURL, parseErr := url.Parse(srv.URL + "/start")
+	require.NoError(t, parseErr)
+	require.Empty(t, jar.Cookies(startURL),
+		"the premise: the request resty holds is not a URL this cookie is sent to")
+
+	spans := endedClientSpans(sr)
+	require.NotEmpty(t, spans)
+	span := spans[len(spans)-1]
+
+	assert.NotContains(t, span.Status().Description, sessionCookie)
+	assert.Contains(t, span.Status().Description, "/final",
+		"and the message survives: the cookie is replaced, not the line")
+	for _, event := range span.Events() {
+		for _, attr := range event.Attributes {
+			assert.NotContains(t, attr.Value.AsString(), sessionCookie)
+		}
+	}
 }
