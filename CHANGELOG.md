@@ -328,8 +328,8 @@ adopters can plan their upgrades.
     two credentials with one name, and asking only whether a Basic for that
     username was listed answered yes about a credential the SDK had never seen.
     The URL must now also be one the caller named — same scheme, same host,
-    same user. Nothing is lost on a same-host redirect, where `net/http` copies
-    the original header rather than deriving a second one.
+    same user. (That was not the whole of it: a **same-host** redirect derives a
+    second header too, which the entry below corrects and closes.)
   - A session cookie a redirect picked up no longer reaches a span. `net/http`
     builds its own request for a redirect and fills its `Cookie` header from
     the client's jar — including a cookie the redirect response itself set — so
