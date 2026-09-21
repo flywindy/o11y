@@ -395,11 +395,28 @@ func Secrets(text string, secrets ...string) string {
 	if len(secrets) == 0 || text == "" {
 		return text
 	}
+	// Empties are dropped, and so are repeats. A caller's list is assembled
+	// from several sources that each expand a value into every form Renderings
+	// names, and the same credential reaches more than one of them: resty
+	// copies a client header into the resolved request, so its Authorization
+	// arrives both from the client's configuration and from the request's own
+	// headers. Every repeat costs a scan of the text here and another of each
+	// decoded reading below.
+	//
+	// It is done here rather than in the lists because this is the one place
+	// every list passes through. Two of the three dedupe themselves already;
+	// the third did not, and a fourth would have had to remember to.
 	ordered := make([]string, 0, len(secrets))
+	seen := make(map[string]struct{}, len(secrets))
 	for _, secret := range secrets {
-		if secret != "" {
-			ordered = append(ordered, secret)
+		if secret == "" {
+			continue
 		}
+		if _, dup := seen[secret]; dup {
+			continue
+		}
+		seen[secret] = struct{}{}
+		ordered = append(ordered, secret)
 	}
 	if len(ordered) == 0 {
 		return text

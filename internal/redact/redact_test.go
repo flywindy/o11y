@@ -1536,3 +1536,29 @@ func TestError_ScrubsTheBasicItCanCompute(t *testing.T) {
 	assert.NotContains(t, got, "hunter2")
 	assert.Contains(t, got, "host/x", "the rest of the message survives")
 }
+
+// TestSecrets_IsUnchangedByRepeatsInItsList pins the property the deduplication
+// rests on: dropping a repeat changes what this function does, not what it
+// produces.
+//
+// A caller's list is assembled from several sources that each expand a value
+// into every rendering, and the same credential reaches more than one of them.
+// The saving is a scan of the text per repeat; the risk of the change is
+// dropping something that was not a repeat, which is what this asserts against.
+func TestSecrets_IsUnchangedByRepeatsInItsList(t *testing.T) {
+	// #nosec G101 -- fabricated fixture credentials, not live ones
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const token, cookie = "Bearer s3cret-token", "sess=c00kie"
+	const message = `rejected header "Bearer s3cret-token" and cookie "sess=c00kie" after 1 try`
+
+	distinct := append(redact.HeaderValueForms(token), redact.HeaderValueForms(cookie)...)
+	repeated := append(append([]string(nil), distinct...), distinct...)
+	require.Greater(t, len(repeated), len(distinct), "the premise: the list holds repeats")
+
+	got := redact.Secrets(message, repeated...)
+
+	assert.Equal(t, redact.Secrets(message, distinct...), got)
+	assert.NotContains(t, got, "s3cret-token")
+	assert.NotContains(t, got, "c00kie")
+	assert.Contains(t, got, "after 1 try", "and nothing else is touched")
+}
