@@ -312,6 +312,25 @@ adopters can plan their upgrades.
   whitespace. `"PROD"`, `"Production"` or a value with a trailing space from a
   manifest resolve to the canonical name instead of failing `Init` — and with
   it the service — at startup.
+- **Docs**: `WithHistogramBuckets` is documented for what it actually shapes.
+  Its godoc, the README and the guide described it as the HTTP latency
+  boundaries, while `Init` passes the same slice into every datastore view, so
+  it also pins `db.client.operation.duration` (redis, mongo, cassandra,
+  elasticsearch), `db.client.connection.create_time` (redis, mongo, cassandra)
+  and `minio.client.operation.duration`. An operator tuning HTTP buckets was
+  silently reshaping the datastore histograms, where the same boundaries are an
+  order of magnitude too coarse. All four places now name every instrument, and
+  say that `WithDisableDefaultViews` drops the HTTP views only — the datastore
+  views keep these boundaries. No behaviour changed.
+- **Docs**: `gin.error.type` and `pyroscope.profile.id` have catalog entries in
+  `docs/semconv.md`, with a Deviations row each, as that file's own "new
+  attribute? update this catalog" rule requires. Both were emitted and promised
+  in the README and guide while absent from the catalog. The entries record
+  what a reader cannot get from the key alone: `gin.error.type` is carried by
+  the `exception` event rather than the span and never becomes a metric label,
+  and `pyroscope.profile.id` is set by the upstream bridge on root spans only,
+  carries the root span's id, marks a span that *can* have a profile rather
+  than one that does, and must never be promoted to a metric label.
 
 ---
 

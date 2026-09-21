@@ -41,8 +41,10 @@ const DefaultMaxUniqueCollections = 200
 // effective limit is derived from the export caps.
 const DefaultCardinalityLimit = metrics.DefaultCardinalityLimit
 
-// defaultLatencyBuckets is the SLO-friendly histogram boundary set applied
-// to all http.server.* histograms when the caller does not override it.
+// defaultLatencyBuckets is the SLO-friendly histogram boundary set applied to
+// every latency histogram the SDK owns a view for — HTTP server and client,
+// and the datastore facades' operation and connection-create histograms — when
+// the caller does not override it. WithHistogramBuckets lists them.
 // Standardizing these boundaries across the company keeps P99 calculations
 // directly comparable between services. Exposed via DefaultLatencyBuckets()
 // so the slice cannot be mutated by callers.
@@ -458,11 +460,31 @@ func WithRuntimeMetrics(enabled bool) Option {
 	}
 }
 
-// WithHistogramBuckets overrides the histogram boundaries applied to HTTP
-// server and client latency histograms. Defaults to DefaultLatencyBuckets;
-// override only when your service has a genuinely different latency profile.
-// Changing these from the package default makes cross-service P99
-// comparisons inconsistent.
+// WithHistogramBuckets overrides the histogram boundaries of every latency
+// histogram this SDK installs a view for. That is more than HTTP, and the list
+// is given in full because tuning one of these reshapes all of them:
+//
+//   - http.server.request.duration and http.client.request.duration;
+//   - db.client.operation.duration, for the redis, mongo, cassandra and
+//     elasticsearch facades;
+//   - db.client.connection.create_time, for the redis, mongo and cassandra
+//     pools;
+//   - minio.client.operation.duration.
+//
+// A datastore's latency profile is not an HTTP service's — a Redis GET lives
+// in the first bucket of an HTTP-shaped set — so an override chosen for HTTP
+// makes the datastore histograms coarser, not merely different. There is no
+// per-signal form of this option and no way to add a view through Init, so a
+// service that needs different boundaries for one of these has to build its
+// own MeterProvider.
+//
+// WithDisableDefaultViews does not narrow this. It drops the SDK's HTTP views
+// only; the datastore views are installed as extra views and keep whatever
+// boundaries are configured here.
+//
+// Defaults to DefaultLatencyBuckets; override only when your service has a
+// genuinely different latency profile. Changing these from the package default
+// makes cross-service P99 comparisons inconsistent.
 func WithHistogramBuckets(buckets []float64) Option {
 	return func(c *Config) {
 		c.histogramBuckets = cloneFloat64s(buckets)
