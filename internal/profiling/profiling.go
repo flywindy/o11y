@@ -211,18 +211,23 @@ func cloneStringMap(in map[string]string) map[string]string {
 // risky today: the adapter has no say in what the upstream chooses to format
 // into a message, and a version bump could move the address onto any of them.
 type pyroscopeSlogAdapter struct {
-	logger   *slog.Logger
-	endpoint string
-	secrets  []string
+	logger *slog.Logger
+	// endpoints are every address pyroscope may name: the configured one and,
+	// when it is set, the PYROSCOPE_ADHOC_SERVER_ADDRESS override that Start
+	// actually uploads to. The secret list already covers both; so must the
+	// endpoint substitution, or a message quoting the override would only be
+	// held by InText's closed rules rather than replaced legibly.
+	endpoints []string
+	secrets   []string
 }
 
 // newPyroscopeSlogAdapter builds the adapter pyroscope logs through, carrying
 // the values that must never reach a record.
 func newPyroscopeSlogAdapter(cfg Config) pyroscopeSlogAdapter {
 	return pyroscopeSlogAdapter{
-		logger:   cfg.Logger,
-		endpoint: cfg.Endpoint,
-		secrets:  authHeaderSecrets(cfg.Endpoint, cfg.AuthHeaders),
+		logger:    cfg.Logger,
+		endpoints: profilingEndpoints(cfg.Endpoint),
+		secrets:   authHeaderSecrets(cfg.Endpoint, cfg.AuthHeaders),
 	}
 }
 
@@ -301,6 +306,16 @@ func authHeaderSecrets(endpoint string, headers map[string]string) []string {
 	return secrets
 }
 
+// profilingEndpoints returns every address pyroscope may name in a message:
+// the configured one, and the adhoc override when it is set.
+func profilingEndpoints(configured string) []string {
+	endpoints := []string{configured}
+	if override := adhocServerAddress(); override != "" && override != configured {
+		endpoints = append(endpoints, override)
+	}
+	return endpoints
+}
+
 // adhocServerAddressEnv is the variable pyroscope.Start reads to override the
 // configured ingest address, before it builds the uploader.
 const adhocServerAddressEnv = "PYROSCOPE_ADHOC_SERVER_ADDRESS"
@@ -319,7 +334,10 @@ func adhocServerAddress() string {
 // scrub renders one pyroscope log line with the endpoint's credentials and the
 // configured auth header values removed.
 func (a pyroscopeSlogAdapter) scrub(format string, args ...any) string {
-	return redact.Secrets(redact.InText(fmt.Sprintf(format, args...), a.endpoint), a.secrets...)
+	return redact.Secrets(
+		redact.InText(fmt.Sprintf(format, args...), a.endpoints...),
+		a.secrets...,
+	)
 }
 
 // logContext is the context these records carry. pyroscope calls the adapter

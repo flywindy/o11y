@@ -215,6 +215,28 @@ func shutdownBudget(ctx context.Context, remaining int) (context.Context, contex
 	return context.WithTimeout(ctx, share)
 }
 
+// profilingStartFailureText renders a Pyroscope start failure for the warning
+// Init writes when profiling could not be enabled.
+//
+// It applies both rules, not only the endpoint one. This site used to pass no
+// secrets at all, which made it the only redaction in the SDK that could echo
+// a configured header value or the Basic credential an endpoint's userinfo
+// becomes: InText recognises structure, and neither of those has any. Whether
+// the pinned Pyroscope puts one in a start error today is beside the point —
+// the premise this package works from is that it does not get to choose what
+// an upstream formats into a message, and every sibling call site is given the
+// same set.
+//
+// It is a function rather than an expression inline in Init so that the set it
+// passes can be tested; an asymmetry nothing exercises is where all of these
+// have come from.
+func profilingStartFailureText(cfg *Config, err error) string {
+	return redact.Secrets(
+		redact.InText(err.Error(), cfg.profilingEndpoint),
+		diagnosticSecrets(cfg)...,
+	)
+}
+
 // shutdownSequence orders the per-pillar closers Shutdown runs. A nil
 // closer (a disabled pillar, or no profiler) is left out, so it neither
 // runs nor counts as a component when the deadline is shared out: with
@@ -558,8 +580,15 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 				// parses the address and returns net/url's error verbatim).
 				// This record goes to stdout and the OTLP log pipeline, i.e.
 				// out of the process.
+				//
+				// The secrets are the same set every other redaction site in
+				// the SDK is given. This one used to pass none, which made it
+				// the only place a configured header value or the endpoint's
+				// derived Basic credential could be echoed — the two rules
+				// InText applies recognise structure, and neither of those has
+				// any.
 				slog.String("endpoint", redact.URL(cfg.profilingEndpoint)),
-				slog.String("error", redact.InText(startErr.Error(), cfg.profilingEndpoint)),
+				slog.String("error", profilingStartFailureText(cfg, startErr)),
 			)
 		} else {
 			profilerCloser = closer

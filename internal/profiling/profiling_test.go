@@ -630,3 +630,33 @@ func TestAuthHeaderSecrets_CoversTheAdhocEndpointOverride(t *testing.T) {
 		assert.NotContains(t, s, "0verrideP4ss")
 	}
 }
+
+// TestPyroscopeSlogAdapter_KeepsAnOverrideEndpointLegible pins what listing
+// the adhoc override as a known endpoint actually buys, which is legibility
+// rather than safety.
+//
+// A message quoting an override with userinfo was already safe without it —
+// InText's userinfo rule matches any "scheme://...@" and rewrites it. The
+// difference shows on a *signed* override: unknown, it trips the closed query
+// rule and the whole line is replaced; known, the signature is substituted and
+// the operator can still read where the upload went.
+func TestPyroscopeSlogAdapter_KeepsAnOverrideEndpointLegible(t *testing.T) {
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const override = "http://adhoc-pyroscope:4040?Signature=0verrideSig"
+	t.Setenv("PYROSCOPE_ADHOC_SERVER_ADDRESS", override)
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	adapter := newPyroscopeSlogAdapter(Config{Logger: logger, Endpoint: "http://pyroscope:4040"})
+
+	adapter.Debugf("uploading at %s", override)
+
+	var record struct {
+		Msg string `json:"msg"`
+	}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
+	assert.NotContains(t, record.Msg, "0verrideSig", "the signature never survives either way")
+	assert.Contains(t, record.Msg, "adhoc-pyroscope:4040",
+		"but the host does, which it would not if the line had been replaced wholesale")
+}
