@@ -655,9 +655,14 @@ func diagnosticSecrets(cfg *Config) []string {
 			// The exporter reports a name that fails to unescape on its own
 			// ("key", k), the same way it reports a value, and a credential
 			// pasted into the wrong side of the "=" is still a credential —
-			// so both parts get both sets of forms.
+			// so both parts get both sets of forms. Both calls are needed:
+			// the name set and the value set overlap only in the fragment
+			// itself, and a Cookie value configured through the environment
+			// reaches the collector rejoined with "; " by HTTP/2, which only
+			// the value set carries.
 			for _, part := range []string{k, v} {
 				for _, form := range headerEnvForms(part) {
+					add(form)
 					addName(form)
 				}
 			}

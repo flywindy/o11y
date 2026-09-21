@@ -726,3 +726,30 @@ func TestDiagnosticSecrets_CoversTheJSONForm(t *testing.T) {
 	assert.Contains(t, secrets, token, "the configured form")
 	assert.Contains(t, secrets, redact.JSONEscaped(token), "and the form a JSON error body holds")
 }
+
+// TestDiagnosticSecrets_EnvFragmentsGetValueFormsToo pins that an
+// environment-configured header is covered on the value side as well as the
+// name side.
+//
+// The two sets overlap only in the fragment itself. A Cookie value reaches the
+// collector rejoined with "; " by HTTP/2, and a value with surrounding
+// whitespace reaches it trimmed — neither of which HeaderNameForms produces.
+// A refactor that routed this loop through the name set alone dropped both,
+// while the comment above it still claimed "both sets of forms".
+func TestDiagnosticSecrets_EnvFragmentsGetValueFormsToo(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const configured = "Cookie=session=x;tenant=t0ken"
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", configured)
+	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "")
+
+	_, value, ok := strings.Cut(configured, "=")
+	require.True(t, ok)
+	onTheWire := redact.CookieWireValue(value)
+	require.NotEqual(t, value, onTheWire, "the premise: HTTP/2 rewrites this value")
+
+	secrets := diagnosticSecrets(&Config{})
+
+	assert.Contains(t, secrets, value, "the configured form")
+	assert.Contains(t, secrets, onTheWire, "and the form an HTTP/2 collector receives")
+}
