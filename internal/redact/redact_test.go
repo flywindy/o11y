@@ -1704,3 +1704,35 @@ func TestHeaderSecrets_ListsTheNameAsWellAsTheValue(t *testing.T) {
 	assert.Contains(t, secrets, redact.GoEscaped(pastedAsName),
 		"and as an error that quotes it renders it")
 }
+
+// TestError_RefusesADigestCredentialPastAScanLimit pins that the digest rule
+// searches the line rather than a guessed number of bytes.
+//
+// resty writes username, realm, nonce and uri before the response parameter
+// (digest.go:240-247), so a long request URI or a long server nonce pushes the
+// hash arbitrarily far into the header. A rule that stopped at a fixed offset
+// missed exactly the credential it exists to catch — and the further the hash
+// is from the scheme name, the more likely the deployment is one where a URI
+// carries identifiers worth keeping out of a span.
+func TestError_RefusesADigestCredentialPastAScanLimit(t *testing.T) {
+	// #nosec G101 -- fabricated fixture credential, not a live one
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const hash = "41f1670a364ebe0a76bb4740d8b68f45"
+	longURI := "/" + strings.Repeat("a-path-segment/", 40)
+	digest := `Digest username="alice", realm="r", nonce="n", uri="` + longURI +
+		`", response="` + hash + `", qop=auth, nc=00000001, cnonce="6ca020a1"`
+	require.Greater(t, strings.Index(digest, "response="), 400,
+		"the premise: the hash is past the offset an earlier version stopped at")
+
+	err := fmt.Errorf("proxy rejected header %q", digest)
+	assert.Equal(t, "[message redacted]", redact.Error(err, nil, nil).Error())
+
+	spaced := fmt.Errorf("proxy rejected header %q",
+		`Digest username="alice", response = "`+hash+`"`)
+	assert.Equal(t, "[message redacted]", redact.Error(spaced, nil, nil).Error(),
+		"whitespace around the equals sign is legal in a header and must not hide it")
+
+	clean := errors.New("Digest authentication is not configured for this route")
+	assert.Equal(t, clean.Error(), redact.Error(clean, nil, nil).Error(),
+		"and prose naming the scheme is still not a credential")
+}

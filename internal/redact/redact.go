@@ -540,11 +540,19 @@ func holdsUnaccountedCredential(text string) bool {
 var basicCredential = regexp.MustCompile(`(?i)\bBasic\s+([A-Za-z0-9+/]{8,}={0,2})`)
 
 // digestCredential matches the RFC 7616 form closely enough to be sure: the
-// scheme name followed, within one header's worth of text, by the response
-// parameter and a value long enough to be the hash it carries. The quote is
-// optional because an error that renders the header with %q escapes it, and
-// the value shape keeps prose about digest responses from matching.
-var digestCredential = regexp.MustCompile(`(?i)\bDigest\s+[^\n]{0,400}?response=[\\"]{0,2}[A-Za-z0-9+/=]{8,}`)
+// scheme name followed, anywhere on the same line, by the response parameter
+// and a value long enough to be the hash it carries. The quote is optional
+// because an error that renders the header with %q escapes it, and the value
+// shape keeps prose about digest responses from matching.
+//
+// The search runs to the end of the line rather than a fixed number of bytes.
+// A first version stopped at 400, which is a guess about how much precedes the
+// response parameter, and resty writes username, realm, nonce and uri before
+// it (digest.go:240-247) — a long request URI or a long server nonce pushes
+// the hash past any such number, and the rule then misses exactly the
+// credential it exists to catch. Go's regexp is RE2, so an unbounded run over
+// one line costs linear time.
+var digestCredential = regexp.MustCompile(`(?i)\bDigest\s+[^\r\n]*?\bresponse\s*=\s*[\\"]{0,2}[A-Za-z0-9+/=]{8,}`)
 
 // redactedMessage replaces a whole message that was holding a secret in a form
 // this package can recognise but cannot rewrite. It is not redactedWhole: that
