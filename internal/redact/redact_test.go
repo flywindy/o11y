@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"html"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1009,6 +1010,61 @@ func TestJSONUnescapedIsTotal(t *testing.T) {
 	} {
 		t.Run(line, func(t *testing.T) {
 			assert.NotPanics(t, func() { _ = redact.InText(line) })
+		})
+	}
+}
+
+// TestInText_FailsClosedOnAnHTMLEscapedQuerySeparator pins the same hole the
+// JSON one had, in the other encoding a Go server produces.
+//
+// html.EscapeString turns "&" into "&amp;", so the query matcher reads the key
+// as "amp;Signature" — not a credential key — and both checks pass.
+func TestInText_FailsClosedOnAnHTMLEscapedQuerySeparator(t *testing.T) {
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const endpoint = "https://pyroscope:4040/ingest?tenant=t&Signature=S3cretSig"
+
+	escaped := html.EscapeString(endpoint)
+	require.Contains(t, escaped, "&amp;Signature=", "the premise: the separator is an entity now")
+	require.NotContains(t, escaped, endpoint, "so the configured endpoint is not a substring")
+
+	got := redact.InText("body: <p>rejected "+escaped+"</p>", endpoint)
+
+	assert.NotContains(t, got, "S3cretSig")
+	assert.Equal(t, "[endpoint redacted]", got)
+}
+
+// TestInText_FailsClosedOnAnEscapedAtSign pins the case the review did not
+// name, which generalising its finding turned up.
+//
+// "&commat;" is an at-sign. Both rules therefore see a text with no userinfo
+// and nothing to account for — and the substitution runs on the text as it
+// stands, so even recognising the decoded form would not let it rewrite this
+// one. An anchor an escape hides is an anchor this function cannot reach, so
+// the line goes wholesale.
+func TestInText_FailsClosedOnAnEscapedAtSign(t *testing.T) {
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const escaped = "https://alice:pa55word&commat;pyroscope:4040/ingest"
+	require.NotContains(t, escaped, "@", "the premise: there is no at-sign to count")
+	require.Contains(t, html.UnescapeString(escaped), "@", "but decoding reveals one")
+
+	got := redact.InText("body: " + escaped)
+
+	assert.NotContains(t, got, "pa55word")
+	assert.Equal(t, "[endpoint redacted]", got)
+}
+
+// TestInText_LeavesHarmlessEntitiesAlone pins the other side: decoding for the
+// check must not start discarding ordinary messages.
+func TestInText_LeavesHarmlessEntitiesAlone(t *testing.T) {
+	for _, line := range []string{
+		`body: <p>bad request: name &amp; id</p>`,
+		`body: expected &lt;tag&gt;`,
+		`upload profile: failed to upload: (429) 'slow down'`,
+	} {
+		t.Run(line, func(t *testing.T) {
+			assert.Equal(t, line, redact.InText(line))
 		})
 	}
 }

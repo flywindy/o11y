@@ -3,6 +3,7 @@ package resty
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -955,4 +956,62 @@ func TestClonedClientResolvesAgainstItsOwnBaseURL(t *testing.T) {
 	require.Len(t, spans, 1)
 	assertAttr(t, spans[0], semconv.ServerAddressKey, "cloned.internal")
 	assertAttr(t, spans[0], semconv.ServerPortKey, int64(2222))
+}
+
+// authReportingTransport is the shape the review named: a RoundTripper that
+// names the Authorization header it was handed. A proxy wrapper, an auth
+// middleware or a retry logger can all do this.
+type authReportingTransport struct{}
+
+func (authReportingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	//nolint:err113 // the point is an error naming the header, not a sentinel
+	return nil, fmt.Errorf("upstream refused Authorization: %s", r.Header.Get("Authorization"))
+}
+
+// TestWrapRedactsTheURLDerivedBasicHeaderFromTheErrorSpan pins the credential
+// a transport sees in place of the URL's userinfo.
+//
+// http.Client converts "user:pass@host" into "Authorization: Basic
+// base64(user:pass)" before RoundTrip is called, so a transport never sees the
+// userinfo — it sees an opaque token containing neither half as a substring.
+// No URL redaction can recognise it, which is why it has to be named as a
+// secret rather than found.
+func TestWrapRedactsTheURLDerivedBasicHeaderFromTheErrorSpan(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.SetTransport(authReportingTransport{})
+
+	// #nosec G101 -- fabricated fixture credential, not a live one
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const password = "hunter2Secret"
+	token := base64.StdEncoding.EncodeToString([]byte("bob:" + password))
+	require.NotContains(t, token, password, "the premise: the wire form hides the password")
+
+	_, err := client.R().Get("http://bob:" + password + "@127.0.0.1:1/orders")
+	require.Error(t, err)
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	span := spans[0]
+
+	var message string
+	for _, event := range span.Events() {
+		if event.Name != semconv.ExceptionEventName {
+			continue
+		}
+		for _, attr := range event.Attributes {
+			if attr.Key == semconv.ExceptionMessageKey {
+				message = attr.Value.AsString()
+			}
+		}
+	}
+	require.NotEmpty(t, message, "the error is recorded as an exception")
+
+	for name, text := range map[string]string{
+		"status description": span.Status().Description,
+		"exception.message":  message,
+	} {
+		assert.NotContains(t, text, token, name+" must not carry the derived credential")
+		assert.NotContains(t, text, password, name+" must not carry the password either")
+	}
 }

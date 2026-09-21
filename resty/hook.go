@@ -266,7 +266,8 @@ func (h *hook) finishError(req *restyclient.Request, state *requestState, err er
 	// text, and Go's client error is a *url.Error holding the request URL with
 	// the username and the query intact. Redacting url.full while recording
 	// that beside it would move the credential rather than remove it.
-	h.finish(req, state, codes.Error, redact.Error(err, nil, nil).Error(), err, attrs, metricAttrs)
+	h.finish(req, state, codes.Error,
+		redact.Error(err, nil, urlDerivedSecrets(req)).Error(), err, attrs, metricAttrs)
 }
 
 // resolvedTarget prefers the fully resolved URL resty builds into RawRequest,
@@ -298,7 +299,7 @@ func (h *hook) finish(
 		state.span.SetAttributes(spanAttrs...)
 	}
 	if err != nil {
-		recordRedactedError(state.span, err)
+		recordRedactedError(state.span, err, urlDerivedSecrets(req))
 	}
 	if status != codes.Unset {
 		state.span.SetStatus(status, description)
@@ -466,11 +467,41 @@ func targetFromURL(u *url.URL) targetAttrs {
 // redacted wrapper would fix the message and break exception.type, which the
 // SDK derives with reflect.TypeOf, so the event is built here from the original
 // error's type and the redacted text.
-func recordRedactedError(span trace.Span, err error) {
+func recordRedactedError(span trace.Span, err error, secrets []string) {
 	span.AddEvent(semconv.ExceptionEventName, trace.WithAttributes(
 		semconv.ExceptionType(exceptionType(err)),
-		semconv.ExceptionMessage(redact.Error(err, nil, nil).Error()),
+		semconv.ExceptionMessage(redact.Error(err, nil, secrets).Error()),
 	))
+}
+
+// urlDerivedSecrets returns the Authorization value net/http derives from the
+// request URL's userinfo, in the forms something may report it.
+//
+// A transport does not see "user:pass@host": http.Client has already turned it
+// into "Authorization: Basic base64(user:pass)" by the time RoundTrip is
+// called, so a RoundTripper that names the header it was given — a proxy
+// wrapper, an auth middleware, a retry logger — reports a credential in a form
+// no URL redaction can recognise. It contains neither half as a substring, and
+// it is not a URL, so neither URLAttribute nor InText's closed rules see
+// anything to act on. It has to be named as a secret.
+//
+// The resolved URL is preferred over the request's own, for the same reason
+// resolvedTarget prefers it: a relative URL carries no userinfo until it has
+// been resolved against the client's base.
+func urlDerivedSecrets(req *restyclient.Request) []string {
+	if req == nil {
+		return nil
+	}
+	raw := req.URL
+	if req.RawRequest != nil && req.RawRequest.URL != nil {
+		raw = req.RawRequest.URL.String()
+	}
+	basic := redact.BasicAuthHeader(raw)
+	if basic == "" {
+		return nil
+	}
+	// The bare token too, for a report that names only that.
+	return []string{basic, strings.TrimPrefix(basic, "Basic ")}
 }
 
 // exceptionType names err's type the way span.RecordError would have.
