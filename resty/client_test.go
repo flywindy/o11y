@@ -1121,3 +1121,93 @@ func TestWrapRedactsACallersOwnAuthorizationHeaderKey(t *testing.T) {
 	require.Len(t, spans, 1)
 	assert.NotContains(t, spans[0].Status().Description, token)
 }
+
+// TestWrapRedactsAnOpaqueRequestURLPayload pins the percent-encoded reading of
+// a request URL's own payload.
+//
+// url.Parse leaves an opaque URL's payload untouched, escapes and all, and a
+// transport that reports what it could not dial repeats it. The outer
+// *url.Error is redacted by the URL rule; the repeated payload is plain text
+// where ":" and "@" arrive as "%3A" and "%40", so neither closed rule had an
+// anchor and the credential was exported by both span fields.
+func TestWrapRedactsAnOpaqueRequestURLPayload(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.SetTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("cannot dial opaque target %s", r.URL.Opaque)
+	}))
+
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	_, err := client.R().Get("http:alice%3Asecret%40host")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "alice%3Asecret%40host",
+		"the premise: the payload is in the error the hook is handed")
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	span := spans[0]
+
+	assert.NotContains(t, span.Status().Description, "alice%3Asecret%40host")
+	assert.NotContains(t, span.Status().Description, "secret")
+	for _, event := range span.Events() {
+		for _, attr := range event.Attributes {
+			assert.NotContains(t, attr.Value.AsString(), "alice%3Asecret%40host",
+				"no span event may carry it either")
+		}
+	}
+}
+
+// TestWrapRefusesACredentialARedirectIntroduced pins the one credential this
+// package cannot name: net/http derives an Authorization header per hop, so a
+// redirect whose Location carries userinfo puts a Basic on the wire that the
+// request never held, and the password reaches the error masked as "***".
+//
+// A transport that names the header it was given therefore reports a base64
+// nothing here can compute or match. The message is given up whole; url.full,
+// server.address and error.type still identify the request.
+func TestWrapRefusesACredentialARedirectIntroduced(t *testing.T) {
+	tp, mp, sr := testProviders()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// #nosec G101 -- fabricated fixture credential, not a live one
+		// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+		http.Redirect(w, r, "http://alice:hunter2@"+r.Host+"/final", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	basic := base64.StdEncoding.EncodeToString([]byte("alice:hunter2"))
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	base := http.DefaultTransport
+	client.SetTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/final" {
+			return nil, fmt.Errorf("proxy rejected header %q", r.Header.Get("Authorization"))
+		}
+		return base.RoundTrip(r)
+	}))
+
+	_, err := client.R().Get(srv.URL + "/start")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), basic,
+		"the premise: net/http derived the header from the Location and the error names it")
+	require.NotContains(t, err.Error(), "hunter2",
+		"and the password is masked, so the header cannot be computed here")
+
+	spans := endedClientSpans(sr)
+	require.NotEmpty(t, spans)
+	span := spans[len(spans)-1]
+
+	assert.NotContains(t, span.Status().Description, basic)
+	for _, event := range span.Events() {
+		for _, attr := range event.Attributes {
+			assert.NotContains(t, attr.Value.AsString(), basic)
+		}
+	}
+	var host string
+	for _, attr := range span.Attributes() {
+		if attr.Key == semconv.ServerAddressKey {
+			host = attr.Value.AsString()
+		}
+	}
+	assert.NotEmpty(t, host, "the request is still identifiable without its message")
+}

@@ -131,7 +131,11 @@ credential-carrying header on the resolved request — `SetAuthToken`,
 client that sets its own `HeaderAuthorizationKey` puts its token in. A
 transport, proxy wrapper or auth middleware that names the header it was given
 therefore does not put its value on the span. Text holding a credential the
-rules can recognise but cannot rewrite in place is replaced wholesale.
+rules can recognise but cannot rewrite in place is replaced wholesale, and so is
+a message naming the `Authorization` header `net/http` derived from a redirect's
+`Location` — that password reaches the SDK masked, so the header cannot be
+computed or matched. `url.full`, `server.address` and `error.type` still
+identify such a request.
 
 ---
 

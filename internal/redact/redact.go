@@ -188,10 +188,14 @@ func InText(text string, knownEndpoints ...string) string {
 // decodedViews returns the readings of text that an escaping on the way here
 // could have hidden an anchor behind, and reports whether that set is complete.
 //
-// The three that matter are the renderings Renderings lists, because they are
-// the ones a Go program produces when it puts a value into an error page, an
-// error document, or a %q: HTML entities, encoding/json's escapes, and
-// strconv's. Each is one decoder covering every spelling its own encoding
+// Three of them are the renderings Renderings lists, because they are the ones
+// a Go program produces when it puts a value into an error page, an error
+// document, or a %q: HTML entities, encoding/json's escapes, and strconv's.
+// The fourth is percent-encoding, which is not a rendering of a secret but a
+// rendering of a URL: net/url escapes ":" and "@" in an opaque payload or a
+// path, and an error that repeats such a payload — "alice%3Asecret%40host" —
+// carries a reversible credential past every rule anchored on those
+// characters. Each is one decoder covering every spelling its own encoding
 // admits — &amp;, &#38; and &#x26; are all one call — rather than a pattern
 // listing them.
 //
@@ -229,7 +233,7 @@ func decodedViews(text string) (views []string, converged bool) {
 // order a program applies them in: a value is escaped for its document last,
 // so that escaping is the first to come off.
 func decodeOnce(text string) string {
-	return goUnescaped(jsonUnescaped(html.UnescapeString(text)))
+	return percentUnescaped(goUnescaped(jsonUnescaped(html.UnescapeString(text))))
 }
 
 // maxDecodePasses bounds that loop. Entities nest — "&amp;amp;Signature" is two
@@ -332,6 +336,37 @@ func goUnescaped(text string) string {
 var goSimpleEscapes = map[byte]byte{
 	'a': 7, 'b': 8, 'f': 12, 'n': 10, 'r': 13, 't': 9, 'v': 11,
 	'\\': '\\', '"': '"', '\'': '\'',
+}
+
+// percentUnescaped returns text with its valid percent escapes replaced by the
+// bytes they stand for, leaving everything else as it stands.
+//
+// url.PathUnescape is the decoder for a whole URL and refuses one that holds a
+// malformed escape. The text here is a log line that may merely quote part of
+// a URL, so this one is total in the same way the others are: an escape it
+// cannot read is left alone, and failing to decode leaves the rules looking at
+// the text they would have looked at anyway.
+//
+// "+" is deliberately not a space here. That reading belongs to a query
+// string, and applying it to a whole line would rewrite text that is not one.
+func percentUnescaped(text string) string {
+	if !strings.Contains(text, "%") {
+		return text
+	}
+	var b strings.Builder
+	b.Grow(len(text))
+	for i := 0; i < len(text); {
+		if text[i] == '%' && i+3 <= len(text) {
+			if v, err := strconv.ParseUint(text[i+1:i+3], 16, 8); err == nil {
+				b.WriteByte(byte(v))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(text[i])
+		i++
+	}
+	return b.String()
 }
 
 // opaquePlaceholder replaces a secret Secrets was told about.
@@ -539,6 +574,13 @@ var escapedOpaquePlaceholder = url.QueryEscape(opaquePlaceholder)
 // either, because the only accepted value is the placeholder in full: text
 // arriving with "Signature=%5Bredacted%5D" already carries "[redacted]" as its
 // signature, and a longer value with that prefix does not match.
+//
+// Both spellings of the placeholder are accepted, because this rule is asked
+// about decoded readings as well as about the text. redactQuery writes the
+// escaped form, and percent-decoding a line that carries it produces the plain
+// one; a reading in which this package's own redaction stopped being
+// recognisable would fail closed on its own output. Accepting the plain form
+// gives nothing away — a value that reads "[redacted]" is that string.
 func unaccountedCredentialQuery(text string) bool {
 	for _, match := range queryParam.FindAllStringSubmatchIndex(text, -1) {
 		if !isCredentialQueryKey(text[match[2]:match[3]]) {
@@ -548,7 +590,7 @@ func unaccountedCredentialQuery(text string) bool {
 		if end := strings.IndexAny(value, "&\"' \t\r\n"); end >= 0 {
 			value = value[:end]
 		}
-		if value != escapedOpaquePlaceholder {
+		if value != escapedOpaquePlaceholder && value != opaquePlaceholder {
 			return true
 		}
 	}
@@ -1048,7 +1090,8 @@ func Error(err error, endpoints, secrets []string) error {
 		return nil
 	}
 	original, rendered := renderError(err)
-	msg := Secrets(errorText(original, err, endpoints), secrets...)
+	text, derived := errorText(original, err, endpoints, secrets)
+	msg := Secrets(text, append(append([]string(nil), secrets...), derived...)...)
 	if rendered && msg == original {
 		return err
 	}
@@ -1077,7 +1120,8 @@ func Error(err error, endpoints, secrets []string) error {
 // rule can speak for what is inside it — a signed query carries its credential
 // with no "@" anywhere. The span keeps url.full, server.address and error.type,
 // so the request is still identifiable without it.
-func errorText(text string, err error, endpoints []string) string {
+func errorText(text string, err error, endpoints, secrets []string) (string, []string) {
+	var derived []string
 	urls := errorURLs(err)
 	// Longest first. A nested *url.Error commonly holds the outer one's URL
 	// plus a query, so replacing the outer first would rewrite its prefix
@@ -1087,7 +1131,14 @@ func errorText(text string, err error, endpoints []string) string {
 	for _, raw := range urls {
 		parsed, parseErr := url.Parse(raw)
 		if parseErr != nil {
-			return redactedWhole
+			return redactedWhole, nil
+		}
+		if parsed.User != nil {
+			forms, accounted := basicFromUserinfo(parsed.User, secrets)
+			if !accounted {
+				return redactedWhole, nil
+			}
+			derived = append(derived, forms...)
 		}
 		redacted := URLAttribute(parsed)
 		text = strings.ReplaceAll(text, raw, redacted)
@@ -1095,7 +1146,73 @@ func errorText(text string, err error, endpoints []string) string {
 			text = strings.ReplaceAll(text, escaped, redacted)
 		}
 	}
-	return InText(text, endpoints...)
+	return InText(text, endpoints...), derived
+}
+
+// maskedPassword is what net/http writes in place of a password it is about to
+// drop from a URL it names in an error (client.go stripPassword). It is the
+// only evidence left that there was one.
+//
+// #nosec G101 -- net/http's mask for a password, not a password
+// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+const maskedPassword = "***"
+
+// basicFromUserinfo returns the forms of the Authorization header net/http
+// derived from a URL's userinfo, and reports whether that header is one this
+// call can speak for at all.
+//
+// http.Client.send sets "Authorization: Basic base64(user:pass)" from
+// req.URL.User before any transport is called (client.go:246), so a
+// RoundTripper, a proxy wrapper or an auth middleware that names the header it
+// was given reports a credential in a form no URL redaction recognises: it
+// contains neither half as a substring. Where the password is still readable
+// the value is simply computed here and scrubbed, which covers a URL the
+// caller never had — a custom transport's own error carries its own.
+//
+// Where it is not, the answer is a refusal rather than a guess. A redirect is
+// the case that matters: net/http derives a fresh header for each hop, so a
+// Location carrying "alice:secret@target" puts a credential on the wire that
+// the request never held, and by the time the error reaches us the password is
+// masked. The only thing that can say such a header was accounted for is the
+// caller's own secret list holding a Basic for that username — which is what
+// resty's request secrets and the SDK's diagnostic secrets both build. Without
+// one, the message may hold a credential nothing here can name, and it is
+// given up whole.
+//
+// Matching on the username is looser than matching the credential, and that is
+// stated rather than hidden: a redirect to the same user with a different
+// password is accepted. Closing that would mean capturing the Location itself,
+// which is not reachable from an error, and a rule that refused every
+// credentialed request's message instead would cost far more than it saves.
+func basicFromUserinfo(user *url.Userinfo, secrets []string) (forms []string, accounted bool) {
+	password, set := user.Password()
+	if set && password == maskedPassword {
+		return nil, basicNamed(user.Username(), secrets)
+	}
+	basic := BasicAuthValue(user.Username(), password)
+	forms = append(forms, HeaderValueForms(basic)...)
+	return append(forms, HeaderValueForms(strings.TrimPrefix(basic, "Basic "))...), true
+}
+
+// basicNamed reports whether secrets holds a Basic credential for this
+// username.
+//
+// The password cannot be compared — that is the whole reason this is being
+// asked — so the username is what is left. A secret that happens to be base64
+// of something holding a colon can answer yes by accident; it costs a message
+// that would have been refused, never a credential that would have been kept.
+func basicNamed(username string, secrets []string) bool {
+	for _, secret := range secrets {
+		payload := strings.TrimSpace(strings.TrimPrefix(secret, "Basic "))
+		decoded, err := base64.StdEncoding.DecodeString(payload)
+		if err != nil {
+			continue
+		}
+		if named, _, ok := strings.Cut(string(decoded), ":"); ok && named == username {
+			return true
+		}
+	}
+	return false
 }
 
 // errorURLs returns the URL of every *url.Error in err's chain.
