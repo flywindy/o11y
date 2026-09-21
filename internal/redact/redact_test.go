@@ -960,3 +960,55 @@ func TestHeaderValueForms_MatchesWhatAnHTTP2ServerReceives(t *testing.T) {
 	assert.Contains(t, redact.HeaderValueForms(configured), received,
 		"the form the server actually received must be in the secret list")
 }
+
+// TestInText_FailsClosedOnAJSONEscapedQuerySeparator pins that the closed
+// query rule is not defeated by the encoding of its own anchor.
+//
+// Both rules are anchored on characters, and encoding/json escapes "&" as
+// \u0026. So a signed URL quoted inside a Go server's JSON error body reads
+// "?tenant=t\u0026Signature=..." and the separator the query rule holds on to
+// is simply not there — the rule saw one parameter, "tenant", and passed.
+func TestInText_FailsClosedOnAJSONEscapedQuerySeparator(t *testing.T) {
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const endpoint = "https://pyroscope:4040/ingest?tenant=t&Signature=S3cretSig"
+
+	body, err := json.Marshal(struct {
+		Error string `json:"error"`
+	}{Error: "rejected: " + endpoint})
+	require.NoError(t, err)
+	require.Contains(t, string(body), `\u0026Signature=`,
+		"the premise: json escaped the separator, so the raw one is gone")
+	require.NotContains(t, string(body), endpoint,
+		"and the configured endpoint is no longer a substring to substitute")
+
+	got := redact.InText("upload profile: failed to upload: (401) '"+string(body)+"'", endpoint)
+
+	assert.NotContains(t, got, "S3cretSig")
+	assert.Equal(t, "[endpoint redacted]", got)
+}
+
+// TestInText_LeavesAnUnrelatedEscapeAlone pins that decoding the text for the
+// check does not make the rule fire on messages that carry no credential.
+func TestInText_LeavesAnUnrelatedEscapeAlone(t *testing.T) {
+	const line = `body: {"error":"bad request: name\u0026id"}`
+
+	assert.Equal(t, line, redact.InText(line))
+}
+
+// TestJSONUnescapedIsTotal pins that the decoder used for that second look can
+// only ever fail to decode — a malformed escape leaves the text as it stands,
+// so the rules see what they would have seen anyway.
+func TestJSONUnescapedIsTotal(t *testing.T) {
+	for _, line := range []string{
+		`no escapes here`,
+		`\u`,
+		`\uZZZZ`,
+		`\u00`,
+		`trailing \u002`,
+	} {
+		t.Run(line, func(t *testing.T) {
+			assert.NotPanics(t, func() { _ = redact.InText(line) })
+		})
+	}
+}

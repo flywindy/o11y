@@ -753,3 +753,33 @@ func TestDiagnosticSecrets_EnvFragmentsGetValueFormsToo(t *testing.T) {
 	assert.Contains(t, secrets, value, "the configured form")
 	assert.Contains(t, secrets, onTheWire, "and the form an HTTP/2 collector receives")
 }
+
+// TestDiagnosticSecrets_CoversEndpointDerivedBasicAuth pins that the OTLP and
+// profiling endpoints get the same treatment authHeaderSecrets gives the
+// profiling one.
+//
+// http.Client derives "Authorization: Basic base64(user:pass)" from an
+// endpoint's userinfo, and both exporters put a non-2xx response body into the
+// error they return. The base64 holds neither half as a substring, so nothing
+// else in this list would match a collector that echoed the header back.
+func TestDiagnosticSecrets_CoversEndpointDerivedBasicAuth(t *testing.T) {
+	// #nosec G101 -- fabricated fixture endpoints, not live credentials
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const traces = "http://alice:tr4cePass@collector:4318"
+	// #nosec G101 -- fabricated fixture endpoints, not live credentials
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const profiles = "http://bob:pr0filePass@pyroscope:4040"
+
+	secrets := diagnosticSecrets(&Config{otlpEndpoint: traces, profilingEndpoint: profiles})
+
+	for _, endpoint := range []string{traces, profiles} {
+		derived := redact.BasicAuthHeader(endpoint)
+		require.NotEmpty(t, derived)
+		assert.Contains(t, secrets, derived)
+		assert.Contains(t, secrets, strings.TrimPrefix(derived, "Basic "))
+	}
+	for _, s := range secrets {
+		assert.NotContains(t, s, "tr4cePass")
+		assert.NotContains(t, s, "pr0filePass")
+	}
+}

@@ -132,10 +132,49 @@ func InText(text string, knownEndpoints ...string) string {
 	// The second closed rule, for the credential a presigned URL carries in its
 	// query instead of its userinfo. Such a URL has no "@" at all, so the rule
 	// above passes it through untouched.
-	if unaccountedCredentialQuery(text) {
+	//
+	// Both rules are anchored on characters, and a character can reach this
+	// text encoded. The one that matters is "&": encoding/json escapes it as
+	// \u0026, so a signed URL quoted inside a Go server's JSON error body
+	// reads "?tenant=t\u0026Signature=..." and the separator the query rule
+	// holds on to is not there. Rather than teach the pattern that spelling —
+	// the enumeration this package refuses elsewhere — the rule is applied a
+	// second time to the text with its \u escapes decoded, so any encoding of
+	// a separator resolves to the character the rule already knows.
+	decoded := jsonUnescaped(text)
+	if unaccountedCredentialQuery(text) || (decoded != text && unaccountedCredentialQuery(decoded)) {
 		return redactedWhole
 	}
 	return urlUserinfo.ReplaceAllString(text, "${1}"+placeholder+"@")
+}
+
+// jsonUnescaped returns text with its \uXXXX escapes replaced by the characters
+// they stand for, leaving everything else exactly as it is.
+//
+// It is not a JSON decoder and does not try to be one: the text it is handed is
+// a log line that may merely contain a JSON fragment, so it cannot be unquoted,
+// and the only thing the closed rules need is for an encoded separator to
+// resolve to its character. A malformed escape is left alone, which keeps the
+// function total — it can only ever fail to decode, and failing to decode
+// leaves the rules looking at the same text they looked at before.
+func jsonUnescaped(text string) string {
+	if !strings.Contains(text, `\u`) {
+		return text
+	}
+	var b strings.Builder
+	b.Grow(len(text))
+	for i := 0; i < len(text); {
+		if i+6 <= len(text) && text[i] == '\\' && text[i+1] == 'u' {
+			if r, err := strconv.ParseUint(text[i+2:i+6], 16, 32); err == nil {
+				b.WriteRune(rune(r))
+				i += 6
+				continue
+			}
+		}
+		b.WriteByte(text[i])
+		i++
+	}
+	return b.String()
 }
 
 // opaquePlaceholder replaces a secret Secrets was told about.
