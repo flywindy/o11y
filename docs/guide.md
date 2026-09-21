@@ -338,6 +338,31 @@ HTTP request metrics (`http.server.request.duration`, `http.client.request.durat
 are emitted by the HTTP integrations; see [HTTP](#http) for route-cardinality
 controls.
 
+**Histogram boundaries.** `WithHistogramBuckets` is one knob for every latency
+histogram the SDK installs a view for, which is more than the HTTP pair:
+
+| Instrument | Emitted by |
+|---|---|
+| `http.server.request.duration` | `http`, `gin` |
+| `http.client.request.duration` | `http`, `resty` |
+| `db.client.operation.duration` | `redis`, `mongo`, `cassandra`, `elasticsearch` |
+| `db.client.connection.create_time` | `redis`, `mongo`, `cassandra` |
+| `minio.client.operation.duration` | `minio` |
+
+The default set (`DefaultLatencyBuckets()`, `[0.005 … 10]` seconds) is shaped
+for HTTP request latency, and a datastore operation is an order of magnitude
+faster: a Redis `GET` lands in the first bucket either way. Widening the
+buckets for a slow HTTP endpoint therefore makes every datastore histogram
+coarser too — check the datastore panels after changing them, not only the
+HTTP ones. There is no per-signal form of the option and no way to add a view
+through `Init`, so a service that needs different boundaries for one of these
+histograms has to build its own MeterProvider. Keeping the default everywhere
+is also what makes cross-service P99 comparisons hold.
+
+`WithDisableDefaultViews()` drops the SDK's HTTP views alone. The datastore
+views are installed as extra views, so they keep both their label allowlists
+and these boundaries.
+
 ## Profiling
 
 Profiling is opt-in and **doubly gated**: it requires both a non-empty
