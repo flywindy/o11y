@@ -606,3 +606,27 @@ func TestPyroscopeSlogAdapter_RedactsAnEchoedBasicAuthHeader(t *testing.T) {
 	assert.NotContains(t, record.Msg, token, "the echoed credential is the same secret")
 	assert.Contains(t, record.Msg, "failed to upload: (401)", "the rest of the line survives")
 }
+
+// TestAuthHeaderSecrets_CoversTheAdhocEndpointOverride pins that the address
+// pyroscope actually uploads to is the one the Basic credential is derived
+// from.
+//
+// Start overrides ServerAddress from PYROSCOPE_ADHOC_SERVER_ADDRESS before it
+// builds the uploader (pyroscope-go api.go:57), so an override carrying
+// userinfo puts a credential on the wire that the configured endpoint never
+// mentioned.
+func TestAuthHeaderSecrets_CoversTheAdhocEndpointOverride(t *testing.T) {
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const override = "http://adhoc:0verrideP4ss@adhoc-pyroscope:4040"
+	t.Setenv("PYROSCOPE_ADHOC_SERVER_ADDRESS", override)
+
+	secrets := authHeaderSecrets("http://pyroscope:4040", nil)
+	derived := redact.BasicAuthHeader(override)
+	require.NotEmpty(t, derived)
+
+	assert.Contains(t, secrets, derived, "the header the override makes net/http send")
+	for _, s := range secrets {
+		assert.NotContains(t, s, "0verrideP4ss")
+	}
+}

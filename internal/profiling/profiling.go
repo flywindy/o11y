@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -278,7 +279,17 @@ func authHeaderSecrets(endpoint string, headers map[string]string) []string {
 	// "Authorization: Basic base64(user:pass)" from it. The base64 contains
 	// neither the username nor the password as a substring, so nothing else in
 	// this list would match a server that echoed the header back.
-	if basic := redact.BasicAuthHeader(endpoint); basic != "" {
+	//
+	// Both endpoints are covered, because the one the SDK was given is not
+	// necessarily the one pyroscope uploads to: Start overrides ServerAddress
+	// from PYROSCOPE_ADHOC_SERVER_ADDRESS before it builds the uploader
+	// (pyroscope-go api.go:57), and an override carrying userinfo would
+	// otherwise put a credential on the wire that this list had never seen.
+	for _, addr := range []string{endpoint, adhocServerAddress()} {
+		basic := redact.BasicAuthHeader(addr)
+		if basic == "" {
+			continue
+		}
 		add(redact.HeaderValueForms(basic))
 		// Also without the scheme, for a report that names only the token.
 		add(redact.HeaderValueForms(strings.TrimPrefix(basic, "Basic ")))
@@ -288,6 +299,21 @@ func authHeaderSecrets(endpoint string, headers map[string]string) []string {
 	}
 	sort.Strings(secrets)
 	return secrets
+}
+
+// adhocServerAddressEnv is the variable pyroscope.Start reads to override the
+// configured ingest address, before it builds the uploader.
+const adhocServerAddressEnv = "PYROSCOPE_ADHOC_SERVER_ADDRESS"
+
+// adhocServerAddress returns the ingest address pyroscope will actually use
+// when that override is set, or "" when it is not.
+//
+// Reading it is not the same as honouring it: the SDK neither sets nor clears
+// the variable, and Start's own override still decides the address. This only
+// lets the redaction know which address the credential it may have to scrub
+// came from.
+func adhocServerAddress() string {
+	return os.Getenv(adhocServerAddressEnv)
 }
 
 // scrub renders one pyroscope log line with the endpoint's credentials and the

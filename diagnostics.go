@@ -640,6 +640,21 @@ func diagnosticSecrets(cfg *Config) []string {
 		addName(k)
 		add(v)
 	}
+	// An endpoint's own userinfo is a credential the SDK never configured as a
+	// header and yet sends as one: http.Client derives
+	// "Authorization: Basic base64(user:pass)" from it. The base64 holds
+	// neither half as a substring, so no other entry in this list would match
+	// a collector that echoed the header back into a non-2xx body — which both
+	// exporters put into the error they return. authHeaderSecrets does the
+	// same for the profiling endpoint; the two lists are meant to agree.
+	for _, endpoint := range []string{cfg.otlpEndpoint, cfg.metricsOTLPEndpoint, cfg.profilingEndpoint} {
+		basic := redact.BasicAuthHeader(endpoint)
+		if basic == "" {
+			continue
+		}
+		add(basic)
+		add(strings.TrimPrefix(basic, "Basic "))
+	}
 	for _, name := range otlpHeaderEnvVars {
 		raw := os.Getenv(name)
 		if raw == "" {

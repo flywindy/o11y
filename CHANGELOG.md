@@ -252,10 +252,18 @@ adopters can plan their upgrades.
     programs that report an error in a JSON body, and in the forms HTTP/2 uses:
     names lowercased, and a `Cookie` value split and rejoined with `"; "`.
   - The `Authorization: Basic …` header that `http.Client` derives from an
-    endpoint's userinfo is now redacted too. It is the credential in a form no
-    other entry held — the base64 contains neither the username nor the
-    password as a substring — so a server echoing back the header it received
-    defeated every other rendering.
+    endpoint's userinfo is now redacted too, for the OTLP, metrics and
+    profiling endpoints alike, and for the address
+    `PYROSCOPE_ADHOC_SERVER_ADDRESS` overrides the profiling one with. It is
+    the credential in a form no other entry held — the base64 contains neither
+    the username nor the password as a substring — so a server echoing back
+    the header it received defeated every other rendering.
+  - A credential query parameter is recognised even where the separator before
+    it arrives encoded. `encoding/json` escapes `&` as `\u0026`, so a signed
+    URL quoted inside a Go server's JSON error body carried no `&` for the
+    closed rule to anchor on. The rule is now applied a second time to the text
+    with its `\u` escapes decoded, rather than by teaching the pattern that
+    one spelling.
   - An opaque endpoint whose payload could be a `user:pass` pair is replaced
     wholesale. `url.Parse` attributes nothing in one, so `http:alice:secret`
     carried no userinfo and no `@` for the existing rule to catch. A
