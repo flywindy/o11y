@@ -446,7 +446,27 @@ func URLAttribute(u *url.URL) string {
 // defaults are silently dropped — which is exactly when an operator most needs
 // to see what they configured.
 func opaqueMayHoldCredentials(opaque string) bool {
-	return strings.ContainsAny(opaque, ":@")
+	if opaque == "" {
+		return false
+	}
+	if strings.ContainsAny(opaque, ":@") {
+		return true
+	}
+	// The characters can arrive percent-encoded, and url.URL.String() renders
+	// an opaque payload back exactly as it was given: "http:alice%3As%40host"
+	// holds neither character literally and yet is a reversible "alice:s@host".
+	// This is the same lesson as InText's decoded views — a rule anchored on a
+	// character has to be asked about the readings of the text, not only its
+	// bytes — and it was missed here when that one was fixed.
+	//
+	// A payload that will not unescape is refused rather than reasoned about:
+	// it is not a shape anything in this SDK produces, and guessing costs more
+	// than a redacted log line.
+	decoded, err := url.PathUnescape(opaque)
+	if err != nil {
+		return true
+	}
+	return strings.ContainsAny(decoded, ":@")
 }
 
 // redactQuery replaces the values of credentialQueryKeys in a raw query
@@ -514,8 +534,27 @@ func JSONEscaped(v string) string {
 	return string(encoded[1 : len(encoded)-1])
 }
 
+// HTMLEscaped returns v as html.EscapeString renders it, the form a value takes
+// inside an HTML page.
+//
+// A collector or a profiling server that reports an error as a page rather than
+// as JSON escapes "&", "<", ">", "'" and quotes. A configured header value
+// holding any of them is echoed in a form that matches neither the raw nor the
+// %q nor the JSON rendering, and Secrets matches literally.
+func HTMLEscaped(v string) string {
+	return html.EscapeString(v)
+}
+
 // Renderings returns the forms a secret can take in text the SDK may be asked
-// to scrub: as it stands, as %q renders it, and as a JSON document holds it.
+// to scrub: as it stands, as %q renders it, and as a JSON document or an HTML
+// page holds it.
+//
+// The HTML form is here rather than handled the way InText handles an escaped
+// URL, and the difference is worth stating: InText only has to *decide* about
+// a line, so it can ask about a decoded reading and fail closed. Secrets has to
+// *replace* inside the text it was given, so a decoded reading is no use — the
+// replacement would have to be written back into text that does not contain it.
+// The rendering has to be listed.
 //
 // Secrets matches literally, so every rendering something might print has to be
 // listed separately. This is the one place that decides which — the two secret
@@ -526,8 +565,8 @@ func JSONEscaped(v string) string {
 // Duplicates are dropped, so a value the escaping leaves alone is returned
 // once. Empty strings are not filtered here; the caller's own list does that.
 func Renderings(v string) []string {
-	forms := make([]string, 0, 3)
-	for _, form := range []string{v, GoEscaped(v), JSONEscaped(v)} {
+	forms := make([]string, 0, 4)
+	for _, form := range []string{v, GoEscaped(v), JSONEscaped(v), HTMLEscaped(v)} {
 		if !slices.Contains(forms, form) {
 			forms = append(forms, form)
 		}
