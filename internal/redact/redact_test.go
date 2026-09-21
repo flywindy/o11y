@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -1561,4 +1562,45 @@ func TestSecrets_IsUnchangedByRepeatsInItsList(t *testing.T) {
 	assert.NotContains(t, got, "s3cret-token")
 	assert.NotContains(t, got, "c00kie")
 	assert.Contains(t, got, "after 1 try", "and nothing else is touched")
+}
+
+// TestCookieRequestForms_MatchesWhatNetHTTPSends pins the reimplementation
+// against net/http's own AddCookie rather than against a reading of it.
+//
+// The sanitisation is reimplemented because AddCookie logs to the standard
+// logger when it drops a byte, and a redaction must not write anywhere on its
+// way to deciding what may be written. A copy of someone else's rule has to be
+// checked against the original, so this drives the original and compares.
+func TestCookieRequestForms_MatchesWhatNetHTTPSends(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cookie http.Cookie
+	}{
+		// #nosec G101 -- fabricated fixture cookies, not live credentials
+		// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+		{"plain", http.Cookie{Name: "session", Value: "c00kie"}},
+		{"newline in the value", http.Cookie{Name: "session", Value: "sec\nret"}},
+		{"quote and semicolon", http.Cookie{Name: "session", Value: `a"b;c`}},
+		{"space", http.Cookie{Name: "session", Value: "a b"}},
+		{"comma", http.Cookie{Name: "session", Value: "a,b"}},
+		{"backslash", http.Cookie{Name: "session", Value: `a\\b`}},
+		{"quoted flag", http.Cookie{Name: "session", Value: "c00kie", Quoted: true}},
+		{"newline in the name", http.Cookie{Name: "ses\nsion", Value: "c00kie"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sent := &http.Request{Header: make(http.Header, 1)}
+			sent.AddCookie(&tc.cookie)
+			pair := sent.Header.Get("Cookie")
+			require.NotEmpty(t, pair)
+
+			forms := redact.CookieRequestForms(tc.cookie.Name, tc.cookie.Value, tc.cookie.Quoted)
+			assert.Contains(t, forms, pair, "the pair net/http writes")
+			_, value, ok := strings.Cut(pair, "=")
+			require.True(t, ok)
+			assert.Contains(t, forms, value, "and the value on its own")
+		})
+	}
+
+	assert.Nil(t, redact.CookieRequestForms("session", "\n\r", false),
+		"a value that sanitises away is not a secret to list")
 }

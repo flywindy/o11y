@@ -340,6 +340,13 @@ adopters can plan their upgrades.
     `?Signature=%5Bredacted%5D#section` was read through the `#`, so this
     SDK's own placeholder looked like a signature it had never seen and the
     whole diagnostic was given up over it.
+  - A cookie is matched in the form it is **sent**, not only the form it is
+    held in. `Request.AddCookie` drops every byte a cookie value cannot carry
+    and quotes what is left when it holds a space or a comma, so a jar value of
+    `sec\nret` goes on the wire as `session=secret` — a string neither the
+    stored value nor `name=value` matches. The sanitisation is reimplemented
+    (driving `AddCookie` would write "invalid byte" lines to the standard
+    logger from inside a redaction) and pinned against `net/http`'s own output.
   - `Shutdown` can no longer be held by an error from a dependency. The walk
     that finds the URLs in an error chain is now bounded by the number of
     errors it visits rather than by how deep it goes: once `Unwrap` returns a
