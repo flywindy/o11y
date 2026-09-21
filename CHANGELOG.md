@@ -258,12 +258,20 @@ adopters can plan their upgrades.
     the credential in a form no other entry held — the base64 contains neither
     the username nor the password as a substring — so a server echoing back
     the header it received defeated every other rendering.
-  - A credential query parameter is recognised even where the separator before
-    it arrives encoded. `encoding/json` escapes `&` as `\u0026`, so a signed
-    URL quoted inside a Go server's JSON error body carried no `&` for the
-    closed rule to anchor on. The rule is now applied a second time to the text
-    with its `\u` escapes decoded, rather than by teaching the pattern that
-    one spelling.
+  - The closed rules are no longer defeated by the encoding of their own
+    anchors. A Go server writing a JSON error body escapes `&` as `\u0026`;
+    one writing an HTML page writes `&amp;`, and can write `@` as `&commat;`.
+    In each case the character the rule holds on to is not in the text. The
+    rules are now asked about a decoded reading as well, and a line whose
+    escaping hides an `@` is replaced wholesale — the substitution runs on the
+    text as it stands and cannot reach what an escape covers. One decoder per
+    encoding, rather than a pattern listing spellings.
+  - `resty` spans no longer carry the `Authorization: Basic …` that
+    `http.Client` derives from a request URL's userinfo. A transport never sees
+    `user:pass@host` — the conversion happens before `RoundTrip` — so a
+    `RoundTripper` that names the header it was given put a credential into the
+    span's status description and `exception.message` that no URL redaction
+    could recognise.
   - An opaque endpoint whose payload could be a `user:pass` pair is replaced
     wholesale. `url.Parse` attributes nothing in one, so `http:alice:secret`
     carried no userinfo and no `@` for the existing rule to catch. A

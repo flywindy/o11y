@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"net/textproto"
 	"net/url"
 	"reflect"
@@ -133,19 +134,50 @@ func InText(text string, knownEndpoints ...string) string {
 	// query instead of its userinfo. Such a URL has no "@" at all, so the rule
 	// above passes it through untouched.
 	//
-	// Both rules are anchored on characters, and a character can reach this
-	// text encoded. The one that matters is "&": encoding/json escapes it as
-	// \u0026, so a signed URL quoted inside a Go server's JSON error body
-	// reads "?tenant=t\u0026Signature=..." and the separator the query rule
-	// holds on to is not there. Rather than teach the pattern that spelling —
-	// the enumeration this package refuses elsewhere — the rule is applied a
-	// second time to the text with its \u escapes decoded, so any encoding of
-	// a separator resolves to the character the rule already knows.
-	decoded := jsonUnescaped(text)
-	if unaccountedCredentialQuery(text) || (decoded != text && unaccountedCredentialQuery(decoded)) {
+	if unaccountedCredentialQuery(text) {
 		return redactedWhole
 	}
+	// Both rules are anchored on characters — "@" for userinfo, "?" and "&"
+	// for a query — and a character can reach this text encoded. A Go server
+	// writing a JSON error body escapes "&" as \u0026; one writing an HTML
+	// page escapes it as &amp; and can write "@" as &commat;. In each case the
+	// anchor the rules hold on to is simply not in the text.
+	//
+	// Rather than teach the patterns those spellings — the enumeration this
+	// package refuses everywhere else — the text is decoded and the rules are
+	// asked about the result. Two things are refused:
+	//
+	//   - a credential query the decoded view shows and this one does not; and
+	//   - an "@" that only the decoded view has, because the substitution below
+	//     runs on the text as it stands and cannot reach what an escape hides.
+	//     Passing such a line through would echo the userinfo unredacted.
+	//
+	// One decoder per encoding covers the whole family of spellings it can
+	// produce, which is the difference between this and enumerating them.
+	for _, decoded := range decodedViews(text) {
+		if decoded == text {
+			continue
+		}
+		if strings.Count(decoded, "@") != strings.Count(text, "@") {
+			return redactedWhole
+		}
+		if unaccountedCredentialQuery(decoded) {
+			return redactedWhole
+		}
+	}
 	return urlUserinfo.ReplaceAllString(text, "${1}"+placeholder+"@")
+}
+
+// decodedViews returns the readings of text that an escaping on the way here
+// could have hidden an anchor behind.
+//
+// The two that matter are the ones a Go server produces when it puts a URL
+// into an error page or an error document: encoding/json escapes, and HTML
+// entities. Each is one decoder covering every spelling its own encoding
+// admits — &amp;, &#38; and &#x26; are all one call — rather than a pattern
+// listing them.
+func decodedViews(text string) []string {
+	return []string{jsonUnescaped(text), html.UnescapeString(text)}
 }
 
 // jsonUnescaped returns text with its \uXXXX escapes replaced by the characters
