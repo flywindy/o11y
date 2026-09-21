@@ -803,8 +803,10 @@ func TestJSONEscaped_MatchesWhatAGoServerWrites(t *testing.T) {
 func TestRenderings(t *testing.T) {
 	assert.Equal(t, []string{"plain"}, redact.Renderings("plain"))
 	assert.Equal(t, []string{
-		"tok<en&more>", `tok\u003cen\u0026more\u003e`,
-	}, redact.Renderings("tok<en&more>"), "%q leaves these alone, JSON does not")
+		"tok<en&more>",
+		`tok\u003cen\u0026more\u003e`,
+		"tok&lt;en&amp;more&gt;",
+	}, redact.Renderings("tok<en&more>"), "%q leaves these alone; JSON and HTML each escape them their own way")
 	assert.Equal(t, []string{
 		"a\tb", `a\tb`,
 	}, redact.Renderings("a\tb"), "%q and JSON agree here, so it is listed twice, not three times")
@@ -1067,4 +1069,67 @@ func TestInText_LeavesHarmlessEntitiesAlone(t *testing.T) {
 			assert.Equal(t, line, redact.InText(line))
 		})
 	}
+}
+
+// TestURL_FailsClosedOnAPercentEncodedOpaquePayload pins the same lesson the
+// decoded views taught InText, in the one place it had not been applied.
+//
+// url.URL.String() renders an opaque payload back exactly as it was given, so
+// "http:alice%3As3cret%40host" holds neither ":" nor "@" literally and is a
+// perfectly reversible "alice:s3cret@host". The rule was written to refuse the
+// shapes a "user:pass" pair needs and checked for them as bytes.
+func TestURL_FailsClosedOnAPercentEncodedOpaquePayload(t *testing.T) {
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const raw = "http:alice%3As3cret%40host"
+
+	u, err := url.Parse(raw)
+	require.NoError(t, err)
+	require.NotContains(t, u.Opaque, ":", "the premise: no literal colon")
+	require.NotContains(t, u.Opaque, "@", "and no literal at-sign")
+	decoded, err := url.PathUnescape(u.Opaque)
+	require.NoError(t, err)
+	require.Equal(t, "alice:s3cret@host", decoded, "but it decodes to a credential pair")
+
+	assert.Equal(t, "[endpoint redacted]", redact.URL(raw))
+	assert.Equal(t, "[endpoint redacted]", redact.URLAttribute(u))
+}
+
+// TestURL_StillKeepsAnEncodedHostPortLegible pins the other side: decoding must
+// not start refusing opaque payloads that decode to a single token.
+func TestURL_StillKeepsAnEncodedHostPortLegible(t *testing.T) {
+	for _, raw := range []string{"pyroscope:4040", "collector:4318/v1%2Ftraces"} {
+		t.Run(raw, func(t *testing.T) {
+			assert.Equal(t, raw, redact.URL(raw))
+		})
+	}
+}
+
+// TestHTMLEscaped covers the rendering a value takes inside an HTML page, the
+// fourth form a secret list has to carry.
+func TestHTMLEscaped(t *testing.T) {
+	assert.Equal(t, "plain", redact.HTMLEscaped("plain"))
+	assert.Equal(t, "abc&amp;def", redact.HTMLEscaped("abc&def"))
+	assert.Equal(t, "a&lt;b&gt;c", redact.HTMLEscaped("a<b>c"))
+	assert.Equal(t, "say &#34;hi&#34;", redact.HTMLEscaped(`say "hi"`))
+}
+
+// TestSecrets_RedactsAnHTMLEscapedValue is the end-to-end shape: a credential
+// echoed back inside a server's HTML error page.
+//
+// It is listed as a rendering rather than handled the way InText handles an
+// escaped URL because Secrets has to replace inside the text it was given — a
+// decoded reading would have nothing to write the replacement back into.
+func TestSecrets_RedactsAnHTMLEscapedValue(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const token = "Bearer a&b<c"
+
+	page := "<html><body>rejected Authorization: " + html.EscapeString(token) + "</body></html>"
+	require.NotContains(t, page, token, "the premise: the raw form is not in the page")
+
+	got := redact.Secrets(page, redact.Renderings(token)...)
+
+	assert.NotContains(t, got, html.EscapeString(token))
+	assert.Contains(t, got, "rejected Authorization:", "the rest of the page survives")
 }
