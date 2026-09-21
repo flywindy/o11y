@@ -2,6 +2,7 @@
 package redact
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/textproto"
@@ -52,15 +53,14 @@ func URL(raw string) string {
 	if raw == "" {
 		return raw
 	}
-	if !strings.Contains(raw, "@") && !hasCredentialQuery(raw) {
-		// No userinfo is possible without an "@" and no credential query
-		// parameter is present, so the common case skips parsing entirely and
-		// returns the operator's exact string.
-		return raw
-	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return redactedWhole
+	}
+	if u.User == nil && u.Opaque == "" && !hasCredentialQuery(raw) {
+		// Nothing here needs replacing, so the operator's exact string is
+		// returned rather than url.URL.String()'s normalisation of it.
+		return raw
 	}
 	return URLAttribute(u)
 }
@@ -349,10 +349,33 @@ func URLAttribute(u *url.URL) string {
 			redacted.RawQuery = scrubbed
 		}
 	}
-	if strings.Contains(redacted.Opaque, "@") || strings.Contains(redacted.Host, "@") {
+	if opaqueMayHoldCredentials(redacted.Opaque) || strings.Contains(redacted.Host, "@") {
 		return redactedWhole
 	}
 	return redacted.String()
+}
+
+// opaqueMayHoldCredentials reports whether an opaque URL's payload could be
+// carrying a credential.
+//
+// url.Parse only recognises userinfo in a hierarchical URL. Given an opaque one
+// it attributes nothing: "http:alice:secret@host" leaves the whole of
+// "alice:secret@host" in Opaque with User nil, so a caller that only replaced
+// User would render the credential straight back out.
+//
+// Two shapes are refused. An "@" is the one userinfo cannot do without. A ":"
+// is the separator of the "user:pass" pair itself, which is what is left when
+// an operator writes such a URL without a host — nothing sends it, since
+// url.URL.User is nil, but it is still a secret they typed.
+//
+// A payload with neither is a single token and cannot be a pair. That is what
+// keeps a scheme-less "pyroscope:4040" legible: url.Parse reads the host as the
+// scheme and leaves "4040" here. Such an endpoint does not actually work in this
+// SDK — url.URL.String() ignores Path when Opaque is set, so the exporters' path
+// defaults are silently dropped — which is exactly when an operator most needs
+// to see what they configured.
+func opaqueMayHoldCredentials(opaque string) bool {
+	return strings.ContainsAny(opaque, ":@")
 }
 
 // redactQuery replaces the values of credentialQueryKeys in a raw query
@@ -477,6 +500,100 @@ func HeaderWireValue(v string) string {
 // names the canonical form, not the configured one.
 func HeaderWireName(name string) string {
 	return textproto.CanonicalMIMEHeaderKey(name)
+}
+
+// HeaderWireNameHTTP2 returns the form HTTP/2 puts a header name on the wire
+// in: lowercase, per RFC 7540 8.1.2.
+//
+// net/http does not send the canonical form over an h2 connection. It encodes
+// each name through httpcommon.LowerHeader (net/http/internal/httpcommon), so
+// the same request that sends "X-Api-Key" over HTTP/1.1 sends "x-api-key" over
+// HTTP/2 — and a TLS endpoint negotiates h2 by default. A name that is not
+// printable ASCII is returned unchanged, matching LowerHeader's own fallback.
+func HeaderWireNameHTTP2(name string) string {
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; c < 0x20 || c > 0x7e {
+			return name
+		}
+	}
+	return strings.ToLower(name)
+}
+
+// CookieWireValue returns the form an HTTP/2 peer receives a Cookie header in.
+//
+// A Cookie value is the one header net/http does not send verbatim over h2. The
+// client splits it on ";" and emits a separate field per pair, stripping the
+// spaces that followed each separator (net/http/internal/httpcommon, the
+// "cookie" branch of the request encoder); the server then rejoins the fields
+// with "; ". So a value written as "session=x;tenant=y" is read back as
+// "session=x; tenant=y", which neither the configured form nor HeaderWireValue
+// of it matches.
+//
+// A value with no ";" is returned unchanged, so this costs nothing for every
+// other header.
+func CookieWireValue(value string) string {
+	if !strings.Contains(value, ";") {
+		return value
+	}
+	fields := strings.Split(value, ";")
+	for i, field := range fields {
+		fields[i] = strings.TrimLeft(field, " ")
+	}
+	return strings.Join(fields, "; ")
+}
+
+// BasicAuthHeader returns the Authorization value net/http derives from a URL's
+// userinfo, or "" when the URL carries none.
+//
+// An endpoint of the form scheme://user:pass@host is a working authentication
+// mechanism precisely because http.Client turns it into a header: send() sets
+// "Authorization: Basic " + base64(user + ":" + pass) whenever req.URL.User is
+// set and no Authorization header was given. That base64 is the credential in a
+// form no other entry in a secret list holds — it contains neither the username
+// nor the password as substrings — so a server echoing the header it received
+// would defeat every other rendering the list carries.
+func BasicAuthHeader(rawURL string) string {
+	if rawURL == "" || !strings.Contains(rawURL, "@") {
+		return ""
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.User == nil {
+		return ""
+	}
+	password, _ := u.User.Password()
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(u.User.Username()+":"+password))
+}
+
+// HeaderValueForms returns every rendering of a configured header value that
+// something between this SDK and the server may produce: as configured, as
+// net/http trims it, as an HTTP/2 peer rejoins it when it is a Cookie, and each
+// of those as %q and as a JSON document render them.
+//
+// It exists so the SDK's two secret lists cannot answer that question
+// differently. They each used to expand a value themselves, and every round of
+// review that added a rendering to one and not the other left a credential
+// matched in one pipeline and not the other.
+func HeaderValueForms(value string) []string {
+	wire := HeaderWireValue(value)
+	var forms []string
+	for _, base := range []string{value, wire, CookieWireValue(wire)} {
+		forms = append(forms, Renderings(base)...)
+	}
+	return forms
+}
+
+// HeaderNameForms returns the renderings of a configured header name: as
+// configured, as Header.Set keys it, and as HTTP/2 sends it.
+//
+// Names are listed because a credential pasted into the wrong side of a header
+// configuration is still a credential, and the name is what an error or an
+// echoing server reports.
+func HeaderNameForms(name string) []string {
+	var forms []string
+	for _, base := range []string{name, HeaderWireName(name), HeaderWireNameHTTP2(name)} {
+		forms = append(forms, Renderings(base)...)
+	}
+	return forms
 }
 
 // Error returns err with credentials removed from its message, keeping the

@@ -1,6 +1,7 @@
 package redact_test
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -825,4 +826,137 @@ func TestSecrets_RedactsAJSONEscapedValue(t *testing.T) {
 
 	assert.NotContains(t, got, `a\u003cb\u0026c\u003ed`)
 	assert.Contains(t, got, "rejected Authorization:", "the rest of the body survives")
+}
+
+// TestURL_FailsClosedOnACredentialShapedOpaqueURL pins the gap the fast path
+// left open.
+//
+// url.Parse attributes nothing in an opaque URL, so "http:alice:secret" has no
+// userinfo and no "@" — the closed rule never engaged, the fast path returned
+// the string verbatim, and URLAttribute, which does inspect Opaque, was never
+// reached. The earlier opaque cases in TestURL all happen to contain an "@",
+// which is why they passed.
+func TestURL_FailsClosedOnACredentialShapedOpaqueURL(t *testing.T) {
+	for _, raw := range []string{
+		// #nosec G101 -- fabricated fixture URL, not a live credential
+		// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+		"http:alice:s3cret",
+		// #nosec G101 -- fabricated fixture URL, not a live credential
+		// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+		"pyroscope:alice:s3cret",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			u, err := url.Parse(raw)
+			require.NoError(t, err)
+			require.Nil(t, u.User, "the premise: the parser attributed no userinfo")
+			require.NotContains(t, raw, "@", "and there is no at-sign for the other rule to catch")
+
+			assert.Equal(t, "[endpoint redacted]", redact.URL(raw))
+			assert.Equal(t, "[endpoint redacted]", redact.URLAttribute(u))
+		})
+	}
+}
+
+// TestURL_KeepsAHostPortEndpointLegible pins the other side of that rule.
+//
+// url.Parse reads "pyroscope:4040" as the scheme "pyroscope" with the opaque
+// payload "4040" — a single token, which cannot be a "user:pass" pair. Such an
+// endpoint does not actually work in this SDK (url.URL.String() ignores Path
+// when Opaque is set, so the exporters' path defaults are dropped), which is
+// exactly when an operator most needs the log line to say what they configured.
+func TestURL_KeepsAHostPortEndpointLegible(t *testing.T) {
+	for _, raw := range []string{"pyroscope:4040", "collector:4318/v1/traces"} {
+		t.Run(raw, func(t *testing.T) {
+			u, err := url.Parse(raw)
+			require.NoError(t, err)
+			require.NotEmpty(t, u.Opaque, "the premise: this parses as an opaque URL")
+
+			assert.Equal(t, raw, redact.URL(raw))
+		})
+	}
+}
+
+// TestHeaderWireNameHTTP2 covers the form an h2 peer receives a header name in.
+//
+// net/http does not send the canonical spelling over HTTP/2: it encodes each
+// name through httpcommon.LowerHeader, and a TLS endpoint negotiates h2 by
+// default, so the same request that sends "X-Api-Key" over HTTP/1.1 sends
+// "x-api-key" here.
+func TestHeaderWireNameHTTP2(t *testing.T) {
+	assert.Equal(t, "x-api-key", redact.HeaderWireNameHTTP2("X-Api-Key"))
+	assert.Equal(t, "authorization", redact.HeaderWireNameHTTP2("Authorization"))
+	assert.Equal(t, "x-api-key", redact.HeaderWireNameHTTP2("x-api-key"))
+	assert.Equal(t, "naïve", redact.HeaderWireNameHTTP2("naïve"),
+		"a name outside printable ASCII is left alone, as LowerHeader leaves it")
+}
+
+// TestCookieWireValue covers the one header net/http rewrites rather than
+// trims.
+//
+// Over HTTP/2 the client splits a Cookie value on ";" and sends a field per
+// pair, stripping the spaces that followed each separator; the server rejoins
+// them with "; ". So a value written without spaces is read back with them.
+func TestCookieWireValue(t *testing.T) {
+	assert.Equal(t, "session=x; tenant=y", redact.CookieWireValue("session=x;tenant=y"))
+	assert.Equal(t, "session=x; tenant=y", redact.CookieWireValue("session=x;   tenant=y"))
+	assert.Equal(t, "session=x; tenant=y", redact.CookieWireValue("session=x; tenant=y"))
+	assert.Equal(t, "Bearer token", redact.CookieWireValue("Bearer token"),
+		"a value with no semicolon is untouched, so this costs nothing elsewhere")
+}
+
+// TestBasicAuthHeader pins the credential an endpoint's userinfo turns into.
+//
+// scheme://user:pass@host works as authentication precisely because
+// http.Client derives "Authorization: Basic base64(user:pass)" from it. The
+// base64 contains neither half as a substring, so no other rendering in a
+// secret list would match a server that echoed the header back.
+func TestBasicAuthHeader(t *testing.T) {
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const endpoint = "http://alice:s3cret@pyroscope:4040"
+
+	got := redact.BasicAuthHeader(endpoint)
+
+	// Derived the way net/http derives it rather than pasted in, so this
+	// fails loudly if the pinned toolchain ever changes the encoding.
+	u, err := url.Parse(endpoint)
+	require.NoError(t, err)
+	password, ok := u.User.Password()
+	require.True(t, ok)
+	want := "Basic " + base64.StdEncoding.EncodeToString([]byte(u.User.Username()+":"+password))
+	assert.Equal(t, want, got)
+	assert.NotContains(t, got, "s3cret", "the point: the credential is not a substring of its own header")
+
+	assert.Empty(t, redact.BasicAuthHeader("http://pyroscope:4040"), "no userinfo, no derived header")
+	assert.Empty(t, redact.BasicAuthHeader(""))
+	assert.Empty(t, redact.BasicAuthHeader("://@"), "an unparseable value yields nothing rather than itself")
+}
+
+// TestHeaderValueForms_MatchesWhatAnHTTP2ServerReceives pins the cookie form
+// against net/http itself over a real h2 connection, rather than against a
+// reading of the encoder.
+func TestHeaderValueForms_MatchesWhatAnHTTP2ServerReceives(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const configured = "session=S3cretToken;tenant=acme"
+
+	var received string
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		received = r.Header.Get("Cookie")
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, nil)
+	require.NoError(t, err)
+	req.Header.Set("Cookie", configured)
+	resp, err := srv.Client().Do(req)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, "HTTP/2.0", resp.Proto, "the premise: this went over h2")
+
+	require.NotEqual(t, configured, received, "the premise: the value was rewritten in flight")
+	assert.Contains(t, redact.HeaderValueForms(configured), received,
+		"the form the server actually received must be in the secret list")
 }

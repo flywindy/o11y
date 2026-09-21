@@ -243,14 +243,16 @@ func TestPyroscopeSlogAdapter_LevelsAndEmptyLoggerAreUnchanged(t *testing.T) {
 // and that an empty header value is left out — redact.Secrets ignores it, and
 // carrying it would only obscure what the adapter is actually guarding.
 func TestAuthHeaderSecrets_SortsAndDropsEmpties(t *testing.T) {
-	assert.Nil(t, authHeaderSecrets(nil))
-	assert.Nil(t, authHeaderSecrets(map[string]string{}))
-	// Names are listed too, in the configured and the canonical MIME form,
-	// and a name survives an empty value — the name is the thing that might
-	// be the credential.
+	assert.Nil(t, authHeaderSecrets("", nil))
+	assert.Nil(t, authHeaderSecrets("", map[string]string{}))
+	// Names are listed too, in the configured form, the canonical MIME form
+	// Header.Set keys by, and the lowercase form HTTP/2 sends — and a name
+	// survives an empty value, the name being the thing that might be the
+	// credential.
 	assert.Equal(t, []string{
-		"Authorization", "X-Empty", "X-Scope-OrgID", "X-Scope-Orgid", "aaa", "bbb",
-	}, authHeaderSecrets(map[string]string{
+		"Authorization", "X-Empty", "X-Scope-OrgID", "X-Scope-Orgid",
+		"aaa", "authorization", "bbb", "x-empty", "x-scope-orgid",
+	}, authHeaderSecrets("", map[string]string{
 		"X-Scope-OrgID": "bbb",
 		"Authorization": "aaa",
 		"X-Empty":       "",
@@ -269,7 +271,7 @@ func TestAuthHeaderSecrets_CoversTheCanonicalName(t *testing.T) {
 	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
 	const pastedAsAName = "x-secret-glc-token"
 
-	secrets := authHeaderSecrets(map[string]string{pastedAsAName: "1"})
+	secrets := authHeaderSecrets("", map[string]string{pastedAsAName: "1"})
 
 	assert.Contains(t, secrets, pastedAsAName, "the configured spelling")
 	assert.Contains(t, secrets, "X-Secret-Glc-Token", "and the one that goes on the wire")
@@ -280,12 +282,16 @@ func TestAuthHeaderSecrets_CoversTheCanonicalName(t *testing.T) {
 // the OTLP headers. redact.Secrets matches literally, so one form does not
 // cover the other; a value the escaping leaves alone is listed once.
 func TestAuthHeaderSecrets_CoversTheEscapedForm(t *testing.T) {
-	assert.Equal(t, []string{"Authorization", "tab\there", "tab\\there"}, authHeaderSecrets(map[string]string{
+	assert.Equal(t, []string{
+		"Authorization", "authorization", "tab\there", "tab\\there",
+	}, authHeaderSecrets("", map[string]string{
 		"Authorization": "tab\there",
 	}))
-	assert.Equal(t, []string{"Authorization", "plain"}, authHeaderSecrets(map[string]string{
+	assert.Equal(t, []string{
+		"Authorization", "authorization", "plain",
+	}, authHeaderSecrets("", map[string]string{
 		"Authorization": "plain",
-	}), "a value %q leaves alone is not listed twice, and neither is a name already canonical")
+	}), "a value %q leaves alone is listed once; the name keeps its canonical and HTTP/2 spellings")
 }
 
 // TestPyroscopeSlogAdapter_RedactsAnEscapedAuthHeader pins the scrub reaching a
@@ -466,7 +472,7 @@ func TestAuthHeaderSecrets_CoversTheWireForm(t *testing.T) {
 	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
 	const padded = " Bearer glc_token "
 
-	secrets := authHeaderSecrets(map[string]string{"Authorization": padded})
+	secrets := authHeaderSecrets("", map[string]string{"Authorization": padded})
 
 	assert.Contains(t, secrets, padded, "the configured form is still listed")
 	assert.Contains(t, secrets, "Bearer glc_token", "and so is the form that goes on the wire")
@@ -510,7 +516,7 @@ func TestAuthHeaderSecrets_CoversTheJSONForm(t *testing.T) {
 	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
 	const token = "Bearer a<b&c>d"
 
-	secrets := authHeaderSecrets(map[string]string{"Authorization": token})
+	secrets := authHeaderSecrets("", map[string]string{"Authorization": token})
 
 	assert.Contains(t, secrets, token, "the configured form")
 	assert.Contains(t, secrets, `Bearer a\u003cb\u0026c\u003ed`, "and the form a JSON error body holds")
@@ -545,5 +551,58 @@ func TestPyroscopeSlogAdapter_RedactsAJSONEchoedHeader(t *testing.T) {
 	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
 	assert.NotContains(t, record.Msg, "a<b&c>d", "the raw form")
 	assert.NotContains(t, record.Msg, redact.JSONEscaped(token), "and the JSON one")
+	assert.Contains(t, record.Msg, "failed to upload: (401)", "the rest of the line survives")
+}
+
+// TestAuthHeaderSecrets_CoversTheEndpointDerivedBasicAuth pins the credential
+// the SDK never configured as a header and yet sends as one.
+//
+// A scheme://user:pass@host profiling endpoint is a working authentication
+// mechanism because http.Client derives "Authorization: Basic base64(user:pass)"
+// from it. The base64 contains neither the username nor the password as a
+// substring, so every other rendering in this list — raw, %q, JSON, wire —
+// misses it, and pyroscope puts a failed upload's whole response body into its
+// ERROR line.
+func TestAuthHeaderSecrets_CoversTheEndpointDerivedBasicAuth(t *testing.T) {
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const endpoint = "http://alice:s3cret@pyroscope:4040"
+
+	secrets := authHeaderSecrets(endpoint, nil)
+	derived := redact.BasicAuthHeader(endpoint)
+	require.NotEmpty(t, derived)
+
+	assert.Contains(t, secrets, derived, "the header value as net/http sends it")
+	assert.Contains(t, secrets, strings.TrimPrefix(derived, "Basic "),
+		"and the bare token, for a report that names only that")
+	for _, s := range secrets {
+		assert.NotContains(t, s, "s3cret", "the list must not itself spell the password out")
+	}
+}
+
+// TestPyroscopeSlogAdapter_RedactsAnEchoedBasicAuthHeader is the same end to
+// end: the uploader reports a non-200 as "failed to upload: (%d) '%s'" with the
+// response body, so a server echoing the Authorization it received puts the
+// derived base64 into an ERROR record.
+func TestPyroscopeSlogAdapter_RedactsAnEchoedBasicAuthHeader(t *testing.T) {
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const endpoint = "http://alice:s3cret@pyroscope:4040"
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	adapter := newPyroscopeSlogAdapter(Config{Logger: logger, Endpoint: endpoint})
+
+	derived := redact.BasicAuthHeader(endpoint)
+	token := strings.TrimPrefix(derived, "Basic ")
+	require.NotContains(t, token, "s3cret", "the premise: the wire form hides both halves")
+
+	adapter.Errorf("upload profile: %v",
+		fmt.Errorf("failed to upload: (401) 'rejected Authorization: %s'", derived)) //nolint:err113
+
+	var record struct {
+		Msg string `json:"msg"`
+	}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
+	assert.NotContains(t, record.Msg, token, "the echoed credential is the same secret")
 	assert.Contains(t, record.Msg, "failed to upload: (401)", "the rest of the line survives")
 }
