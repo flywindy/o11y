@@ -806,10 +806,41 @@ func TestRenderings(t *testing.T) {
 		"tok<en&more>",
 		`tok\u003cen\u0026more\u003e`,
 		"tok&lt;en&amp;more&gt;",
-	}, redact.Renderings("tok<en&more>"), "%q leaves these alone; JSON and HTML each escape them their own way")
+		`tok\\u003cen\\u0026more\\u003e`,
+		`tok\u0026lt;en\u0026amp;more\u0026gt;`,
+		"tok&amp;lt;en&amp;amp;more&amp;gt;",
+	}, redact.Renderings("tok<en&more>"),
+		"%q leaves these alone; JSON and HTML each escape them their own way, "+
+			"and each escaping of an escaped form is listed too")
 	assert.Equal(t, []string{
-		"a\tb", `a\tb`,
-	}, redact.Renderings("a\tb"), "%q and JSON agree here, so it is listed twice, not three times")
+		"a\tb", `a\tb`, `a\\tb`,
+	}, redact.Renderings("a\tb"),
+		"%q and JSON agree here, so the first round adds one form rather than two")
+}
+
+// TestRenderings_ComposesTheEscapings pins the composition itself, on the
+// shape that produces it: a server that HTML-escapes the value it echoes and
+// then writes that string into a JSON error body.
+//
+// The composed form matches none of the three single escapings — that is the
+// whole point of listing it — so the assertion is on the form, not merely on
+// the length of the list.
+func TestRenderings_ComposesTheEscapings(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const token = "tok&en"
+
+	composed := redact.JSONEscaped(redact.HTMLEscaped(token))
+	require.Equal(t, `tok\u0026amp;en`, composed, "the premise: this is what such a server writes")
+	for _, single := range []string{token, redact.GoEscaped(token), redact.JSONEscaped(token), redact.HTMLEscaped(token)} {
+		require.NotEqual(t, composed, single, "and no single escaping produces it")
+	}
+
+	assert.Contains(t, redact.Renderings(token), composed)
+
+	body := `{"error":"rejected header ` + composed + `"}`
+	assert.NotContains(t, redact.Secrets(body, redact.Renderings(token)...), composed,
+		"so Secrets can replace it in place rather than give up the line")
 }
 
 // TestSecrets_RedactsAJSONEscapedValue is the end-to-end shape: a credential
@@ -1188,4 +1219,180 @@ func TestInText_LeavesAFragmentBearingURLAlone(t *testing.T) {
 	const line = "see https://docs.example.com/guide#section-2 for details"
 
 	assert.Equal(t, line, redact.InText(line))
+}
+
+// TestURL_FailsClosedOnADoublyEncodedOpaquePayload pins that the opaque rule
+// asks about the payload's readings rather than about one step towards them.
+//
+// "%253A" is an escaped "%3A" is an escaped ":": a payload written that way
+// holds neither delimiter after one unescape and both after two, so a single
+// pass answered about a string that was still encoded and echoed a reversible
+// "alice:secret@host" straight back out.
+func TestURL_FailsClosedOnADoublyEncodedOpaquePayload(t *testing.T) {
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const doubled = "http:alice%253Asecret%2540host"
+
+	require.NotContains(t, doubled, ":secret", "the premise: neither delimiter is there literally")
+	once, err := url.PathUnescape(doubled)
+	require.NoError(t, err)
+	require.NotContains(t, once, "@", "nor after the single pass this used to make")
+	require.Contains(t, mustUnescapeTwice(t, doubled), "alice:secret@host", "and both are there after the second")
+
+	assert.Equal(t, "[endpoint redacted]", redact.URL(doubled))
+
+	assert.Equal(t, "pyroscope:4040", redact.URL("pyroscope:4040"),
+		"a payload that decodes to itself and holds neither delimiter is still legible")
+}
+
+// mustUnescapeTwice is the second reading of an opaque payload, for a test that
+// asserts what the first one hides.
+func mustUnescapeTwice(t *testing.T, raw string) string {
+	t.Helper()
+	once, err := url.PathUnescape(raw)
+	require.NoError(t, err)
+	twice, err := url.PathUnescape(once)
+	require.NoError(t, err)
+	return twice
+}
+
+// TestInText_RefusesTextItCouldNotFinishDecoding pins the budget as a reason to
+// fail closed rather than a reason to stop looking.
+//
+// Nested entities are one pass each, so a URL escaped nine times still reads as
+// "&amp;Signature" when the budget runs out — an ordinary parameter named
+// "amp;Signature" to every rule here, which let the signature through in full.
+// The eighth-layer case is asserted beside it, because a bound that refuses
+// everything is not a bound.
+func TestInText_RefusesTextItCouldNotFinishDecoding(t *testing.T) {
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const signed = "https://h/x?tenant=t&Signature=S3cretSig"
+
+	nested := signed
+	for range 9 {
+		nested = html.EscapeString(nested)
+	}
+	require.Contains(t, nested, "S3cretSig", "the premise: the signature is in the text as it stands")
+
+	assert.NotContains(t, redact.InText(nested), "S3cretSig")
+	assert.Equal(t, "[endpoint redacted]", redact.InText(nested))
+
+	clean := "dial tcp: lookup collector: no such host"
+	for range 8 {
+		clean = html.EscapeString(clean)
+	}
+	assert.Equal(t, clean, redact.InText(clean),
+		"a text the decoder does finish is answered about, not refused")
+}
+
+// TestInText_DecodesTheEscapesGoWrites pins the third decoder.
+//
+// GoEscaped is one of the renderings this package says a secret can arrive in,
+// so it has to be one of the readings the closed rules are asked about. A "@"
+// written as the escape %q uses for an unprintable byte is not an "@" to the
+// counting rule, and the userinfo before it went unredacted.
+func TestInText_DecodesTheEscapesGoWrites(t *testing.T) {
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const escapedAt = `upload to https://alice:hunter2\x40collector failed`
+
+	require.NotContains(t, escapedAt, "@", "the premise: no at-sign for the closed rule to count")
+
+	assert.Equal(t, "[endpoint redacted]", redact.InText(escapedAt))
+}
+
+// TestSecrets_GivesUpTheLineItCannotRewrite pins the closed rule that backs the
+// listed renderings up.
+//
+// Renderings composes the escapings only to renderingDepth, and nothing bounds
+// how deeply a server may escape what it echoes. A secret the list cannot match
+// literally cannot be replaced — the replacement would have to be written into
+// text that does not contain it — so the text goes instead of the value.
+func TestSecrets_GivesUpTheLineItCannotRewrite(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const token = "tok&en"
+
+	deep := token
+	for range 5 {
+		deep = html.EscapeString(deep)
+	}
+	forms := redact.HeaderValueForms(token)
+	require.NotContains(t, forms, deep, "the premise: this depth is past what the list holds")
+
+	assert.Equal(t, "[message redacted]", redact.Secrets("rejected header "+deep, forms...))
+}
+
+// TestSecrets_LeavesAMessageWithNoSecretInIt pins the other side of that rule:
+// a decoded reading is asked the question the replacement asked, so a message
+// that merely contains an escape is not a message that contains a secret.
+func TestSecrets_LeavesAMessageWithNoSecretInIt(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const token = "tok&en"
+
+	const message = `{"error":"upstream said \u0026lt;busy\u0026gt; after 13 attempts"}`
+	assert.Equal(t, message, redact.Secrets(message, redact.HeaderValueForms(token)...))
+	assert.Equal(t, message, redact.Secrets(message, "1"),
+		"a short secret keeps the whole-token rule in a decoded reading too: the "+
+			`"1" in "13" is not a token in the text, so it is not one in a reading of it`)
+}
+
+// TestCredentialHeaderName pins the rule by which a header's value is treated
+// as a credential: its name, which is what whoever configured it chose, rather
+// than its shape, which this package refuses to guess at anywhere.
+func TestCredentialHeaderName(t *testing.T) {
+	for _, name := range []string{
+		"Authorization", "authorization", "Proxy-Authorization", "Cookie", "Set-Cookie",
+		"X-Api-Key", "x-amz-security-token", "X-Goog-Signature", "X-Session-Id",
+		"X-Auth-Request-Token", "my-password", "client_secret", "X-Credential",
+	} {
+		assert.True(t, redact.CredentialHeaderName(name), name)
+	}
+	for _, name := range []string{
+		"", "  ", "Content-Type", "Accept", "User-Agent", "Traceparent", "X-Request-Id",
+	} {
+		assert.False(t, redact.CredentialHeaderName(name), name)
+	}
+}
+
+// TestHeaderSecrets covers the values it picks out, the forms it lists them in,
+// and the caller-named header a client that lets its token go somewhere else
+// needs.
+func TestHeaderSecrets(t *testing.T) {
+	assert.Nil(t, redact.HeaderSecrets(nil))
+
+	header := http.Header{}
+	// #nosec G101 -- fabricated fixture header values, not live credentials
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	header.Set("Authorization", "Bearer tok&en")
+	header.Set("Content-Type", "application/json")
+	header.Set("X-Tenant-Hdr", "t0ken-in-a-name-no-rule-knows")
+
+	secrets := redact.HeaderSecrets(header)
+	assert.Contains(t, secrets, "Bearer tok&en", "the value as configured")
+	assert.Contains(t, secrets, "Bearer tok&amp;en", "and as an HTML page holds it")
+	assert.NotContains(t, secrets, "application/json", "a header that is not a credential is not one")
+	assert.NotContains(t, secrets, "t0ken-in-a-name-no-rule-knows", "nor is a name no rule recognises")
+
+	named := redact.HeaderSecrets(header, "x-tenant-hdr")
+	assert.Contains(t, named, "t0ken-in-a-name-no-rule-knows",
+		"until the caller says that is where its token goes")
+
+	assert.Equal(t, secrets, redact.HeaderSecrets(header),
+		"the order is stable, so a test that pins it cannot flake on map iteration")
+}
+
+// TestBasicAuthValue pins that the pair is rendered the way net/http sends it,
+// so the same string covers a URL's userinfo and a client's SetBasicAuth.
+func TestBasicAuthValue(t *testing.T) {
+	// #nosec G101 -- fabricated fixture credential, not a live one
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	value := redact.BasicAuthValue("alice", "hunter2")
+
+	assert.Equal(t, "Basic "+base64.StdEncoding.EncodeToString([]byte("alice:hunter2")), value)
+	assert.Equal(t, value, redact.BasicAuthHeader("https://alice:hunter2@collector:4318"),
+		"the URL path and the pair path must produce one string, not two")
+	assert.NotContains(t, value, "hunter2", "which is why it has to be listed: it holds neither half")
 }

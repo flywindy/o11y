@@ -46,6 +46,13 @@ type requestState struct {
 	attempt    int
 	retryCount int
 	finished   bool
+	// secrets and authHeaderKey are what only beforeRequest can see: resty
+	// passes the invoking client to no other hook, and the client is where a
+	// token, a basic-auth pair and the name of the header they go in are
+	// configured. They are resolved once, at the same moment the target is and
+	// for the same reason.
+	secrets       []string
+	authHeaderKey string
 }
 
 type targetAttrs struct {
@@ -111,7 +118,9 @@ func (h *hook) beforeRequest(c *restyclient.Client, req *restyclient.Request) er
 		// the hook slice, so a clone that changes BaseURL shares this hook —
 		// a client reference captured at Wrap time would be the wrong one.
 		// Later stages upgrade this from RawRequest once resty has built it.
-		target: requestTarget(c, req),
+		target:        requestTarget(c, req),
+		secrets:       clientSecrets(c),
+		authHeaderKey: c.HeaderAuthorizationKey,
 	}
 	ctx = context.WithValue(ctx, stateKey{}, state)
 	state.ctx = ctx
@@ -267,7 +276,7 @@ func (h *hook) finishError(req *restyclient.Request, state *requestState, err er
 	// the username and the query intact. Redacting url.full while recording
 	// that beside it would move the credential rather than remove it.
 	h.finish(req, state, codes.Error,
-		redact.Error(err, nil, urlDerivedSecrets(req)).Error(), err, attrs, metricAttrs)
+		redact.Error(err, nil, requestSecrets(req, state)).Error(), err, attrs, metricAttrs)
 }
 
 // resolvedTarget prefers the fully resolved URL resty builds into RawRequest,
@@ -299,7 +308,7 @@ func (h *hook) finish(
 		state.span.SetAttributes(spanAttrs...)
 	}
 	if err != nil {
-		recordRedactedError(state.span, err, urlDerivedSecrets(req))
+		recordRedactedError(state.span, err, requestSecrets(req, state))
 	}
 	if status != codes.Unset {
 		state.span.SetStatus(status, description)
@@ -472,6 +481,96 @@ func recordRedactedError(span trace.Span, err error, secrets []string) {
 		semconv.ExceptionType(exceptionType(err)),
 		semconv.ExceptionMessage(redact.Error(err, nil, secrets).Error()),
 	))
+}
+
+// requestSecrets returns every credential this request could have put on the
+// wire, in the forms something may report them.
+//
+// There are three sources and they are all here, rather than the one a review
+// pointed at, because being covered in one place and not its sibling is the
+// defect this file has produced most often:
+//
+//   - the request URL's userinfo, which http.Client turns into a Basic header
+//     before any transport sees it (urlDerivedSecrets);
+//   - the resolved request headers, which is where a caller's own
+//     SetAuthToken, SetBasicAuth or Authorization ends up — resty writes all
+//     three into RawRequest.Header in addCredentials, so reading that one
+//     header set covers every way of configuring them;
+//   - and what was configured on the request and the client but may not have
+//     reached a header yet, because a before-request hook that fails or panics
+//     ends the span before resty has built RawRequest at all.
+//
+// The client's half is in state, resolved in beforeRequest: resty hands the
+// invoking client to no other hook, and Client.Clone shares the hook slice, so
+// a client captured at Wrap time would be the wrong one.
+func requestSecrets(req *restyclient.Request, state *requestState) []string {
+	var (
+		secrets []string
+		authKey string
+	)
+	if state != nil {
+		secrets = append(secrets, state.secrets...)
+		authKey = state.authHeaderKey
+	}
+	if req == nil {
+		return secrets
+	}
+	secrets = append(secrets, urlDerivedSecrets(req)...)
+	header := req.Header
+	if req.RawRequest != nil && req.RawRequest.Header != nil {
+		header = req.RawRequest.Header
+	}
+	secrets = append(secrets, redact.HeaderSecrets(header, authKey)...)
+	return append(secrets, configuredSecrets(req.AuthScheme, req.Token, req.UserInfo, req.Cookies)...)
+}
+
+// clientSecrets returns the credentials configured on the invoking client, the
+// half of the set that stops being reachable once beforeRequest returns.
+func clientSecrets(c *restyclient.Client) []string {
+	if c == nil {
+		return nil
+	}
+	secrets := redact.HeaderSecrets(c.Header, c.HeaderAuthorizationKey)
+	return append(secrets, configuredSecrets(c.AuthScheme, c.Token, c.UserInfo, c.Cookies)...)
+}
+
+// configuredSecrets renders the credentials resty's addCredentials builds a
+// header out of, in the forms something may report them.
+//
+// The token is listed both bare and with its scheme, because a report may name
+// either the header value resty composed or the value the caller configured.
+// The basic pair is listed as the base64 http.Request.SetBasicAuth encodes —
+// which holds neither half as a substring, so nothing else in the list would
+// match it — and as the password on its own.
+//
+// The username is deliberately not a secret here. It is an identity rather
+// than a credential, it is frequently an ordinary word, and redact.Secrets
+// would replace that word everywhere it appeared in the message. Where it is
+// part of a URL it is already replaced, by URLAttribute, which can tell the
+// difference from position.
+func configuredSecrets(scheme, token string, user *restyclient.User, cookies []*http.Cookie) []string {
+	var secrets []string
+	add := func(v string) {
+		if v != "" {
+			secrets = append(secrets, redact.HeaderValueForms(v)...)
+		}
+	}
+	if token != "" {
+		add(token)
+		add(strings.TrimSpace(scheme + " " + token))
+	}
+	if user != nil {
+		basic := redact.BasicAuthValue(user.Username, user.Password)
+		add(basic)
+		add(strings.TrimPrefix(basic, "Basic "))
+		add(user.Password)
+	}
+	for _, cookie := range cookies {
+		if cookie != nil {
+			add(cookie.Value)
+		}
+	}
+	return secrets
 }
 
 // urlDerivedSecrets returns the Authorization value net/http derives from the

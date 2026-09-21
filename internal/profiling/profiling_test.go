@@ -283,10 +283,10 @@ func TestAuthHeaderSecrets_CoversTheCanonicalName(t *testing.T) {
 // cover the other; a value the escaping leaves alone is listed once.
 func TestAuthHeaderSecrets_CoversTheEscapedForm(t *testing.T) {
 	assert.Equal(t, []string{
-		"Authorization", "authorization", "tab\there", "tab\\there",
+		"Authorization", "authorization", "tab\there", "tab\\\\there", "tab\\there",
 	}, authHeaderSecrets("", map[string]string{
 		"Authorization": "tab\there",
-	}))
+	}), "the escaped form has an escaped form of its own: a quoted value quoted again")
 	assert.Equal(t, []string{
 		"Authorization", "authorization", "plain",
 	}, authHeaderSecrets("", map[string]string{

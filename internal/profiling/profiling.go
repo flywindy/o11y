@@ -243,16 +243,20 @@ func newPyroscopeSlogAdapter(cfg Config) pyroscopeSlogAdapter {
 // auth-token deprecation warning reads "set the [redacted] header manually".
 // That is the trade this package makes everywhere else.
 //
-// Each of those is listed in four renderings, matching diagnosticSecrets:
+// Each of those is listed in every rendering redact.Renderings names, matching
+// diagnosticSecrets:
 //
 //   - as configured, because something may echo the configuration;
 //   - as net/http puts it on the wire, which for a value is trimmed
 //     (redact.HeaderWireValue) and for a name is the canonical MIME form
 //     (redact.HeaderWireName), because that is what a server receives;
-//   - and each of those as %q and as a JSON document render it
-//     (redact.Renderings), because redact.Secrets matches literally and a
-//     caller that quotes a value, or a Go server that puts it in a JSON error
-//     body, produces text the raw form does not cover.
+//   - and each of those as %q, as a JSON document and as an HTML page render
+//     it, and as those escapings compose, because redact.Secrets matches
+//     literally and a caller that quotes a value, or a Go server that puts it
+//     in a JSON error body, produces text the raw form does not cover.
+//
+// Which renderings those are is redact.Renderings' decision, not this
+// function's, so this list and diagnosticSecrets cannot answer it differently.
 //
 // Nothing in the pinned pyroscope or net/http is known to quote a header value
 // — Go's own invalid-header error names the header, not what it held — but

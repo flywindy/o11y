@@ -28,6 +28,8 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
+
+	"github.com/flywindy/o11y/internal/redact"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -1014,4 +1016,108 @@ func TestWrapRedactsTheURLDerivedBasicHeaderFromTheErrorSpan(t *testing.T) {
 		assert.NotContains(t, text, token, name+" must not carry the derived credential")
 		assert.NotContains(t, text, password, name+" must not carry the password either")
 	}
+}
+
+// TestWrapRedactsTheConfiguredRequestCredentials pins that a credential the
+// caller configured — rather than one this SDK derived from the URL — is
+// removed from both of the span's error fields.
+//
+// urlDerivedSecrets covered only the Basic header http.Client builds out of a
+// URL's userinfo. A caller who uses SetAuthToken or sets Authorization directly
+// hands the token to a transport this package does not own, and a proxy
+// wrapper, an auth middleware or a retry logger that names the header it was
+// given puts it in an error. It is not a URL, so nothing in the URL redaction
+// has anything to act on: it has to be named.
+func TestWrapRedactsTheConfiguredRequestCredentials(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.SetTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("proxy rejected header %q and cookie %q",
+			r.Header.Get("Authorization"), r.Header.Get("Cookie"))
+	}))
+
+	// #nosec G101 -- fabricated fixture credentials, not live ones
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const token, cookie = "s3cret-bearer-token", "c00kie-value"
+
+	_, err := client.R().
+		SetAuthToken(token).
+		SetCookie(&http.Cookie{Name: "sess", Value: cookie}).
+		Get("https://api.example.com/orders")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), token, "the premise: the token is in the error the hook is handed")
+	require.Contains(t, err.Error(), cookie, "and so is the cookie")
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	span := spans[0]
+
+	assert.NotContains(t, span.Status().Description, token)
+	assert.NotContains(t, span.Status().Description, cookie)
+	assert.Contains(t, span.Status().Description, "api.example.com",
+		"the server still has to be identifiable")
+	for _, event := range span.Events() {
+		for _, attr := range event.Attributes {
+			assert.NotContains(t, attr.Value.AsString(), token, "no span event may carry it either")
+			assert.NotContains(t, attr.Value.AsString(), cookie)
+		}
+	}
+}
+
+// TestWrapRedactsTheClientLevelCredentials pins the half of that set which
+// stops being reachable once beforeRequest returns.
+//
+// resty passes the invoking client to no other hook, so a token or a
+// basic-auth pair configured on the client — rather than on the request — is
+// only in hand at that one moment. It is resolved there and carried on the
+// request state, the same way the target is.
+func TestWrapRedactsTheClientLevelCredentials(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	// #nosec G101 -- fabricated fixture credential, not a live one
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	client.SetBasicAuth("alice", "hunter2")
+	client.SetTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("proxy rejected header %q", r.Header.Get("Authorization"))
+	}))
+
+	basic := base64.StdEncoding.EncodeToString([]byte("alice:hunter2"))
+
+	_, err := client.R().Get("https://api.example.com/orders")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), basic,
+		"the premise: what reaches the error is the base64, which holds neither half")
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	assert.NotContains(t, spans[0].Status().Description, basic)
+	assert.NotContains(t, spans[0].Status().Description, "hunter2")
+}
+
+// TestWrapRedactsACallersOwnAuthorizationHeaderKey pins the one case a rule on
+// header names cannot reach on its own: resty lets the caller move its token to
+// a header of their choosing, and the name they chose need not read like a
+// credential. The client knows which header that is, so the hook asks it rather
+// than guessing from the name.
+func TestWrapRedactsACallersOwnAuthorizationHeaderKey(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.HeaderAuthorizationKey = "X-Tenant-Hdr"
+	client.SetTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("proxy rejected header %q", r.Header.Get("X-Tenant-Hdr"))
+	}))
+
+	// #nosec G101 -- fabricated fixture credential, not a live one
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const token = "s3cret-bearer-token"
+	require.False(t, redact.CredentialHeaderName("X-Tenant-Hdr"),
+		"the premise: nothing about this name says it carries one")
+
+	_, err := client.R().SetAuthToken(token).Get("https://api.example.com/orders")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), token, "and the token is in the error")
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	assert.NotContains(t, spans[0].Status().Description, token)
 }

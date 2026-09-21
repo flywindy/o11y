@@ -119,6 +119,20 @@ Histogram boundaries use the SDK's configured latency buckets.
 |---|---|
 | Raw URL path as `http.route` | High cardinality. Resty route metrics require explicit caller-provided templates. |
 
+### Error Fields (package `github.com/flywindy/o11y/resty`)
+
+A failed request also writes the error's text into the span's status
+description and into the `exception.message` of its exception event. Both are
+redacted before they are recorded, against the same rules as `url.full` plus
+the credentials this SDK knows the request carried: the `Authorization: Basic …`
+that `http.Client` derives from the URL's userinfo, and the values of any
+credential-carrying header on the resolved request — `SetAuthToken`,
+`SetBasicAuth`, a `Cookie`, an `Authorization` set directly, or the header a
+client that sets its own `HeaderAuthorizationKey` puts its token in. A
+transport, proxy wrapper or auth middleware that names the header it was given
+therefore does not put its value on the span. Text holding a credential the
+rules can recognise but cannot rewrite in place is replaced wholesale.
+
 ---
 
 ## Go Runtime (package `go.opentelemetry.io/contrib/instrumentation/runtime`)
