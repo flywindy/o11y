@@ -321,6 +321,25 @@ adopters can plan their upgrades.
     password — a custom transport's own error carries a URL this SDK never had
     — the derived header is computed and replaced instead, so the message
     survives.
+  - A credential a redirect introduced is now refused even when it **reuses the
+    username**. `net/http` strips the `Authorization` header on a redirect to
+    another host and derives a fresh one from the `Location`, so
+    `alice:oldpass` on the request and `alice:newsecret` on the `Location` are
+    two credentials with one name, and asking only whether a Basic for that
+    username was listed answered yes about a credential the SDK had never seen.
+    The URL must now also be one the caller named — same scheme, same host,
+    same user. Nothing is lost on a same-host redirect, where `net/http` copies
+    the original header rather than deriving a second one.
+  - A session cookie a redirect picked up no longer reaches a span. `net/http`
+    builds its own request for a redirect and fills its `Cookie` header from
+    the client's jar — including a cookie the redirect response itself set — so
+    the cookie never appears on the request `resty` holds. The jar is now asked
+    about the URLs the error names, which is where what was actually sent can
+    be read.
+  - A redacted query followed by a fragment keeps its line.
+    `?Signature=%5Bredacted%5D#section` was read through the `#`, so this
+    SDK's own placeholder looked like a signature it had never seen and the
+    whole diagnostic was given up over it.
   - `Shutdown` can no longer be held by an error from a dependency. The walk
     that finds the URLs in an error chain is now bounded by the number of
     errors it visits rather than by how deep it goes: once `Unwrap` returns a

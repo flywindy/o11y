@@ -568,8 +568,11 @@ var escapedOpaquePlaceholder = url.QueryEscape(opaquePlaceholder)
 // InText to substitute, and nothing else looked at the query.
 //
 // Each value is read to the first character that cannot appear unescaped inside
-// one — "&", whitespace, or a quote — and compared against the placeholder
-// redactQuery writes. Reading short is safe: it can only make a value differ
+// one — "&", "#", whitespace, or a quote — and compared against the placeholder
+// redactQuery writes. The fragment delimiter belongs in that set for the same
+// reason "&" does: "?Signature=%5Bredacted%5D#section" is a redacted query
+// followed by a fragment, and reading through the "#" made this package's own
+// output look like a signature it had never seen. Reading short is safe: it can only make a value differ
 // from the placeholder, which fails closed. Nothing can be forged past it
 // either, because the only accepted value is the placeholder in full: text
 // arriving with "Signature=%5Bredacted%5D" already carries "[redacted]" as its
@@ -587,7 +590,7 @@ func unaccountedCredentialQuery(text string) bool {
 			continue
 		}
 		value := text[match[1]:]
-		if end := strings.IndexAny(value, "&\"' \t\r\n"); end >= 0 {
+		if end := strings.IndexAny(value, "&#\"' \t\r\n"); end >= 0 {
 			value = value[:end]
 		}
 		if value != escapedOpaquePlaceholder && value != opaquePlaceholder {
@@ -1134,7 +1137,7 @@ func errorText(text string, err error, endpoints, secrets []string) (string, []s
 			return redactedWhole, nil
 		}
 		if parsed.User != nil {
-			forms, accounted := basicFromUserinfo(parsed.User, secrets)
+			forms, accounted := basicFromUserinfo(parsed, endpoints, secrets)
 			if !accounted {
 				return redactedWhole, nil
 			}
@@ -1179,19 +1182,51 @@ const maskedPassword = "***"
 // one, the message may hold a credential nothing here can name, and it is
 // given up whole.
 //
-// Matching on the username is looser than matching the credential, and that is
-// stated rather than hidden: a redirect to the same user with a different
-// password is accepted. Closing that would mean capturing the Location itself,
-// which is not reachable from an error, and a rule that refused every
-// credentialed request's message instead would cost far more than it saves.
-func basicFromUserinfo(user *url.Userinfo, secrets []string) (forms []string, accounted bool) {
-	password, set := user.Password()
+// The accounting is on the URL and not on the username alone. An earlier
+// version asked only whether the list held a Basic for that user, and a
+// cross-host redirect to the same username with a different password defeated
+// it: "alice:oldpass" on the original request answered for
+// "alice:newsecret" on the Location, and the new credential was exported in
+// full. So the URL must also be one the caller named — same scheme, same host,
+// same user — which a redirect to another host is not.
+//
+// Restricting it that way loses nothing on a same-host redirect, because
+// net/http does not derive a second header there: it copies the original
+// Authorization when the destination host matches (shouldCopyHeaderOnRedirect),
+// and send only derives one when that header is empty. A credential the caller
+// could not name is therefore a credential net/http built from a URL the
+// caller never had.
+func basicFromUserinfo(u *url.URL, endpoints, secrets []string) (forms []string, accounted bool) {
+	password, set := u.User.Password()
 	if set && password == maskedPassword {
-		return nil, basicNamed(user.Username(), secrets)
+		return nil, namedEndpoint(u, endpoints) && basicNamed(u.User.Username(), secrets)
 	}
-	basic := BasicAuthValue(user.Username(), password)
+	basic := BasicAuthValue(u.User.Username(), password)
 	forms = append(forms, HeaderValueForms(basic)...)
 	return append(forms, HeaderValueForms(strings.TrimPrefix(basic, "Basic "))...), true
+}
+
+// namedEndpoint reports whether u is one of the endpoints the caller named,
+// compared on scheme, host and username.
+//
+// The password is deliberately not compared: net/http has already masked it by
+// the time a URL reaches here, which is the whole reason this question is being
+// asked. The path is not compared either, because an exporter's error names the
+// endpoint plus the signal path it appended, and a caller configures the
+// endpoint.
+func namedEndpoint(u *url.URL, endpoints []string) bool {
+	for _, endpoint := range endpoints {
+		known, err := url.Parse(endpoint)
+		if err != nil || known.User == nil {
+			continue
+		}
+		if strings.EqualFold(known.Scheme, u.Scheme) &&
+			strings.EqualFold(known.Host, u.Host) &&
+			known.User.Username() == u.User.Username() {
+			return true
+		}
+	}
+	return false
 }
 
 // basicNamed reports whether secrets holds a Basic credential for this
@@ -1213,6 +1248,17 @@ func basicNamed(username string, secrets []string) bool {
 		}
 	}
 	return false
+}
+
+// ErrorURLs returns the URL of every *url.Error in err's chain, for a caller
+// that has to ask something of its own about them.
+//
+// resty needs it for the cookie jar: net/http adds a jar's cookies to the
+// request it builds for a redirect, not to the one resty holds, so the only
+// way to know which cookies went on the wire is to ask the jar about the URLs
+// the error names.
+func ErrorURLs(err error) []string {
+	return errorURLs(err)
 }
 
 // errorURLs returns the URL of every *url.Error in err's chain.
