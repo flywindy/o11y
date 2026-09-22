@@ -13,6 +13,10 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+---
+
+## [0.13.0] - 2026-09-22
+
 ### Added
 
 - `o11y_export_failures_total{otel_component_type}` counts every export
@@ -131,7 +135,8 @@ adopters can plan their upgrades.
   live in a driver-free internal package; each integration keeps
   `MetricViews` as a re-export, so **no service changes a line of code**
   (ADR 0026 Option A). The root package's transitive dependencies drop from
-  590 to 457, and all four drivers to zero linked packages. What a service
+  590 to 458 (`go list -deps github.com/flywindy/o11y`, not counting the
+  package itself), and all four drivers to zero linked packages. What a service
   sees after upgrading and running `go mod tidy`: a smaller binary, the four
   drivers gone from its `go.mod` and `go.sum` unless it imports them
   directly, and `govulncheck` — which works from the call graph — no longer
@@ -508,6 +513,89 @@ adopters can plan their upgrades.
   and `pyroscope.profile.id` is set by the upstream bridge on root spans only,
   carries the root span's id, marks a span that *can* have a profile rather
   than one that does, and must never be promoted to a metric label.
+
+### Migration
+
+- **`Init` now fails when an OTel environment variable an enabled pillar reads
+  is malformed**, where the exporters and providers previously parsed it
+  themselves, echoed the value in a log line and carried on with a default. A
+  deployment carrying a typo that has been silently defaulting will stop
+  starting on this upgrade. What is read, per enabled pillar: with traces, or
+  metrics on the OTLP push path, every generic and signal-prefixed
+  `OTEL_EXPORTER_OTLP_*` `ENDPOINT`, `TIMEOUT`, `HEADERS`, `CERTIFICATE` and
+  `CLIENT_CERTIFICATE` / `CLIENT_KEY` pair, plus the metric exporter's
+  `TEMPORALITY_PREFERENCE` and `DEFAULT_HISTOGRAM_AGGREGATION`; with logs, the
+  same TLS and header variables plus `COMPRESSION` (its `ENDPOINT` and
+  `INSECURE` are never read, because `Init` passes them, and its `HEADERS`
+  only when `WithOTLPHeaders` set none); and the SDK's own `OTEL_BSP_*`, span
+  and attribute limits, `OTEL_TRACES_SAMPLER` / `_ARG`, `OTEL_BLRP_*`,
+  `OTEL_LOGRECORD_*`, `OTEL_GO_X_CARDINALITY_LIMIT` and
+  `OTEL_METRIC_EXPORT_INTERVAL` / `_TIMEOUT`. A variable no enabled pillar
+  reads is left alone. The error names the variable, and for a header list the
+  offending pair's position, but never the value and never the parser's
+  message — both echo the text. Run a canary through `Init` before rolling a
+  fleet.
+- **`target_info` loses four labels and gains three.** Dropping
+  `resource.WithProcess()` removes `process_command_args`, `process_owner`,
+  `process_executable_path` and `process_runtime_description`; adding
+  `resource.WithTelemetrySDK()` adds `telemetry_sdk_name`,
+  `telemetry_sdk_language` and `telemetry_sdk_version`. Dashboards, joins and
+  recording rules reading any of the four dropped labels need updating. The
+  same four attributes also leave OTLP spans and log records. No series name
+  changes.
+- **A key from `OTEL_RESOURCE_ATTRIBUTES` can now be dropped at startup.** One
+  that only aliases an SDK-owned or detected key, that falls in
+  `telemetry.sdk.*` or `process.*`, or that the Prometheus exporter cannot
+  translate is dropped with a startup warning instead of being joined into
+  that label's value. Read the warnings on the first rollout: a key that was
+  quietly producing `"evil;opentelemetry"` is the case this closes, but a
+  deployment that set one of those keys deliberately loses it.
+- **The per-stream cardinality limit drops from 1,024,000 to 4,000.** Every
+  instrument, the application's own included, now folds everything past 3,999
+  attribute sets into one `otel_metric_overflow="true"` series. Alert on that
+  series. Where a stream legitimately needs more, raise it with
+  `WithCardinalityLimit(n)`, or raise `WithMaxUniqueRoutes`, which the derived
+  limit follows. A service that was exporting six-figure series counts per pod
+  will see them collapse on rollout — the guard working, but it changes what
+  the graphs show.
+- **`resty` spans: `url.full` is redacted.** Userinfo and the values of
+  `AWSAccessKeyId`, `Signature`, `sig` and `X-Goog-Signature` are replaced. A
+  saved search or an alert matching one of those URLs exactly needs updating;
+  parameter order and escaping are preserved, so anything matching on the rest
+  of the URL still matches, and the request itself still authenticates.
+- **`mongo`: `network_peer_address` changes value and sheds series.** It moves
+  from the driver's `host:port[-n]` connection identifier to `host`, and
+  `network_peer_port` from a hardcoded `27017` to the port actually connected
+  to. Anything grouped by either needs updating, and series counts fall
+  sharply on rollout. See ADR 0021 §Connection-identifier normalization.
+- **Prometheus pull path: a reserved-key attribute is dropped from every
+  stream**, and an exemplar no longer carries the attributes its view filtered
+  out. A dashboard reading an attribute whose label collided with
+  `service_name`, `service_namespace`, `service_version`,
+  `deployment_environment_name`, an `otel_scope_*` label, `le` / `quantile` or
+  the `__x__` shape was getting a failed scrape rather than that label, so what
+  returns is the rest of the family; a query reading an exemplar label other
+  than `trace_id` / `span_id` on an integration histogram loses it. The OTLP
+  push path is unchanged on both counts.
+- **`Shutdown` divides its deadline across the enabled components** instead of
+  letting the first one consume it, recomputing the share as each finishes. A
+  service with a tight shutdown deadline and several pillars enabled may see a
+  drain report a timeout that previously completed. Size the deadline for the
+  number of enabled pillars, or pass a context without one — that is passed
+  through unchanged.
+- **`go.mod` shrinks after `go mod tidy`.** The root package no longer links
+  gocql, minio-go, mongo-driver or go-redis, so a service that does not import
+  those integrations directly loses them from its `go.mod` and `go.sum`, and
+  `govulncheck` stops reporting advisories for drivers it never calls. No code
+  changes: each integration still re-exports its own `MetricViews`.
+- **`SDK.ErrorHandler()` and `SDK.Logr()` are opt-in.** The SDK does not
+  install them, because it does not write OTel globals (ADR 0003). An
+  application that wants OTel's own errors and warnings in its structured log
+  passes them to `otel.SetErrorHandler` and `otel.SetLogger` in `main()`.
+- **`WithTraceSampler(nil)` no longer clears a sampler set earlier in the
+  option list.** A service passing nil to mean "no custom sampler" was
+  silently back at 100 % head sampling and now keeps the configured ratio. If
+  that 100 % was the intent, set it explicitly.
 
 ---
 
