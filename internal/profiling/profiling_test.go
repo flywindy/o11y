@@ -3,8 +3,12 @@ package profiling
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net/url"
+	"path"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +19,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
+
+	"github.com/flywindy/o11y/internal/redact"
 )
 
 type fakeProfiler struct {
@@ -164,16 +170,155 @@ func TestTruncatePyroscopeTagValue_PreservesUTF8(t *testing.T) {
 	assert.Equal(t, strings.Repeat("a", maxPyroscopeTagValueBytes-1), truncated)
 }
 
-func TestPyroscopeSlogAdapter_InfofUsesInfoLevel(t *testing.T) {
+// TestPyroscopeSlogAdapter_RedactsTheEndpointAndAuthHeaders pins that no
+// pyroscope log line can carry the profiling endpoint's credentials or a
+// configured auth header value.
+//
+// The messages are the ones pyroscope-go v1.3.0 actually produces. `uploading
+// at %s` is upstream/remote/remote.go:193 (Debugf) with the parsed ingest URL,
+// userinfo intact. `upload profile: %v` is :272 (Errorf) with the *url.Error
+// net/http returns, which masks the password and keeps the username — so the
+// error path leaks at ERROR level, not only at DEBUG.
+func TestPyroscopeSlogAdapter_RedactsTheEndpointAndAuthHeaders(t *testing.T) {
+	const (
+		// #nosec G101 -- fabricated fixture endpoint, not a live credential
+		// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+		endpoint = "http://alice:s3cretpw@pyroscope:4040"
+		// #nosec G101 -- fabricated fixture header value, not a live credential
+		// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+		token = "Bearer glc_eyJvIjoiMTIzNDU2In0="
+	)
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	adapter := pyroscopeSlogAdapter{logger: logger}
+	adapter := newPyroscopeSlogAdapter(Config{
+		Logger:      logger,
+		Endpoint:    endpoint,
+		AuthHeaders: map[string]string{"Authorization": token},
+	})
+
+	adapter.Debugf("uploading at %s", endpoint+"/ingest?name=svc&spyName=gospy")
+	adapter.Errorf("upload profile: %v",
+		fmt.Errorf(`Post "http://alice:***@pyroscope:4040/ingest?name=svc": dial tcp: i/o timeout`)) //nolint:err113
+	adapter.Infof("sending Authorization header %s", token)
+
+	output := buf.String()
+	assert.NotContains(t, output, "s3cretpw", "the endpoint password must never reach a record")
+	assert.NotContains(t, output, "alice", "the endpoint username must never reach a record either")
+	assert.NotContains(t, output, "glc_eyJvIjoiMTIzNDU2In0=", "a configured auth header value is a secret")
+	assert.Contains(t, output, "pyroscope:4040", "the host stays, so the line still says where it was uploading")
+	assert.Contains(t, output, "name=svc", "and so does the rest of the URL")
+}
+
+// TestPyroscopeSlogAdapter_LevelsAndEmptyLoggerAreUnchanged covers the parts of
+// the adapter the redaction must not disturb: each method keeps its level, an
+// endpoint with no credentials is echoed as the operator wrote it, and a nil
+// logger is still a no-op rather than a panic.
+func TestPyroscopeSlogAdapter_LevelsAndEmptyLoggerAreUnchanged(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	adapter := newPyroscopeSlogAdapter(Config{Logger: logger, Endpoint: "http://pyroscope:4040"})
 
 	adapter.Infof("upload %s", "started")
+	adapter.Debugf("uploading at %s", "http://pyroscope:4040/ingest")
+	adapter.Errorf("upload profile: %s", "refused")
 
 	output := buf.String()
 	assert.Contains(t, output, `"level":"INFO"`)
 	assert.Contains(t, output, `"msg":"upload started"`)
+	assert.Contains(t, output, `"level":"DEBUG"`)
+	assert.Contains(t, output, `"msg":"uploading at http://pyroscope:4040/ingest"`)
+	assert.Contains(t, output, `"level":"ERROR"`)
+	assert.Contains(t, output, `"msg":"upload profile: refused"`)
+
+	empty := newPyroscopeSlogAdapter(Config{})
+	assert.NotPanics(t, func() {
+		empty.Infof("x")
+		empty.Debugf("x")
+		empty.Errorf("x")
+	})
+}
+
+// TestAuthHeaderSecrets_SortsAndDropsEmpties pins that the secret list a
+// pyroscope line is scrubbed against does not depend on map iteration order,
+// and that an empty header value is left out — redact.Secrets ignores it, and
+// carrying it would only obscure what the adapter is actually guarding.
+func TestAuthHeaderSecrets_SortsAndDropsEmpties(t *testing.T) {
+	assert.Nil(t, authHeaderSecrets("", nil))
+	assert.Nil(t, authHeaderSecrets("", map[string]string{}))
+	// Names are listed too, in the configured form, the canonical MIME form
+	// Header.Set keys by, and the lowercase form HTTP/2 sends — and a name
+	// survives an empty value, the name being the thing that might be the
+	// credential.
+	assert.Equal(t, []string{
+		"Authorization", "X-Empty", "X-Scope-OrgID", "X-Scope-Orgid",
+		"aaa", "authorization", "bbb", "x-empty", "x-scope-orgid",
+	}, authHeaderSecrets("", map[string]string{
+		"X-Scope-OrgID": "bbb",
+		"Authorization": "aaa",
+		"X-Empty":       "",
+	}))
+}
+
+// TestAuthHeaderSecrets_CoversTheCanonicalName pins the form net/http actually
+// sends a header name as.
+//
+// Header.Set does not key by the name it was given — it keys by
+// textproto.CanonicalMIMEHeaderKey — so a credential supplied as a header name
+// reaches the server canonicalized, and the pinned uploader puts a failed
+// upload's whole response body into its ERROR line.
+func TestAuthHeaderSecrets_CoversTheCanonicalName(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header name, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const pastedAsAName = "x-secret-glc-token"
+
+	secrets := authHeaderSecrets("", map[string]string{pastedAsAName: "1"})
+
+	assert.Contains(t, secrets, pastedAsAName, "the configured spelling")
+	assert.Contains(t, secrets, "X-Secret-Glc-Token", "and the one that goes on the wire")
+}
+
+// TestAuthHeaderSecrets_CoversTheEscapedForm pins that a value whose rendering
+// changes under %q is listed both ways, the same as diagnosticSecrets does for
+// the OTLP headers. redact.Secrets matches literally, so one form does not
+// cover the other; a value the escaping leaves alone is listed once.
+func TestAuthHeaderSecrets_CoversTheEscapedForm(t *testing.T) {
+	assert.Equal(t, []string{
+		"Authorization", "authorization", "tab\there", "tab\\\\there", "tab\\there",
+	}, authHeaderSecrets("", map[string]string{
+		"Authorization": "tab\there",
+	}), "the escaped form has an escaped form of its own: a quoted value quoted again")
+	assert.Equal(t, []string{
+		"Authorization", "authorization", "plain",
+	}, authHeaderSecrets("", map[string]string{
+		"Authorization": "plain",
+	}), "a value %q leaves alone is listed once; the name keeps its canonical and HTTP/2 spellings")
+}
+
+// TestPyroscopeSlogAdapter_RedactsAnEscapedAuthHeader pins the scrub reaching a
+// line that quotes the header value rather than printing it raw.
+func TestPyroscopeSlogAdapter_RedactsAnEscapedAuthHeader(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const token = "glc\tsecret"
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	adapter := newPyroscopeSlogAdapter(Config{
+		Logger:      logger,
+		AuthHeaders: map[string]string{"Authorization": token},
+	})
+
+	adapter.Errorf("upload profile: invalid header value %q", token)
+
+	// The record is decoded rather than matched against the raw buffer: the
+	// JSON handler escapes the backslash again, so a buffer-level assertion on
+	// the quoted form would miss whether the scrub ran at all.
+	var record struct {
+		Msg string `json:"msg"`
+	}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
+	assert.NotContains(t, record.Msg, `glc\tsecret`, "the quoted rendering is a form of the same secret")
+	assert.NotContains(t, record.Msg, token, "and so is the raw one")
+	assert.Contains(t, record.Msg, "invalid header value", "the rest of the line survives")
 }
 
 // TestCloser_HonoursContextWhileStopBlocks pins that a Stop stalled on the
@@ -279,4 +424,239 @@ func TestCloser_ReleasesSlotEvenWhenStopFails(t *testing.T) {
 	require.NoError(t, second(context.Background()))
 	assert.Equal(t, 1, healthy.stopCalls, "the replacement profiler must be stopped exactly once")
 	assert.Equal(t, 1, failing.stopCalls, "the failed closer must not be re-invoked")
+}
+
+// TestPyroscopeSlogAdapter_RedactsASignedEndpoint pins the adapter against what
+// the pinned uploader actually formats for a presigned endpoint.
+//
+// remote.uploadProfile appends "/ingest" to the path and rebuilds the query
+// with url.Values.Encode before logging "uploading at %s", so the configured
+// endpoint is not a substring of the message and there is nothing for InText to
+// substitute. The signature travels in the query, so there is no "@" either —
+// the rule that covers a userinfo endpoint passes this straight through. Both
+// the per-upload DEBUG line and the failed-upload ERROR line carried it.
+func TestPyroscopeSlogAdapter_RedactsASignedEndpoint(t *testing.T) {
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const endpoint = "https://pyroscope:4040?Signature=s3cretsig"
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	adapter := newPyroscopeSlogAdapter(Config{Logger: logger, Endpoint: endpoint})
+
+	// Exactly what remote.uploadProfile builds: path joined, query re-encoded.
+	u, err := url.Parse(endpoint)
+	require.NoError(t, err)
+	q := u.Query()
+	q.Set("name", "svc")
+	u.Path = path.Join(u.Path, "ingest")
+	u.RawQuery = q.Encode()
+	require.NotContains(t, u.String(), endpoint, "the premise: the configured endpoint is not a substring")
+
+	adapter.Debugf("uploading at %s", u.String())
+	adapter.Errorf("upload profile: %v",
+		fmt.Errorf("Post %q: dial tcp: i/o timeout", u.String())) //nolint:err113
+
+	assert.NotContains(t, buf.String(), "s3cretsig", "a signature is a credential like any other")
+}
+
+// TestAuthHeaderSecrets_CoversTheWireForm pins that a value configured with
+// surrounding whitespace is listed as net/http sends it.
+//
+// Header.Set stores the configured string untouched, but the write path trims
+// it, so a server that echoes the header it received reports the trimmed form —
+// and the pinned uploader puts a failed upload's whole response body into its
+// ERROR line. redact.Secrets matches literally, so the configured form does not
+// cover it.
+func TestAuthHeaderSecrets_CoversTheWireForm(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const padded = " Bearer glc_token "
+
+	secrets := authHeaderSecrets("", map[string]string{"Authorization": padded})
+
+	assert.Contains(t, secrets, padded, "the configured form is still listed")
+	assert.Contains(t, secrets, "Bearer glc_token", "and so is the form that goes on the wire")
+}
+
+// TestPyroscopeSlogAdapter_RedactsAnEchoedWireHeader pins the same through the
+// adapter: pyroscope reports a non-200 upload as
+// "failed to upload: (%d) '%s'" with the response body, so a server that echoes
+// the header it received puts the wire form of the token into an ERROR record.
+func TestPyroscopeSlogAdapter_RedactsAnEchoedWireHeader(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const padded = "\tBearer glc_token\t"
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	adapter := newPyroscopeSlogAdapter(Config{
+		Logger:      logger,
+		AuthHeaders: map[string]string{"Authorization": padded},
+	})
+
+	adapter.Errorf("upload profile: %v",
+		fmt.Errorf("failed to upload: (401) 'rejected Authorization: %s'", //nolint:err113
+			redact.HeaderWireValue(padded)))
+
+	var record struct {
+		Msg string `json:"msg"`
+	}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
+	assert.NotContains(t, record.Msg, "glc_token", "the echoed wire form is the same secret")
+	assert.Contains(t, record.Msg, "failed to upload: (401)", "the rest of the line survives")
+}
+
+// TestAuthHeaderSecrets_CoversTheJSONForm pins the rendering a Go server
+// produces when it puts a received header into a JSON error body.
+//
+// encoding/json escapes "<", ">" and "&" by default, so none of the raw, %q or
+// wire forms matches it — and pyroscope puts a failed upload's whole response
+// body into its ERROR line.
+func TestAuthHeaderSecrets_CoversTheJSONForm(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const token = "Bearer a<b&c>d"
+
+	secrets := authHeaderSecrets("", map[string]string{"Authorization": token})
+
+	assert.Contains(t, secrets, token, "the configured form")
+	assert.Contains(t, secrets, `Bearer a\u003cb\u0026c\u003ed`, "and the form a JSON error body holds")
+}
+
+// TestPyroscopeSlogAdapter_RedactsAJSONEchoedHeader is the same end to end:
+// the uploader reports a non-200 as "failed to upload: (%d) '%s'" with the
+// response body, so a JSON body echoing the header reaches an ERROR record.
+func TestPyroscopeSlogAdapter_RedactsAJSONEchoedHeader(t *testing.T) {
+	// #nosec G101 -- fabricated fixture header value, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const token = "Bearer a<b&c>d"
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	adapter := newPyroscopeSlogAdapter(Config{
+		Logger:      logger,
+		AuthHeaders: map[string]string{"Authorization": token},
+	})
+
+	body, err := json.Marshal(struct {
+		Error string `json:"error"`
+	}{Error: "rejected Authorization: " + token})
+	require.NoError(t, err)
+	require.NotContains(t, string(body), token, "the premise: the raw form is not in the body")
+
+	adapter.Errorf("upload profile: %v",
+		fmt.Errorf("failed to upload: (401) '%s'", string(body))) //nolint:err113
+
+	var record struct {
+		Msg string `json:"msg"`
+	}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
+	assert.NotContains(t, record.Msg, "a<b&c>d", "the raw form")
+	assert.NotContains(t, record.Msg, redact.JSONEscaped(token), "and the JSON one")
+	assert.Contains(t, record.Msg, "failed to upload: (401)", "the rest of the line survives")
+}
+
+// TestAuthHeaderSecrets_CoversTheEndpointDerivedBasicAuth pins the credential
+// the SDK never configured as a header and yet sends as one.
+//
+// A scheme://user:pass@host profiling endpoint is a working authentication
+// mechanism because http.Client derives "Authorization: Basic base64(user:pass)"
+// from it. The base64 contains neither the username nor the password as a
+// substring, so every other rendering in this list — raw, %q, JSON, wire —
+// misses it, and pyroscope puts a failed upload's whole response body into its
+// ERROR line.
+func TestAuthHeaderSecrets_CoversTheEndpointDerivedBasicAuth(t *testing.T) {
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const endpoint = "http://alice:s3cret@pyroscope:4040"
+
+	secrets := authHeaderSecrets(endpoint, nil)
+	derived := redact.BasicAuthHeader(endpoint)
+	require.NotEmpty(t, derived)
+
+	assert.Contains(t, secrets, derived, "the header value as net/http sends it")
+	assert.Contains(t, secrets, strings.TrimPrefix(derived, "Basic "),
+		"and the bare token, for a report that names only that")
+	for _, s := range secrets {
+		assert.NotContains(t, s, "s3cret", "the list must not itself spell the password out")
+	}
+}
+
+// TestPyroscopeSlogAdapter_RedactsAnEchoedBasicAuthHeader is the same end to
+// end: the uploader reports a non-200 as "failed to upload: (%d) '%s'" with the
+// response body, so a server echoing the Authorization it received puts the
+// derived base64 into an ERROR record.
+func TestPyroscopeSlogAdapter_RedactsAnEchoedBasicAuthHeader(t *testing.T) {
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const endpoint = "http://alice:s3cret@pyroscope:4040"
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	adapter := newPyroscopeSlogAdapter(Config{Logger: logger, Endpoint: endpoint})
+
+	derived := redact.BasicAuthHeader(endpoint)
+	token := strings.TrimPrefix(derived, "Basic ")
+	require.NotContains(t, token, "s3cret", "the premise: the wire form hides both halves")
+
+	adapter.Errorf("upload profile: %v",
+		fmt.Errorf("failed to upload: (401) 'rejected Authorization: %s'", derived)) //nolint:err113
+
+	var record struct {
+		Msg string `json:"msg"`
+	}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
+	assert.NotContains(t, record.Msg, token, "the echoed credential is the same secret")
+	assert.Contains(t, record.Msg, "failed to upload: (401)", "the rest of the line survives")
+}
+
+// TestAuthHeaderSecrets_CoversTheAdhocEndpointOverride pins that the address
+// pyroscope actually uploads to is the one the Basic credential is derived
+// from.
+//
+// Start overrides ServerAddress from PYROSCOPE_ADHOC_SERVER_ADDRESS before it
+// builds the uploader (pyroscope-go api.go:57), so an override carrying
+// userinfo puts a credential on the wire that the configured endpoint never
+// mentioned.
+func TestAuthHeaderSecrets_CoversTheAdhocEndpointOverride(t *testing.T) {
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const override = "http://adhoc:0verrideP4ss@adhoc-pyroscope:4040"
+	t.Setenv("PYROSCOPE_ADHOC_SERVER_ADDRESS", override)
+
+	secrets := authHeaderSecrets("http://pyroscope:4040", nil)
+	derived := redact.BasicAuthHeader(override)
+	require.NotEmpty(t, derived)
+
+	assert.Contains(t, secrets, derived, "the header the override makes net/http send")
+	for _, s := range secrets {
+		assert.NotContains(t, s, "0verrideP4ss")
+	}
+}
+
+// TestPyroscopeSlogAdapter_KeepsAnOverrideEndpointLegible pins what listing
+// the adhoc override as a known endpoint actually buys, which is legibility
+// rather than safety.
+//
+// A message quoting an override with userinfo was already safe without it —
+// InText's userinfo rule matches any "scheme://...@" and rewrites it. The
+// difference shows on a *signed* override: unknown, it trips the closed query
+// rule and the whole line is replaced; known, the signature is substituted and
+// the operator can still read where the upload went.
+func TestPyroscopeSlogAdapter_KeepsAnOverrideEndpointLegible(t *testing.T) {
+	// #nosec G101 -- fabricated fixture endpoint, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const override = "http://adhoc-pyroscope:4040?Signature=0verrideSig"
+	t.Setenv("PYROSCOPE_ADHOC_SERVER_ADDRESS", override)
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	adapter := newPyroscopeSlogAdapter(Config{Logger: logger, Endpoint: "http://pyroscope:4040"})
+
+	adapter.Debugf("uploading at %s", override)
+
+	var record struct {
+		Msg string `json:"msg"`
+	}
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &record))
+	assert.NotContains(t, record.Msg, "0verrideSig", "the signature never survives either way")
+	assert.Contains(t, record.Msg, "adhoc-pyroscope:4040",
+		"but the host does, which it would not if the line had been replaced wholesale")
 }

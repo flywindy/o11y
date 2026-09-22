@@ -589,13 +589,6 @@ func isHTTPToken(s string) bool {
 	return true
 }
 
-// goEscaped returns v as strconv.Quote renders it between the quotes, the
-// form net/http and fmt's %q verb give a string in an error message.
-func goEscaped(v string) string {
-	q := strconv.Quote(v)
-	return q[1 : len(q)-1]
-}
-
 // diagnosticSecrets lists the header names and values the diagnostics must
 // never print: the names and values of WithOTLPHeaders and
 // WithProfilingAuthHeaders, and
@@ -614,12 +607,8 @@ func goEscaped(v string) string {
 func diagnosticSecrets(cfg *Config) []string {
 	seen := make(map[string]struct{})
 	var out []string
-	add := func(v string) {
-		// A rendering that quotes the value with %q escapes control and
-		// non-printable characters, so that form is listed too whenever
-		// it differs; a value the escaping leaves alone is added once.
-		for _, s := range []string{v, goEscaped(v)} {
-			s = strings.TrimSpace(s)
+	addForms := func(forms []string) {
+		for _, s := range forms {
 			if s == "" {
 				continue
 			}
@@ -630,16 +619,41 @@ func diagnosticSecrets(cfg *Config) []string {
 			out = append(out, s)
 		}
 	}
+	// redact.HeaderValueForms and HeaderNameForms expand a configured header
+	// into every way something between this SDK and the collector may render
+	// it: as configured; as net/http actually sends it, which trims a value,
+	// canonicalizes a name over HTTP/1.1, lowercases it over HTTP/2 and
+	// rejoins a Cookie; and each of those as %q and as a JSON document hold
+	// them, which is what a Go server writing a JSON error body produces.
+	// They live in redact so this list and the profiling one cannot answer
+	// that question differently — they have disagreed three times already.
+	add := func(v string) { addForms(redact.HeaderValueForms(v)) }
+	addName := func(v string) { addForms(redact.HeaderNameForms(v)) }
 	// Names as well as values: a credential pasted in as a header name
 	// reaches net/http, whose "invalid header field name" error echoes it
 	// through the export error the ErrorHandler records.
 	for k, v := range cfg.otlpHeaders {
-		add(k)
+		addName(k)
 		add(v)
 	}
 	for k, v := range cfg.profilingAuthHeaders {
-		add(k)
+		addName(k)
 		add(v)
+	}
+	// An endpoint's own userinfo is a credential the SDK never configured as a
+	// header and yet sends as one: http.Client derives
+	// "Authorization: Basic base64(user:pass)" from it. The base64 holds
+	// neither half as a substring, so no other entry in this list would match
+	// a collector that echoed the header back into a non-2xx body — which both
+	// exporters put into the error they return. authHeaderSecrets does the
+	// same for the profiling endpoint; the two lists are meant to agree.
+	for _, endpoint := range []string{cfg.otlpEndpoint, cfg.metricsOTLPEndpoint, cfg.profilingEndpoint} {
+		basic := redact.BasicAuthHeader(endpoint)
+		if basic == "" {
+			continue
+		}
+		add(basic)
+		add(strings.TrimPrefix(basic, "Basic "))
 	}
 	for _, name := range otlpHeaderEnvVars {
 		raw := os.Getenv(name)
@@ -655,14 +669,45 @@ func diagnosticSecrets(cfg *Config) []string {
 			}
 			// The exporter reports a name that fails to unescape on its own
 			// ("key", k), the same way it reports a value, and a credential
-			// pasted into the wrong side of the "=" is still a credential.
+			// pasted into the wrong side of the "=" is still a credential —
+			// so both parts get both sets of forms. Both calls are needed:
+			// the name set and the value set overlap only in the fragment
+			// itself, and a Cookie value configured through the environment
+			// reaches the collector rejoined with "; " by HTTP/2, which only
+			// the value set carries.
 			for _, part := range []string{k, v} {
-				add(part)
-				if unescaped, err := url.PathUnescape(strings.TrimSpace(part)); err == nil {
-					add(unescaped)
+				for _, form := range headerEnvForms(part) {
+					add(form)
+					addName(form)
 				}
 			}
 		}
 	}
 	return out
+}
+
+// headerEnvForms returns the renderings an OTEL_EXPORTER_OTLP_HEADERS fragment
+// can take by the time something reports it.
+//
+// The pinned exporter does not send what the variable holds. Its parser trims
+// the name, and for the value unescapes first and trims after — in that order
+// (otlptracehttp internal/envconfig, stringToHeader) — with strings.TrimSpace,
+// which takes Unicode spaces net/http would have kept. So a value written as
+// "%C2%A0BearerSecret%C2%A0" is sent as "BearerSecret", a string neither the
+// configured text nor redact.HeaderWireValue of it matches, and the exporter
+// puts a non-2xx response body into the error it returns ("body: %s"), where a
+// collector echoing the header it received would name exactly that form.
+//
+// Both orders are covered for both parts because which side of the "=" holds
+// the credential is not knowable here.
+func headerEnvForms(part string) []string {
+	forms := []string{part, strings.TrimSpace(part)}
+	for _, candidate := range []string{part, strings.TrimSpace(part)} {
+		unescaped, err := url.PathUnescape(candidate)
+		if err != nil {
+			continue
+		}
+		forms = append(forms, unescaped, strings.TrimSpace(unescaped))
+	}
+	return forms
 }

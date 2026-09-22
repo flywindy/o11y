@@ -106,7 +106,7 @@ Histogram boundaries use the SDK's configured latency buckets.
 | `http.route` | string | Resty only, opt-in through `resty.WithRouteFromContext` and `resty.WithMetricRouteEnabled(true)`. Must be a caller-supplied route template, never the raw URL path. Export cardinality is capped through `WithMaxUniqueRoutes`. |
 | `http.response.status_code` | int | Response-path metric label and span attribute. |
 | `http.request.resend_count` | int | Resty spans only; emitted on retry attempts after the first attempt. |
-| `url.full` | string | Resty spans only; full outbound URL. Do not put secrets in URLs. |
+| `url.full` | string | Emitted by both facades, redacted differently. **`http`**: otelhttp strips the URL's userinfo and records everything else, query string included. **`resty`**: userinfo is replaced by `redacted` and the values of `AWSAccessKeyId`, `Signature`, `sig` and `X-Goog-Signature` by `[redacted]`, per semconv v1.39.0; parameter order and escaping are otherwise preserved, so the attribute still matches the upstream's access log, and a URL whose credentials cannot be accounted for (an opaque one such as `http:user:pass@host`) is replaced wholesale. Any other secret a caller puts in a URL is still recorded by either facade. |
 | `error.type` | string | Error-path metric label and span attribute. |
 | `resty.error.kind` | string | Resty spans only; SDK-owned closed enum: `client_canceled`, `client_timeout`, `server_timeout`, `tls`, `transport`, `protocol`, `unknown`. |
 | `resty.retry.exhausted` | bool | Resty spans only; set on the last failed attempt when resty's retry budget is exhausted. |
@@ -118,6 +118,27 @@ Histogram boundaries use the SDK's configured latency buckets.
 | Key | Reason |
 |---|---|
 | Raw URL path as `http.route` | High cardinality. Resty route metrics require explicit caller-provided templates. |
+
+### Error Fields (package `github.com/flywindy/o11y/resty`)
+
+A failed request also writes the error's text into the span's status
+description and into the `exception.message` of its exception event. Both are
+redacted before they are recorded, against the same rules as `url.full` plus
+the credentials this SDK knows the request carried: the `Authorization: Basic …`
+that `http.Client` derives from the URL's userinfo, and the values of any
+credential-carrying header on the resolved request — `SetAuthToken`,
+`SetBasicAuth`, a `Cookie`, an `Authorization` set directly, or the header a
+client that sets its own `HeaderAuthorizationKey` puts its token in. A
+transport, proxy wrapper or auth middleware that names the header it was given
+therefore does not put its value on the span. Text holding a credential the
+rules can recognise but cannot rewrite in place is replaced wholesale, and so is
+a message naming the `Authorization` header `net/http` derived from a redirect's
+`Location` — that password reaches the SDK masked, so the header cannot be
+computed or matched, and reusing the request's own username does not account
+for it. `url.full`, `server.address` and `error.type` still identify such a
+request. Cookies the client's jar added to a redirected request are read from
+the jar and replaced in place, so such a message keeps everything but the
+cookie.
 
 ---
 

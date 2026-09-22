@@ -101,6 +101,11 @@ type SDK struct {
 	errorHandler *otelErrorHandler
 	logr         logr.Logger
 
+	// The configured endpoints and secrets Shutdown scrubs an exporter's
+	// error against, the same pair ErrorHandler and Logr already use.
+	diagnosticEndpoints []string
+	diagnosticSecrets   []string
+
 	shutdownOnce sync.Once
 	shutdownErr  error
 }
@@ -163,6 +168,7 @@ func (s *SDK) Shutdown(ctx context.Context) error {
 			err := fn(closerCtx)
 			cancel()
 			if err != nil {
+				err = s.redactError(err)
 				s.Logger.ErrorContext(ctx, "SDK component shutdown failed", slog.Any("error", err))
 				errs = append(errs, err)
 			}
@@ -170,6 +176,27 @@ func (s *SDK) Shutdown(ctx context.Context) error {
 		s.shutdownErr = errors.Join(errs...)
 	})
 	return s.shutdownErr
+}
+
+// redactError returns err with the configured endpoints' credentials and the
+// configured header values removed from its message, leaving the error chain
+// intact.
+//
+// An exporter's shutdown error is a net/http one, and net/http masks the
+// password in the URL it reports but keeps the username:
+//
+//	Post "http://alice:***@collector:4318/v1/traces": dial tcp: …
+//
+// The SDK redacts that same endpoint everywhere else it writes one — see
+// redact.URL, ErrorHandler and Logr — and its rule is that no "@" survives
+// into a record, which this message breaks.
+//
+// The returned error is redacted, not only the line Shutdown logs. The pattern
+// the guide documents is slog.Any("error", obs.Shutdown(ctx)) in the caller's
+// own defer, so scrubbing one record and handing the credential to the next
+// would leave the leak exactly where it was.
+func (s *SDK) redactError(err error) error {
+	return redact.Error(err, s.diagnosticEndpoints, s.diagnosticSecrets)
 }
 
 // shutdownBudget derives the context one closer runs under: an even share
@@ -186,6 +213,28 @@ func shutdownBudget(ctx context.Context, remaining int) (context.Context, contex
 		return ctx, func() {}
 	}
 	return context.WithTimeout(ctx, share)
+}
+
+// profilingStartFailureText renders a Pyroscope start failure for the warning
+// Init writes when profiling could not be enabled.
+//
+// It applies both rules, not only the endpoint one. This site used to pass no
+// secrets at all, which made it the only redaction in the SDK that could echo
+// a configured header value or the Basic credential an endpoint's userinfo
+// becomes: InText recognises structure, and neither of those has any. Whether
+// the pinned Pyroscope puts one in a start error today is beside the point —
+// the premise this package works from is that it does not get to choose what
+// an upstream formats into a message, and every sibling call site is given the
+// same set.
+//
+// It is a function rather than an expression inline in Init so that the set it
+// passes can be tested; an asymmetry nothing exercises is where all of these
+// have come from.
+func profilingStartFailureText(cfg *Config, err error) string {
+	return redact.Secrets(
+		redact.InText(err.Error(), cfg.profilingEndpoint),
+		diagnosticSecrets(cfg)...,
+	)
 }
 
 // shutdownSequence orders the per-pillar closers Shutdown runs. A nil
@@ -531,8 +580,15 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 				// parses the address and returns net/url's error verbatim).
 				// This record goes to stdout and the OTLP log pipeline, i.e.
 				// out of the process.
+				//
+				// The secrets are the same set every other redaction site in
+				// the SDK is given. This one used to pass none, which made it
+				// the only place a configured header value or the endpoint's
+				// derived Basic credential could be echoed — the two rules
+				// InText applies recognise structure, and neither of those has
+				// any.
 				slog.String("endpoint", redact.URL(cfg.profilingEndpoint)),
-				slog.String("error", redact.InText(startErr.Error(), cfg.profilingEndpoint)),
+				slog.String("error", profilingStartFailureText(cfg, startErr)),
 			)
 		} else {
 			profilerCloser = closer
@@ -571,6 +627,8 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		shutdowns:              shutdowns,
 		errorHandler:           errorHandler,
 		logr:                   newLogr(slog.New(stdoutHandler), diagnosticEndpoints, diagnosticSecrets(cfg)),
+		diagnosticEndpoints:    diagnosticEndpoints,
+		diagnosticSecrets:      diagnosticSecrets(cfg),
 	}, nil
 }
 
