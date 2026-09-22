@@ -104,23 +104,11 @@ func (s *logrSink) Info(level int, msg string, keysAndValues ...any) {
 	s.write(slogLevel(level), msg, msg, keysAndValues)
 }
 
-// ErrorText renders err for a diagnostic record without letting a broken
-// error value take the process down: a typed nil pointer is named rather
-// than dereferenced by its own Error method, and an Error method that
-// panics is recovered into a placeholder naming the type. A diagnostic is
-// never worth a crash. Both the logr sink and the SDK's ErrorHandler render
-// through it.
-func ErrorText(err error) (text string) {
-	if rv := reflect.ValueOf(err); rv.Kind() == reflect.Pointer && rv.IsNil() {
-		return fmt.Sprintf("<nil %T>", err)
-	}
-	defer func() {
-		if r := recover(); r != nil {
-			text = fmt.Sprintf("[omitted: %T panicked while rendering]", err)
-		}
-	}()
-	return err.Error()
-}
+// ErrorText renders err for a diagnostic record without letting a broken error
+// value take the process down. It forwards to redact.ErrorText, which is where
+// the SDK's error rendering and its redaction live together; this alias keeps
+// the sink's own call site reading as it did.
+func ErrorText(err error) string { return redact.ErrorText(err) }
 
 // Error implements logr.LogSink. The error text, with any configured
 // endpoint's credentials redacted, is carried as the "error" attribute and

@@ -202,6 +202,182 @@ adopters can plan their upgrades.
 
 ### Fixed
 
+- **Credentials no longer reach logs or spans through four paths that echoed a
+  configured endpoint.** The SDK's rule is that it never writes a
+  `scheme://user:pass@host` endpoint verbatim, because Go turns userinfo into a
+  Basic `Authorization` header and operators do configure them; these four sites
+  wrote one anyway.
+  - `profiling`: pyroscope-go formats the ingest URL into its own log messages
+    and redacts nothing — the password on every upload at DEBUG, and the
+    username (net/http masks only the password) on an upload failure at ERROR.
+    All three adapter methods now scrub the endpoint and the configured auth
+    header values.
+  - `nats`: `Connect`'s three error paths formatted the server list verbatim,
+    so a `nats://user:pass@host` password reached any caller logging the error.
+    nats.go's own error does not name the server; the facade added it. Each
+    entry of the comma-separated list is now redacted on its own.
+  - `resty`: the `url.full` span attribute recorded the outbound URL verbatim,
+    userinfo and presigned-URL signature included. It now follows semconv
+    v1.39.0 — userinfo replaced, and the values of `AWSAccessKeyId`,
+    `Signature`, `sig` and `X-Goog-Signature` replaced — matching what
+    otelhttp already did behind `o11yhttp.NewTransport`. Parameter order and
+    escaping are preserved, so the attribute still matches the upstream's
+    access log, and the request itself still authenticates.
+  - `Shutdown`: an exporter error is a net/http one, which masks the password
+    in the URL but keeps the username. Both the record `Shutdown` writes and
+    the error it returns are now scrubbed against the configured endpoints and
+    header values; the returned error still unwraps to the exporter's own, so
+    `errors.Is` and `errors.As` are unaffected.
+  - A **presigned** endpoint is covered too, not only a `user:pass@host` one.
+    A signature travels in the query, so such a URL has no `@` for the
+    userinfo rule to hold on to. `WithProfilingEndpoint` was the case that
+    showed it: pyroscope's uploader appends `/ingest` and re-encodes the query
+    before logging the URL, so the configured endpoint is no longer a
+    substring to substitute, and `?Signature=…` reached a DEBUG line on every
+    upload and an ERROR line on every failure. Endpoint redaction now replaces
+    the values of `AWSAccessKeyId`, `Signature`, `sig` and `X-Goog-Signature`
+    wherever the endpoint is recognised, and a log line holding a credential
+    query parameter the SDK did not redact itself is replaced wholesale.
+  - A configured header is now also matched in the form it is actually sent
+    as, not only as it was written. net/http trims a value's surrounding
+    whitespace and keys a name by its canonical MIME form, and the OTLP
+    exporter unescapes an `OTEL_EXPORTER_OTLP_HEADERS` value before trimming
+    it — so `" Bearer …"`, `x-api-key` and `%C2%A0Secret%C2%A0` reach the
+    server as `Bearer …`, `X-Api-Key` and `Secret`. Both exporters put a
+    non-2xx response body into the error they return, so a server echoing the
+    header it received named a string the configured form did not match. The
+    profiling header list now covers names as well as values, as the OTLP one
+    already did. A configured header is also matched as a JSON document holds
+    it — `encoding/json` escapes `<`, `>` and `&` — since both backends are Go
+    programs that report an error in a JSON body, and in the forms HTTP/2 uses:
+    names lowercased, and a `Cookie` value split and rejoined with `"; "`.
+  - The `Authorization: Basic …` header that `http.Client` derives from an
+    endpoint's userinfo is now redacted too, for the OTLP, metrics and
+    profiling endpoints alike, and for the address
+    `PYROSCOPE_ADHOC_SERVER_ADDRESS` overrides the profiling one with. It is
+    the credential in a form no other entry held — the base64 contains neither
+    the username nor the password as a substring — so a server echoing back
+    the header it received defeated every other rendering.
+  - The closed rules are no longer defeated by the encoding of their own
+    anchors. A Go server writing a JSON error body escapes `&` as `\u0026`;
+    one writing an HTML page writes `&amp;`, and can write `@` as `&commat;`.
+    In each case the character the rule holds on to is not in the text. The
+    rules are now asked about a decoded reading as well, and a line whose
+    escaping hides an `@` is replaced wholesale — the substitution runs on the
+    text as it stands and cannot reach what an escape covers. One decoder per
+    encoding, rather than a pattern listing spellings.
+  - `resty` spans no longer carry the `Authorization: Basic …` that
+    `http.Client` derives from a request URL's userinfo. A transport never sees
+    `user:pass@host` — the conversion happens before `RoundTrip` — so a
+    `RoundTripper` that names the header it was given put a credential into the
+    span's status description and `exception.message` that no URL redaction
+    could recognise.
+  - An opaque endpoint whose payload could be a `user:pass` pair is replaced
+    wholesale. `url.Parse` attributes nothing in one, so `http:alice:secret`
+    carried no userinfo and no `@` for the existing rule to catch. A
+    scheme-less `host:port` is still echoed: its payload is a single token and
+    cannot be a pair.
+  - `resty` spans no longer carry a credential the **caller** configured,
+    either. `SetAuthToken`, `SetBasicAuth`, a `Cookie`, or an `Authorization`
+    header set directly are handed to a transport this SDK does not own, and a
+    proxy wrapper, an auth middleware or a retry logger that names the header it
+    was given reports one in an error — a value that is not a URL, so no URL
+    redaction had anything to act on. The span's status description and
+    `exception.message` are now scrubbed against the credentials configured on
+    the request *and* on the client, including the header a client that sets its
+    own `HeaderAuthorizationKey` puts its token in.
+  - A secret is now recognised in the escapings **composed**, not only applied
+    one at a time. A server that HTML-escapes the header value it echoes and
+    then writes that string into a JSON error body produces `tok\u0026amp;en`
+    for `tok&en`, which matches none of the three single renderings. Those
+    compositions are listed, and a secret escaped more deeply than the list
+    goes now costs the line rather than the value: what cannot be replaced in
+    place — the replacement would have to be written into text that does not
+    contain it — is replaced by `[message redacted]`.
+  - The decoded readings a redaction decides on are now complete or refused.
+    Entities nest one layer per pass, so a URL escaped past the decoder's
+    budget still read as `&amp;Signature` when the budget ran out — an ordinary
+    parameter named `amp;Signature` to every rule, which let the signature
+    through in full. Text still decoding at the bound is now replaced
+    wholesale, and the same applies to an opaque endpoint's payload: `%253A` is
+    an escaped `%3A` is a `:`, so `http:alice%253Asecret%2540host` held neither
+    delimiter after the single unescape it used to get. The escapes `%q` writes
+    joined the decoders too, so the readings cover the three renderings this
+    SDK says a secret can arrive in rather than two of them.
+  - A percent-encoded credential is now read as one. `url.Parse` leaves an
+    opaque URL's payload escaped, so a transport error repeating
+    `alice%3Asecret%40host` carried a reversible `alice:secret@host` with no
+    `:` or `@` for either closed rule to hold on to. Percent-decoding joined
+    the readings a redaction is decided on, alongside the HTML, JSON and `%q`
+    ones.
+  - A credential a **redirect** introduced is refused rather than echoed.
+    `net/http` derives `Authorization: Basic …` from userinfo for every hop, so
+    a `Location` carrying `user:pass@host` puts a credential on the wire that
+    the request never held — and by the time the error arrives, `net/http` has
+    masked that password as `***`, so the header cannot be computed. A message
+    naming one is given up whole unless the caller's own secret list holds a
+    Basic for that username; `url.full`, `server.address` and `error.type`
+    still identify the request. Where a URL in the chain does still carry its
+    password — a custom transport's own error carries a URL this SDK never had
+    — the derived header is computed and replaced instead, so the message
+    survives.
+  - A credential a redirect introduced is now refused even when it **reuses the
+    username**. `net/http` strips the `Authorization` header on a redirect to
+    another host and derives a fresh one from the `Location`, so
+    `alice:oldpass` on the request and `alice:newsecret` on the `Location` are
+    two credentials with one name, and asking only whether a Basic for that
+    username was listed answered yes about a credential the SDK had never seen.
+    The URL must now also be one the caller named — same scheme, same host,
+    same user. (That was not the whole of it: a **same-host** redirect derives a
+    second header too, which the entry below corrects and closes.)
+  - A session cookie a redirect picked up no longer reaches a span. `net/http`
+    builds its own request for a redirect and fills its `Cookie` header from
+    the client's jar — including a cookie the redirect response itself set — so
+    the cookie never appears on the request `resty` holds. The jar is now asked
+    about the URLs the error names, which is where what was actually sent can
+    be read.
+  - A redacted query followed by a fragment keeps its line.
+    `?Signature=%5Bredacted%5D#section` was read through the `#`, so this
+    SDK's own placeholder looked like a signature it had never seen and the
+    whole diagnostic was given up over it.
+  - A cookie is matched in the form it is **sent**, not only the form it is
+    held in. `Request.AddCookie` drops every byte a cookie value cannot carry
+    and quotes what is left when it holds a space or a comma, so a jar value of
+    `sec\nret` goes on the wire as `session=secret` — a string neither the
+    stored value nor `name=value` matches. The sanitisation is reimplemented
+    (driving `AddCookie` would write "invalid byte" lines to the standard
+    logger from inside a redaction) and pinned against `net/http`'s own output.
+  - A configured credential that is *itself* `[redacted]` no longer passes
+    through as though it had been scrubbed. Replacing it was a no-op, and the
+    value came back indistinguishable from the genuine redaction beside it in
+    the same line. Such a message is now replaced wholesale — the third
+    collision this rule has had with its own output, after the `redacted@`
+    strip and the sentinel swap.
+  - A credential **no list could have held** is now refused by a
+    post-condition rather than chased with another list. After everything this
+    package can replace has been replaced, text still carrying an HTTP
+    credential the RFCs define — a `Basic` token that decodes to something
+    holding a colon (RFC 7617), or a `Digest` credential with its `response`
+    parameter (RFC 7616) — is one nothing accounted for, and the message is
+    replaced wholesale. It catches two cases no secret list can reach: the
+    Basic header `net/http` derives from a redirect's `Location` (for a
+    **same-host** redirect too — the header derived for the first hop lives on
+    a fork inside `send` and is not among the headers `makeHeadersCopier`
+    carries over, so there is nothing to reuse and a second one is derived),
+    and the `Authorization: Digest …` resty's digest transport signs on a copy
+    of the request that no caller ever sees. Prose is not refused: "Basic
+    authentication failed" holds no valid base64, and `Bearer` is deliberately
+    not checked, having no structure that separates a token from a sentence.
+  - `resty` lists a credential-carrying header's **name** as well as its value,
+    which the profiling and diagnostic lists already did. `net/http` quotes an
+    unusable name straight back — `invalid header field name "…"` — so a
+    credential pasted into the name side of a header configuration reached the
+    span.
+  - `Shutdown` can no longer be held by an error from a dependency. The walk
+    that finds the URLs in an error chain is now bounded by the number of
+    errors it visits rather than by how deep it goes: once `Unwrap` returns a
+    slice, an error holding itself twice branches in two at every step, so a
+    depth cap alone bounded nothing.
 - `mongo`: `db.client.connection.count{state=idle}` no longer drifts below the
   pool's real size. The v2 driver creates a connection before it handshakes and,
   when the handshake fails, removes it with a `ConnectionClosed` event and no

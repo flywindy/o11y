@@ -363,6 +363,112 @@ func TestConnect_RejectsNilProviders(t *testing.T) {
 	})
 }
 
+// TestConnect_ErrorsRedactTheServerCredentials pins that none of the three
+// error paths in Connect echoes a password from the server list.
+//
+// nats://user:pass@host is a working authentication mechanism, so an operator
+// may configure one. nats.go's own connect error does not name the server —
+// this facade adds it — and the SDK's logging pattern, slog.Any("error", err),
+// puts whatever the message holds onto stdout and into the OTLP log pipeline.
+func TestConnect_ErrorsRedactTheServerCredentials(t *testing.T) {
+	tp, prop, _ := newTestProviders()
+	const (
+		// #nosec G101 -- fabricated fixture endpoint, not a live credential
+		// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+		url = "nats://alice:s3cr3t@127.0.0.1:1"
+		// #nosec G101 -- the same fixture password, to assert on its absence
+		// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+		password = "s3cr3t"
+	)
+
+	assertRedacted := func(t *testing.T, err error) {
+		t.Helper()
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), password, "the server password must not reach the error message")
+		assert.Contains(t, err.Error(), "127.0.0.1:1", "the server still has to be identifiable")
+	}
+
+	t.Run("nil tracer provider", func(t *testing.T) {
+		_, err := o11ynats.Connect(context.Background(), url, nil, prop)
+		assertRedacted(t, err)
+	})
+
+	t.Run("nil propagator", func(t *testing.T) {
+		_, err := o11ynats.Connect(context.Background(), url, tp, nil)
+		assertRedacted(t, err)
+	})
+
+	t.Run("upstream connect failure", func(t *testing.T) {
+		_, err := o11ynats.Connect(context.Background(), url, tp, prop)
+		assertRedacted(t, err)
+	})
+}
+
+// TestConnect_ErrorRedactsEveryServerInTheList pins that a comma-separated
+// server list — the form nats.Connect accepts — is redacted entry by entry
+// rather than parsed as one URL, and that an entry without credentials is
+// echoed as the operator wrote it.
+func TestConnect_ErrorRedactsEveryServerInTheList(t *testing.T) {
+	tp, prop, _ := newTestProviders()
+
+	_, err := o11ynats.Connect(context.Background(),
+		"nats://alice:first@127.0.0.1:1, nats://bob:second@127.0.0.2:1,nats://127.0.0.3:1", tp, prop)
+
+	require.Error(t, err)
+	message := err.Error()
+	assert.NotContains(t, message, "first")
+	assert.NotContains(t, message, "second")
+	assert.Contains(t, message, "127.0.0.1:1")
+	assert.Contains(t, message, "127.0.0.2:1")
+	assert.Contains(t, message, "nats://127.0.0.3:1", "an entry with no credentials is left alone")
+}
+
+// TestConnect_ErrorRedactsASchemeLessAuthToken pins that an entry with no
+// scheme is redacted too.
+//
+// nats.go normalises the server list before parsing it: parseServerURL
+// prepends the connection scheme to anything without "://", so
+// "token@localhost" is "nats://token@localhost" and that userinfo is an
+// authentication token. url.Parse on the raw form puts the whole entry in
+// Path, where no userinfo is possible, so a redactor reading it as written
+// would echo the token.
+func TestConnect_ErrorRedactsASchemeLessAuthToken(t *testing.T) {
+	tp, prop, _ := newTestProviders()
+
+	for _, entry := range []string{
+		// #nosec G101 -- fabricated fixture token, not a live credential
+		// nosemgrep: gosec.G101-1
+		"s3cr3ttoken@127.0.0.1:1",
+		// #nosec G101 -- fabricated fixture token, not a live credential
+		// nosemgrep: gosec.G101-1
+		"s3cr3ttoken@127.0.0.1",
+	} {
+		t.Run(entry, func(t *testing.T) {
+			_, err := o11ynats.Connect(context.Background(), entry, tp, prop)
+
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), "s3cr3ttoken",
+				"a scheme-less entry's userinfo is an auth token, not a path")
+			assert.Contains(t, err.Error(), "127.0.0.1", "the server still has to be identifiable")
+		})
+	}
+}
+
+// TestConnect_ErrorRedactsTheWrappedUpstreamError pins that the error this
+// facade wraps is redacted as well as the URL it adds.
+//
+// A malformed server URL makes nats.go return net/url's parse error, which
+// quotes the URL verbatim. Redacting only the facade's own copy would leave
+// the credential in the wrapped half of the same message.
+func TestConnect_ErrorRedactsTheWrappedUpstreamError(t *testing.T) {
+	tp, prop, _ := newTestProviders()
+
+	_, err := o11ynats.Connect(context.Background(), "nats://alice:s3cr3t@127.0.0.1:1/%zz", tp, prop)
+
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "s3cr3t", "net/url quotes the whole URL in its parse error")
+}
+
 func TestConnect_InvalidURL(t *testing.T) {
 	tp, prop, _ := newTestProviders()
 

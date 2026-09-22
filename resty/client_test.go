@@ -3,11 +3,15 @@ package resty
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -25,6 +29,8 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
+
+	"github.com/flywindy/o11y/internal/redact"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -106,6 +112,245 @@ func TestWrapRecordsComposedRestyURL(t *testing.T) {
 	spans := endedClientSpans(sr)
 	require.Len(t, spans, 1)
 	assertAttr(t, spans[0], semconv.URLFullKey, ts.URL+"/orders/123?include=items")
+}
+
+// TestWrapRedactsCredentialsFromURLFull pins that the url.full span attribute
+// carries neither the request's userinfo nor a presigned URL's signature.
+//
+// A span attribute leaves the process exactly as a log record does. otelhttp,
+// the SDK's other client facade, already strips userinfo before emitting
+// url.full, so the same call used to be redacted through o11yhttp.NewTransport
+// and not through this one. semconv v1.39.0 asks for the query parameters too.
+func TestWrapRedactsCredentialsFromURLFull(t *testing.T) {
+	tp, mp, sr := testProviders()
+	var gotAuth string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	host := strings.TrimPrefix(ts.URL, "http://")
+	client := NewClient(tp, mp, propagation.TraceContext{})
+
+	resp, err := client.R().
+		SetQueryParam("Signature", "abc+def").
+		SetQueryParam("include", "items").
+		Get("http://bob:hunter2@" + host + "/orders")
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode())
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	full := attrValue(t, spans[0], semconv.URLFullKey).AsString()
+
+	assert.NotContains(t, full, "hunter2", "the request's password must not reach url.full")
+	// The signature is checked in its encoded form: resty escapes the value
+	// into the query, so "abc+def" never appears literally and asserting on it
+	// would pass whether or not the redaction ran.
+	assert.NotContains(t, full, "abc%2Bdef", "nor the signature of a presigned URL")
+	assert.Contains(t, full, host, "the server still has to be identifiable")
+	assert.Contains(t, full, "include=items", "and the rest of the query is left alone")
+
+	// The redaction is for the attribute only: the request itself still
+	// authenticates, so clearing userinfo on the caller's URL would break it.
+	assert.NotEmpty(t, gotAuth, "userinfo must still reach the server as Basic auth")
+}
+
+// TestRequestTarget_FailsClosedOnUnresolvableURLs pins that the fallbacks
+// taken before resty has built a RawRequest never put a raw URL on the span.
+//
+// finishError reads the target before RawRequest exists, so these paths run in
+// practice. Two shapes get past an IsAbs check while still carrying a
+// credential: a scheme-relative URL, where url.Parse sets User but reports the
+// URL as not absolute, and an opaque one, where the credential lands in Opaque
+// and User stays nil.
+func TestRequestTarget_FailsClosedOnUnresolvableURLs(t *testing.T) {
+	tests := []struct {
+		name   string
+		rawURL string
+		want   string
+	}{
+		{
+			name: "scheme-relative URL carries userinfo past IsAbs",
+			// #nosec G101 -- fabricated fixture URL, not a live credential
+			// nosemgrep: gosec.G101-1
+			rawURL: "//bob:hunter2@api.example.com/orders",
+			want:   "//redacted@api.example.com/orders",
+		},
+		{
+			name: "an opaque URL hides the credential from the parser",
+			// #nosec G101 -- fabricated fixture URL, not a live credential
+			// nosemgrep: gosec.G101-1
+			rawURL: "http:bob:hunter2@api.example.com",
+			want:   "[endpoint redacted]",
+		},
+		{
+			name:   "an ordinary relative path is left alone",
+			rawURL: "/orders/123?include=items",
+			want:   "/orders/123?include=items",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// A nil client is the no-base-URL fallback; req.RawRequest is nil
+			// because resty has not built one yet.
+			target := requestTarget(nil, &restyclient.Request{URL: tt.rawURL})
+
+			assert.NotContains(t, target.fullURL, "hunter2")
+			assert.Equal(t, tt.want, target.fullURL)
+		})
+	}
+}
+
+// TestRequestTarget_DropsAnUnparseableURL pins that a URL the parser rejects
+// contributes nothing: it could be hiding a credential in any position, and
+// there is no reading of it that says otherwise.
+func TestRequestTarget_DropsAnUnparseableURL(t *testing.T) {
+	target := requestTarget(nil, &restyclient.Request{URL: "http://%zz"})
+
+	assert.Empty(t, target.fullURL)
+}
+
+// TestWrapRedactsCredentialsFromTheErrorSpan pins that a failed request does
+// not export through the span's error fields what url.full had removed.
+//
+// Go's client error is a *url.Error holding the request URL: net/http masks the
+// password there but keeps the username and the whole query. That text reaches
+// the span twice — as the status description and as exception.message — so
+// redacting only the attribute would move the credential rather than remove it.
+func TestWrapRedactsCredentialsFromTheErrorSpan(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+
+	// Port 1 refuses immediately, so the failure is a transport error whose
+	// *url.Error carries the request URL.
+	_, err := client.R().
+		SetQueryParam("Signature", "abc+def").
+		Get("http://bob:hunter2@127.0.0.1:1/orders")
+	require.Error(t, err)
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	span := spans[0]
+
+	assert.NotContains(t, span.Status().Description, "bob",
+		"the username survives net/http's masking, so the SDK has to remove it")
+	assert.NotContains(t, span.Status().Description, "abc%2Bdef",
+		"and so does a presigned URL's signature")
+	assert.Contains(t, span.Status().Description, "127.0.0.1:1",
+		"the server still has to be identifiable")
+
+	var exception sdktrace.Event
+	for _, event := range span.Events() {
+		if event.Name == semconv.ExceptionEventName {
+			exception = event
+		}
+	}
+	require.Equal(t, semconv.ExceptionEventName, exception.Name, "the error is still recorded as an exception")
+
+	var message, exceptionType string
+	for _, attr := range exception.Attributes {
+		switch attr.Key {
+		case semconv.ExceptionMessageKey:
+			message = attr.Value.AsString()
+		case semconv.ExceptionTypeKey:
+			exceptionType = attr.Value.AsString()
+		}
+	}
+	assert.NotContains(t, message, "bob")
+	assert.NotContains(t, message, "abc%2Bdef")
+	// The regression to catch is the exception being recorded as a redaction
+	// wrapper. The hook is handed resty's own *resty.ResponseError — not the
+	// *url.Error that Get returns to the caller — and the redaction still
+	// reaches the *url.Error inside it through errors.As.
+	assert.NotContains(t, exceptionType, "redact",
+		"the exception must not be recorded as the redaction wrapper's type")
+	assert.Equal(t, "*resty.ResponseError", exceptionType,
+		"it is the error the hook was handed, unchanged")
+
+}
+
+// TestWrapRedactsANestedTransportError pins that a credential inside a URL the
+// SDK never saw — one a custom RoundTripper put in its own error — does not
+// reach either of the span's error fields.
+//
+// resty accepts a custom transport, and net/http wraps whatever it returns in
+// an outer *url.Error. The inner one carries its own URL, quoted into the same
+// message, and a signed query holds its credential with no "@" anywhere, so
+// neither substituting the outer URL nor the closed at-sign rule would catch
+// it. A URL that cannot be parsed takes the whole message with it; url.full,
+// server.address and error.type still identify the request.
+func TestWrapRedactsANestedTransportError(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.SetTransport(roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		// #nosec G101 -- fabricated fixture URL, not a live credential
+		// nosemgrep: gosec.G101-1
+		return nil, &url.Error{Op: "Get", URL: "https://inner/%zz?Signature=s3cret", Err: errors.New("dial")}
+	}))
+
+	_, err := client.R().Get("https://api.example.com/orders")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "s3cret", "the premise: the credential is in the error resty is handed")
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	span := spans[0]
+
+	assert.NotContains(t, span.Status().Description, "s3cret")
+	for _, event := range span.Events() {
+		for _, attr := range event.Attributes {
+			assert.NotContains(t, attr.Value.AsString(), "s3cret",
+				"no span event may carry it either")
+		}
+	}
+}
+
+// roundTripperFunc adapts a function to http.RoundTripper.
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+// RoundTrip implements http.RoundTripper.
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// TestExceptionType_MatchesTheSDKRendering pins that the exception type this
+// package records is the one span.RecordError would have recorded.
+//
+// Building the event by hand was necessary to keep the type while redacting the
+// message, but it put the naming in this package's hands. The OTel SDK reports
+// a named type with its full import path, which is what semconv asks for and
+// what a backend groups on; %T reports the short package name instead. A
+// pointer type renders the same either way, so a named non-pointer error — the
+// shape a caller's own OnBeforeRequest hook can return — is what separates them.
+func TestExceptionType_MatchesTheSDKRendering(t *testing.T) {
+	for _, err := range []error{
+		namedError{},          // a named non-pointer type: the case %T gets wrong
+		&namedError{},         // a pointer to it
+		errors.New("builtin"), // an unexported stdlib type
+		&url.Error{Op: "Get"}, // the shape the client path actually produces
+	} {
+		t.Run(sdkExceptionType(err), func(t *testing.T) {
+			assert.Equal(t, sdkExceptionType(err), exceptionType(err))
+		})
+	}
+}
+
+// namedError is a named, non-pointer error type, the shape whose rendering
+// differs between %T and the SDK's.
+type namedError struct{}
+
+// Error implements error.
+func (namedError) Error() string { return "named" }
+
+// sdkExceptionType reproduces the pinned OTel SDK's typeStr
+// (sdk/trace/span.go), so the assertion is against the upstream rule rather
+// than against a copy of this package's own implementation.
+func sdkExceptionType(i any) string {
+	t := reflect.TypeOf(i)
+	if t.PkgPath() == "" && t.Name() == "" {
+		return t.String()
+	}
+	return fmt.Sprintf("%s.%s", t.PkgPath(), t.Name())
 }
 
 func TestWrapIsIdempotent(t *testing.T) {
@@ -401,6 +646,19 @@ func endedClientSpans(sr *tracetest.SpanRecorder) []sdktrace.ReadOnlySpan {
 		}
 	}
 	return out
+}
+
+// attrValue returns the value span recorded for key, failing the test when the
+// attribute is absent.
+func attrValue(t *testing.T, span sdktrace.ReadOnlySpan, key attribute.Key) attribute.Value {
+	t.Helper()
+	for _, attr := range span.Attributes() {
+		if attr.Key == key {
+			return attr.Value
+		}
+	}
+	t.Fatalf("span %q has no %s attribute", span.Name(), key)
+	return attribute.Value{}
 }
 
 func assertAttr(t *testing.T, span sdktrace.ReadOnlySpan, key attribute.Key, want any) {
@@ -701,4 +959,552 @@ func TestClonedClientResolvesAgainstItsOwnBaseURL(t *testing.T) {
 	require.Len(t, spans, 1)
 	assertAttr(t, spans[0], semconv.ServerAddressKey, "cloned.internal")
 	assertAttr(t, spans[0], semconv.ServerPortKey, int64(2222))
+}
+
+// authReportingTransport is the shape the review named: a RoundTripper that
+// names the Authorization header it was handed. A proxy wrapper, an auth
+// middleware or a retry logger can all do this.
+type authReportingTransport struct{}
+
+func (authReportingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	//nolint:err113 // the point is an error naming the header, not a sentinel
+	return nil, fmt.Errorf("upstream refused Authorization: %s", r.Header.Get("Authorization"))
+}
+
+// TestWrapRedactsTheURLDerivedBasicHeaderFromTheErrorSpan pins the credential
+// a transport sees in place of the URL's userinfo.
+//
+// http.Client converts "user:pass@host" into "Authorization: Basic
+// base64(user:pass)" before RoundTrip is called, so a transport never sees the
+// userinfo — it sees an opaque token containing neither half as a substring.
+// No URL redaction can recognise it, which is why it has to be named as a
+// secret rather than found.
+func TestWrapRedactsTheURLDerivedBasicHeaderFromTheErrorSpan(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.SetTransport(authReportingTransport{})
+
+	// #nosec G101 -- fabricated fixture credential, not a live one
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const password = "hunter2Secret"
+	token := base64.StdEncoding.EncodeToString([]byte("bob:" + password))
+	require.NotContains(t, token, password, "the premise: the wire form hides the password")
+
+	_, err := client.R().Get("http://bob:" + password + "@127.0.0.1:1/orders")
+	require.Error(t, err)
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	span := spans[0]
+
+	var message string
+	for _, event := range span.Events() {
+		if event.Name != semconv.ExceptionEventName {
+			continue
+		}
+		for _, attr := range event.Attributes {
+			if attr.Key == semconv.ExceptionMessageKey {
+				message = attr.Value.AsString()
+			}
+		}
+	}
+	require.NotEmpty(t, message, "the error is recorded as an exception")
+
+	for name, text := range map[string]string{
+		"status description": span.Status().Description,
+		"exception.message":  message,
+	} {
+		assert.NotContains(t, text, token, name+" must not carry the derived credential")
+		assert.NotContains(t, text, password, name+" must not carry the password either")
+	}
+}
+
+// TestWrapRedactsTheConfiguredRequestCredentials pins that a credential the
+// caller configured — rather than one this SDK derived from the URL — is
+// removed from both of the span's error fields.
+//
+// urlDerivedSecrets covered only the Basic header http.Client builds out of a
+// URL's userinfo. A caller who uses SetAuthToken or sets Authorization directly
+// hands the token to a transport this package does not own, and a proxy
+// wrapper, an auth middleware or a retry logger that names the header it was
+// given puts it in an error. It is not a URL, so nothing in the URL redaction
+// has anything to act on: it has to be named.
+func TestWrapRedactsTheConfiguredRequestCredentials(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.SetTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("proxy rejected header %q and cookie %q",
+			r.Header.Get("Authorization"), r.Header.Get("Cookie"))
+	}))
+
+	// #nosec G101 -- fabricated fixture credentials, not live ones
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const token, cookie = "s3cret-bearer-token", "c00kie-value"
+
+	_, err := client.R().
+		SetAuthToken(token).
+		SetCookie(&http.Cookie{Name: "sess", Value: cookie}).
+		Get("https://api.example.com/orders")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), token, "the premise: the token is in the error the hook is handed")
+	require.Contains(t, err.Error(), cookie, "and so is the cookie")
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	span := spans[0]
+
+	assert.NotContains(t, span.Status().Description, token)
+	assert.NotContains(t, span.Status().Description, cookie)
+	assert.Contains(t, span.Status().Description, "api.example.com",
+		"the server still has to be identifiable")
+	for _, event := range span.Events() {
+		for _, attr := range event.Attributes {
+			assert.NotContains(t, attr.Value.AsString(), token, "no span event may carry it either")
+			assert.NotContains(t, attr.Value.AsString(), cookie)
+		}
+	}
+}
+
+// TestWrapRedactsTheClientLevelCredentials pins the half of that set which
+// stops being reachable once beforeRequest returns.
+//
+// resty passes the invoking client to no other hook, so a token or a
+// basic-auth pair configured on the client — rather than on the request — is
+// only in hand at that one moment. It is resolved there and carried on the
+// request state, the same way the target is.
+func TestWrapRedactsTheClientLevelCredentials(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	// #nosec G101 -- fabricated fixture credential, not a live one
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	client.SetBasicAuth("alice", "hunter2")
+	client.SetTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("proxy rejected header %q", r.Header.Get("Authorization"))
+	}))
+
+	basic := base64.StdEncoding.EncodeToString([]byte("alice:hunter2"))
+
+	_, err := client.R().Get("https://api.example.com/orders")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), basic,
+		"the premise: what reaches the error is the base64, which holds neither half")
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	assert.NotContains(t, spans[0].Status().Description, basic)
+	assert.NotContains(t, spans[0].Status().Description, "hunter2")
+}
+
+// TestWrapRedactsACallersOwnAuthorizationHeaderKey pins the one case a rule on
+// header names cannot reach on its own: resty lets the caller move its token to
+// a header of their choosing, and the name they chose need not read like a
+// credential. The client knows which header that is, so the hook asks it rather
+// than guessing from the name.
+func TestWrapRedactsACallersOwnAuthorizationHeaderKey(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.HeaderAuthorizationKey = "X-Tenant-Hdr"
+	client.SetTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("proxy rejected header %q", r.Header.Get("X-Tenant-Hdr"))
+	}))
+
+	// #nosec G101 -- fabricated fixture credential, not a live one
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const token = "s3cret-bearer-token"
+	require.False(t, redact.CredentialHeaderName("X-Tenant-Hdr"),
+		"the premise: nothing about this name says it carries one")
+
+	_, err := client.R().SetAuthToken(token).Get("https://api.example.com/orders")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), token, "and the token is in the error")
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	assert.NotContains(t, spans[0].Status().Description, token)
+}
+
+// TestWrapRedactsAnOpaqueRequestURLPayload pins the percent-encoded reading of
+// a request URL's own payload.
+//
+// url.Parse leaves an opaque URL's payload untouched, escapes and all, and a
+// transport that reports what it could not dial repeats it. The outer
+// *url.Error is redacted by the URL rule; the repeated payload is plain text
+// where ":" and "@" arrive as "%3A" and "%40", so neither closed rule had an
+// anchor and the credential was exported by both span fields.
+func TestWrapRedactsAnOpaqueRequestURLPayload(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.SetTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("cannot dial opaque target %s", r.URL.Opaque)
+	}))
+
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	_, err := client.R().Get("http:alice%3Asecret%40host")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "alice%3Asecret%40host",
+		"the premise: the payload is in the error the hook is handed")
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	span := spans[0]
+
+	assert.NotContains(t, span.Status().Description, "alice%3Asecret%40host")
+	assert.NotContains(t, span.Status().Description, "secret")
+	for _, event := range span.Events() {
+		for _, attr := range event.Attributes {
+			assert.NotContains(t, attr.Value.AsString(), "alice%3Asecret%40host",
+				"no span event may carry it either")
+		}
+	}
+}
+
+// TestWrapRefusesACredentialARedirectIntroduced pins the one credential this
+// package cannot name: net/http derives an Authorization header per hop, so a
+// redirect whose Location carries userinfo puts a Basic on the wire that the
+// request never held, and the password reaches the error masked as "***".
+//
+// A transport that names the header it was given therefore reports a base64
+// nothing here can compute or match. The message is given up whole; url.full,
+// server.address and error.type still identify the request.
+func TestWrapRefusesACredentialARedirectIntroduced(t *testing.T) {
+	tp, mp, sr := testProviders()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// #nosec G101 -- fabricated fixture credential, not a live one
+		// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+		http.Redirect(w, r, "http://alice:hunter2@"+r.Host+"/final", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	basic := base64.StdEncoding.EncodeToString([]byte("alice:hunter2"))
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	base := http.DefaultTransport
+	client.SetTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/final" {
+			return nil, fmt.Errorf("proxy rejected header %q", r.Header.Get("Authorization"))
+		}
+		return base.RoundTrip(r)
+	}))
+
+	_, err := client.R().Get(srv.URL + "/start")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), basic,
+		"the premise: net/http derived the header from the Location and the error names it")
+	require.NotContains(t, err.Error(), "hunter2",
+		"and the password is masked, so the header cannot be computed here")
+
+	spans := endedClientSpans(sr)
+	require.NotEmpty(t, spans)
+	span := spans[len(spans)-1]
+
+	assert.NotContains(t, span.Status().Description, basic)
+	for _, event := range span.Events() {
+		for _, attr := range event.Attributes {
+			assert.NotContains(t, attr.Value.AsString(), basic)
+		}
+	}
+	var host string
+	for _, attr := range span.Attributes() {
+		if attr.Key == semconv.ServerAddressKey {
+			host = attr.Value.AsString()
+		}
+	}
+	assert.NotEmpty(t, host, "the request is still identifiable without its message")
+}
+
+// TestWrapRefusesACrossHostRedirectReusingTheUsername pins the hole that the
+// first version of the redirect rule left: it asked only whether a Basic for
+// that username had been listed, and the original request's own credential
+// answered yes for a different one.
+//
+// net/http strips the Authorization header on a redirect to another host
+// (shouldCopyHeaderOnRedirect) and derives a fresh one from the Location, so
+// "alice:oldpass" on the request and "alice:newsecret" on the Location are two
+// credentials with one username.
+func TestWrapRefusesACrossHostRedirectReusingTheUsername(t *testing.T) {
+	tp, mp, sr := testProviders()
+
+	final := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer final.Close()
+	start := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// #nosec G101 -- fabricated fixture credential, not a live one
+		// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+		http.Redirect(w, r, "http://alice:newsecret@"+final.Listener.Addr().String()+"/final", http.StatusFound)
+	}))
+	defer start.Close()
+
+	newBasic := base64.StdEncoding.EncodeToString([]byte("alice:newsecret"))
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	base := http.DefaultTransport
+	client.SetTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/final" {
+			return nil, fmt.Errorf("proxy rejected header %q", r.Header.Get("Authorization"))
+		}
+		return base.RoundTrip(r)
+	}))
+
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	_, err := client.R().Get("http://alice:oldpass@" + start.Listener.Addr().String() + "/start")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), newBasic,
+		"the premise: the credential on the wire is the one the Location introduced")
+
+	spans := endedClientSpans(sr)
+	require.NotEmpty(t, spans)
+	span := spans[len(spans)-1]
+
+	assert.NotContains(t, span.Status().Description, newBasic)
+	for _, event := range span.Events() {
+		for _, attr := range event.Attributes {
+			assert.NotContains(t, attr.Value.AsString(), newBasic)
+		}
+	}
+}
+
+// TestWrapRedactsACookieTheJarAddedToARedirect pins the credential that never
+// touches the request this package holds.
+//
+// net/http builds its own request for a redirect and fills its Cookie header
+// from the client's jar — including a cookie the redirect response itself set
+// — so a session cookie reaches the wire without appearing on resty's request
+// at all. The jar is asked about the URLs the error names, which is where the
+// cookies that were actually sent can be read from.
+func TestWrapRedactsACookieTheJarAddedToARedirect(t *testing.T) {
+	tp, mp, sr := testProviders()
+
+	// #nosec G101 -- fabricated fixture credential, not a live one
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const sessionCookie = "s3ssion-c00kie"
+	// The cookie is scoped to the path the redirect leads to, so it is
+	// reachable only through the URL the error names — asking the jar about
+	// the request resty holds returns nothing. That is what makes this test
+	// load-bearing for the part of the fix that walks the error's URLs; a
+	// cookie on "/" would have been found either way.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			http.SetCookie(w, &http.Cookie{Name: "session", Value: sessionCookie, Path: "/final"})
+			http.Redirect(w, r, "/final", http.StatusFound)
+		}
+	}))
+	defer srv.Close()
+
+	jar, err := cookiejar.New(nil)
+	require.NoError(t, err)
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.GetClient().Jar = jar
+	base := http.DefaultTransport
+	client.SetTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/final" {
+			return nil, fmt.Errorf("proxy rejected cookie %q", r.Header.Get("Cookie"))
+		}
+		return base.RoundTrip(r)
+	}))
+
+	_, err = client.R().Get(srv.URL + "/start")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), sessionCookie,
+		"the premise: the cookie went on the wire and the error names it")
+
+	startURL, parseErr := url.Parse(srv.URL + "/start")
+	require.NoError(t, parseErr)
+	require.Empty(t, jar.Cookies(startURL),
+		"the premise: the request resty holds is not a URL this cookie is sent to")
+
+	spans := endedClientSpans(sr)
+	require.NotEmpty(t, spans)
+	span := spans[len(spans)-1]
+
+	assert.NotContains(t, span.Status().Description, sessionCookie)
+	assert.Contains(t, span.Status().Description, "/final",
+		"and the message survives: the cookie is replaced, not the line")
+	for _, event := range span.Events() {
+		for _, attr := range event.Attributes {
+			assert.NotContains(t, attr.Value.AsString(), sessionCookie)
+		}
+	}
+}
+
+// TestWrapRedactsTheSerializedFormOfAJarCookie pins the form a cookie takes on
+// the wire rather than the form the jar holds.
+//
+// A jar accepts a value net/http will not send verbatim: AddCookie drops every
+// byte a cookie value cannot carry, so "sec\nret" in the jar leaves as
+// "session=secret". Neither the stored value nor "name=value" matches that, so
+// an error naming the Cookie header reported a credential no list held.
+//
+// The cookie is scoped to the path the redirect leads to, so it is not on the
+// request resty holds — otherwise the header secrets read from that request
+// would cover the sanitised form and the test would pass either way.
+func TestWrapRedactsTheSerializedFormOfAJarCookie(t *testing.T) {
+	tp, mp, sr := testProviders()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			http.Redirect(w, r, "/final", http.StatusFound)
+		}
+	}))
+	defer srv.Close()
+
+	// #nosec G101 -- fabricated fixture credential, not a live one
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	const held, sent = "sec\nret", "secret"
+	jar, err := cookiejar.New(nil)
+	require.NoError(t, err)
+	base, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+	jar.SetCookies(base, []*http.Cookie{{Name: "session", Value: held, Path: "/final"}})
+
+	startURL, err := url.Parse(srv.URL + "/start")
+	require.NoError(t, err)
+	require.Empty(t, jar.Cookies(startURL),
+		"the premise: the cookie is not on the request resty holds")
+
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.GetClient().Jar = jar
+	transport := http.DefaultTransport
+	client.SetTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/final" {
+			return nil, fmt.Errorf("proxy rejected cookie %q", r.Header.Get("Cookie"))
+		}
+		return transport.RoundTrip(r)
+	}))
+
+	_, err = client.R().Get(srv.URL + "/start")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "session="+sent,
+		"the premise: what went on the wire is the sanitised value, not the stored one")
+
+	spans := endedClientSpans(sr)
+	require.NotEmpty(t, spans)
+	span := spans[len(spans)-1]
+
+	assert.NotContains(t, span.Status().Description, sent)
+	for _, event := range span.Events() {
+		for _, attr := range event.Attributes {
+			assert.NotContains(t, attr.Value.AsString(), sent)
+		}
+	}
+}
+
+// TestWrapRefusesACredentialASameHostRedirectIntroduced pins the case that
+// disproved this package's earlier reasoning.
+//
+// The rule added a round before assumed net/http reuses the first hop's
+// Authorization on a same-host redirect. It does not: the header it derived
+// for that hop lives on a fork inside send, and makeHeadersCopier captured the
+// initial request's headers before that fork existed (client.go:604). So a
+// same-host Location carrying different userinfo produces a *second*
+// credential, which no list here has ever seen.
+func TestWrapRefusesACredentialASameHostRedirectIntroduced(t *testing.T) {
+	tp, mp, sr := testProviders()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			// #nosec G101 -- fabricated fixture credential, not a live one
+			// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+			http.Redirect(w, r, "http://alice:newsecret@"+r.Host+"/final", http.StatusFound)
+		}
+	}))
+	defer srv.Close()
+
+	newBasic := base64.StdEncoding.EncodeToString([]byte("alice:newsecret"))
+	oldBasic := base64.StdEncoding.EncodeToString([]byte("alice:oldpass"))
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	transport := http.DefaultTransport
+	client.SetTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/final" {
+			return nil, fmt.Errorf("proxy rejected header %q", r.Header.Get("Authorization"))
+		}
+		return transport.RoundTrip(r)
+	}))
+
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	_, err := client.R().Get("http://alice:oldpass@" + strings.TrimPrefix(srv.URL, "http://") + "/start")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), newBasic,
+		"the premise: the credential on the wire is the Location's, not the request's")
+	require.NotContains(t, err.Error(), oldBasic,
+		"and the first hop's derived header was not carried over")
+
+	spans := endedClientSpans(sr)
+	require.NotEmpty(t, spans)
+	span := spans[len(spans)-1]
+
+	assert.NotContains(t, span.Status().Description, newBasic)
+	for _, event := range span.Events() {
+		for _, attr := range event.Attributes {
+			assert.NotContains(t, attr.Value.AsString(), newBasic)
+		}
+	}
+}
+
+// TestWrapRefusesADigestCredential pins the credential resty signs on a copy
+// of the request. digestTransport clones the request, sets Authorization on
+// the clone and performs the second round trip with it, so req.RawRequest
+// never carries it and the response hash is not something any list could hold.
+func TestWrapRefusesADigestCredential(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	client.SetTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			return nil, fmt.Errorf("proxy rejected header %q", auth)
+		}
+		return &http.Response{
+			StatusCode: http.StatusUnauthorized,
+			Header:     http.Header{"Www-Authenticate": []string{`Digest realm="r", nonce="n", qop="auth"`}},
+			Body:       http.NoBody,
+			Request:    r,
+		}, nil
+	}))
+	// After SetTransport: SetDigestAuth wraps whatever transport is installed.
+	// #nosec G101 -- fabricated fixture credential, not a live one
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	client.SetDigestAuth("alice", "hunter2")
+
+	_, err := client.R().Get("https://api.example.com/orders")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "response=",
+		"the premise: the digest response reaches the error")
+
+	spans := endedClientSpans(sr)
+	require.NotEmpty(t, spans)
+	span := spans[len(spans)-1]
+
+	assert.Equal(t, "[message redacted]", span.Status().Description)
+	for _, event := range span.Events() {
+		for _, attr := range event.Attributes {
+			assert.NotContains(t, attr.Value.AsString(), "response=")
+		}
+	}
+}
+
+// TestWrapRedactsACredentialPastedIntoAHeaderName pins the name side of a
+// header configuration, which resty's secret list covered for values only
+// while the profiling and diagnostic lists already covered both.
+func TestWrapRedactsACredentialPastedIntoAHeaderName(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+
+	// A name net/http cannot send, so it quotes it back verbatim — and
+	// Header.Set stores such a name unchanged, since canonicalization gives up
+	// on a byte that cannot appear in one.
+	// #nosec G101 -- fabricated fixture header name, not a live credential
+	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+	pastedAsName := "BearerSecret" + "\n" + "Token"
+
+	_, err := client.R().SetHeader(pastedAsName, "v").Get("https://api.example.com/orders")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "BearerSecret",
+		"the premise: the name is in the error the hook is handed")
+
+	spans := endedClientSpans(sr)
+	require.NotEmpty(t, spans)
+	span := spans[len(spans)-1]
+
+	assert.NotContains(t, span.Status().Description, "BearerSecret")
+	assert.Contains(t, span.Status().Description, "invalid header field name",
+		"the diagnosis survives: it is the name that goes, not the line")
 }
