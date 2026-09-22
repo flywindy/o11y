@@ -74,8 +74,10 @@ needs; the other two add only label bloat.
 |---|---|---|---|
 | `http.server.request.duration` | Float64Histogram | `s` | Duration of HTTP server requests. `_count` doubles as traffic + error counter; no separate counter emitted. |
 
-Histogram boundaries pinned via an OTel View to
-`[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]` seconds.
+Histogram boundaries use the SDK's configured latency buckets
+(`WithHistogramBuckets`), which default to
+`[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]` seconds. The same
+option shapes the HTTP client and datastore histograms below.
 
 ### Attributes
 
@@ -85,6 +87,24 @@ Histogram boundaries pinned via an OTel View to
 | `http.route` | string | Normalized route template (e.g. `/users/:id`), never the raw URL path. Export cardinality is capped via `WithMaxUniqueRoutes` (default 1000); ordinary overflow collapses to `"other"`, while SDK aggregation overflow uses `otel.metric.overflow=true`. |
 | `http.response.status_code` | int | Must be `attribute.Int`, not `attribute.String`. |
 | `otel.metric.overflow` | bool | Emitted by the OTel SDK when the aggregation cardinality limit is reached. This is an SDK safety valve, not a semconv HTTP label. |
+
+### Gin Error Events (package `github.com/flywindy/o11y/gin`)
+
+`o11ygin.ErrorRecorder` records each entry of `gin.Context.Errors` on the
+active server span with `span.RecordError`. It is part of the canonical
+`o11ygin.Middleware` chain, so the key below appears by default wherever that
+chain is installed and an application calls `c.Error` / `c.AbortWithError`. It
+is carried by the `exception` event, not by the span itself, and never by a
+metric.
+
+| Key | Type | Notes |
+|---|---|---|
+| `gin.error.type` | string | SDK-owned (see Deviations); one per recorded `exception` event. Value is gin's own error classification rendered as text: `any` for the `ErrorTypeAny` sentinel, otherwise the names of the bits set, joined with a vertical bar — `bind`, `render`, `private`, `public` — with any remaining bits appended as `unknown:<n>` (`unknown:0` when the type is zero). Bounded by gin's own type set plus that escape hatch. |
+
+The SDK's HTTP server view governs the metric label set (`http.request.method`,
+`http.route`, `http.response.status_code`, plus
+`WithExtraHTTPServerAttributeKeys`), so this key never becomes a metric label
+however many error types an application defines.
 
 ---
 
@@ -173,6 +193,25 @@ schema governs the `otel.component.type` attribute.
 | Key | Type | Notes |
 |---|---|---|
 | `otel.component.type` | string | semconv v1.39.0 well-known values, one per OTLP/HTTP exporter the SDK builds: `otlp_http_span_exporter`, `otlp_http_log_exporter`, `otlp_http_metric_exporter`. Closed set; never a caller-supplied value. |
+
+---
+
+## Profiling (package `github.com/flywindy/o11y`)
+
+Emitted only when the profiling pillar started: `Init` wraps its
+`TracerProvider` with `github.com/grafana/otel-profiling-go` (`otelpyroscope`,
+pinned v0.5.1) *after* `pyroscope.Start` succeeds, so a span never carries the
+attribute below when no profiler is running.
+
+### Attributes
+
+| Key | Type | Notes |
+|---|---|---|
+| `pyroscope.profile.id` | string | Owned by the upstream bridge, not by this SDK and not by semconv (see Deviations). Set on **root spans only** (the bridge's default `scopeRootSpan`), with the root span's own span id as the value. It marks a span that *can* have a profile: the bridge sets it whether or not samples were collected, and a span shorter than the CPU sampling interval will legitimately resolve to an empty profile. High cardinality by construction — a span id — so it is a span attribute only and must never be promoted to a metric label. |
+
+Pyroscope samples are labelled to match, which is what lets Grafana open a CPU
+profile from a Tempo span. See the guide's Profiling section for the
+trace-to-profile caveats.
 
 ---
 
@@ -379,6 +418,8 @@ stopped being an address.
 | `db.client.connection.timeouts` | Int64Counter | `{timeout}` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
 | `db.client.connection.create_time` | Float64Histogram | `s` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
 
+Histogram boundaries come from the SDK's configured latency buckets (`WithHistogramBuckets`, default `DefaultLatencyBuckets()`), shared with the HTTP histograms — the option is one knob for all of them.
+
 ### Expected Attributes
 
 | Key | Type | Notes |
@@ -448,6 +489,8 @@ Spans and metrics are emitted by the SDK-owned
 | `db.client.connection.timeouts` | Int64ObservableCounter | `{timeout}` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
 | `db.client.connection.create_time` | Float64Histogram | `s` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port` |
 
+Histogram boundaries come from the SDK's configured latency buckets (`WithHistogramBuckets`, default `DefaultLatencyBuckets()`), shared with the HTTP histograms — the option is one knob for all of them.
+
 ### Explicitly NOT Emitted by Default
 
 | Key | Reason |
@@ -510,6 +553,8 @@ driver attempt and per page (ADR 0019 §4).
 | `cassandra.query.attempts` | Int64Counter | `{attempt}` | SDK-owned name. `db.system.name`, `db.operation.name`, `db.namespace`, `db.collection.name` ‡, `server.address`, `server.port`, `error.type`. Incremented by 1 per `ObserveQuery` callback (one per attempt and per page) — a client-side **round-trip** count covering retries, speculative executions, and paging, **not** a retries-only counter. See the note below the table. |
 | `db.client.connection.create_time` | Float64Histogram | `s` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port`. `server.*` is the node actually dialed (`ObservedConnect.Host`), not the contact point. |
 | `cassandra.connection.attempts` | Int64Counter | `{attempt}` | SDK-owned name. `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port`, `error.type`. |
+
+The two histograms above (`db.client.operation.duration`, `db.client.connection.create_time`) take the SDK's configured latency buckets (`WithHistogramBuckets`), shared with the HTTP histograms.
 
 `db.client.connection.pool.name` is the application pool label semconv
 recommends on connection metrics (Recommended in v1.39.0, which asks
@@ -645,6 +690,9 @@ provides the dual-emit mechanism.
 |---|---|---|---|
 | `minio.client.operation.duration` | Float64Histogram | `s` | `object_store.operation.name`, `object_store.bucket.name`, `server.address`, `server.port`, `error.type` |
 
+Histogram boundaries come from the SDK's configured latency buckets
+(`WithHistogramBuckets`), shared with the HTTP histograms.
+
 Cardinality is bounded by the `MetricViews()` allowlist installed via
 `o11y.Init`'s `ExtraViews` (mirrors the redis/mongo pattern). Services
 that build their own MeterProvider must register the same views via
@@ -733,6 +781,8 @@ by status + `http.response.status_code`.
 |---|---|---|---|
 | `db.client.operation.duration` | Float64Histogram | `s` | `db.system.name`, `db.operation.name`, `db.collection.name` ‡, `server.address`, `server.port`, `error.type` (failures only), `db.response.status_code` (HTTP failures only). One sample per request, measured `Start → Close` (spans retries and the product check, like the span); scope `github.com/flywindy/o11y/elasticsearch`. |
 
+- Histogram boundaries come from the SDK's configured latency buckets
+  (`WithHistogramBuckets`), shared with the HTTP histograms.
 - `db.operation.name` is the endpoint id the generated API passes to the
   instrumentation (`search`, `bulk`, `index`, `indices.create`, …) — a fixed set.
 - `server.address` / `server.port` are the node the **terminal** attempt was
@@ -816,6 +866,8 @@ Data Model attributes automatically.
 | `object_store.*` namespace (`system.name`, `operation.name`, `bucket.name`, `object.key`, `object.size`) | `minio` wrapper | OTel object-store semconv is at status Development and only the AWS-S3 page exists, framed as AWS-SDK / `rpc.system=aws-api`. The SDK-owned `object_store.*` namespace is package-local but shaped to mirror current OTel naming patterns; future migration to a blessed convention is expected to be a key rename. See ADR 0018 §4 and References. |
 | `minio.error.kind`, `minio.client.operation.duration` | `minio` wrapper | MinIO-specific bounded SRE classification (span-only) and per-operation duration histogram. No stable OTel object-store metric exists, so the instrument name stays package-local; standard `error.type` is co-emitted on spans and as the metric failure label. |
 | Legacy ES keys (`db.system`, `db.operation`, `db.statement`, `db.elasticsearch.*`) | `go-elasticsearch/v8` first-party instrumentation | The pinned `elastic-transport-go/v8 v8.8.0` predates DB semconv stabilization and emits these deprecated spellings on its own span. A T2 facade has no seam to rewrite them, so the drift is accepted and documented (ADR 0020 §4, option (a)) rather than normalized via a span processor. A compatibility test pins the exact emitted keys; an upstream fix is inherited for free. The SDK-owned `db.client.operation.duration` (ADR 0027) is unaffected and uses the current keys. |
+| `gin.error.type` | `gin` wrapper | SDK-owned rendering of gin's own error classification, which no semconv key describes: v1.39.0 has no `gin.*` namespace, and `error.type` names the error's type rather than the framework's bind/render/private/public bitmask. Carried on the `exception` event only, never as a metric label, so it adds no cardinality. Retire it if gin's classification ever gains a semconv equivalent. |
+| `pyroscope.profile.id` | `github.com/grafana/otel-profiling-go` (`otelpyroscope` v0.5.1) | Upstream-owned span attribute the SDK inherits by wrapping its TracerProvider; the SDK neither sets nor rewrites it. semconv v1.39.0 has a `profile.*` namespace (`profile.frame.type`) but nothing that identifies a profile from a span, so there is no current key to normalize to. A T2-style wrapper has no seam to rename it without also breaking Grafana's trace-to-profile lookup, which keys on this exact name. |
 | `cassandra.query.attempts`, `cassandra.connection.attempts`, `cassandra.query.attempt` | `cassandra` wrapper | SDK-owned names for the client-side attempt/retry/speculative-execution signal, which server-side exporters cannot provide. semconv v1.39.0 defines no attempts metric or attribute; kept package-local (per ADR 0019 §7.B) so they are easy to retire/rename if semconv later standardizes one. |
 | `o11y.export.failures` | root package exporter wrappers | SDK-owned instrument name. semconv v1.39.0 describes SDK self-metrics for exporters (`otel.sdk.exporter.span.exported`, `otel.sdk.exporter.log.exported`, `otel.sdk.exporter.metric_data_point.exported`, status Development) that count exported *items* and carry `error.type` on failure. The pinned OTLP/HTTP exporters (otlptracehttp / otlpmetrichttp v1.44.0, otlploghttp v0.19.0) already emit them, but only behind the experimental `OTEL_GO_X_OBSERVABILITY=true` opt-in and only on the **global** MeterProvider (`otel.GetMeterProvider()`), which this SDK never sets (ADR 0003); an application that wires the global to `sdk.MeterProvider()` and enables the flag gets both families on the same provider, item-level next to batch-level, with no name overlap. This counter needs no opt-in and keeps a package-local name so the two can coexist. Its attribute is the semconv `otel.component.type`. Mitigation: retire once the exporters' self-metrics are on by default and stable, at which point the item-level metrics cover the same alert. |
 
