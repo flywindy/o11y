@@ -13,6 +13,22 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+### Fixed
+
+- `redis`: the four pool attributes it wrote as string literals now reference
+  their semconv v1.39.0 constants (`DBClientConnectionPoolName`,
+  `DBClientConnectionStateUsed` / `...Idle`), which `docs/semconv.md`
+  Enforcement Rule #1 has required all along and every other integration
+  already did. The keys on the wire do not change. What changes is that the
+  emitter and the view can no longer drift apart: the views in
+  `internal/views/redis.go` filter these streams with an allow-keys list built
+  from the same constants, so on a semconv version bump the view would follow
+  the rename and the literals would not, and the filter would drop the
+  attribute the view exists to keep. `db.client.connection.state` had no test
+  at all; it does now, and it fails when the emitter's spelling and the view's
+  disagree — the two observations collapse onto one attribute set and the pool
+  reports its connection count once instead of per state.
+
 ---
 
 ## [0.13.0] - 2026-09-22
