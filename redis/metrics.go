@@ -164,10 +164,10 @@ func (p *poolMetrics) observeClient(observer metric.Observer, client *goredis.Cl
 
 	used := int64(stats.TotalConns - stats.IdleConns)
 	observer.ObserveInt64(p.count, used, metric.WithAttributes(append(attrs,
-		attribute.String("db.client.connection.state", "used"),
+		semconv.DBClientConnectionStateUsed,
 	)...))
 	observer.ObserveInt64(p.count, int64(stats.IdleConns), metric.WithAttributes(append(attrs,
-		attribute.String("db.client.connection.state", "idle"),
+		semconv.DBClientConnectionStateIdle,
 	)...))
 	if idleMax, ok := maxIdleConnections(opt); ok {
 		observer.ObserveInt64(p.idleMax, int64(idleMax), metric.WithAttributes(attrs...))
@@ -183,7 +183,7 @@ func poolAttrs(poolName, addr string) []attribute.KeyValue {
 	parsed := parseAddress(addr)
 	attrs := []attribute.KeyValue{
 		semconv.DBSystemNameRedis,
-		attribute.String("db.client.connection.pool.name", poolName),
+		semconv.DBClientConnectionPoolName(poolName),
 		semconv.ServerAddress(parsed.host),
 	}
 	if parsed.port > 0 {

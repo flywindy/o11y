@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -566,6 +567,40 @@ func TestPoolMetricsEmitV139Names(t *testing.T) {
 		assertMetricPointHas(t, m, semconv.ServerPort(6379))
 	}
 	assert.Nil(t, metricByName(rm, "db.client.connections.use_time"))
+}
+
+// TestPoolConnectionCountSplitsUsedFromIdle pins the one pool attribute that
+// carries a dimension. db.client.connection.count is observed twice per pool,
+// once per connection state, and its view is the only redis view whose
+// allow-keys filter lets db.client.connection.state through.
+//
+// Nothing covered that attribute before. It is worth covering because the
+// emitter and the view name the key independently — the view allows
+// semconv.DBClientConnectionStateKey — so a spelling only the emitter knows is
+// dropped by the filter and the two observations collapse onto one attribute
+// set. The instrument still appears, every other assertion still passes, and
+// the pool silently reports its connection count twice.
+func TestPoolConnectionCountSplitsUsedFromIdle(t *testing.T) {
+	tp, _, mp, reader := newRedisTestProviders()
+	client := goredis.NewClient(&goredis.Options{Addr: "127.0.0.1:6379"})
+	defer client.Close()
+
+	_, err := Wrap(client, tp, mp, WithPoolName("sessions-cache"))
+	require.NoError(t, err)
+
+	m := findMetric(t, collectRedisMetrics(t, reader), "db.client.connection.count")
+	sum, ok := m.Data.(metricdata.Sum[int64])
+	require.True(t, ok, "db.client.connection.count is an observable up-down counter")
+	require.Len(t, sum.DataPoints, 2, "one data point per connection state")
+
+	states := make([]string, 0, len(sum.DataPoints))
+	for _, dp := range sum.DataPoints {
+		v, ok := dp.Attributes.Value(semconv.DBClientConnectionStateKey)
+		require.True(t, ok, "the state attribute must survive the view's allow-keys filter")
+		states = append(states, v.AsString())
+	}
+	sort.Strings(states)
+	assert.Equal(t, []string{"idle", "used"}, states)
 }
 
 func TestPoolMetricsOmitMaxWhenUnbounded(t *testing.T) {

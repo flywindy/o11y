@@ -62,7 +62,7 @@ func newRedisHook(
 	addr := parseAddress(client.Options().Addr)
 	poolMetricAttrs := []attribute.KeyValue{
 		semconv.DBSystemNameRedis,
-		attribute.String("db.client.connection.pool.name", poolName),
+		semconv.DBClientConnectionPoolName(poolName),
 		semconv.ServerAddress(addr.host),
 	}
 	if addr.port > 0 {
