@@ -30,7 +30,7 @@ ADR 0008 §2 checklist applied to
 | Maintenance signal | ✅ Maintained by OpenTelemetry contrib; releases track gin and OTel SDK semver. |
 | Semconv alignment | ✅ Recent versions emit v1.30+ stable HTTP attributes; we pin to a release that emits v1.39.0 to match ADR 0006. If no such release exists at adoption time, we either wait or pin one minor version behind and document the gap. |
 | Configurability | ✅ Span name formatter, attribute injector, and filter all overridable. |
-| Framework signal access | ⚠️ Modern `otelgin` writes `c.Errors.String()` as a single concatenated `gin.errors` string attribute, but does **not** call `span.RecordError` per-error nor classify by `gin.ErrorType`. ErrorRecorder (§2) **enhances** rather than replaces this: it adds typed `RecordError` calls with `gin.error.type` so each error becomes a span event queryable in TraceQL. |
+| Framework signal access | ⚠️ Modern `otelgin` writes `c.Errors.String()` as a single concatenated `gin.errors` string attribute, but does **not** call `span.RecordError` per-error nor classify by `gin.ErrorType`. ErrorRecorder (§2) **enhances** rather than replaces this: it adds typed `RecordError` calls with `gin.error.type` so each error becomes a span event queryable in TraceQL. *Wrong at the pinned version: otelgin v0.68.0 does call `span.RecordError` per error — see the 2026-09-26 amendment.* |
 
 Adoption-time verification pinned `otelgin` v0.68.0, which already emits
 `http.server.request.duration` and already records `c.Errors` as span error
@@ -112,6 +112,10 @@ signature is `WithSpanNameFormatter(func(*gin.Context) string)`.
 - `WithMetricAttributesFn(...)` passes through to otelgin
 
 ### 2. ErrorRecorder semantics
+
+> Superseded for the canonical `Middleware` chain by the
+> [2026-09-26 amendment](#amendment-2026-09-26--the-canonical-chain-adds-ginerror-not-a-second-exception).
+> What follows still describes `ErrorRecorder` used on its own.
 
 Pseudocode (concrete implementation in PR):
 
@@ -341,3 +345,71 @@ but not on the `http/` facade itself.
   Deferred. The gin package must not import the root
   `github.com/flywindy/o11y` package until user feedback shows the
   four-argument provider form is too much friction.
+
+---
+
+## Amendment (2026-09-26) — the canonical chain adds `gin.error`, not a second exception
+
+### Finding
+
+The §Context checklist row "Framework signal access" says `otelgin` does
+not call `span.RecordError` per error. At the pinned v0.68.0 it does
+(`gin.go`, after `c.Next()`: one `span.RecordError(err.Err)` per
+`c.Errors` entry). `ErrorRecorder` runs inside `otelgin` and also calls
+`RecordError` per entry, so every `c.Error` / `c.AbortWithError` in the
+canonical chain produced **two** `exception` events: one with
+`gin.error.type` (ours) and one without (otelgin's). Exception counts in
+Tempo, and any alert built on them, read twice the real number. The
+matrix tests counted only events carrying `gin.error.type`, so they could
+not see the duplicate.
+
+`otelgin` offers no option to turn its recording off, and clearing
+`c.Errors` before it unwinds would hide the errors from every other
+middleware that reads them (gin's logger, error-response middleware).
+The duplicate has to be removed on our side.
+
+### Decision
+
+1. **Canonical chain.** `Middleware` no longer includes `ErrorRecorder`.
+   It includes an unexported handler with the same position and
+   no-span guard that adds, per `c.Errors` entry and in `c.Errors`
+   order, one span event named **`gin.error`** carrying
+   `gin.error.type`. It calls neither `RecordError` nor `SetStatus`:
+   `otelgin` owns the exception events and the span status.
+   The `gin.error` event carries no `exception.*` attributes, so the
+   message is not stored twice. The n-th `gin.error` event describes
+   the same error as the n-th `exception` event, because both layers
+   walk `c.Errors` in order. The `gin.error` events all precede the
+   `exception` events, because the handler that adds them unwinds before
+   `otelgin` does. Position is the only correlation, and it is the
+   documented one.
+2. **`ErrorRecorder` on its own** keeps its behaviour: one `exception`
+   event per error carrying `gin.error.type`, and span status Error on a
+   5xx response. That is the case where nothing else reads `c.Errors` —
+   a gin engine served through `o11yhttp.NewServerHandler`, or under a
+   span the application started — so there it is the only source of the
+   exception event. Its godoc now says not to add it after `Middleware`.
+3. **The pin is tested, not assumed.** The matrix helper counts every
+   event on the span and requires exactly one `exception` and one
+   `gin.error` per error. A future `otelgin` that stops recording
+   exceptions (contrib issue 8441 tracks moving off `RecordError`) or
+   records them differently fails the matrix on upgrade, instead of
+   silently leaving zero or two.
+
+Matrix rows 3, 4, 5 and 7 now read "one `exception` event (from
+`otelgin`) and one `gin.error` event per error"; the other rows are
+unchanged. Row 10 additionally asserts the one `exception` event the OTel
+SDK's `span.End` records for the panic that unwinds through `otelgin`,
+which the old helper ignored because it carried no `gin.error.type`.
+
+### Consequences
+
+- Exception-event volume from gin errors halves on rollout. Dashboards
+  and alerts that count `exception` events read the real number from
+  then on; a before/after comparison shows a step down that is not an
+  improvement in error rate.
+- A TraceQL query on the attribute alone, `{ event.gin.error.type =
+  "bind" }`, keeps matching. A query that also constrains
+  `event:name = "exception"` must change to `event:name = "gin.error"`.
+- `docs/semconv.md` lists `gin.error` as an SDK-owned event name next to
+  the existing `gin.error.type` row.

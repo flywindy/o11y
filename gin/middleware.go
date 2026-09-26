@@ -8,7 +8,10 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// Middleware returns the canonical gin middleware chain for o11y tracing.
+// Middleware returns the canonical gin middleware chain for o11y tracing:
+// otelgin, which opens the server span and records each gin.Context.Errors
+// entry as an exception event, followed by a handler that adds one "gin.error"
+// event per entry carrying gin.error.type. Do not add ErrorRecorder after it.
 //
 // The returned slice is intended to be spread into Engine.Use:
 //
@@ -27,6 +30,6 @@ func Middleware(service string, tp trace.TracerProvider, mp metric.MeterProvider
 	base = append(base, applyOptions(opts)...)
 	return []ginframework.HandlerFunc{
 		otelgin.Middleware(service, base...),
-		ErrorRecorder(),
+		errorTypeEvents(),
 	}
 }

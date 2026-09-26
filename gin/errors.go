@@ -10,15 +10,29 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-const ginErrorTypeKey = "gin.error.type"
+const (
+	ginErrorTypeKey = "gin.error.type"
 
-// ErrorRecorder records gin.Context.Errors on the active server span.
+	// ginErrorEventName names the span event the canonical Middleware chain
+	// adds for each gin.Context.Errors entry. It is deliberately not
+	// "exception": otelgin already records one exception event per entry, and
+	// a second would double every exception count read from the span.
+	ginErrorEventName = "gin.error"
+)
+
+// ErrorRecorder records gin.Context.Errors on the active span, for chains that
+// do not include Middleware.
 //
-// It must run after otelgin.Middleware in the gin chain so that
-// c.Request.Context contains the server span. If no valid span is active,
-// ErrorRecorder is a no-op. In the canonical Middleware chain, otelgin owns
-// the final HTTP-derived span status during unwind; ErrorRecorder's SetStatus
-// path preserves useful behavior when ErrorRecorder is used separately.
+// Middleware already includes the equivalent of ErrorRecorder; do not add it
+// again after Middleware. Inside the canonical chain otelgin records each
+// error as an exception event itself, so the chain adds a separate
+// "gin.error" event carrying gin.error.type instead of a second exception.
+//
+// Used on its own — for example on a gin engine served through
+// o11yhttp.NewServerHandler, where nothing else reads c.Errors — ErrorRecorder
+// is what turns each error into an exception event: it calls span.RecordError
+// with the gin.error.type attribute, and sets the span status to Error when the
+// response status is 5xx. If no valid span is active, it is a no-op.
 func ErrorRecorder() ginframework.HandlerFunc {
 	return func(c *ginframework.Context) {
 		c.Next()
@@ -34,10 +48,33 @@ func ErrorRecorder() ginframework.HandlerFunc {
 				trace.WithAttributes(attribute.String(ginErrorTypeKey, ginErrorTypeString(ge.Type))),
 			)
 		}
-		// This is mainly for standalone ErrorRecorder use. In the canonical
-		// chain, otelgin runs after this during unwind and sets final status.
 		if c.Writer.Status() >= 500 {
 			span.SetStatus(codes.Error, c.Errors.Last().Error())
+		}
+	}
+}
+
+// errorTypeEvents is the canonical chain's error handler. It runs inside
+// otelgin, which on unwind records every c.Errors entry as an exception event
+// and sets the span status (otelgin v0.68.0 gin.go). What otelgin cannot know
+// is gin's bind/render/private/public classification, so this adds only that:
+// one "gin.error" event per entry, in c.Errors order. The n-th gin.error event
+// therefore describes the same error as the n-th exception event otelgin
+// records after it.
+func errorTypeEvents() ginframework.HandlerFunc {
+	return func(c *ginframework.Context) {
+		c.Next()
+		if len(c.Errors) == 0 {
+			return
+		}
+		span := trace.SpanFromContext(c.Request.Context())
+		if !span.SpanContext().IsValid() {
+			return
+		}
+		for _, ge := range c.Errors {
+			span.AddEvent(ginErrorEventName,
+				trace.WithAttributes(attribute.String(ginErrorTypeKey, ginErrorTypeString(ge.Type))),
+			)
 		}
 	}
 }

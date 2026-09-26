@@ -161,7 +161,15 @@ func TestMiddleware_MatrixRow10_InvertedRecoveryOrderProducesIncompleteSpan(t *t
 	assertSpanAttr(t, result.span, semconv.HTTPRouteKey, testRoute)
 	assertSpanAttrMissing(t, result.span, semconv.HTTPResponseStatusCodeKey)
 	assertSpanStatus(t, result.span, codes.Unset, "")
-	assertTypedErrorEvents(t, result.span)
+	// The panic unwinds through otelgin before recovery runs, so the OTel SDK's
+	// span.End records it as an exception event of its own. No c.Errors entry
+	// exists, so the chain adds no gin.error event.
+	events := result.span.Events()
+	require.Len(t, events, 1)
+	assert.Equal(t, semconv.ExceptionEventName, events[0].Name)
+	message, ok := eventAttribute(events[0], semconv.ExceptionMessageKey)
+	require.True(t, ok)
+	assert.Equal(t, "boom", message)
 	assertMetricStatusCodes(t, result.metrics)
 }
 
@@ -398,17 +406,41 @@ func assertSpanAttrMissing(t *testing.T, span sdktrace.ReadOnlySpan, key attribu
 	}
 }
 
+// assertTypedErrorEvents checks the events the canonical Middleware chain
+// leaves on the server span for want, in c.Errors order.
+//
+// Each error must appear exactly twice: once as the exception event otelgin
+// records (message, no gin.error.type) and once as the chain's own gin.error
+// event (gin.error.type, no exception attributes). The two sequences are paired
+// by position, which is the correlation the chain documents. Counting every
+// event, not only the typed ones, is what catches a second exception event
+// for the same error — or none, if a future otelgin stops recording them.
 func assertTypedErrorEvents(t *testing.T, span sdktrace.ReadOnlySpan, want ...typedError) {
 	t.Helper()
-	var got []typedError
+	var messages, errorTypes []string
 	for _, event := range span.Events() {
-		errorType, ok := eventAttribute(event, "gin.error.type")
-		if !ok {
-			continue
+		switch event.Name {
+		case semconv.ExceptionEventName:
+			_, typed := eventAttribute(event, "gin.error.type")
+			assert.False(t, typed, "exception event must not carry gin.error.type: the chain adds no exception of its own")
+			message, ok := eventAttribute(event, semconv.ExceptionMessageKey)
+			require.True(t, ok, "exception event missing exception.message")
+			messages = append(messages, message)
+		case "gin.error":
+			_, hasMessage := eventAttribute(event, semconv.ExceptionMessageKey)
+			assert.False(t, hasMessage, "gin.error event must not repeat the exception message")
+			errorType, ok := eventAttribute(event, "gin.error.type")
+			require.True(t, ok, "gin.error event missing gin.error.type")
+			errorTypes = append(errorTypes, errorType)
+		default:
+			t.Errorf("unexpected span event %q", event.Name)
 		}
-		message, ok := eventAttribute(event, "exception.message")
-		require.True(t, ok, "typed error event missing exception.message")
-		got = append(got, typedError{message: message, errorType: errorType})
+	}
+	require.Len(t, messages, len(want), "want exactly one exception event per gin error")
+	require.Len(t, errorTypes, len(want), "want exactly one gin.error event per gin error")
+	var got []typedError
+	for i := range want {
+		got = append(got, typedError{message: messages[i], errorType: errorTypes[i]})
 	}
 	assert.Equal(t, want, got)
 }
