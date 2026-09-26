@@ -22,22 +22,20 @@ adopters can plan their upgrades.
   `exception` events on the server span — one with `gin.error.type`, one
   without — and exception counts in Tempo, and any alert built on them, read
   twice the real number. The chain now adds a separate `gin.error` event per
-  error carrying `gin.error.type` and `gin.error.message` — the latter equal
-  to the `exception.message` of otelgin's exception event for that error, and
-  no `exception.*` key of its own — and leaves
-  the exception and the span status to otelgin. A request excluded by
-  `WithFilter` / `WithSkipPaths` is left alone by the whole chain: under an
-  outer span (an engine served through `o11yhttp.NewServerHandler`) it no
-  longer gets exception events there. **Exception-event volume from gin errors halves on
-  rollout**; that step down on a dashboard is the correction, not a drop in
-  errors. `ErrorRecorder` used on its own, without `Middleware`, is unchanged,
+  error carrying only `gin.error.type`, in `c.Errors` order, and leaves the
+  exception, its message and the span status to otelgin. **Exception-event
+  volume from gin errors halves on rollout**; that step down on a dashboard
+  is the correction, not a drop in errors. A request excluded by `WithFilter`
+  / `WithSkipPaths` is left alone by the whole chain: under an outer span (an
+  engine served through `o11yhttp.NewServerHandler`) it no longer gets
+  exception events there. The filters are now evaluated once per request,
+  and that one answer drives both tracing and error classification; the
+  result is the same for any filter whose answer does not change between
+  calls. `ErrorRecorder` used on its own, without `Middleware`, is unchanged
   except that a `c.Errors` entry with a nil `Err` (`c.Error(&gin.Error{...})`)
-  is now skipped instead of panicking on a 5xx response, and that it records
-  on the span active when it runs rather than on one a later middleware left
-  in the request context. `WithFilter` / `WithSkipPaths` filters are now
-  evaluated once per request instead of by otelgin per filter; the result is
-  the same for any filter whose answer does not change between calls.
-  See ADR 0010's 2026-09-26 amendment.
+  is skipped instead of panicking on a 5xx response, and the status
+  description comes from the last entry that has an error. See ADR 0010's
+  2026-09-26 amendment.
 
 - `redis`: the four pool attributes it wrote as string literals now reference
   their semconv v1.39.0 constants (`DBClientConnectionPoolName`,
@@ -58,13 +56,12 @@ adopters can plan their upgrades.
 - **gin: a TraceQL query that selects the typed error by event name must
   change.** `{ event.gin.error.type = "bind" }` keeps matching. A query that
   also constrains `event:name = "exception"`, or combines `gin.error.type`
-  with `event.exception.message` on one event, must use
-  `event:name = "gin.error"` and `event.gin.error.message`: the `exception`
-  event no longer carries `gin.error.type`. Do not add
-  `o11ygin.ErrorRecorder()` after `o11ygin.Middleware(...)` to get the old
-  event back — that reintroduces the duplicate.
-- **gin: a collector processor that redacts `exception.message` must also
-  cover `gin.error.message`**, which carries the same text.
+  with `event.exception.*` on one event, must select
+  `event:name = "gin.error"` for the type and read the message from the
+  span's `exception` events: the `exception` event no longer carries
+  `gin.error.type`. Do not add `o11ygin.ErrorRecorder()` after
+  `o11ygin.Middleware(...)` to get the old event back — that reintroduces the
+  duplicate.
 
 ---
 

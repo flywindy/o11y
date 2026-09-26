@@ -11,21 +11,21 @@ import (
 )
 
 const (
-	ginErrorTypeKey    = "gin.error.type"
-	ginErrorMessageKey = "gin.error.message"
+	ginErrorTypeKey = "gin.error.type"
 
 	// ginErrorEventName names the span event the canonical Middleware chain
 	// adds for each gin.Context.Errors entry. It is deliberately not
 	// "exception": otelgin already records one exception event per entry, and
 	// a second would double every exception count read from the span.
 	ginErrorEventName = "gin.error"
-)
 
-// tracedKey is the gin.Context key under which a Middleware chain with filters
-// records whether they let the request be traced. Chains nested on route groups
-// share it safely: each chain's gin filter writes it and that chain's error
-// handler reads it before c.Next, so no inner chain has run in between.
-const tracedKey = "o11y.gin.traced"
+	// tracedKey is the gin.Context key under which a Middleware chain with
+	// filters records whether they let the request be traced. Chains nested on
+	// route groups share it safely: each chain's gin filter writes it and that
+	// chain's error handler reads it before c.Next, so no inner chain has run
+	// in between.
+	tracedKey = "o11y.gin.traced"
+)
 
 // ErrorRecorder records gin.Context.Errors on the active span, for chains that
 // do not include Middleware.
@@ -39,14 +39,17 @@ const tracedKey = "o11y.gin.traced"
 // o11yhttp.NewServerHandler, where nothing else reads c.Errors — ErrorRecorder
 // is what turns each error into an exception event: it calls span.RecordError
 // with the gin.error.type attribute, and sets the span status to Error when the
-// response status is 5xx. It records on the span active when it runs, read
-// before the handlers after it, which may replace the request context. Entries
-// with a nil Err are skipped. If no valid span is active, it is a no-op.
+// response status is 5xx. It must run after the middleware that starts the
+// span. Entries with a nil Err are skipped. If no span is recording, it is a
+// no-op.
 func ErrorRecorder() ginframework.HandlerFunc {
 	return func(c *ginframework.Context) {
-		span := trace.SpanFromContext(c.Request.Context())
 		c.Next()
-		if len(c.Errors) == 0 || !span.SpanContext().IsValid() {
+		if len(c.Errors) == 0 {
+			return
+		}
+		span := trace.SpanFromContext(c.Request.Context())
+		if !span.IsRecording() {
 			return
 		}
 		var last error
@@ -69,33 +72,24 @@ func ErrorRecorder() ginframework.HandlerFunc {
 // otelgin, which on unwind records every c.Errors entry as an exception event
 // and sets the span status (otelgin v0.68.0 gin.go). What otelgin cannot know
 // is gin's bind/render/private/public classification, so this adds only that:
-// one "gin.error" event per entry, carrying gin.error.type and, as
-// gin.error.message, the same text otelgin's exception event carries as
-// exception.message. The message is what ties the two together; their
-// positions on the span do not, because application code may record
-// exceptions of its own on the server span. It is an SDK-owned key rather than
-// exception.message so that exception.* stays on exception events only and a
-// query selecting exceptions by attribute does not count each error twice.
+// one "gin.error" event per entry, in c.Errors order, carrying gin.error.type.
+// It repeats nothing otelgin's exception event already carries.
 //
-// filtered is false when the chain has no filters. Otherwise the chain's
-// otelgin gin filter has recorded under tracedKey whether the request is
-// traced; a request it
-// excluded has no span of this chain's, so the span in the context, if any,
-// belongs to some other layer and is left alone, as otelgin leaves it. The
-// span is read before c.Next, while the context is still the one otelgin
-// handed on, since a downstream middleware may replace c.Request's context
-// without restoring it.
+// When filtered is true, the chain's otelgin gin filter has recorded under
+// tracedKey whether the request is traced. A request it excluded has no span
+// of this chain's, so the span in the context, if any, belongs to some other
+// layer and is left alone, as otelgin leaves it. The span is read before
+// c.Next, while the context is still the one otelgin handed on, since a
+// downstream middleware may replace c.Request's context without restoring it.
 func errorTypeEvents(filtered bool) ginframework.HandlerFunc {
 	return func(c *ginframework.Context) {
-		if filtered {
-			if traced := c.GetBool(tracedKey); !traced {
-				c.Next()
-				return
-			}
+		if filtered && !c.GetBool(tracedKey) {
+			c.Next()
+			return
 		}
 		span := trace.SpanFromContext(c.Request.Context())
 		c.Next()
-		if len(c.Errors) == 0 || !span.SpanContext().IsValid() {
+		if len(c.Errors) == 0 || !span.IsRecording() {
 			return
 		}
 		for _, ge := range c.Errors {
@@ -104,7 +98,6 @@ func errorTypeEvents(filtered bool) ginframework.HandlerFunc {
 			}
 			span.AddEvent(ginErrorEventName, trace.WithAttributes(
 				attribute.String(ginErrorTypeKey, ginErrorTypeString(ge.Type)),
-				attribute.String(ginErrorMessageKey, ge.Err.Error()),
 			))
 		}
 	}

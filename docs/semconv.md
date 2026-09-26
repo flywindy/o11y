@@ -91,21 +91,23 @@ option shapes the HTTP client and datastore histograms below.
 ### Gin Error Events (package `github.com/flywindy/o11y/gin`)
 
 The canonical `o11ygin.Middleware` chain adds one span event named
-**`gin.error`** per entry of `gin.Context.Errors`, next to the `exception`
-event `otelgin` records for the same entry. The `gin.error` event carries the
-two keys below and no `exception.*` key; `gin.error.message` equals that
-exception event's `exception.message`, which is what identifies which
-exception it classifies — position on the span does not. A request the
-chain's filter excludes (`WithFilter`, `WithSkipPaths`) gets neither event.
-When `o11ygin.ErrorRecorder` is used on its own without `Middleware`, each
-entry is recorded as an `exception` event (`span.RecordError`) carrying
-`gin.error.type` instead. Either way the keys are on an event, not
-on the span itself, and never on a metric. See ADR 0010's 2026-09-26 amendment.
+**`gin.error`** per entry of `gin.Context.Errors`, in `c.Errors` order, next
+to the `exception` event `otelgin` records for the same entry. The `gin.error`
+event carries the key below and nothing else; the error text stays on the
+`exception` event alone (semconv marks duplicating `exception.message` NOT
+RECOMMENDED). The classification describes the request's gin errors, not one
+particular exception: position on the span is no reliable link, since
+application code may record exceptions on the same span and the event limit
+evicts the oldest events first. A request the chain's filter excludes
+(`WithFilter`, `WithSkipPaths`) gets neither event. When
+`o11ygin.ErrorRecorder` is used on its own without `Middleware`, each entry is
+recorded as an `exception` event (`span.RecordError`) carrying
+`gin.error.type` instead. Either way the key is on an event, not on the span
+itself, and never on a metric. See ADR 0010's 2026-09-26 amendment.
 
 | Key | Type | Notes |
 |---|---|---|
 | `gin.error.type` | string | SDK-owned (see Deviations); one per `gin.error` event (canonical chain) or per `exception` event (`ErrorRecorder` alone). Value is gin's own error classification rendered as text: `any` for the `ErrorTypeAny` sentinel, otherwise the names of the bits set, joined with a vertical bar — `bind`, `render`, `private`, `public` — with any remaining bits appended as `unknown:<n>` (`unknown:0` when the type is zero). Bounded by gin's own type set plus that escape hatch. |
-| `gin.error.message` | string | SDK-owned (see Deviations); on `gin.error` events only. The error's `Error()` text, equal to the `exception.message` otelgin records for the same entry. |
 
 The SDK's HTTP server view governs the metric label set (`http.request.method`,
 `http.route`, `http.response.status_code`, plus
@@ -873,8 +875,7 @@ Data Model attributes automatically.
 | `minio.error.kind`, `minio.client.operation.duration` | `minio` wrapper | MinIO-specific bounded SRE classification (span-only) and per-operation duration histogram. No stable OTel object-store metric exists, so the instrument name stays package-local; standard `error.type` is co-emitted on spans and as the metric failure label. |
 | Legacy ES keys (`db.system`, `db.operation`, `db.statement`, `db.elasticsearch.*`) | `go-elasticsearch/v8` first-party instrumentation | The pinned `elastic-transport-go/v8 v8.8.0` predates DB semconv stabilization and emits these deprecated spellings on its own span. A T2 facade has no seam to rewrite them, so the drift is accepted and documented (ADR 0020 §4, option (a)) rather than normalized via a span processor. A compatibility test pins the exact emitted keys; an upstream fix is inherited for free. The SDK-owned `db.client.operation.duration` (ADR 0027) is unaffected and uses the current keys. |
 | `gin.error.type` | `gin` wrapper | SDK-owned rendering of gin's own error classification, which no semconv key describes: v1.39.0 has no `gin.*` namespace, and `error.type` names the error's type rather than the framework's bind/render/private/public bitmask. Carried on span events only — `gin.error` in the canonical chain, `exception` from `ErrorRecorder` alone — never as a metric label, so it adds no cardinality. Retire it if gin's classification ever gains a semconv equivalent. |
-| `gin.error` (event name) | `gin` wrapper | SDK-owned span event name. `otelgin` v0.68.0 already records each gin error as an `exception` event, so the typed classification rides a separate event rather than a second `exception`, which would double exception counts. It carries no `exception.*` key, so a query or backend that detects exceptions by attribute does not count it (ADR 0010, 2026-09-26 amendment). |
-| `gin.error.message` | `gin` wrapper | SDK-owned copy of the error text on the `gin.error` event, identifying which `exception` event it classifies; position on the span cannot, since application code may record exceptions on the same span and the event limit evicts the oldest first. Deliberately not `exception.message`, which belongs on `exception` events. It duplicates that text, so a collector processor that redacts `exception.message` must also cover this key. Span-event only, never a metric label. |
+| `gin.error` (event name) | `gin` wrapper | SDK-owned span event name. `otelgin` v0.68.0 already records each gin error as an `exception` event, so the typed classification rides a separate event rather than a second `exception`, which would double exception counts. It carries `gin.error.type` only — no `exception.*` key and no copy of the error text — so a query or backend that detects exceptions by attribute does not count it (ADR 0010, 2026-09-26 amendment). |
 | `pyroscope.profile.id` | `github.com/grafana/otel-profiling-go` (`otelpyroscope` v0.5.1) | Upstream-owned span attribute the SDK inherits by wrapping its TracerProvider; the SDK neither sets nor rewrites it. semconv v1.39.0 has a `profile.*` namespace (`profile.frame.type`) but nothing that identifies a profile from a span, so there is no current key to normalize to. A T2-style wrapper has no seam to rename it without also breaking Grafana's trace-to-profile lookup, which keys on this exact name. |
 | `cassandra.query.attempts`, `cassandra.connection.attempts`, `cassandra.query.attempt` | `cassandra` wrapper | SDK-owned names for the client-side attempt/retry/speculative-execution signal, which server-side exporters cannot provide. semconv v1.39.0 defines no attempts metric or attribute; kept package-local (per ADR 0019 §7.B) so they are easy to retire/rename if semconv later standardizes one. |
 | `o11y.export.failures` | root package exporter wrappers | SDK-owned instrument name. semconv v1.39.0 describes SDK self-metrics for exporters (`otel.sdk.exporter.span.exported`, `otel.sdk.exporter.log.exported`, `otel.sdk.exporter.metric_data_point.exported`, status Development) that count exported *items* and carry `error.type` on failure. The pinned OTLP/HTTP exporters (otlptracehttp / otlpmetrichttp v1.44.0, otlploghttp v0.19.0) already emit them, but only behind the experimental `OTEL_GO_X_OBSERVABILITY=true` opt-in and only on the **global** MeterProvider (`otel.GetMeterProvider()`), which this SDK never sets (ADR 0003); an application that wires the global to `sdk.MeterProvider()` and enables the flag gets both families on the same provider, item-level next to batch-level, with no name overlap. This counter needs no opt-in and keeps a package-local name so the two can coexist. Its attribute is the semconv `otel.component.type`. Mitigation: retire once the exporters' self-metrics are on by default and stable, at which point the item-level metrics cover the same alert. |

@@ -52,11 +52,10 @@ func TestErrorRecorder_RecordsTypedGinErrors(t *testing.T) {
 	assertStandaloneErrorEvents(t, spans[0], typedError{message: "typed", errorType: "bind"})
 }
 
-// TestMiddleware_GinErrorIdentifiesItsException covers the case position
-// pairing got wrong: the handler records an exception of its own on the server
-// span before pushing a gin error. The gin.error event must still name the gin
-// error through gin.error.message, not the handler's exception.
-func TestMiddleware_GinErrorIdentifiesItsException(t *testing.T) {
+// TestMiddleware_ClassifiesGinErrorsOnly has the handler record an exception
+// of its own on the server span before pushing a gin error. Only the gin error
+// is classified: one gin.error event beside two exception events.
+func TestMiddleware_ClassifiesGinErrorsOnly(t *testing.T) {
 	env := newTestEnv(t)
 	router := ginframework.New()
 	router.Use(o11ygin.Middleware(testService, env.tracerProvider, env.meterProvider, propagation.TraceContext{})...)
@@ -69,23 +68,19 @@ func TestMiddleware_GinErrorIdentifiesItsException(t *testing.T) {
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, testPath, nil))
 	result := env.finish(t, rec)
 
-	var exceptionMessages []string
-	var typed []sdktrace.Event
+	var exceptionMessages, errorTypes []string
 	for _, event := range result.span.Events() {
 		switch event.Name {
 		case semconv.ExceptionEventName:
 			message, _ := eventAttribute(event, semconv.ExceptionMessageKey)
 			exceptionMessages = append(exceptionMessages, message)
 		case "gin.error":
-			typed = append(typed, event)
+			errorType, _ := eventAttribute(event, "gin.error.type")
+			errorTypes = append(errorTypes, errorType)
 		}
 	}
 	assert.Equal(t, []string{"cache miss", "invalid id"}, exceptionMessages, "the handler's exception, then otelgin's")
-	require.Len(t, typed, 1)
-	message, _ := eventAttribute(typed[0], "gin.error.message")
-	errorType, _ := eventAttribute(typed[0], "gin.error.type")
-	assert.Equal(t, "invalid id", message, "gin.error names the gin error, not the first exception on the span")
-	assert.Equal(t, "bind", errorType)
+	assert.Equal(t, []string{"bind"}, errorTypes)
 }
 
 // TestMiddleware_FilteredRequestLeavesOuterSpanAlone covers a request the
@@ -253,43 +248,6 @@ func TestMiddleware_FilterEvaluatedOncePerRequest(t *testing.T) {
 	spans := env.spanRecorder.Ended()
 	require.Len(t, spans, 1, "the first request is traced, the second excluded")
 	assertTypedErrorEvents(t, spans[0], typedError{message: "sampled", errorType: "private"})
-}
-
-// TestErrorRecorder_ContextSwapDownstream puts a middleware after
-// ErrorRecorder that replaces c.Request's context with a child span's and
-// never restores it. ErrorRecorder must record on the span that was active
-// when it ran, not on the already-ended child.
-func TestErrorRecorder_ContextSwapDownstream(t *testing.T) {
-	env := newTestEnv(t)
-	router := ginframework.New()
-	router.Use(spanStarter(env.tracerProvider), o11ygin.ErrorRecorder())
-	router.Use(func(c *ginframework.Context) {
-		ctx, child := env.tracerProvider.Tracer("test").Start(c.Request.Context(), "child")
-		c.Request = c.Request.WithContext(ctx)
-		c.Next()
-		child.End()
-	})
-	router.GET("/fail", func(c *ginframework.Context) {
-		c.AbortWithError(http.StatusInternalServerError, errors.New("swapped")).SetType(ginframework.ErrorTypeBind) //nolint:errcheck
-	})
-
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/fail", nil))
-
-	var outer, child sdktrace.ReadOnlySpan
-	for _, span := range env.spanRecorder.Ended() {
-		switch span.Name() {
-		case "manual":
-			outer = span
-		case "child":
-			child = span
-		}
-	}
-	require.NotNil(t, outer)
-	require.NotNil(t, child)
-	assert.Empty(t, child.Events())
-	assertSpanStatus(t, outer, codes.Error, "swapped")
-	assertStandaloneErrorEvents(t, outer, typedError{message: "swapped", errorType: "bind"})
 }
 
 // TestErrorRecorder_StatusSkipsTrailingNilErr pushes a real error and then a

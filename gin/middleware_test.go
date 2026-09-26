@@ -410,16 +410,14 @@ func assertSpanAttrMissing(t *testing.T, span sdktrace.ReadOnlySpan, key attribu
 // leaves on the server span for want, in c.Errors order.
 //
 // Each error must appear exactly twice: once as the exception event otelgin
-// records (no gin.error.type) and once as the chain's own gin.error event,
-// which carries gin.error.type and, as gin.error.message, the
-// exception.message of that same exception event — and no exception.*
-// attribute of its own. Counting every event, not only the typed ones, is what
-// catches a second exception event for the same error — or none, if a future
-// otelgin stops recording them.
+// records (its message, no gin.error.type) and once as the chain's own
+// gin.error event (gin.error.type, nothing else). Both kinds are recorded in
+// c.Errors order, so the n-th of each is compared with want[n]. Counting every
+// event, not only the typed ones, is what catches a second exception event for
+// the same error — or none, if a future otelgin stops recording them.
 func assertTypedErrorEvents(t *testing.T, span sdktrace.ReadOnlySpan, want ...typedError) {
 	t.Helper()
-	var exceptionMessages []string
-	var got []typedError
+	var messages, errorTypes []string
 	for _, event := range span.Events() {
 		switch event.Name {
 		case semconv.ExceptionEventName:
@@ -427,28 +425,23 @@ func assertTypedErrorEvents(t *testing.T, span sdktrace.ReadOnlySpan, want ...ty
 			assert.False(t, typed, "exception event must not carry gin.error.type: the chain adds no exception of its own")
 			message, ok := eventAttribute(event, semconv.ExceptionMessageKey)
 			require.True(t, ok, "exception event missing exception.message")
-			exceptionMessages = append(exceptionMessages, message)
+			messages = append(messages, message)
 		case "gin.error":
-			for _, attr := range event.Attributes {
-				assert.NotContains(t, string(attr.Key), "exception.", "gin.error must not carry exception.* keys")
-			}
+			require.Len(t, event.Attributes, 1, "gin.error carries gin.error.type only")
 			errorType, ok := eventAttribute(event, "gin.error.type")
 			require.True(t, ok, "gin.error event missing gin.error.type")
-			message, ok := eventAttribute(event, "gin.error.message")
-			require.True(t, ok, "gin.error event missing gin.error.message")
-			got = append(got, typedError{message: message, errorType: errorType})
+			errorTypes = append(errorTypes, errorType)
 		default:
 			t.Errorf("unexpected span event %q", event.Name)
 		}
 	}
-	require.Len(t, exceptionMessages, len(want), "want exactly one exception event per gin error")
-	assert.Equal(t, want, got)
-	var typedMessages []string
-	for _, g := range got {
-		typedMessages = append(typedMessages, g.message)
+	require.Len(t, messages, len(want), "want exactly one exception event per gin error")
+	require.Len(t, errorTypes, len(want), "want exactly one gin.error event per gin error")
+	var got []typedError
+	for i := range want {
+		got = append(got, typedError{message: messages[i], errorType: errorTypes[i]})
 	}
-	assert.ElementsMatch(t, exceptionMessages, typedMessages,
-		"each gin.error.message must equal the exception.message of its exception event")
+	assert.Equal(t, want, got)
 }
 
 func eventAttribute(event sdktrace.Event, key attribute.Key) (string, bool) {

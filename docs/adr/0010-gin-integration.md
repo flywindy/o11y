@@ -376,75 +376,85 @@ The duplicate has to be removed on our side.
 ### Decision
 
 1. **Canonical chain.** `Middleware` no longer includes `ErrorRecorder`.
-   Its second handler adds, per `c.Errors` entry, one span event named
-   **`gin.error`** carrying `gin.error.type` and `gin.error.message`, the
-   latter equal to the `exception.message` of the `exception` event
-   `otelgin` records for the same entry. It calls neither `RecordError` nor `SetStatus`: `otelgin`
+   Its second handler adds, per `c.Errors` entry and in `c.Errors` order,
+   one span event named **`gin.error`** carrying `gin.error.type` and
+   nothing else. It calls neither `RecordError` nor `SetStatus`: `otelgin`
    owns the exception events and the span status.
-2. **The event identifies its exception by content, not by position.**
-   A first version relied on the n-th `gin.error` matching the n-th
-   `exception`. Review showed that breaks in ordinary use: application
-   code that calls `RecordError` on the server span inserts exceptions
-   of its own, and the span event limit (128 by default) evicts the
-   oldest events first — which are the `gin.error` events, since the
-   handler unwinds before `otelgin` — shifting every remaining pair.
-   Carrying the message costs it a second time per error, and buys two
-   things: a `gin.error` event that survives is never attributed to the
-   wrong exception, and each one is readable on its own. Eviction can
-   still drop classifications; it can no longer misplace them. The key is
-   SDK-owned, not `exception.message`: a second review round pointed out
-   that `exception.*` on a non-exception event moves the double count onto
-   any query or backend that detects exceptions by attribute rather than
-   by event name. `exception.*` therefore stays on `exception` events only.
+2. **The classification is per request, not per exception.** The
+   `gin.error` events answer "which kinds of gin error did this request
+   have"; the `exception` events carry the messages. The event does not
+   repeat the error text to tie itself to one exception: semconv v1.39.0
+   marks duplicating `exception.message` NOT RECOMMENDED (`error.message`
+   note), and a copy under an SDK-owned key would sidestep that guidance,
+   and would put error text, which can carry user data, on a second key
+   that redaction rules for `exception.message` do not cover. Position is
+   not a reliable link either — application code may record exceptions
+   of its own on the server span, and the span event limit evicts the
+   oldest events, the `gin.error` ones, first — so the SDK promises none.
+   With one gin error per request, the common case, both events plainly
+   describe the same error.
 3. **Requests the chain filters out are not instrumented by it.** On a
    request excluded by `WithFilter` / `WithSkipPaths`, `otelgin` opens no
    span and records nothing, yet an outer layer's span
    (`o11yhttp.NewServerHandler`, an application span, an enclosing
-   `Middleware` on the engine) may be active. The handler does the same as
-   `otelgin`: nothing. It knows because the facade's `WithFilter` no longer
-   hands filters to `otelgin` one by one. `Middleware` wraps all of them in
-   a single `otelgin.WithGinFilter` that evaluates them once per request —
-   all must pass, as `otelgin` requires — returns the answer to `otelgin`
-   and stores it under a `gin.Context` key for the handler, so the two
-   cannot disagree even for a filter whose answer changes between calls
+   `Middleware` on the engine) may be active. The handler does the same
+   as `otelgin`: nothing. The facade's `WithFilter` no longer hands
+   filters to `otelgin` one by one; `Middleware` wraps all of them in a
+   single `otelgin.WithGinFilter` that evaluates them once per request
+   (all must pass, as `otelgin` requires), returns the answer to `otelgin`
+   and stores it under a `gin.Context` key for the handler. The two
+   cannot disagree, even for a filter whose answer changes between calls
    (per-request sampling). Each chain's handler reads the key before
    `c.Next()`, so a `Middleware` nested on a route group, which writes the
    same key later, cannot affect the enclosing chain. A chain with no
-   filters installs no gin filter and writes nothing.
-   Review of intermediate versions rejected four alternatives:
-   putting `gin.error` on whatever span is active (a classification with
-   no exception beside it, on a span the chain does not own), and
-   recording exceptions onto that span as `ErrorRecorder` did before this
-   amendment (a second exception whenever the outer span is an enclosing
-   `Middleware`'s, since that chain's `otelgin` records the same errors).
-   detecting whether `otelgin` opened a span by comparing span contexts
-   stored in `c.Keys` (a map write on every request, and wrong on nested
-   chains), and re-evaluating the filters in the handler (two answers
-   from a non-deterministic filter, and every filter run twice).
-   The handler reads the span **before** `c.Next()`, while the context is
-   the one `otelgin` handed on: a downstream middleware may replace the
-   request context without restoring it. Entries whose `Err` is nil are
-   skipped rather than dereferenced, here and in `ErrorRecorder`.
-4. **`ErrorRecorder` on its own** keeps its behaviour: one `exception`
+   filters installs no gin filter and writes nothing. When it does write,
+   the cost is one entry in `c.Keys`, which `otelgin` already allocates
+   on every traced request for its own tracer key.
+4. **The handler reads the span before `c.Next()`,** while the request
+   context is the one `otelgin` handed on: a downstream middleware may
+   replace it without restoring it. It skips entries whose `Err` is nil
+   (`c.Error(&gin.Error{...})` appends one; `otelgin`'s `RecordError(nil)`
+   records nothing for it either), and does no work on a span that is not
+   recording.
+5. **`ErrorRecorder` on its own** keeps its behaviour: one `exception`
    event per error carrying `gin.error.type`, and span status Error on a
    5xx response. That is the case where nothing else reads `c.Errors`.
-   Its godoc now says not to add it after `Middleware`. Like the chain's
-   handler it now reads the span before `c.Next()`, and it takes the
-   status description from the last entry that has an error rather than
-   dropping the status when the last entry's `Err` is nil.
-5. **The pin is tested, not assumed.** The matrix helper counts every
+   Its godoc now says not to add it after `Middleware`. Two crash-level
+   fixes apply to it as well: a nil-`Err` entry is skipped instead of
+   panicking the 5xx status path, and the status description comes from
+   the last entry that has an error.
+6. **The pin is tested, not assumed.** The matrix helper counts every
    event on the span and requires exactly one `exception` and one
-   `gin.error` per error, with `gin.error.message` equal to the
-   exception's `exception.message` and no `exception.*` key on
-   `gin.error`. A future
-   `otelgin` that stops recording exceptions (contrib issue 8441 tracks
-   moving off `RecordError`) or records them differently fails the
-   matrix on upgrade, instead of silently leaving zero or two.
+   `gin.error` per error. A future `otelgin` that stops recording
+   exceptions (contrib issue 8441 tracks moving off `RecordError`) or
+   records them differently fails the matrix on upgrade, instead of
+   silently leaving zero or two.
 
 The §5 matrix and walkthrough above are updated accordingly. Row 10 now
 also asserts the one `exception` event the OTel SDK's `span.End` records
 for the panic that unwinds through `otelgin`, which the old helper
 ignored because it carried no `gin.error.type`.
+
+### Alternatives rejected in review
+
+- **Pair the n-th `gin.error` with the n-th `exception`.** Breaks when
+  application code records exceptions on the server span, and when the
+  event limit evicts the `gin.error` events first.
+- **Copy the error text onto `gin.error`**, as `exception.message` or as
+  an SDK-owned key. The first moves the double count onto any query or
+  backend that detects exceptions by attribute; both duplicate
+  `exception.message` against semconv's guidance and widen what
+  redaction has to cover (Decision 2).
+- **Put `gin.error` on whatever span is active** on a filtered request:
+  a classification with no exception beside it, on a span the chain does
+  not own.
+- **Record exceptions on that span**, as `ErrorRecorder` did before this
+  amendment: a second exception whenever the outer span belongs to an
+  enclosing `Middleware`, whose `otelgin` records the same errors.
+- **Detect whether `otelgin` opened a span** by storing the incoming span
+  context in `c.Keys` and comparing: wrong on nested chains.
+- **Re-evaluate the filters in the handler:** two answers from a filter
+  that is not deterministic, and every filter run twice.
 
 ### Consequences
 
@@ -452,20 +462,13 @@ ignored because it carried no `gin.error.type`.
   and alerts that count `exception` events read the real number from
   then on; a before/after comparison shows a step down that is not an
   improvement in error rate.
-- `gin.error.message` identifies the error by its text. Two `c.Errors`
-  entries with the same message and different types are
-  indistinguishable by message; the classification is still correct per
-  event, only which of the two identical exceptions it belongs to is not.
-- A request a filter excludes (for example `/healthz` under
-  `WithSkipPaths`) no longer gets exception events on an outer span; before
-  this amendment `ErrorRecorder` recorded them there.
 - `{ event.gin.error.type = "bind" }` keeps matching. A query that also
-  constrains `event:name = "exception"`, or combines `gin.error.type` with
-  `event.exception.message` on one event, must change to
-  `event:name = "gin.error"` and `event.gin.error.message`.
-- The error text is stored twice per error, once as `exception.message`
-  and once as `gin.error.message`. A collector processor that redacts
-  `exception.message` must also cover `gin.error.message`.
-- `docs/semconv.md` lists `gin.error` as an SDK-owned event name and
-  `gin.error.message` as an SDK-owned key next to the existing
-  `gin.error.type` row.
+  constrains `event:name = "exception"`, or combines `gin.error.type`
+  with `event.exception.*` on one event, must select
+  `event:name = "gin.error"` for the type and read the message from the
+  span's `exception` events.
+- A request a filter excludes (for example `/healthz` under
+  `WithSkipPaths`) no longer gets exception events on an outer span;
+  before this amendment `ErrorRecorder` recorded them there.
+- `docs/semconv.md` lists `gin.error` as an SDK-owned event name next to
+  the existing `gin.error.type` row.
