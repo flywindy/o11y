@@ -73,7 +73,7 @@ func TestMiddleware_MatrixRow04_AbortWithError500(t *testing.T) {
 
 	assert.Equal(t, http.StatusInternalServerError, result.statusCode)
 	assertSpanShape(t, result.span, http.MethodGet, testRoute, http.StatusInternalServerError)
-	assertSpanStatus(t, result.span, codes.Error, "Error #01: database down\n")
+	assertSpanStatus(t, result.span, codes.Error, "") // 5xx: otelgin's status-code description wins; messages are on the exception events
 	assertTypedErrorEvents(t, result.span, typedError{message: "database down", errorType: "private"})
 	assertMetricStatusCodes(t, result.metrics, "500")
 }
@@ -86,7 +86,7 @@ func TestMiddleware_MatrixRow05_MultipleErrorsThenAbort500(t *testing.T) {
 
 	assert.Equal(t, http.StatusInternalServerError, result.statusCode)
 	assertSpanShape(t, result.span, http.MethodGet, testRoute, http.StatusInternalServerError)
-	assertSpanStatus(t, result.span, codes.Error, "Error #01: first failure\nError #02: second failure\n")
+	assertSpanStatus(t, result.span, codes.Error, "") // 5xx: otelgin's status-code description wins; messages are on the exception events
 	assertTypedErrorEvents(t, result.span,
 		typedError{message: "first failure", errorType: "public"},
 		typedError{message: "second failure", errorType: "private"},
@@ -113,7 +113,7 @@ func TestMiddleware_MatrixRow07_PanicWithCustomRecoveryPushingError(t *testing.T
 
 	assert.Equal(t, http.StatusInternalServerError, result.statusCode)
 	assertSpanShape(t, result.span, http.MethodGet, testRoute, http.StatusInternalServerError)
-	assertSpanStatus(t, result.span, codes.Error, "Error #01: panic: boom\n")
+	assertSpanStatus(t, result.span, codes.Error, "") // 5xx: otelgin's status-code description wins; messages are on the exception events
 	assertTypedErrorEvents(t, result.span, typedError{message: "panic: boom", errorType: "private"})
 	assertMetricStatusCodes(t, result.metrics, "500")
 }
@@ -161,7 +161,15 @@ func TestMiddleware_MatrixRow10_InvertedRecoveryOrderProducesIncompleteSpan(t *t
 	assertSpanAttr(t, result.span, semconv.HTTPRouteKey, testRoute)
 	assertSpanAttrMissing(t, result.span, semconv.HTTPResponseStatusCodeKey)
 	assertSpanStatus(t, result.span, codes.Unset, "")
-	assertTypedErrorEvents(t, result.span)
+	// The panic unwinds through otelgin before recovery runs, so the OTel SDK's
+	// span.End records it as an exception event of its own. No c.Errors entry
+	// exists, so the chain records nothing of its own.
+	events := result.span.Events()
+	require.Len(t, events, 1)
+	assert.Equal(t, semconv.ExceptionEventName, events[0].Name)
+	message, ok := eventAttribute(events[0], semconv.ExceptionMessageKey)
+	require.True(t, ok)
+	assert.Equal(t, "boom", message)
 	assertMetricStatusCodes(t, result.metrics)
 }
 
@@ -398,16 +406,21 @@ func assertSpanAttrMissing(t *testing.T, span sdktrace.ReadOnlySpan, key attribu
 	}
 }
 
+// assertTypedErrorEvents checks the events the canonical Middleware chain
+// leaves on the server span for want, in c.Errors order: exactly one exception
+// event per error, each carrying its message and gin.error.type, and no other
+// event. Counting every event, not only the typed ones, is what catches a
+// second exception for the same error — the one otelgin records unless the
+// chain keeps c.Errors from it.
 func assertTypedErrorEvents(t *testing.T, span sdktrace.ReadOnlySpan, want ...typedError) {
 	t.Helper()
 	var got []typedError
 	for _, event := range span.Events() {
+		require.Equal(t, semconv.ExceptionEventName, event.Name, "unexpected span event")
 		errorType, ok := eventAttribute(event, "gin.error.type")
-		if !ok {
-			continue
-		}
-		message, ok := eventAttribute(event, "exception.message")
-		require.True(t, ok, "typed error event missing exception.message")
+		require.True(t, ok, "exception event missing gin.error.type: recorded by otelgin, not the chain")
+		message, ok := eventAttribute(event, semconv.ExceptionMessageKey)
+		require.True(t, ok, "exception event missing exception.message")
 		got = append(got, typedError{message: message, errorType: errorType})
 	}
 	assert.Equal(t, want, got)
