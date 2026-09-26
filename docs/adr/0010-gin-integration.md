@@ -458,6 +458,16 @@ a query migration:
   request with several, and every query on
   `event:name = "exception" && event.gin.error.type` stops matching.
 
+Wrapping the `TracerProvider` handed to `otelgin`, so its span drops
+`otelgin`'s untyped `RecordError` and keeps the chain's 5xx status
+description, was also considered and rejected. That span is the one
+`otelgin` puts in the request context: every handler's
+`trace.SpanFromContext` would get the wrapper, whose concrete type is no
+longer the SDK's (breaking any type assertion on it), and every call the
+application makes on it would pass through code that has to tell
+`otelgin`'s calls from the application's. Keeping `c.Errors` aside during
+`otelgin`'s unwind touches nothing the application can observe.
+
 Two ways of handling filtered requests were rejected as well:
 recording on whatever span is active (a second exception whenever that
 span belongs to an enclosing `Middleware`, whose `otelgin` records the

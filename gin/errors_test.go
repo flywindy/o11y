@@ -239,6 +239,78 @@ func TestMiddleware_NestedChains(t *testing.T) {
 	}
 }
 
+// TestMiddleware_HandleContextKeepsTracedFlag re-dispatches the request with
+// engine.HandleContext to a path the chain's filter excludes, and pushes the
+// error there. HandleContext clears c.Keys, but the outer chain read whether it
+// traced the request before c.Next, so the error is still recorded once, typed,
+// on the outer span.
+func TestMiddleware_HandleContextKeepsTracedFlag(t *testing.T) {
+	env := newTestEnv(t)
+	router := ginframework.New()
+	router.Use(o11ygin.Middleware(testService, env.tracerProvider, env.meterProvider, propagation.TraceContext{},
+		o11ygin.WithSkipPaths(),
+	)...)
+	router.GET("/healthz", func(c *ginframework.Context) {
+		c.AbortWithError(http.StatusServiceUnavailable, errors.New("not ready")).SetType(ginframework.ErrorTypePublic) //nolint:errcheck
+	})
+	router.GET(testRoute, func(c *ginframework.Context) {
+		c.Request.URL.Path = "/healthz"
+		router.HandleContext(c)
+	})
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, testPath, nil))
+
+	spans := env.spanRecorder.Ended()
+	require.Len(t, spans, 1, "only the outer request is traced")
+	assertTypedErrorEvents(t, spans[0], typedError{message: "not ready", errorType: "public"})
+}
+
+// TestMiddleware_NilErrOnlyLeavesStatusUnset pushes only a nil-Err entry on a
+// 4xx response. There is no error to record, so the chain neither records an
+// exception nor marks the span Error, as ErrorRecorder does.
+func TestMiddleware_NilErrOnlyLeavesStatusUnset(t *testing.T) {
+	env := newTestEnv(t)
+	router := ginframework.New()
+	router.Use(o11ygin.Middleware(testService, env.tracerProvider, env.meterProvider, propagation.TraceContext{})...)
+	router.GET(testRoute, func(c *ginframework.Context) {
+		c.Error(&ginframework.Error{Type: ginframework.ErrorTypeBind}) //nolint:errcheck
+		c.Status(http.StatusBadRequest)
+	})
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, testPath, nil))
+	result := env.finish(t, rec)
+
+	assertSpanStatus(t, result.span, codes.Unset, "")
+	assert.Empty(t, result.span.Events())
+}
+
+// TestMiddleware_HiddenErrorsLeaveNoKey checks the chain removes the entry it
+// used to set c.Errors aside once it puts them back, so c.Keys holds nothing
+// of the chain's after the request.
+func TestMiddleware_HiddenErrorsLeaveNoKey(t *testing.T) {
+	env := newTestEnv(t)
+	var keys map[any]any
+	router := ginframework.New()
+	router.Use(func(c *ginframework.Context) {
+		c.Next()
+		keys = c.Keys
+	})
+	router.Use(o11ygin.Middleware(testService, env.tracerProvider, env.meterProvider, propagation.TraceContext{})...)
+	router.GET(testRoute, func(c *ginframework.Context) {
+		c.AbortWithError(http.StatusBadRequest, errors.New("bad")) //nolint:errcheck
+	})
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, testPath, nil))
+
+	for key := range keys {
+		_, isString := key.(string)
+		assert.True(t, isString, "unexpected non-string key %#v left in c.Keys", key)
+	}
+}
+
 // TestNilErrEntryDoesNotPanic pushes a *gin.Error with no Err, which gin
 // appends as is, on a 5xx response. There is nothing to classify or record;
 // neither the canonical chain nor ErrorRecorder on its own may dereference it.

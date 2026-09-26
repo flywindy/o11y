@@ -56,8 +56,12 @@ func ErrorRecorder() ginframework.HandlerFunc {
 // (gin.go). It cannot add gin's bind/render/private/public classification, and
 // an exception event cannot be amended once recorded. So this handler records
 // each entry as the exception event itself, carrying gin.error.type, sets the
-// status as otelgin would, and then hides c.Errors from otelgin — moving them
-// under hiddenKey — so otelgin records nothing a second time. The chain's
+// status to Error with c.Errors.String() as otelgin would when any entry has
+// an error, and then hides c.Errors from otelgin — moving them under
+// hiddenKey — so otelgin records nothing a second time. On a 5xx response
+// otelgin still sets the status from the HTTP code afterwards, Error with an
+// empty description, which replaces this one; the messages stay on the
+// exception events. The chain's
 // first handler puts them back as soon as otelgin returns, so every
 // middleware outside the chain still sees them.
 //
@@ -80,7 +84,7 @@ func chainErrors(tracedKey, hiddenKey *chainKey) ginframework.HandlerFunc {
 		if len(c.Errors) == 0 {
 			return
 		}
-		if span.IsRecording() {
+		if span.IsRecording() && lastError(c.Errors) != nil {
 			recordTypedExceptions(span, c.Errors)
 			span.SetStatus(codes.Error, c.Errors.String())
 		}
@@ -96,9 +100,9 @@ func restoreErrors(c *ginframework.Context, hiddenKey *chainKey) {
 	if !ok {
 		return
 	}
+	c.Delete(hiddenKey)
 	hidden, _ := v.([]*ginframework.Error)
 	c.Errors = append(hidden, c.Errors...)
-	c.Set(hiddenKey, nil)
 }
 
 // recordTypedExceptions records each entry with an error as an exception event
