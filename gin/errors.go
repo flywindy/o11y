@@ -10,35 +10,24 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-const (
-	ginErrorTypeKey = "gin.error.type"
+const ginErrorTypeKey = "gin.error.type"
 
-	// ginErrorEventName names the span event the canonical Middleware chain
-	// adds for each gin.Context.Errors entry. It is deliberately not
-	// "exception": otelgin already records one exception event per entry, and
-	// a second would double every exception count read from the span.
-	ginErrorEventName = "gin.error"
-
-	// tracedKey is the gin.Context key under which a Middleware chain with
-	// filters records whether they let the request be traced. Chains nested on
-	// route groups share it safely: each chain's gin filter writes it and that
-	// chain's error handler reads it before c.Next, so no inner chain has run
-	// in between.
-	tracedKey = "o11y.gin.traced"
-)
+// chainKey is a gin.Context key private to one Middleware chain. Each chain
+// allocates its own, so chains nested on route groups never read each other's
+// entries, and no application key can collide with one. It is not zero-sized,
+// so distinct keys never compare equal.
+type chainKey struct{ name string }
 
 // ErrorRecorder records gin.Context.Errors on the active span, for chains that
 // do not include Middleware.
 //
-// Middleware already handles c.Errors; do not add ErrorRecorder after it.
-// Inside the canonical chain otelgin records each error as an exception event
-// itself, so the chain adds a separate "gin.error" event carrying
-// gin.error.type instead of a second exception.
+// Middleware already records c.Errors; do not add ErrorRecorder after it, or
+// every error is recorded twice.
 //
 // Used on its own — for example on a gin engine served through
 // o11yhttp.NewServerHandler, where nothing else reads c.Errors — ErrorRecorder
-// is what turns each error into an exception event: it calls span.RecordError
-// with the gin.error.type attribute, and sets the span status to Error when the
+// turns each error into an exception event: it calls span.RecordError with the
+// gin.error.type attribute, and sets the span status to Error when the
 // response status is 5xx. It must run after the middleware that starts the
 // span. Entries with a nil Err are skipped. If no span is recording, it is a
 // no-op.
@@ -52,55 +41,82 @@ func ErrorRecorder() ginframework.HandlerFunc {
 		if !span.IsRecording() {
 			return
 		}
-		var last error
-		for _, ge := range c.Errors {
-			if ge.Err == nil {
-				continue // c.Error(&gin.Error{...}) can append one; nothing to record
-			}
-			last = ge.Err
-			span.RecordError(ge.Err,
-				trace.WithAttributes(attribute.String(ginErrorTypeKey, ginErrorTypeString(ge.Type))),
-			)
-		}
+		last := recordTypedExceptions(span, c.Errors)
 		if c.Writer.Status() >= 500 && last != nil {
 			span.SetStatus(codes.Error, last.Error())
 		}
 	}
 }
 
-// errorTypeEvents is the canonical chain's error handler. It runs inside
-// otelgin, which on unwind records every c.Errors entry as an exception event
-// and sets the span status (otelgin v0.68.0 gin.go). What otelgin cannot know
-// is gin's bind/render/private/public classification, so this adds only that:
-// one "gin.error" event per entry, in c.Errors order, carrying gin.error.type.
-// It repeats nothing otelgin's exception event already carries.
+// chainErrors is the canonical chain's error handler. It runs inside otelgin,
+// directly after otelgin's own handler.
 //
-// When filtered is true, the chain's otelgin gin filter has recorded under
-// tracedKey whether the request is traced. A request it excluded has no span
-// of this chain's, so the span in the context, if any, belongs to some other
-// layer and is left alone, as otelgin leaves it. The span is read before
-// c.Next, while the context is still the one otelgin handed on, since a
-// downstream middleware may replace c.Request's context without restoring it.
-func errorTypeEvents(filtered bool) ginframework.HandlerFunc {
+// otelgin v0.68.0, on unwind, sets the span status to Error with
+// c.Errors.String() and calls span.RecordError for every c.Errors entry
+// (gin.go). It cannot add gin's bind/render/private/public classification, and
+// an exception event cannot be amended once recorded. So this handler records
+// each entry as the exception event itself, carrying gin.error.type, sets the
+// status as otelgin would, and then hides c.Errors from otelgin — moving them
+// under hiddenKey — so otelgin records nothing a second time. The chain's
+// first handler puts them back as soon as otelgin returns, so every
+// middleware outside the chain still sees them.
+//
+// tracedKey is nil when the chain has no filters. Otherwise the chain's
+// otelgin gin filter sets it on a request it traces; a request it excluded has
+// no span of this chain's, so the handler leaves it alone, as otelgin does.
+// The span is read before c.Next, while the context is still the one otelgin
+// handed on, since a downstream middleware may replace c.Request's context
+// without restoring it.
+func chainErrors(tracedKey, hiddenKey *chainKey) ginframework.HandlerFunc {
 	return func(c *ginframework.Context) {
-		if filtered && !c.GetBool(tracedKey) {
-			c.Next()
-			return
+		if tracedKey != nil {
+			if _, traced := c.Get(tracedKey); !traced {
+				c.Next()
+				return
+			}
 		}
 		span := trace.SpanFromContext(c.Request.Context())
 		c.Next()
-		if len(c.Errors) == 0 || !span.IsRecording() {
+		if len(c.Errors) == 0 {
 			return
 		}
-		for _, ge := range c.Errors {
-			if ge.Err == nil {
-				continue // otelgin's RecordError(nil) records nothing either
-			}
-			span.AddEvent(ginErrorEventName, trace.WithAttributes(
-				attribute.String(ginErrorTypeKey, ginErrorTypeString(ge.Type)),
-			))
+		if span.IsRecording() {
+			recordTypedExceptions(span, c.Errors)
+			span.SetStatus(codes.Error, c.Errors.String())
 		}
+		c.Set(hiddenKey, []*ginframework.Error(c.Errors))
+		c.Errors = nil
 	}
+}
+
+// restoreErrors puts back the c.Errors chainErrors hid from otelgin, ahead of
+// anything appended since.
+func restoreErrors(c *ginframework.Context, hiddenKey *chainKey) {
+	v, ok := c.Get(hiddenKey)
+	if !ok {
+		return
+	}
+	hidden, _ := v.([]*ginframework.Error)
+	c.Errors = append(hidden, c.Errors...)
+	c.Set(hiddenKey, nil)
+}
+
+// recordTypedExceptions records each entry with an error as an exception event
+// carrying gin.error.type, and returns the last error recorded. An entry with a
+// nil Err — c.Error(&gin.Error{...}) appends one — is skipped: there is no
+// error to record, and otelgin's RecordError(nil) records nothing either.
+func recordTypedExceptions(span trace.Span, errs []*ginframework.Error) error {
+	var last error
+	for _, ge := range errs {
+		if ge.Err == nil {
+			continue
+		}
+		last = ge.Err
+		span.RecordError(ge.Err,
+			trace.WithAttributes(attribute.String(ginErrorTypeKey, ginErrorTypeString(ge.Type))),
+		)
+	}
+	return last
 }
 
 func ginErrorTypeString(errorType ginframework.ErrorType) string {

@@ -9,9 +9,11 @@ import (
 )
 
 // Middleware returns the canonical gin middleware chain for o11y tracing:
-// otelgin, which opens the server span and records each gin.Context.Errors
-// entry as an exception event, followed by a handler that adds one "gin.error"
-// event per entry carrying gin.error.type. A request excluded by WithFilter or
+// otelgin, which opens the server span, followed by a handler that records
+// each gin.Context.Errors entry as one exception event carrying
+// gin.error.type. otelgin would record each entry again on its own; the chain
+// keeps it from doing so, and every middleware outside the chain still sees
+// c.Errors as the handlers left them. A request excluded by WithFilter or
 // WithSkipPaths is not instrumented by the chain at all. Do not add
 // ErrorRecorder after it.
 //
@@ -31,22 +33,26 @@ func Middleware(service string, tp trace.TracerProvider, mp metric.MeterProvider
 	}
 	options := applyOptions(opts)
 	base = append(base, options.otel...)
-	filtered := len(options.filters) > 0
-	if filtered {
+	var tracedKey *chainKey
+	if filters := options.filters; len(filters) > 0 {
+		tracedKey = &chainKey{name: "o11y.gin.traced"}
 		base = append(base, otelgin.WithGinFilter(func(c *ginframework.Context) bool {
-			traced := true
-			for _, filter := range options.filters {
+			for _, filter := range filters {
 				if !filter(c.Request) {
-					traced = false
-					break
+					return false
 				}
 			}
-			c.Set(tracedKey, traced)
-			return traced
+			c.Set(tracedKey, true)
+			return true
 		}))
 	}
+	hiddenKey := &chainKey{name: "o11y.gin.hidden_errors"}
+	instrument := otelgin.Middleware(service, base...)
 	return []ginframework.HandlerFunc{
-		otelgin.Middleware(service, base...),
-		errorTypeEvents(filtered),
+		func(c *ginframework.Context) {
+			defer restoreErrors(c, hiddenKey)
+			instrument(c)
+		},
+		chainErrors(tracedKey, hiddenKey),
 	}
 }

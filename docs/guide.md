@@ -721,14 +721,12 @@ router.GET("/fail", func(c *gin.Context) {
 ```
 
 Each error pushed via `c.Error` / `c.AbortWithError` appears on the server span
-as one `exception` event, recorded by otelgin, and one `gin.error` event
-carrying only `gin.error.type` (`bind`, `render`, `private`, `public`, …).
-`{ event:name = "gin.error" && event.gin.error.type = "bind" }` finds requests
-with a bind error; the messages are on the span's `exception` events. The
-classification describes the request's gin errors, not a particular
-exception: don't pair the two kinds of event by their order on the span. A
-request excluded by `WithFilter` or `WithSkipPaths` is not instrumented by the
-chain, so it gets neither event. Use `o11ygin.ErrorRecorder()` only in a chain
+as one `exception` event carrying `gin.error.type` (`bind`, `render`,
+`private`, `public`, …); `{ event:name = "exception" && event.gin.error.type =
+"bind" }` finds it. On a 5xx response the span status is Error with an empty
+description; the error messages are on the exception events. A request
+excluded by `WithFilter` or `WithSkipPaths` is not instrumented by the chain,
+so it gets no event. Use `o11ygin.ErrorRecorder()` only in a chain
 without `Middleware` — for example a gin engine served through
 `o11yhttp.NewServerHandler` — where it records each error as an `exception`
 event carrying `gin.error.type` itself. The metric label set remains governed

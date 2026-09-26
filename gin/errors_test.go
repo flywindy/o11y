@@ -52,10 +52,11 @@ func TestErrorRecorder_RecordsTypedGinErrors(t *testing.T) {
 	assertStandaloneErrorEvents(t, spans[0], typedError{message: "typed", errorType: "bind"})
 }
 
-// TestMiddleware_ClassifiesGinErrorsOnly has the handler record an exception
-// of its own on the server span before pushing a gin error. Only the gin error
-// is classified: one gin.error event beside two exception events.
-func TestMiddleware_ClassifiesGinErrorsOnly(t *testing.T) {
+// TestMiddleware_LeavesApplicationExceptionsAlone has the handler record an
+// exception of its own on the server span before pushing a gin error. The
+// application's exception is left as recorded; only the gin error gets
+// gin.error.type, and each is recorded once.
+func TestMiddleware_LeavesApplicationExceptionsAlone(t *testing.T) {
 	env := newTestEnv(t)
 	router := ginframework.New()
 	router.Use(o11ygin.Middleware(testService, env.tracerProvider, env.meterProvider, propagation.TraceContext{})...)
@@ -68,26 +69,80 @@ func TestMiddleware_ClassifiesGinErrorsOnly(t *testing.T) {
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, testPath, nil))
 	result := env.finish(t, rec)
 
-	var exceptionMessages, errorTypes []string
-	for _, event := range result.span.Events() {
-		switch event.Name {
-		case semconv.ExceptionEventName:
-			message, _ := eventAttribute(event, semconv.ExceptionMessageKey)
-			exceptionMessages = append(exceptionMessages, message)
-		case "gin.error":
-			errorType, _ := eventAttribute(event, "gin.error.type")
-			errorTypes = append(errorTypes, errorType)
+	events := result.span.Events()
+	require.Len(t, events, 2)
+	message, _ := eventAttribute(events[0], semconv.ExceptionMessageKey)
+	_, typed := eventAttribute(events[0], "gin.error.type")
+	assert.Equal(t, "cache miss", message)
+	assert.False(t, typed)
+	message, _ = eventAttribute(events[1], semconv.ExceptionMessageKey)
+	errorType, _ := eventAttribute(events[1], "gin.error.type")
+	assert.Equal(t, "invalid id", message)
+	assert.Equal(t, "bind", errorType)
+	assertSpanStatus(t, result.span, codes.Error, "Error #01: invalid id\n")
+}
+
+// TestMiddleware_OuterMiddlewareSeesErrors checks that keeping c.Errors from
+// otelgin is invisible outside the chain: a middleware registered before
+// Middleware, like gin's logger or an error-response middleware, still finds
+// every error the handlers pushed, in order.
+func TestMiddleware_OuterMiddlewareSeesErrors(t *testing.T) {
+	env := newTestEnv(t)
+	var seen []string
+	router := ginframework.New()
+	router.Use(func(c *ginframework.Context) {
+		c.Next()
+		for _, ge := range c.Errors {
+			seen = append(seen, ge.Error())
 		}
+	})
+	router.Use(o11ygin.Middleware(testService, env.tracerProvider, env.meterProvider, propagation.TraceContext{})...)
+	router.GET(testRoute, func(c *ginframework.Context) {
+		c.Error(errors.New("first"))                                           //nolint:errcheck
+		c.AbortWithError(http.StatusInternalServerError, errors.New("second")) //nolint:errcheck
+	})
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, testPath, nil))
+	result := env.finish(t, rec)
+
+	assert.Equal(t, []string{"first", "second"}, seen)
+	assertTypedErrorEvents(t, result.span,
+		typedError{message: "first", errorType: "private"},
+		typedError{message: "second", errorType: "private"},
+	)
+}
+
+// TestMiddleware_FilterOptionsCombine passes WithSkipPaths and a WithFilter of
+// its own. Every filter from every option must pass for a request to be
+// traced, and an excluded request gets no event from the chain.
+func TestMiddleware_FilterOptionsCombine(t *testing.T) {
+	env := newTestEnv(t)
+	router := ginframework.New()
+	router.Use(o11ygin.Middleware(testService, env.tracerProvider, env.meterProvider, propagation.TraceContext{},
+		o11ygin.WithSkipPaths(),
+		o11ygin.WithFilter(func(r *http.Request) bool { return r.URL.Path != "/internal" }),
+	)...)
+	for _, path := range []string{"/healthz", "/internal", testRoute} {
+		router.GET(path, func(c *ginframework.Context) {
+			c.AbortWithError(http.StatusBadRequest, errors.New("bad")).SetType(ginframework.ErrorTypeBind) //nolint:errcheck
+		})
 	}
-	assert.Equal(t, []string{"cache miss", "invalid id"}, exceptionMessages, "the handler's exception, then otelgin's")
-	assert.Equal(t, []string{"bind"}, errorTypes)
+
+	for _, path := range []string{"/healthz", "/internal", testPath} {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	}
+
+	spans := env.spanRecorder.Ended()
+	require.Len(t, spans, 1, "only the path neither filter excludes is traced")
+	assertTypedErrorEvents(t, spans[0], typedError{message: "bad", errorType: "bind"})
 }
 
 // TestMiddleware_FilteredRequestLeavesOuterSpanAlone covers a request the
 // chain's filter excludes while an outer layer's span is active. otelgin opens
 // no span and records nothing; the chain's error handler must do the same
-// rather than put a gin.error event, with no exception beside it, on a span
-// that is not its own.
+// rather than record on a span that is not its own.
 func TestMiddleware_FilteredRequestLeavesOuterSpanAlone(t *testing.T) {
 	env := newTestEnv(t)
 	router := ginframework.New()
@@ -110,8 +165,8 @@ func TestMiddleware_FilteredRequestLeavesOuterSpanAlone(t *testing.T) {
 
 // TestMiddleware_ContextSwapDownstream puts a middleware after the chain that
 // replaces c.Request's context with a child span's and never restores it. The
-// gin.error events must still land on otelgin's server span, next to its
-// exception events, not on the already-ended child.
+// exception events must still land on otelgin's server span, not on the
+// already-ended child.
 func TestMiddleware_ContextSwapDownstream(t *testing.T) {
 	env := newTestEnv(t)
 	router := ginframework.New()
@@ -145,9 +200,9 @@ func TestMiddleware_ContextSwapDownstream(t *testing.T) {
 
 // TestMiddleware_NestedChains installs Middleware on the engine and again on a
 // group, with each chain tracing or filtering the request. Every span carries
-// exactly one exception and one gin.error event per error, and a chain that
-// filtered the request adds nothing: neither chain acts on the other's span or
-// on the other's filter answer.
+// exactly one typed exception event per error, and a chain that filtered the
+// request adds nothing: neither chain acts on the other's span, filter answer
+// or hidden errors.
 func TestMiddleware_NestedChains(t *testing.T) {
 	for _, tc := range []struct {
 		outerFiltered, innerFiltered bool
@@ -212,7 +267,6 @@ func TestNilErrEntryDoesNotPanic(t *testing.T) {
 			assert.Equal(t, http.StatusInternalServerError, rec.Code)
 			for _, span := range env.spanRecorder.Ended() {
 				for _, event := range span.Events() {
-					assert.NotEqual(t, "gin.error", event.Name)
 					assert.NotEqual(t, semconv.ExceptionEventName, event.Name)
 				}
 			}
@@ -223,8 +277,7 @@ func TestNilErrEntryDoesNotPanic(t *testing.T) {
 // TestMiddleware_FilterEvaluatedOncePerRequest uses a filter whose answer
 // changes on every call, like a sampling filter. The chain must ask it once
 // per request, so otelgin and the error handler act on the same answer: a
-// traced request gets its exception and its gin.error, an excluded one gets
-// neither.
+// traced request gets its typed exception, an excluded one nothing.
 func TestMiddleware_FilterEvaluatedOncePerRequest(t *testing.T) {
 	env := newTestEnv(t)
 	calls := 0

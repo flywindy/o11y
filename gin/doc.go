@@ -6,13 +6,13 @@
 //	r.Use(o11ygin.Middleware("svc", tp, mp, prop)...)
 //	r.Use(gin.Recovery())
 //
-// The otelgin middleware opens the server span and, on unwind, records each
-// gin.Context.Errors entry as an exception event. The chain's second handler
-// adds one "gin.error" event per entry carrying the gin.error.type attribute,
-// making gin error categories queryable without a second exception event and
-// without adding high-cardinality metric labels. gin.Recovery should be
-// registered inside that chain so recovered panics still produce complete HTTP
-// status attributes and metrics.
+// The otelgin middleware opens the server span. The chain's second handler
+// records each gin.Context.Errors entry as one exception event carrying the
+// gin.error.type attribute, making gin error categories queryable without
+// adding high-cardinality metric labels, and keeps c.Errors from otelgin so
+// the error is not recorded a second time. gin.Recovery should be registered
+// inside that chain so recovered panics still produce complete HTTP status
+// attributes and metrics.
 //
 // ErrorRecorder is for chains that do not use Middleware; there it records
 // each error as an exception event carrying gin.error.type.

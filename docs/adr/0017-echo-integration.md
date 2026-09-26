@@ -48,10 +48,10 @@ exists rather than a one-line "do what 0010 did":
    `c.AbortWithError`, which a `RoundTripper`- or `http.Handler`-level
    middleware cannot see. ADR 0010 closed that gap with a self-written
    handler in the chain because `otelgin` exposes no error hook. (`otelgin`
-   v0.68.0 does record each `c.Errors` entry as an `exception` event itself;
-   what it cannot add is gin's error classification, so since ADR 0010's
-   2026-09-26 amendment the SDK's handler adds only that, as a `gin.error`
-   event.)
+   v0.68.0 does record each `c.Errors` entry as an `exception` event itself,
+   but cannot add gin's error classification; since ADR 0010's 2026-09-26
+   amendment the SDK's handler records the typed exception and keeps
+   `c.Errors` from `otelgin` so it is not recorded twice.)
    Echo is the opposite: handlers **return** `error`, the error
    propagates back up the middleware chain, and a centralized
    `Echo.HTTPErrorHandler` turns it into a response. `otelecho`
