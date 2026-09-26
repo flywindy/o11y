@@ -32,8 +32,22 @@ func Middleware(service string, tp trace.TracerProvider, mp metric.MeterProvider
 	}
 	options := applyOptions(opts)
 	base = append(base, options.otel...)
+	filtered := len(options.filters) > 0
+	if filtered {
+		base = append(base, otelgin.WithGinFilter(func(c *ginframework.Context) bool {
+			traced := true
+			for _, filter := range options.filters {
+				if !filter(c.Request) {
+					traced = false
+					break
+				}
+			}
+			c.Set(tracedKey, traced)
+			return traced
+		}))
+	}
 	return []ginframework.HandlerFunc{
 		otelgin.Middleware(service, base...),
-		errorTypeEvents(options.filters),
+		errorTypeEvents(filtered),
 	}
 }

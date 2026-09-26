@@ -32,7 +32,11 @@ adopters can plan their upgrades.
   rollout**; that step down on a dashboard is the correction, not a drop in
   errors. `ErrorRecorder` used on its own, without `Middleware`, is unchanged,
   except that a `c.Errors` entry with a nil `Err` (`c.Error(&gin.Error{...})`)
-  is now skipped instead of panicking on a 5xx response.
+  is now skipped instead of panicking on a 5xx response, and that it records
+  on the span active when it runs rather than on one a later middleware left
+  in the request context. `WithFilter` / `WithSkipPaths` filters are now
+  evaluated once per request instead of by otelgin per filter; the result is
+  the same for any filter whose answer does not change between calls.
   See ADR 0010's 2026-09-26 amendment.
 
 - `redis`: the four pool attributes it wrote as string literals now reference
@@ -56,9 +60,11 @@ adopters can plan their upgrades.
   also constrains `event:name = "exception"`, or combines `gin.error.type`
   with `event.exception.message` on one event, must use
   `event:name = "gin.error"` and `event.gin.error.message`: the `exception`
-  event no longer carries `gin.error.type`. Do not add `o11ygin.ErrorRecorder()` after
-  `o11ygin.Middleware(...)` to get the old event back — that reintroduces the
-  duplicate.
+  event no longer carries `gin.error.type`. Do not add
+  `o11ygin.ErrorRecorder()` after `o11ygin.Middleware(...)` to get the old
+  event back — that reintroduces the duplicate.
+- **gin: a collector processor that redacts `exception.message` must also
+  cover `gin.error.message`**, which carries the same text.
 
 ---
 

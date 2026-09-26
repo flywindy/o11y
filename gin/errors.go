@@ -1,7 +1,6 @@
 package gin
 
 import (
-	"net/http"
 	"strconv"
 	"strings"
 
@@ -22,6 +21,12 @@ const (
 	ginErrorEventName = "gin.error"
 )
 
+// tracedKey is the gin.Context key under which a Middleware chain with filters
+// records whether they let the request be traced. Chains nested on route groups
+// share it safely: each chain's gin filter writes it and that chain's error
+// handler reads it before c.Next, so no inner chain has run in between.
+const tracedKey = "o11y.gin.traced"
+
 // ErrorRecorder records gin.Context.Errors on the active span, for chains that
 // do not include Middleware.
 //
@@ -34,28 +39,28 @@ const (
 // o11yhttp.NewServerHandler, where nothing else reads c.Errors — ErrorRecorder
 // is what turns each error into an exception event: it calls span.RecordError
 // with the gin.error.type attribute, and sets the span status to Error when the
-// response status is 5xx. Entries with a nil Err are skipped. If no valid span
-// is active, it is a no-op.
+// response status is 5xx. It records on the span active when it runs, read
+// before the handlers after it, which may replace the request context. Entries
+// with a nil Err are skipped. If no valid span is active, it is a no-op.
 func ErrorRecorder() ginframework.HandlerFunc {
 	return func(c *ginframework.Context) {
-		c.Next()
-		if len(c.Errors) == 0 {
-			return
-		}
 		span := trace.SpanFromContext(c.Request.Context())
-		if !span.SpanContext().IsValid() {
+		c.Next()
+		if len(c.Errors) == 0 || !span.SpanContext().IsValid() {
 			return
 		}
+		var last error
 		for _, ge := range c.Errors {
 			if ge.Err == nil {
 				continue // c.Error(&gin.Error{...}) can append one; nothing to record
 			}
+			last = ge.Err
 			span.RecordError(ge.Err,
 				trace.WithAttributes(attribute.String(ginErrorTypeKey, ginErrorTypeString(ge.Type))),
 			)
 		}
-		if last := c.Errors.Last(); c.Writer.Status() >= 500 && last.Err != nil {
-			span.SetStatus(codes.Error, last.Err.Error())
+		if c.Writer.Status() >= 500 && last != nil {
+			span.SetStatus(codes.Error, last.Error())
 		}
 	}
 }
@@ -68,21 +73,22 @@ func ErrorRecorder() ginframework.HandlerFunc {
 // gin.error.message, the same text otelgin's exception event carries as
 // exception.message. The message is what ties the two together; their
 // positions on the span do not, because application code may record
-// exceptions of its own on the server span, and the span's event limit evicts
-// the oldest events first. It is an SDK-owned key rather than
+// exceptions of its own on the server span. It is an SDK-owned key rather than
 // exception.message so that exception.* stays on exception events only and a
 // query selecting exceptions by attribute does not count each error twice.
 //
-// filters are the ones otelgin was given. A request any of them rejects was
-// not traced by otelgin, so the span in the context, if any, belongs to some
-// other layer; the chain leaves it alone, as otelgin does. The span is read
-// before c.Next, while the context is still the one otelgin handed on, since
-// a downstream middleware may replace c.Request's context without restoring
-// it.
-func errorTypeEvents(filters []func(*http.Request) bool) ginframework.HandlerFunc {
+// filtered is false when the chain has no filters. Otherwise the chain's
+// otelgin gin filter has recorded under tracedKey whether the request is
+// traced; a request it
+// excluded has no span of this chain's, so the span in the context, if any,
+// belongs to some other layer and is left alone, as otelgin leaves it. The
+// span is read before c.Next, while the context is still the one otelgin
+// handed on, since a downstream middleware may replace c.Request's context
+// without restoring it.
+func errorTypeEvents(filtered bool) ginframework.HandlerFunc {
 	return func(c *ginframework.Context) {
-		for _, filter := range filters {
-			if !filter(c.Request) {
+		if filtered {
+			if traced := c.GetBool(tracedKey); !traced {
 				c.Next()
 				return
 			}

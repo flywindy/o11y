@@ -149,19 +149,29 @@ func TestMiddleware_ContextSwapDownstream(t *testing.T) {
 }
 
 // TestMiddleware_NestedChains installs Middleware on the engine and again on a
-// group, once with the inner chain tracing and once with it filtering the
-// request. Either way every span carries exactly one exception and one
-// gin.error event per error: the inner chain never records on the outer
-// chain's span.
+// group, with each chain tracing or filtering the request. Every span carries
+// exactly one exception and one gin.error event per error, and a chain that
+// filtered the request adds nothing: neither chain acts on the other's span or
+// on the other's filter answer.
 func TestMiddleware_NestedChains(t *testing.T) {
-	for _, innerFiltered := range []bool{false, true} {
-		t.Run(fmt.Sprintf("innerFiltered=%t", innerFiltered), func(t *testing.T) {
+	for _, tc := range []struct {
+		outerFiltered, innerFiltered bool
+		spans                        int
+	}{
+		{false, false, 2},
+		{false, true, 1},
+		{true, false, 1},
+		{true, true, 0},
+	} {
+		t.Run(fmt.Sprintf("outerFiltered=%t/innerFiltered=%t", tc.outerFiltered, tc.innerFiltered), func(t *testing.T) {
 			env := newTestEnv(t)
 			router := ginframework.New()
-			router.Use(o11ygin.Middleware(testService, env.tracerProvider, env.meterProvider, propagation.TraceContext{})...)
+			router.Use(o11ygin.Middleware(testService, env.tracerProvider, env.meterProvider, propagation.TraceContext{},
+				o11ygin.WithFilter(func(*http.Request) bool { return !tc.outerFiltered }),
+			)...)
 			group := router.Group("/")
 			group.Use(o11ygin.Middleware("inner", env.tracerProvider, env.meterProvider, propagation.TraceContext{},
-				o11ygin.WithFilter(func(*http.Request) bool { return !innerFiltered }),
+				o11ygin.WithFilter(func(*http.Request) bool { return !tc.innerFiltered }),
 			)...)
 			group.GET(testRoute, func(c *ginframework.Context) {
 				c.AbortWithError(http.StatusInternalServerError, errors.New("nested")).SetType(ginframework.ErrorTypePublic) //nolint:errcheck
@@ -171,11 +181,7 @@ func TestMiddleware_NestedChains(t *testing.T) {
 			router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, testPath, nil))
 
 			spans := env.spanRecorder.Ended()
-			if innerFiltered {
-				require.Len(t, spans, 1)
-			} else {
-				require.Len(t, spans, 2)
-			}
+			require.Len(t, spans, tc.spans)
 			for _, span := range spans {
 				assertTypedErrorEvents(t, span, typedError{message: "nested", errorType: "public"})
 			}
@@ -217,6 +223,95 @@ func TestNilErrEntryDoesNotPanic(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestMiddleware_FilterEvaluatedOncePerRequest uses a filter whose answer
+// changes on every call, like a sampling filter. The chain must ask it once
+// per request, so otelgin and the error handler act on the same answer: a
+// traced request gets its exception and its gin.error, an excluded one gets
+// neither.
+func TestMiddleware_FilterEvaluatedOncePerRequest(t *testing.T) {
+	env := newTestEnv(t)
+	calls := 0
+	router := ginframework.New()
+	router.Use(o11ygin.Middleware(testService, env.tracerProvider, env.meterProvider, propagation.TraceContext{},
+		o11ygin.WithFilter(func(*http.Request) bool {
+			calls++
+			return calls%2 == 1 // true, false, true, … — a second call would flip it
+		}),
+	)...)
+	router.GET(testRoute, func(c *ginframework.Context) {
+		c.AbortWithError(http.StatusInternalServerError, errors.New("sampled")).SetType(ginframework.ErrorTypePrivate) //nolint:errcheck
+	})
+
+	for range 2 {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, testPath, nil))
+	}
+
+	assert.Equal(t, 2, calls, "one filter call per request")
+	spans := env.spanRecorder.Ended()
+	require.Len(t, spans, 1, "the first request is traced, the second excluded")
+	assertTypedErrorEvents(t, spans[0], typedError{message: "sampled", errorType: "private"})
+}
+
+// TestErrorRecorder_ContextSwapDownstream puts a middleware after
+// ErrorRecorder that replaces c.Request's context with a child span's and
+// never restores it. ErrorRecorder must record on the span that was active
+// when it ran, not on the already-ended child.
+func TestErrorRecorder_ContextSwapDownstream(t *testing.T) {
+	env := newTestEnv(t)
+	router := ginframework.New()
+	router.Use(spanStarter(env.tracerProvider), o11ygin.ErrorRecorder())
+	router.Use(func(c *ginframework.Context) {
+		ctx, child := env.tracerProvider.Tracer("test").Start(c.Request.Context(), "child")
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+		child.End()
+	})
+	router.GET("/fail", func(c *ginframework.Context) {
+		c.AbortWithError(http.StatusInternalServerError, errors.New("swapped")).SetType(ginframework.ErrorTypeBind) //nolint:errcheck
+	})
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/fail", nil))
+
+	var outer, child sdktrace.ReadOnlySpan
+	for _, span := range env.spanRecorder.Ended() {
+		switch span.Name() {
+		case "manual":
+			outer = span
+		case "child":
+			child = span
+		}
+	}
+	require.NotNil(t, outer)
+	require.NotNil(t, child)
+	assert.Empty(t, child.Events())
+	assertSpanStatus(t, outer, codes.Error, "swapped")
+	assertStandaloneErrorEvents(t, outer, typedError{message: "swapped", errorType: "bind"})
+}
+
+// TestErrorRecorder_StatusSkipsTrailingNilErr pushes a real error and then a
+// nil-Err entry on a 5xx response. The status must come from the last error
+// there is, not be dropped because the last entry has none.
+func TestErrorRecorder_StatusSkipsTrailingNilErr(t *testing.T) {
+	env := newTestEnv(t)
+	router := ginframework.New()
+	router.Use(spanStarter(env.tracerProvider), o11ygin.ErrorRecorder())
+	router.GET("/fail", func(c *ginframework.Context) {
+		c.Error(errors.New("db down")).SetType(ginframework.ErrorTypePrivate) //nolint:errcheck
+		c.Error(&ginframework.Error{Type: ginframework.ErrorTypePrivate})     //nolint:errcheck
+		c.Status(http.StatusInternalServerError)
+	})
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/fail", nil))
+
+	spans := env.spanRecorder.Ended()
+	require.Len(t, spans, 1)
+	assertSpanStatus(t, spans[0], codes.Error, "db down")
+	assertStandaloneErrorEvents(t, spans[0], typedError{message: "db down", errorType: "private"})
 }
 
 // assertStandaloneErrorEvents checks that ErrorRecorder used without

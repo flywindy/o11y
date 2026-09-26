@@ -16,8 +16,9 @@ type Option interface {
 
 type ginOptions struct {
 	otel []otelgin.Option
-	// filters mirrors every filter handed to otelgin, so the chain's error
-	// handler can tell a request otelgin excluded from one it traced.
+	// filters are not handed to otelgin directly: Middleware evaluates them
+	// once per request in a single otelgin gin filter and records the answer
+	// for the chain's error handler, so the two can never disagree.
 	filters []func(*http.Request) bool
 }
 
@@ -35,13 +36,13 @@ func WithSpanNameFormatter(f func(*ginframework.Context) string) Option {
 }
 
 // WithFilter excludes requests for which any filter returns false.
+//
+// Middleware evaluates the filters once per request and uses that one answer
+// both for tracing and for classifying c.Errors, so a filter whose answer
+// changes between calls, such as a sampling filter, still gives each request a
+// consistent outcome.
 func WithFilter(filters ...func(*http.Request) bool) Option {
 	return optionFunc(func(opts *ginOptions) {
-		otelFilters := make([]otelgin.Filter, 0, len(filters))
-		for _, filter := range filters {
-			otelFilters = append(otelFilters, otelgin.Filter(filter))
-		}
-		opts.otel = append(opts.otel, otelgin.WithFilter(otelFilters...))
 		opts.filters = append(opts.filters, filters...)
 	})
 }
