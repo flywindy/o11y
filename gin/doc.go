@@ -9,8 +9,8 @@
 // The otelgin middleware opens the server span and, on unwind, records each
 // gin.Context.Errors entry as an exception event. The chain's second handler
 // adds one "gin.error" event per entry carrying the gin.error.type attribute
-// and the exception.type and exception.message of that entry's exception
-// event, making gin error categories queryable without a second exception
+// and gin.error.message, equal to the exception.message of that entry's
+// exception event, making gin error categories queryable without a second exception
 // event and without adding high-cardinality metric labels. gin.Recovery should be
 // registered inside that chain so recovered panics still produce complete HTTP
 // status attributes and metrics.

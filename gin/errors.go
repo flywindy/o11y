@@ -1,20 +1,18 @@
 package gin
 
 import (
-	"fmt"
-	"reflect"
 	"strconv"
 	"strings"
 
 	ginframework "github.com/gin-gonic/gin"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
-	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
 )
 
 const (
-	ginErrorTypeKey = "gin.error.type"
+	ginErrorTypeKey    = "gin.error.type"
+	ginErrorMessageKey = "gin.error.message"
 
 	// ginErrorEventName names the span event the canonical Middleware chain
 	// adds for each gin.Context.Errors entry. It is deliberately not
@@ -44,7 +42,11 @@ const (
 func ErrorRecorder() ginframework.HandlerFunc {
 	return func(c *ginframework.Context) {
 		c.Next()
-		if span, ok := errorSpan(c); ok {
+		if len(c.Errors) == 0 {
+			return
+		}
+		span := trace.SpanFromContext(c.Request.Context())
+		if span.SpanContext().IsValid() {
 			recordExceptions(c, span)
 		}
 	}
@@ -54,82 +56,82 @@ func ErrorRecorder() ginframework.HandlerFunc {
 // otelgin, which on unwind records every c.Errors entry as an exception event
 // and sets the span status (otelgin v0.68.0 gin.go). What otelgin cannot know
 // is gin's bind/render/private/public classification, so this adds only that:
-// one "gin.error" event per entry.
+// one "gin.error" event per entry, carrying gin.error.type and, as
+// gin.error.message, the same text otelgin's exception event carries as
+// exception.message. The message is what ties the two together; their
+// positions on the span do not, because application code may record
+// exceptions of its own on the server span, and the span's event limit evicts
+// the oldest events first. It is an SDK-owned key rather than
+// exception.message so that exception.* stays on exception events only and a
+// query selecting exceptions by attribute does not count each error twice.
 //
-// Each gin.error event carries the exception.type and exception.message of the
-// exception event otelgin records for the same entry. That is what ties the
-// two together; their positions on the span do not, because application code
-// may record exceptions of its own on the server span, and the span's event
-// limit evicts the oldest events first.
-//
-// When otelgin filtered the request out (WithFilter, WithSkipPaths) it opened
-// no span and records nothing, so any span in the context belongs to an outer
-// layer. The handler then records exceptions itself, as ErrorRecorder would.
+// The span and whether otelgin opened it are read before c.Next, while the
+// request context is still the one otelgin handed on: a downstream middleware
+// may replace c.Request's context without restoring it, and a nested
+// Middleware overwrites incomingSpanKey. When otelgin filtered the request out
+// (WithFilter, WithSkipPaths) it opened no span and records nothing, so any
+// span in the context belongs to an outer layer; the handler then records the
+// errors as exception events itself, as ErrorRecorder would.
 func errorTypeEvents() ginframework.HandlerFunc {
 	return func(c *ginframework.Context) {
+		span := trace.SpanFromContext(c.Request.Context())
+		opened := openedByOtelgin(c, span)
 		c.Next()
-		span, ok := errorSpan(c)
-		if !ok {
+		if len(c.Errors) == 0 || !span.SpanContext().IsValid() {
 			return
 		}
-		if !openedByOtelgin(c, span) {
+		if !opened {
 			recordExceptions(c, span)
 			return
 		}
 		for _, ge := range c.Errors {
+			if ge.Err == nil {
+				continue // otelgin's RecordError(nil) records nothing either
+			}
 			span.AddEvent(ginErrorEventName, trace.WithAttributes(
 				attribute.String(ginErrorTypeKey, ginErrorTypeString(ge.Type)),
-				semconv.ExceptionType(errorTypeName(ge.Err)),
-				semconv.ExceptionMessage(ge.Err.Error()),
+				attribute.String(ginErrorMessageKey, ge.Err.Error()),
 			))
 		}
 	}
 }
 
-// errorSpan returns the span c's errors are recorded on, and false when c has
-// no errors or no valid span is active.
-func errorSpan(c *ginframework.Context) (trace.Span, bool) {
-	if len(c.Errors) == 0 {
-		return nil, false
-	}
-	span := trace.SpanFromContext(c.Request.Context())
-	return span, span.SpanContext().IsValid()
-}
-
 // recordExceptions records each c.Errors entry as an exception event carrying
 // gin.error.type, and sets the span status to Error on a 5xx response.
+//
+// An entry with a nil Err — c.Error(&gin.Error{Type: ...}) appends one — is
+// skipped, since there is no error to record, and never dereferenced.
 func recordExceptions(c *ginframework.Context, span trace.Span) {
 	for _, ge := range c.Errors {
+		if ge.Err == nil {
+			continue
+		}
 		span.RecordError(ge.Err,
 			trace.WithAttributes(attribute.String(ginErrorTypeKey, ginErrorTypeString(ge.Type))),
 		)
 	}
 	if c.Writer.Status() >= 500 {
-		span.SetStatus(codes.Error, c.Errors.Last().Error())
+		description := ""
+		if last := c.Errors.Last(); last.Err != nil {
+			description = last.Err.Error()
+		}
+		span.SetStatus(codes.Error, description)
 	}
 }
 
 // openedByOtelgin reports whether span is the one otelgin started for this
-// request, by comparing it with the span context Middleware stored before
-// otelgin ran. A missing entry counts as not opened, so errors are never lost.
+// request, by comparing it with the span context Middleware stored just
+// before otelgin ran. errorTypeEvents is only ever installed by Middleware,
+// directly after the handler that stores the entry, so the entry is always
+// present; if it were not, otelgin is still in the chain, and assuming it
+// opened the span avoids recording every error twice.
 func openedByOtelgin(c *ginframework.Context, span trace.Span) bool {
 	v, ok := c.Get(incomingSpanKey)
 	if !ok {
-		return false
+		return true
 	}
 	incoming, ok := v.(trace.SpanContext)
-	return ok && !incoming.Equal(span.SpanContext())
-}
-
-// errorTypeName renders err's type the way the OTel SDK's span.RecordError
-// does for exception.type (sdk/trace typeStr), so a gin.error event and the
-// exception event otelgin records for the same error carry the same value.
-func errorTypeName(err error) string {
-	t := reflect.TypeOf(err)
-	if t.PkgPath() == "" && t.Name() == "" {
-		return t.String()
-	}
-	return fmt.Sprintf("%s.%s", t.PkgPath(), t.Name())
+	return !ok || !incoming.Equal(span.SpanContext())
 }
 
 func ginErrorTypeString(errorType ginframework.ErrorType) string {

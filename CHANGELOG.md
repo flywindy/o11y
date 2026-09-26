@@ -22,8 +22,9 @@ adopters can plan their upgrades.
   `exception` events on the server span — one with `gin.error.type`, one
   without — and exception counts in Tempo, and any alert built on them, read
   twice the real number. The chain now adds a separate `gin.error` event per
-  error carrying `gin.error.type` plus the `exception.type` and
-  `exception.message` of otelgin's exception event for that error, and leaves
+  error carrying `gin.error.type` and `gin.error.message` — the latter equal
+  to the `exception.message` of otelgin's exception event for that error, and
+  no `exception.*` key of its own — and leaves
   the exception and the span status to otelgin. On a request otelgin filters
   out (`WithFilter`, `WithSkipPaths`) under an outer span, the chain records
   the exception event itself, as before. **Exception-event volume from gin errors halves on
@@ -48,13 +49,11 @@ adopters can plan their upgrades.
 ### Migration
 
 - **gin: a TraceQL query that selects the typed error by event name must
-  change.** `{ event.gin.error.type = "bind" }` keeps matching, and so does a
-  query combining it with `event.exception.message` or `event.exception.type`.
-  A query that also constrains `event:name = "exception"` must use
-  `event:name = "gin.error"`: the `exception` event no longer carries
-  `gin.error.type`. A query that counts errors by an `exception.*` attribute
-  without constraining the event name now matches both events of each gin
-  error; add `event:name = "exception"`. Do not add `o11ygin.ErrorRecorder()` after
+  change.** `{ event.gin.error.type = "bind" }` keeps matching. A query that
+  also constrains `event:name = "exception"`, or combines `gin.error.type`
+  with `event.exception.message` on one event, must use
+  `event:name = "gin.error"` and `event.gin.error.message`: the `exception`
+  event no longer carries `gin.error.type`. Do not add `o11ygin.ErrorRecorder()` after
   `o11ygin.Middleware(...)` to get the old event back — that reintroduces the
   duplicate.
 
