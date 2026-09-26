@@ -95,15 +95,16 @@ The canonical `o11ygin.Middleware` chain adds one span event named
 event `otelgin` records for the same entry. The `gin.error` event carries the
 two keys below and no `exception.*` key; `gin.error.message` equals that
 exception event's `exception.message`, which is what identifies which
-exception it classifies — position on the span does not. On a request `otelgin` filters out, and when
-`o11ygin.ErrorRecorder` is used on its own without `Middleware`, each entry is
-recorded as an `exception` event (`span.RecordError`) carrying the same key
-instead, with `gin.error.type` only. Either way the keys are on an event, not
+exception it classifies — position on the span does not. A request the
+chain's filter excludes (`WithFilter`, `WithSkipPaths`) gets neither event.
+When `o11ygin.ErrorRecorder` is used on its own without `Middleware`, each
+entry is recorded as an `exception` event (`span.RecordError`) carrying
+`gin.error.type` instead. Either way the keys are on an event, not
 on the span itself, and never on a metric. See ADR 0010's 2026-09-26 amendment.
 
 | Key | Type | Notes |
 |---|---|---|
-| `gin.error.type` | string | SDK-owned (see Deviations); one per `gin.error` event (canonical chain) or per `exception` event (`ErrorRecorder` alone, or a request `otelgin` filters out). Value is gin's own error classification rendered as text: `any` for the `ErrorTypeAny` sentinel, otherwise the names of the bits set, joined with a vertical bar — `bind`, `render`, `private`, `public` — with any remaining bits appended as `unknown:<n>` (`unknown:0` when the type is zero). Bounded by gin's own type set plus that escape hatch. |
+| `gin.error.type` | string | SDK-owned (see Deviations); one per `gin.error` event (canonical chain) or per `exception` event (`ErrorRecorder` alone). Value is gin's own error classification rendered as text: `any` for the `ErrorTypeAny` sentinel, otherwise the names of the bits set, joined with a vertical bar — `bind`, `render`, `private`, `public` — with any remaining bits appended as `unknown:<n>` (`unknown:0` when the type is zero). Bounded by gin's own type set plus that escape hatch. |
 | `gin.error.message` | string | SDK-owned (see Deviations); on `gin.error` events only. The error's `Error()` text, equal to the `exception.message` otelgin records for the same entry. |
 
 The SDK's HTTP server view governs the metric label set (`http.request.method`,

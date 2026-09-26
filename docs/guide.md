@@ -726,8 +726,9 @@ carrying `gin.error.type` (`bind`, `render`, `private`, `public`, …) and
 `gin.error.message`, which equals that exception event's `exception.message`.
 Match the two by message, not by their order on the span:
 `{ event:name = "gin.error" && event.gin.error.type = "bind" }` finds the
-classification, and its `gin.error.message` names the error. Query the classification in TraceQL with
-`{ event.gin.error.type = "bind" }`. Use `o11ygin.ErrorRecorder()` only in a
+classification, and its `gin.error.message` names the error. A request
+excluded by `WithFilter` or `WithSkipPaths` is not instrumented by the chain,
+so it gets neither event. Use `o11ygin.ErrorRecorder()` only in a
 chain without `Middleware` — for example a gin engine served through
 `o11yhttp.NewServerHandler` — where it records each error as an `exception`
 event carrying `gin.error.type` itself. The metric label set remains governed by the

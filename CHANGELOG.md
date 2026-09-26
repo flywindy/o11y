@@ -25,11 +25,14 @@ adopters can plan their upgrades.
   error carrying `gin.error.type` and `gin.error.message` — the latter equal
   to the `exception.message` of otelgin's exception event for that error, and
   no `exception.*` key of its own — and leaves
-  the exception and the span status to otelgin. On a request otelgin filters
-  out (`WithFilter`, `WithSkipPaths`) under an outer span, the chain records
-  the exception event itself, as before. **Exception-event volume from gin errors halves on
+  the exception and the span status to otelgin. A request excluded by
+  `WithFilter` / `WithSkipPaths` is left alone by the whole chain: under an
+  outer span (an engine served through `o11yhttp.NewServerHandler`) it no
+  longer gets exception events there. **Exception-event volume from gin errors halves on
   rollout**; that step down on a dashboard is the correction, not a drop in
-  errors. `ErrorRecorder` used on its own, without `Middleware`, is unchanged.
+  errors. `ErrorRecorder` used on its own, without `Middleware`, is unchanged,
+  except that a `c.Errors` entry with a nil `Err` (`c.Error(&gin.Error{...})`)
+  is now skipped instead of panicking on a 5xx response.
   See ADR 0010's 2026-09-26 amendment.
 
 - `redis`: the four pool attributes it wrote as string literals now reference

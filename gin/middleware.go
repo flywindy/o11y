@@ -12,9 +12,9 @@ import (
 // otelgin, which opens the server span and records each gin.Context.Errors
 // entry as an exception event, followed by a handler that adds one "gin.error"
 // event per entry carrying gin.error.type and gin.error.message, the latter
-// equal to the exception.message of that entry's exception event. On a
-// request otelgin filters out, the second handler records the exception events
-// itself. Do not add ErrorRecorder after it.
+// equal to the exception.message of that entry's exception event. A request
+// excluded by WithFilter or WithSkipPaths is not instrumented by the chain at
+// all. Do not add ErrorRecorder after it.
 //
 // The returned slice is intended to be spread into Engine.Use:
 //
@@ -30,13 +30,10 @@ func Middleware(service string, tp trace.TracerProvider, mp metric.MeterProvider
 		otelgin.WithMeterProvider(mp),
 		otelgin.WithPropagators(prop),
 	}
-	base = append(base, applyOptions(opts)...)
-	instrument := otelgin.Middleware(service, base...)
+	options := applyOptions(opts)
+	base = append(base, options.otel...)
 	return []ginframework.HandlerFunc{
-		func(c *ginframework.Context) {
-			c.Set(incomingSpanKey, trace.SpanContextFromContext(c.Request.Context()))
-			instrument(c)
-		},
-		errorTypeEvents(),
+		otelgin.Middleware(service, base...),
+		errorTypeEvents(options.filters),
 	}
 }

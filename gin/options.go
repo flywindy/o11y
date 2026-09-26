@@ -16,6 +16,9 @@ type Option interface {
 
 type ginOptions struct {
 	otel []otelgin.Option
+	// filters mirrors every filter handed to otelgin, so the chain's error
+	// handler can tell a request otelgin excluded from one it traced.
+	filters []func(*http.Request) bool
 }
 
 type optionFunc func(*ginOptions)
@@ -39,6 +42,7 @@ func WithFilter(filters ...func(*http.Request) bool) Option {
 			otelFilters = append(otelFilters, otelgin.Filter(filter))
 		}
 		opts.otel = append(opts.otel, otelgin.WithFilter(otelFilters...))
+		opts.filters = append(opts.filters, filters...)
 	})
 }
 
@@ -136,7 +140,7 @@ func WithSkipPaths(opts ...SkipPathsOption) Option {
 	})
 }
 
-func applyOptions(options []Option) []otelgin.Option {
+func applyOptions(options []Option) ginOptions {
 	opts := ginOptions{}
 	for _, option := range options {
 		if option == nil {
@@ -144,5 +148,5 @@ func applyOptions(options []Option) []otelgin.Option {
 		}
 		option.applyGinOption(&opts)
 	}
-	return opts.otel
+	return opts
 }

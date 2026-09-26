@@ -30,7 +30,7 @@ ADR 0008 §2 checklist applied to
 | Maintenance signal | ✅ Maintained by OpenTelemetry contrib; releases track gin and OTel SDK semver. |
 | Semconv alignment | ✅ Recent versions emit v1.30+ stable HTTP attributes; we pin to a release that emits v1.39.0 to match ADR 0006. If no such release exists at adoption time, we either wait or pin one minor version behind and document the gap. |
 | Configurability | ✅ Span name formatter, attribute injector, and filter all overridable. |
-| Framework signal access | ⚠️ Modern `otelgin` writes `c.Errors.String()` as a single concatenated `gin.errors` string attribute, but does **not** call `span.RecordError` per-error nor classify by `gin.ErrorType`. ErrorRecorder (§2) **enhances** rather than replaces this: it adds typed `RecordError` calls with `gin.error.type` so each error becomes a span event queryable in TraceQL. *Wrong at the pinned version: otelgin v0.68.0 does call `span.RecordError` per error — see the 2026-09-26 amendment.* |
+| Framework signal access | ⚠️ Modern `otelgin` writes `c.Errors.String()` as a single concatenated `gin.errors` string attribute *(it does not: v0.68.0 uses that string as the span status description)*, but does **not** call `span.RecordError` per-error nor classify by `gin.ErrorType`. ErrorRecorder (§2) **enhances** rather than replaces this: it adds typed `RecordError` calls with `gin.error.type` so each error becomes a span event queryable in TraceQL. *Wrong at the pinned version: otelgin v0.68.0 does call `span.RecordError` per error — see the 2026-09-26 amendment.* |
 
 Adoption-time verification pinned `otelgin` v0.68.0, which already emits
 `http.server.request.duration` and already records `c.Errors` as span error
@@ -394,17 +394,29 @@ The duplicate has to be removed on our side.
    that `exception.*` on a non-exception event moves the double count onto
    any query or backend that detects exceptions by attribute rather than
    by event name. `exception.*` therefore stays on `exception` events only.
-3. **Requests `otelgin` filters out.** On a request excluded by
-   `WithFilter` / `WithSkipPaths`, `otelgin` opens no span and records
-   nothing, yet an outer layer's span (`o11yhttp.NewServerHandler`, an
-   application span) may be active. `Middleware` stores the span context
-   active before `otelgin` runs; when the span after it is the same one,
-   the handler records the errors as `exception` events itself, exactly
-   as `ErrorRecorder` does, so nothing is lost. The handler reads the span
-   and this comparison **before** `c.Next()`: a downstream middleware may
-   replace the request context without restoring it, and a `Middleware`
-   nested on a route group overwrites the stored entry. Entries whose
-   `Err` is nil are skipped on both paths rather than dereferenced.
+3. **Requests the chain filters out are not instrumented by it.** On a
+   request excluded by `WithFilter` / `WithSkipPaths`, `otelgin` opens no
+   span and records nothing, yet an outer layer's span
+   (`o11yhttp.NewServerHandler`, an application span, an enclosing
+   `Middleware` on the engine) may be active. The handler does the same as
+   `otelgin`: nothing. It knows because every filter reaches `otelgin`
+   through the facade's `WithFilter`, which keeps a copy of each for the
+   handler to evaluate on the same request; `otelgin` v0.68.0 appends
+   filters and requires all of them to pass, and so does the handler.
+   Filters must therefore be deterministic, which `otelgin` already
+   assumes. Review of intermediate versions rejected two alternatives:
+   putting `gin.error` on whatever span is active (a classification with
+   no exception beside it, on a span the chain does not own), and
+   recording exceptions onto that span as `ErrorRecorder` did before this
+   amendment (a second exception whenever the outer span is an enclosing
+   `Middleware`'s, since that chain's `otelgin` records the same errors).
+   Detecting whether `otelgin` opened a span by comparing span contexts
+   through `c.Keys` was also tried and dropped: it cost a map write per
+   request and broke on nested chains.
+   The handler reads the span **before** `c.Next()`, while the context is
+   the one `otelgin` handed on: a downstream middleware may replace the
+   request context without restoring it. Entries whose `Err` is nil are
+   skipped rather than dereferenced, here and in `ErrorRecorder`.
 4. **`ErrorRecorder` on its own** keeps its behaviour: one `exception`
    event per error carrying `gin.error.type`, and span status Error on a
    5xx response. That is the case where nothing else reads `c.Errors`.
@@ -429,6 +441,13 @@ ignored because it carried no `gin.error.type`.
   and alerts that count `exception` events read the real number from
   then on; a before/after comparison shows a step down that is not an
   improvement in error rate.
+- `gin.error.message` identifies the error by its text. Two `c.Errors`
+  entries with the same message and different types are
+  indistinguishable by message; the classification is still correct per
+  event, only which of the two identical exceptions it belongs to is not.
+- A request a filter excludes (for example `/healthz` under
+  `WithSkipPaths`) no longer gets exception events on an outer span; before
+  this amendment `ErrorRecorder` recorded them there.
 - `{ event.gin.error.type = "bind" }` keeps matching. A query that also
   constrains `event:name = "exception"`, or combines `gin.error.type` with
   `event.exception.message` on one event, must change to
