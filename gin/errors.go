@@ -41,8 +41,8 @@ func ErrorRecorder() ginframework.HandlerFunc {
 		if !span.IsRecording() {
 			return
 		}
-		last := recordTypedExceptions(span, c.Errors)
-		if c.Writer.Status() >= 500 && last != nil {
+		recordTypedExceptions(span, c.Errors)
+		if last := lastError(c.Errors); c.Writer.Status() >= 500 && last != nil {
 			span.SetStatus(codes.Error, last.Error())
 		}
 	}
@@ -102,21 +102,27 @@ func restoreErrors(c *ginframework.Context, hiddenKey *chainKey) {
 }
 
 // recordTypedExceptions records each entry with an error as an exception event
-// carrying gin.error.type, and returns the last error recorded. An entry with a
-// nil Err — c.Error(&gin.Error{...}) appends one — is skipped: there is no
-// error to record, and otelgin's RecordError(nil) records nothing either.
-func recordTypedExceptions(span trace.Span, errs []*ginframework.Error) error {
-	var last error
+// carrying gin.error.type. An entry with a nil Err — c.Error(&gin.Error{...})
+// appends one — is skipped: there is no error to record, and otelgin's
+// RecordError(nil) records nothing either.
+func recordTypedExceptions(span trace.Span, errs []*ginframework.Error) {
 	for _, ge := range errs {
-		if ge.Err == nil {
-			continue
+		if ge.Err != nil {
+			span.RecordError(ge.Err,
+				trace.WithAttributes(attribute.String(ginErrorTypeKey, ginErrorTypeString(ge.Type))),
+			)
 		}
-		last = ge.Err
-		span.RecordError(ge.Err,
-			trace.WithAttributes(attribute.String(ginErrorTypeKey, ginErrorTypeString(ge.Type))),
-		)
 	}
-	return last
+}
+
+// lastError returns the Err of the last entry that has one, or nil.
+func lastError(errs []*ginframework.Error) error {
+	for i := len(errs) - 1; i >= 0; i-- {
+		if errs[i].Err != nil {
+			return errs[i].Err
+		}
+	}
+	return nil
 }
 
 func ginErrorTypeString(errorType ginframework.ErrorType) string {
