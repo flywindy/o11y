@@ -57,7 +57,7 @@ Package layout:
 
 ```text
 gin/
-├── middleware.go       // Middleware: otelgin.Middleware + ErrorRecorder
+├── middleware.go       // Middleware: otelgin.Middleware + gin.error handler (amended 2026-09-26)
 ├── errors.go           // ErrorRecorder gin.HandlerFunc
 ├── doc.go              // Tier and policy reference
 └── *_test.go
@@ -191,13 +191,17 @@ ADR 0009 §2 still apply as defense in depth (in particular, gin's
 
 ### 5. Recovery interaction and middleware ordering
 
+> Updated by the 2026-09-26 amendment: slot `[1]` is the chain's
+> `gin.error` handler, no longer `ErrorRecorder`, and otelgin v0.68.0
+> records each `c.Errors` entry as an `exception` event itself.
+
 `otelgin.Middleware`, `ErrorRecorder`, and `gin.Recovery()` form a
 three-layer stack whose ordering determines correctness. The
 **recommended canonical order** that `Middleware(...)` returns is:
 
 ```go
 r.Use(o11ygin.Middleware("svc", tp, mp, prop)...) // [0] otelgin span open
-                                                  // [1] ErrorRecorder (defer)
+                                                  // [1] gin.error handler (post-c.Next)
 r.Use(gin.Recovery())                             // [2] panic recover (innermost)
 // ... user handlers below
 ```
@@ -206,8 +210,8 @@ Execution order on a request:
 
 1. `[0] otelgin` runs first → opens server span, registers
    `defer span.End()`, replaces `c.Request.Context()`, calls `c.Next()`.
-2. `[1] ErrorRecorder` enters → calls `c.Next()` directly (no defer;
-   it inspects `c.Errors` after `c.Next()` returns).
+2. `[1]` the `gin.error` handler enters → calls `c.Next()` directly (no
+   defer; it inspects `c.Errors` after `c.Next()` returns).
 3. `[2] gin.Recovery` enters → registers a `defer { recover() ... }`,
    calls `c.Next()`.
 4. Handler runs.
@@ -215,15 +219,16 @@ Execution order on a request:
    - `gin.Recovery`'s `defer` recovers any panic and writes 500 to
      the response writer. Control then returns up the chain
      **normally** (the default `gin.Recovery` does not re-panic).
-   - `ErrorRecorder`'s post-`c.Next()` code runs, reads `c.Errors`,
-     annotates the active span via `span.RecordError`. With the
+   - The `gin.error` handler's post-`c.Next()` code runs, reads
+     `c.Errors`, and adds one `gin.error` event per entry. With the
      default `gin.Recovery`, `c.Errors` is empty after a panic
-     (Recovery does not push the panic into `c.Errors`), so
-     `ErrorRecorder` is a no-op for that case.
+     (Recovery does not push the panic into `c.Errors`), so the
+     handler is a no-op for that case.
    - `otelgin`'s post-`c.Next()` code reads `c.Writer.Status()` (now
-     500), sets the OTel span status from it, sets the
-     `http.response.status_code` attribute, and writes
-     `c.Errors.String()` as the `gin.errors` attribute. Then
+     500), sets the OTel span status from it and the
+     `http.response.status_code` attribute, and, when `c.Errors` is
+     non-empty, sets status Error with `c.Errors.String()` as the
+     description and records each entry as an `exception` event. Then
      `defer span.End()` fires.
 
 The end-state span for a panic in canonical order: status `Error`
@@ -232,7 +237,7 @@ The end-state span for a panic in canonical order: status `Error`
 swallowed by `gin.Recovery` before any tracing layer saw it. To
 capture the panic value itself, callers either replace
 `gin.Recovery` with a custom recovery that pushes the panic into
-`c.Errors` (then `ErrorRecorder` records it) or move the recovery
+`c.Errors` (then the chain records it) or move the recovery
 **outside** of otelgin, accepting the trade-off in row 10 below.
 
 If a service inverts the order (e.g. `gin.Recovery()` outermost,
@@ -254,14 +259,14 @@ plain 4xx responses remain Unset.
 |---|---|---|---|---|---|---|---|
 | 1 | Happy path | `gin.Recovery()` | n/a | 200 OK | Unset | none | 200 |
 | 2 | 4xx via `c.JSON(400, ...)` | `gin.Recovery()` | n/a | 400 | Unset | none | 400 |
-| 3 | 4xx via `c.AbortWithError(400, err)` | `gin.Recovery()` | n/a | 400 | Error, message = `c.Errors.String()` from otelgin v0.68.0 | one typed error event with `gin.error.type` | 400 |
-| 4 | 5xx via `c.AbortWithError(500, err)` | `gin.Recovery()` | n/a | 500 | Error, message = `c.Errors.String()` | one typed error event | 500 |
-| 5 | Multiple `c.Error(err1)` + `c.AbortWithError(500, err2)` | `gin.Recovery()` | n/a | 500 | Error, message = `c.Errors.String()` | both typed error events recorded in order | 500 |
+| 3 | 4xx via `c.AbortWithError(400, err)` | `gin.Recovery()` | n/a | 400 | Error, message = `c.Errors.String()` from otelgin v0.68.0 | one `exception` event (otelgin) and one `gin.error` event with `gin.error.type` | 400 |
+| 4 | 5xx via `c.AbortWithError(500, err)` | `gin.Recovery()` | n/a | 500 | Error, message = `c.Errors.String()` | one `exception` and one `gin.error` event | 500 |
+| 5 | Multiple `c.Error(err1)` + `c.AbortWithError(500, err2)` | `gin.Recovery()` | n/a | 500 | Error, message = `c.Errors.String()` | one `exception` and one `gin.error` event per error | 500 |
 | 6 | Handler panics, default Recovery | `gin.Recovery()` | n/a | 500 | Error (from status code), description **empty** — panic was swallowed by inner Recovery before any tracing layer saw it | none (`gin.Recovery` does not push panic into `c.Errors`) | 500 |
-| 7 | Handler panics, custom Recovery that **does** push into `c.Errors` | none | custom that calls `c.Error(panicErr); c.AbortWithStatus(500)` | 500 | Error | one typed error event with the panic value | 500 |
+| 7 | Handler panics, custom Recovery that **does** push into `c.Errors` | none | custom that calls `c.Error(panicErr); c.AbortWithStatus(500)` | 500 | Error | one `exception` and one `gin.error` event for the panic value | 500 |
 | 8 | Handler panics, custom Recovery that swallows the panic and writes 200 | none | custom that recovers and `c.JSON(200, fallback)` | 200 | Unset | none | 200 |
 | 9 | `c.Abort()` without error, status 204 | `gin.Recovery()` | n/a | 204 | Unset | none | 204 |
-| 10 | Inverted order: `gin.Recovery()` outermost, then `Middleware(...)` (handler panics) | `gin.Recovery()` | n/a | 500 (panic, recovered by outer Recovery) | **Span exists but is incomplete**: opened by otelgin's pre-`c.Next()` code, ended by its `defer span.End()`, but `status_code` attribute and span status are **not set** because otelgin's post-`c.Next()` code was skipped by the propagating panic. ErrorRecorder is also skipped. | none | **not recorded** (otelgin's metric is also written post-`c.Next()`, which never ran) |
+| 10 | Inverted order: `gin.Recovery()` outermost, then `Middleware(...)` (handler panics) | `gin.Recovery()` | n/a | 500 (panic, recovered by outer Recovery) | **Span exists but is incomplete**: opened by otelgin's pre-`c.Next()` code, ended by its `defer span.End()`, but `status_code` attribute and span status are **not set** because otelgin's post-`c.Next()` code was skipped by the propagating panic. The `gin.error` handler is also skipped; the OTel SDK's `span.End` records the propagating panic as one `exception` event. | none | **not recorded** (otelgin's metric is also written post-`c.Next()`, which never ran) |
 
 Row 10 documents the failure mode of the wrong order; the test
 asserts the failure as a regression guard. The README's gin section
@@ -355,7 +360,7 @@ but not on the `http/` facade itself.
 The §Context checklist row "Framework signal access" says `otelgin` does
 not call `span.RecordError` per error. At the pinned v0.68.0 it does
 (`gin.go`, after `c.Next()`: one `span.RecordError(err.Err)` per
-`c.Errors` entry). `ErrorRecorder` runs inside `otelgin` and also calls
+`c.Errors` entry). `ErrorRecorder` runs inside `otelgin` and also called
 `RecordError` per entry, so every `c.Error` / `c.AbortWithError` in the
 canonical chain produced **two** `exception` events: one with
 `gin.error.type` (ours) and one without (otelgin's). Exception counts in
@@ -371,36 +376,46 @@ The duplicate has to be removed on our side.
 ### Decision
 
 1. **Canonical chain.** `Middleware` no longer includes `ErrorRecorder`.
-   It includes an unexported handler with the same position and
-   no-span guard that adds, per `c.Errors` entry and in `c.Errors`
-   order, one span event named **`gin.error`** carrying
-   `gin.error.type`. It calls neither `RecordError` nor `SetStatus`:
-   `otelgin` owns the exception events and the span status.
-   The `gin.error` event carries no `exception.*` attributes, so the
-   message is not stored twice. The n-th `gin.error` event describes
-   the same error as the n-th `exception` event, because both layers
-   walk `c.Errors` in order. The `gin.error` events all precede the
-   `exception` events, because the handler that adds them unwinds before
-   `otelgin` does. Position is the only correlation, and it is the
-   documented one.
-2. **`ErrorRecorder` on its own** keeps its behaviour: one `exception`
+   Its second handler adds, per `c.Errors` entry, one span event named
+   **`gin.error`** carrying `gin.error.type` plus the `exception.type` and
+   `exception.message` of the `exception` event `otelgin` records for the
+   same entry. It calls neither `RecordError` nor `SetStatus`: `otelgin`
+   owns the exception events and the span status.
+2. **The event identifies its exception by content, not by position.**
+   A first version relied on the n-th `gin.error` matching the n-th
+   `exception`. Review showed that breaks in ordinary use: application
+   code that calls `RecordError` on the server span inserts exceptions
+   of its own, and the span event limit (128 by default) evicts the
+   oldest events first — which are the `gin.error` events, since the
+   handler unwinds before `otelgin`. Carrying the two `exception.*` keys
+   costs the message a second time per error, and buys three things: the
+   pairing survives both cases, each `gin.error` event is readable on its
+   own, and a TraceQL query that combines `gin.error.type` with
+   `exception.message` or `exception.type` on one event keeps matching.
+   `exception.type` is rendered exactly as the OTel SDK's `RecordError`
+   renders it, and a test compares the two.
+3. **Requests `otelgin` filters out.** On a request excluded by
+   `WithFilter` / `WithSkipPaths`, `otelgin` opens no span and records
+   nothing, yet an outer layer's span (`o11yhttp.NewServerHandler`, an
+   application span) may be active. `Middleware` stores the span context
+   active before `otelgin` runs; when the span after it is the same one,
+   the handler records the errors as `exception` events itself, exactly
+   as `ErrorRecorder` does, so nothing is lost.
+4. **`ErrorRecorder` on its own** keeps its behaviour: one `exception`
    event per error carrying `gin.error.type`, and span status Error on a
-   5xx response. That is the case where nothing else reads `c.Errors` —
-   a gin engine served through `o11yhttp.NewServerHandler`, or under a
-   span the application started — so there it is the only source of the
-   exception event. Its godoc now says not to add it after `Middleware`.
-3. **The pin is tested, not assumed.** The matrix helper counts every
+   5xx response. That is the case where nothing else reads `c.Errors`.
+   Its godoc now says not to add it after `Middleware`.
+5. **The pin is tested, not assumed.** The matrix helper counts every
    event on the span and requires exactly one `exception` and one
-   `gin.error` per error. A future `otelgin` that stops recording
-   exceptions (contrib issue 8441 tracks moving off `RecordError`) or
-   records them differently fails the matrix on upgrade, instead of
-   silently leaving zero or two.
+   `gin.error` per error, with matching `exception.*` values. A future
+   `otelgin` that stops recording exceptions (contrib issue 8441 tracks
+   moving off `RecordError`) or records them differently fails the
+   matrix on upgrade, instead of silently leaving zero or two.
 
-Matrix rows 3, 4, 5 and 7 now read "one `exception` event (from
-`otelgin`) and one `gin.error` event per error"; the other rows are
-unchanged. Row 10 additionally asserts the one `exception` event the OTel
-SDK's `span.End` records for the panic that unwinds through `otelgin`,
-which the old helper ignored because it carried no `gin.error.type`.
+The §5 matrix and walkthrough above are updated accordingly. Row 10 now
+also asserts the one `exception` event the OTel SDK's `span.End` records
+for the panic that unwinds through `otelgin`, which the old helper
+ignored because it carried no `gin.error.type`.
 
 ### Consequences
 
@@ -408,8 +423,12 @@ which the old helper ignored because it carried no `gin.error.type`.
   and alerts that count `exception` events read the real number from
   then on; a before/after comparison shows a step down that is not an
   improvement in error rate.
-- A TraceQL query on the attribute alone, `{ event.gin.error.type =
-  "bind" }`, keeps matching. A query that also constrains
+- `{ event.gin.error.type = "bind" }` keeps matching, and so does a
+  query that combines it with `event.exception.message` or
+  `event.exception.type`. A query that also constrains
   `event:name = "exception"` must change to `event:name = "gin.error"`.
+- A query that counts errors by an `exception.*` attribute **without**
+  constraining the event name now matches both events of each gin
+  error; count with `event:name = "exception"`.
 - `docs/semconv.md` lists `gin.error` as an SDK-owned event name next to
   the existing `gin.error.type` row.

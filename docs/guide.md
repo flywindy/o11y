@@ -722,9 +722,11 @@ router.GET("/fail", func(c *gin.Context) {
 
 Each error pushed via `c.Error` / `c.AbortWithError` appears on the server span
 as one `exception` event, recorded by otelgin, and one `gin.error` event
-carrying `gin.error.type` (`bind`, `render`, `private`, `public`, …). The
-`gin.error` events come first, in `c.Errors` order, and otelgin's `exception`
-events follow in the same order, so the n-th of each describes the same error. Query the classification in TraceQL with
+carrying `gin.error.type` (`bind`, `render`, `private`, `public`, …) together
+with the same `exception.type` and `exception.message` as that exception event.
+Match the two by those values, not by their order on the span. When counting
+errors, select `event:name = "exception"`: an `exception.*` attribute alone
+also matches the `gin.error` event. Query the classification in TraceQL with
 `{ event.gin.error.type = "bind" }`. Use `o11ygin.ErrorRecorder()` only in a
 chain without `Middleware` — for example a gin engine served through
 `o11yhttp.NewServerHandler` — where it records each error as an `exception`

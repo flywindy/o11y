@@ -22,9 +22,11 @@ adopters can plan their upgrades.
   `exception` events on the server span — one with `gin.error.type`, one
   without — and exception counts in Tempo, and any alert built on them, read
   twice the real number. The chain now adds a separate `gin.error` event per
-  error carrying `gin.error.type`, in `c.Errors` order — the n-th `gin.error`
-  event describes the same error as the n-th `exception` event — and leaves
-  the exception and the span status to otelgin. **Exception-event volume from gin errors halves on
+  error carrying `gin.error.type` plus the `exception.type` and
+  `exception.message` of otelgin's exception event for that error, and leaves
+  the exception and the span status to otelgin. On a request otelgin filters
+  out (`WithFilter`, `WithSkipPaths`) under an outer span, the chain records
+  the exception event itself, as before. **Exception-event volume from gin errors halves on
   rollout**; that step down on a dashboard is the correction, not a drop in
   errors. `ErrorRecorder` used on its own, without `Middleware`, is unchanged.
   See ADR 0010's 2026-09-26 amendment.
@@ -46,10 +48,13 @@ adopters can plan their upgrades.
 ### Migration
 
 - **gin: a TraceQL query that selects the typed error by event name must
-  change.** `{ event.gin.error.type = "bind" }` keeps matching. A query that
-  also constrains `event:name = "exception"` must use
+  change.** `{ event.gin.error.type = "bind" }` keeps matching, and so does a
+  query combining it with `event.exception.message` or `event.exception.type`.
+  A query that also constrains `event:name = "exception"` must use
   `event:name = "gin.error"`: the `exception` event no longer carries
-  `gin.error.type`. Do not add `o11ygin.ErrorRecorder()` after
+  `gin.error.type`. A query that counts errors by an `exception.*` attribute
+  without constraining the event name now matches both events of each gin
+  error; add `event:name = "exception"`. Do not add `o11ygin.ErrorRecorder()` after
   `o11ygin.Middleware(...)` to get the old event back — that reintroduces the
   duplicate.
 

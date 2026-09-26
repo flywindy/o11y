@@ -43,7 +43,7 @@ Every component the SDK ships fits into exactly one tier:
 | Tier | Description | Examples | Sourcing rule |
 |---|---|---|---|
 | **T1 — Core SDK** | The opinionated layer that defines the SDK: `Init`, slog ↔ trace bridge, OTLP exporters wiring, Resource construction, Provider lifecycle, shutdown semantics, ADR 0003 enforcement. | `o11y.go`, `options.go`, `internal/log`, `internal/trace`, `internal/metrics` | **Always self-written.** This is the SDK's reason to exist. |
-| **T2 — Thin facade over an instrumentation library** | A package that accepts SDK providers (`tp`, `mp`, `prop`) and configures a maintained third-party (community or corporate) instrumentation library. May add small ergonomics (typed handler signatures, panic glue, framework-specific signal extraction the upstream lib doesn't expose). Should not exceed ~100 lines per integration. | `nats/`, planned `mongo/`, planned `gin/` (otelgin + ErrorRecorder) | **Default for all new integrations.** The upstream lib must pass the checklist in §2. |
+| **T2 — Thin facade over an instrumentation library** | A package that accepts SDK providers (`tp`, `mp`, `prop`) and configures a maintained third-party (community or corporate) instrumentation library. May add small ergonomics (typed handler signatures, panic glue, framework-specific signal extraction the upstream lib doesn't expose). Should not exceed ~100 lines per integration. | `nats/`, planned `mongo/`, planned `gin/` (otelgin + typed `c.Errors` events, ADR 0010) | **Default for all new integrations.** The upstream lib must pass the checklist in §2. |
 | **T3 — Self-written instrumentation** | A package that reimplements span creation, attribute population, metric recording from primitives. Permitted only when the §2 checklist for every candidate library fails. | Currently none should remain after ADR 0009 lands. Resty (planned, ADR 0011) is a justified T3 because no maintained `otelresty` exists. | **Exception only.** Each T3 package's ADR must enumerate which checklist items failed for which candidate libraries. |
 
 ### 2. Library evaluation checklist (T2 gate)
@@ -143,7 +143,7 @@ ADR:
 | `nats/` | T2 facade over corp lib | T2 — keep | ADR 0004 (already accepted) |
 | `mongo/` | T2 facade over corp lib | T2 — keep | ADR 0005 (already accepted) |
 | `http/` | T3 self-written by accident | **Replace with otelhttp facade**; cardinality moves to the metrics pipeline | ADR 0009 |
-| `gin/` | (planned T3) | **T2 facade over otelgin + ErrorRecorder** | ADR 0010 (forthcoming) |
+| `gin/` | (planned T3) | **T2 facade over otelgin + typed `c.Errors` events** | ADR 0010 (forthcoming) |
 | `resty/` | (planned T3) | **Justified T3** (no maintained otelresty passes §2) | ADR 0011 (forthcoming) |
 | Future: gRPC | n/a | T2 over `otelgrpc` | future ADR |
 | Cassandra (`gocql`) | n/a | **Justified T3** — SDK-owned observers. The `otelgocql` contrib module this row originally predicted was **removed** in contrib v1.19.0 and emitted pre-stable semconv, so no candidate passes §2. | ADR 0019 |
