@@ -90,16 +90,18 @@ option shapes the HTTP client and datastore histograms below.
 
 ### Gin Error Events (package `github.com/flywindy/o11y/gin`)
 
-`o11ygin.ErrorRecorder` records each entry of `gin.Context.Errors` on the
-active server span with `span.RecordError`. It is part of the canonical
-`o11ygin.Middleware` chain, so the key below appears by default wherever that
-chain is installed and an application calls `c.Error` / `c.AbortWithError`. It
-is carried by the `exception` event, not by the span itself, and never by a
-metric.
+The canonical `o11ygin.Middleware` chain records each entry of
+`gin.Context.Errors` as one `exception` event (`span.RecordError`) carrying
+the key below, in `c.Errors` order. `otelgin` would record each entry again,
+without the key; the chain keeps `c.Errors` from it so it does not. A request
+the chain's filter excludes (`WithFilter`, `WithSkipPaths`) gets no event.
+`o11ygin.ErrorRecorder`, used on its own without `Middleware`, records the
+same event. The key is on the `exception` event, not on the span itself, and
+never on a metric. See ADR 0010's 2026-09-26 amendment.
 
 | Key | Type | Notes |
 |---|---|---|
-| `gin.error.type` | string | SDK-owned (see Deviations); one per recorded `exception` event. Value is gin's own error classification rendered as text: `any` for the `ErrorTypeAny` sentinel, otherwise the names of the bits set, joined with a vertical bar — `bind`, `render`, `private`, `public` — with any remaining bits appended as `unknown:<n>` (`unknown:0` when the type is zero). Bounded by gin's own type set plus that escape hatch. |
+| `gin.error.type` | string | SDK-owned (see Deviations); one per `exception` event the gin wrapper records. Value is gin's own error classification rendered as text: `any` for the `ErrorTypeAny` sentinel, otherwise the names of the bits set, joined with a vertical bar — `bind`, `render`, `private`, `public` — with any remaining bits appended as `unknown:<n>` (`unknown:0` when the type is zero). Bounded by gin's own type set plus that escape hatch. |
 
 The SDK's HTTP server view governs the metric label set (`http.request.method`,
 `http.route`, `http.response.status_code`, plus

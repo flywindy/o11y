@@ -15,6 +15,30 @@ adopters can plan their upgrades.
 
 ### Fixed
 
+- `gin`: each gin error is now recorded as one `exception` event instead of
+  two. otelgin v0.68.0 already calls `span.RecordError` for every
+  `c.Errors` entry, and the `ErrorRecorder` the canonical `Middleware` chain
+  included did it again, so every `c.Error` / `c.AbortWithError` left two
+  `exception` events on the server span — one with `gin.error.type`, one
+  without — and exception counts in Tempo, and any alert built on them, read
+  twice the real number. The chain now records the typed exception itself and
+  keeps `c.Errors` from otelgin while otelgin finishes, putting them back as
+  soon as it returns, so middleware outside the chain still sees every error.
+  The event that remains is the typed one v0.13.0 already emitted, so
+  queries need no change. **Exception-event volume from gin errors halves on
+  rollout**; that step down on a dashboard is the correction, not a drop in
+  errors. A request excluded by `WithFilter`
+  / `WithSkipPaths` is left alone by the whole chain: under an outer span (an
+  engine served through `o11yhttp.NewServerHandler`) it no longer gets
+  exception events there. The filters are now evaluated once per request,
+  and that one answer drives both tracing and error classification; the
+  result is the same for any filter whose answer does not change between
+  calls. `ErrorRecorder` used on its own, without `Middleware`, is unchanged
+  except that a `c.Errors` entry with a nil `Err` (`c.Error(&gin.Error{...})`)
+  is skipped instead of panicking on a 5xx response, and the status
+  description comes from the last entry that has an error. See ADR 0010's
+  2026-09-26 amendment.
+
 - `redis`: the four pool attributes it wrote as string literals now reference
   their semconv v1.39.0 constants (`DBClientConnectionPoolName`,
   `DBClientConnectionStateUsed` / `...Idle`), which `docs/semconv.md`
@@ -28,6 +52,17 @@ adopters can plan their upgrades.
   at all; it does now, and it fails when the emitter's spelling and the view's
   disagree — the two observations collapse onto one attribute set and the pool
   reports its connection count once instead of per state.
+
+### Migration
+
+- **gin: a 5xx span with gin errors now has an empty status description**
+  (it was `c.Errors.String()`, e.g. `Error #01: database down`). otelgin sets
+  the status from the HTTP code after the chain has recorded the errors, and
+  now nothing follows it. The messages are on the span's `exception` events;
+  a search or alert on the status message of a 5xx must read
+  `event.exception.message` instead. 4xx spans keep the description.
+- **gin: do not add `o11ygin.ErrorRecorder()` after
+  `o11ygin.Middleware(...)`** — that records every error twice.
 
 ---
 

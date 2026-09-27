@@ -720,9 +720,17 @@ router.GET("/fail", func(c *gin.Context) {
 })
 ```
 
-`ErrorRecorder` adds typed `gin.error.type` span events for errors pushed via
-`c.Error` / `c.AbortWithError`. The metric label set remains governed by the
-SDK's HTTP metric views and does not include gin error types. gin's
+Each error pushed via `c.Error` / `c.AbortWithError` appears on the server span
+as one `exception` event carrying `gin.error.type` (`bind`, `render`,
+`private`, `public`, …); `{ event:name = "exception" && event.gin.error.type =
+"bind" }` finds it. On a 5xx response the span status is Error with an empty
+description; the error messages are on the exception events. A request
+excluded by `WithFilter` or `WithSkipPaths` is not instrumented by the chain,
+so it gets no event. Use `o11ygin.ErrorRecorder()` only in a chain
+without `Middleware` — for example a gin engine served through
+`o11yhttp.NewServerHandler` — where it records each error as an `exception`
+event carrying `gin.error.type` itself. The metric label set remains governed
+by the SDK's HTTP metric views and does not include gin error types. gin's
 `http.server.request.duration` histogram participates in the same exemplar and
 route-cardinality behavior described under [Metrics](#metrics).
 
