@@ -15,6 +15,24 @@ adopters can plan their upgrades.
 
 ### Fixed
 
+- `nats`: `Conn.Request` and `Conn.RequestMsg` now report a timeout the way
+  native `nats.Conn.Request` does. They bound the wait with a context derived
+  from `ctx`, and nats.go's context-based request returns that context's
+  error, so a timeout came back as `context.DeadlineExceeded` and never as
+  `nats.ErrTimeout`. A service migrated from `nc.Request(subj, data, 2*time.Second)`
+  to `conn.Request(ctx, subj, data, 2*time.Second)` kept its
+  `errors.Is(err, nats.ErrTimeout)` retry or fallback branch, and it silently
+  stopped firing. The error now wraps both, so either check holds, whichever
+  deadline ended the wait — the `timeout` argument's or `ctx`'s own, as in
+  the usual migration shape of a `ctx` and a `timeout` of the same length.
+  A call with no time left — `ctx` past its deadline, or a `timeout` of zero
+  or less — sends nothing and returns `context.DeadlineExceeded` alone, so a
+  retry-on-timeout loop stops, rather than spins, once its budget is spent
+  (native `nc.Request` sends first even with a zero timeout);
+  cancellation (`context.Canceled`) is left as is.
+  `nats.ErrNoResponders` is unchanged. The same holds on the traced and the
+  direct path and with `nats.UseOldRequestStyle`.
+
 - `gin`: each gin error is now recorded as one `exception` event instead of
   two. otelgin v0.68.0 already calls `span.RecordError` for every
   `c.Errors` entry, and the `ErrorRecorder` the canonical `Middleware` chain
@@ -63,6 +81,16 @@ adopters can plan their upgrades.
   `event.exception.message` instead. 4xx spans keep the description.
 - **gin: do not add `o11ygin.ErrorRecorder()` after
   `o11ygin.Middleware(...)`** — that records every error twice.
+- **nats: compare request errors with `errors.Is`, not `==`.** A timeout
+  from `Conn.Request` / `Conn.RequestMsg` is now a wrapper around both
+  `nats.ErrTimeout` and `context.DeadlineExceeded`, with the message
+  `nats: timeout: context deadline exceeded`. `err == nats.ErrTimeout` (a
+  common pattern in older nats.go code) and `err == context.DeadlineExceeded`
+  (what the facade returned until now) are both false for it; log matchers on
+  the old `context deadline exceeded` text must allow the new prefix. The
+  `request {subject}` span still records the upstream error,
+  `context deadline exceeded`: otel-nats records it before the facade can
+  classify it.
 
 ---
 

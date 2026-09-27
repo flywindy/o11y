@@ -7,6 +7,7 @@ package nats
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -305,15 +306,37 @@ func (c *Conn) Respond(ctx context.Context, msg *natsgo.Msg, data []byte) error 
 //	defer span.End()
 //	reply, err := conn.Request(ctx, subject, payload, timeout)
 //
+// Errors. When the request is sent and no reply arrives in time — timeout
+// runs out, or ctx reaches its own deadline while waiting — the error
+// satisfies both errors.Is(err, nats.ErrTimeout), as native
+// nats.Conn.Request's does, and errors.Is(err, context.DeadlineExceeded),
+// which the ctx-based wait underneath reports. It is a wrapper, so compare
+// with errors.Is: err == nats.ErrTimeout is false.
+//
+// These are not wrapped:
+//   - No time left at the call: ctx is past its deadline, or timeout is zero
+//     or less. Nothing is sent and the error is context.DeadlineExceeded
+//     alone, so a retry-on-timeout loop stops once its budget is spent
+//     instead of spinning. Native nats.Conn.Request sends first even with a
+//     zero timeout; this does not.
+//   - ctx cancelled, before or during the wait: context.Canceled. If it was
+//     cancelled while waiting, the request had already been sent.
+//   - Every other error, such as nats.ErrNoResponders.
+//
+// The "request {subject}" span records the upstream error, context deadline
+// exceeded: otel-nats records it before this method classifies it. The
+// embedded RequestWithContext and RequestMsgWithContext mirror nats.go's and,
+// like them, return the ctx error alone.
+//
 // Migration note (pre-1.0 API change, otel-nats v0.6.0 upgrade): the
 // variadic attrs parameter was removed. The reply receive span is now
 // created inside otel-nats, which currently offers no caller-attribute
 // injection point; attach domain identifiers (request/correlation IDs,
 // room/site IDs) to your own ambient span instead.
 func (c *Conn) Request(ctx context.Context, subject string, data []byte, timeout time.Duration) (*natsgo.Msg, error) {
-	reqCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	return c.RequestWithContext(reqCtx, subject, data)
+	return withRequestTimeout(ctx, timeout, func(reqCtx context.Context) (*natsgo.Msg, error) {
+		return c.RequestWithContext(reqCtx, subject, data)
+	})
 }
 
 // RequestMsg sends a pre-built request message — use it to set headers on the
@@ -322,7 +345,8 @@ func (c *Conn) Request(ctx context.Context, subject string, data []byte, timeout
 // the wait. The "request {subject}" span parents to ctx; as with Request, the
 // upstream layer records the bare "receive" reply span under the responder's
 // reply-send context, linked to that same span when the reply carries trace
-// context and recorded without a link when it does not.
+// context and recorded without a link when it does not. Errors are reported
+// exactly as by Request.
 //
 // This shadows the embedded otelnats.Conn.RequestMsg(msg, timeout), whose
 // ctx-less signature parents its producer span to context.Background() and so
@@ -333,9 +357,53 @@ func (c *Conn) RequestMsg(ctx context.Context, msg *natsgo.Msg, timeout time.Dur
 	if msg == nil {
 		return nil, fmt.Errorf("nats request-msg: msg must not be nil")
 	}
-	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	return withRequestTimeout(ctx, timeout, func(reqCtx context.Context) (*natsgo.Msg, error) {
+		return c.RequestMsgWithContext(reqCtx, msg)
+	})
+}
+
+// withRequestTimeout runs request under a context derived from ctx that ends
+// after timeout, and reports a sent request that ran out of time as
+// nats.ErrTimeout; Request's godoc states the contract.
+//
+// nats.go's ctx-based request returns the context's error, so without this a
+// timeout surfaces only as context.DeadlineExceeded and a migrated
+// errors.Is(err, nats.ErrTimeout) branch never fires. Either deadline counts,
+// timeout's or ctx's own: in the usual migration shape, ctx, cancel :=
+// context.WithTimeout(ctx, d) then conn.Request(ctx, subject, data, d), the
+// caller's deadline lands a moment first and always ends the wait.
+//
+// A call with no time left is not a timeout. Calling it one would turn a
+// retry-on-timeout loop into a busy loop once its budget is spent. The request
+// context gets the earlier of ctx's deadline and now+timeout as a deadline of
+// its own, so when that is already past — ctx spent, or a zero, negative or
+// tiny timeout — it is done the moment it is created, even in the instant
+// after ctx's deadline when ctx itself is not yet cancelled. nats.go then
+// rejects the request before sending, the traced path still records its span
+// as it always has, and the error is left unwrapped.
+//
+// A deadline that passes after that point but before nats.go's own check is
+// reported as a timeout although nothing was sent; the next call finds no time
+// left, so a retry loop makes at most that one extra attempt.
+//
+// A nil ctx returns nats.ErrInvalidContext, as nats.go's RequestWithContext
+// does, instead of panicking in context.WithDeadline.
+func withRequestTimeout(ctx context.Context, timeout time.Duration, request func(context.Context) (*natsgo.Msg, error)) (*natsgo.Msg, error) {
+	if ctx == nil {
+		return nil, natsgo.ErrInvalidContext
+	}
+	deadline := time.Now().Add(timeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	reqCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-	return c.RequestMsgWithContext(reqCtx, msg)
+	noTimeLeft := reqCtx.Err() != nil
+	reply, err := request(reqCtx)
+	if !noTimeLeft && errors.Is(err, context.DeadlineExceeded) {
+		err = fmt.Errorf("%w: %w", natsgo.ErrTimeout, err)
+	}
+	return reply, err
 }
 
 // redactedURLs renders the server list for an error message with any embedded

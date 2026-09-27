@@ -505,7 +505,14 @@ engagement plan below sequences it accordingly.
   vs `RequestWithContext(ctx, subject, data)`; no method takes both.
 - **Tracked in**: [#72](https://github.com/flywindy/o11y/issues/72).
 - **Unlocks**: `o11y/nats.Conn.Request` drops its `context.WithTimeout` shim.
-  (Low urgency for o11y — the shim fully hides this from SDK users.)
+  (Low urgency for o11y — the shim fully hides this from SDK users.) Since
+  2026-09-27 the shim also rewrites the timeout error: the ctx-based path
+  returns `context.DeadlineExceeded`, so the facade wraps it in
+  `nats.ErrTimeout` to match native `nc.Request`. The `request {subject}` span
+  cannot follow, because `tracedConn.requestWithCtx` (v0.9.1) records the raw
+  error before returning it; a method that takes both ctx and
+  timeout could report `nats.ErrTimeout` on the span as well, removing the
+  mismatch between span and returned error.
 - **Friction**: low-medium — additive, but naming needs the maintainer's
   API-mirror philosophy applied.
 
