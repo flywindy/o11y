@@ -56,8 +56,15 @@ type CapturedRequest struct {
 }
 
 // NewCapturingOTLPServer starts a fake OTLP/HTTP server that records each
-// inbound request. Auto-closed via t.Cleanup.
+// inbound request and answers 200 OK. Auto-closed via t.Cleanup.
 func NewCapturingOTLPServer(t *testing.T) *CapturingOTLPServer {
+	t.Helper()
+	return NewCapturingOTLPServerWithStatus(t, http.StatusOK)
+}
+
+// NewCapturingOTLPServerWithStatus is NewCapturingOTLPServer answering every
+// request with status, for tests that need the exporter to see a rejection.
+func NewCapturingOTLPServerWithStatus(t *testing.T, status int) *CapturingOTLPServer {
 	t.Helper()
 	c := &CapturingOTLPServer{}
 	c.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -71,7 +78,7 @@ func NewCapturingOTLPServer(t *testing.T) *CapturingOTLPServer {
 		// Drain the body so the client's connection can be reused, but do
 		// not retain it.
 		_, _ = io.Copy(io.Discard, r.Body)
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(status)
 	}))
 	t.Cleanup(c.Close)
 	return c
