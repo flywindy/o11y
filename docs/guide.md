@@ -1353,6 +1353,36 @@ or one that used the raw `msg.Respond` instead of `conn.Respond` — the
 receive span is still recorded (in the requester's own trace) but carries no
 link.
 
+**Errors.** When the `timeout` argument runs out before a reply arrives,
+`Request` and `RequestMsg` return an error that satisfies both `errors.Is(err,
+gonats.ErrTimeout)` — what native `nc.Request` returns, so a retry or fallback
+branch written against it keeps working after migrating to the facade — and
+`errors.Is(err, context.DeadlineExceeded)`. The same holds when `ctx` reaches
+its own deadline first, so a `ctx` and a `timeout` of the same length behave as
+one timeout; read `ctx.Err()` if you need to know whose deadline it was. A call
+with no time left — `ctx` past its deadline, or a `timeout` of zero or less —
+sends nothing and returns `context.DeadlineExceeded` alone, so a
+retry-on-timeout loop sharing one `ctx` stops once that budget is spent instead
+of spinning; a `ctx` cancelled while waiting returns `context.Canceled` (the
+request was already sent). `gonats.ErrNoResponders` is returned unchanged. The
+embedded `RequestWithContext` / `RequestMsgWithContext` mirror nats.go's and,
+like them, return the bare `ctx` error. Compare with `errors.Is`: the timeout
+error wraps both sentinels, so `err == gonats.ErrTimeout` is false. The
+`request {subject}` span records the upstream error text, `context deadline
+exceeded`, since otel-nats records it before the facade classifies it.
+
+```go
+reply, err := conn.Request(ctx, "orders.get", []byte("42"), 2*time.Second)
+switch {
+case errors.Is(err, gonats.ErrTimeout):
+    // no reply in time: retry (while ctx.Err() == nil) or fall back
+case errors.Is(err, gonats.ErrNoResponders):
+    // nobody subscribed to orders.get
+case err != nil:
+    // ctx cancelled, or a connection error
+}
+```
+
 Migration note (pre-1.0 API change, otel-nats v0.6.0 upgrade): `Request`'s
 optional variadic `attrs` parameter was removed — the reply span is now
 created inside otel-nats, which has no caller-attribute injection point.

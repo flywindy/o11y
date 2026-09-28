@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1281,5 +1282,112 @@ func TestQueueSubscribe_Validation(t *testing.T) {
 			assert.Nil(t, sub)
 			assert.Contains(t, err.Error(), tc.wantErr)
 		})
+	}
+}
+
+// TestRequest_TimeoutErrors pins how Request and RequestMsg report the ways a
+// request can end without a reply, on the traced path, the direct path, and
+// nats.go's old request style, which waits on a per-request subscription.
+// Running out of time must satisfy errors.Is for nats.ErrTimeout — what native
+// nats.Conn.Request returns, and what a migrated service's retry branch checks
+// — as well as for context.DeadlineExceeded, whichever deadline ended the
+// wait: the timeout argument's, the caller's, or the two set to the same
+// duration, the usual migration shape. A ctx that is already done, the
+// caller's cancellation and no responders must not be reported as a timeout.
+func TestRequest_TimeoutErrors(t *testing.T) {
+	_, url := startTestServer(t)
+	tp, prop, _ := newTestProviders()
+
+	type requestFunc func(ctx context.Context, conn *o11ynats.Conn, subject string, timeout time.Duration) (*nats.Msg, error)
+	requests := map[string]requestFunc{
+		"Request": func(ctx context.Context, conn *o11ynats.Conn, subject string, timeout time.Duration) (*nats.Msg, error) {
+			return conn.Request(ctx, subject, []byte("ping"), timeout)
+		},
+		"RequestMsg": func(ctx context.Context, conn *o11ynats.Conn, subject string, timeout time.Duration) (*nats.Msg, error) {
+			return conn.RequestMsg(ctx, &nats.Msg{Subject: subject, Data: []byte("ping")}, timeout)
+		},
+	}
+	paths := map[string][]o11ynats.ConnectOption{
+		"traced":    {o11ynats.WithTracingEnabled(true)},
+		"direct":    {o11ynats.WithTracingEnabled(false)},
+		"old style": {o11ynats.WithTracingEnabled(true), o11ynats.WithNATSOptions(nats.UseOldRequestStyle())},
+	}
+
+	for pathName, opts := range paths {
+		conn, err := o11ynats.ConnectWithOptions(context.Background(), url, tp, prop, opts...)
+		require.NoError(t, err)
+		t.Cleanup(conn.Close)
+
+		// A subscriber that never replies: the request reaches a responder,
+		// so the wait ends by a deadline rather than by no-responders.
+		silent := "test.request.silent." + strings.ReplaceAll(pathName, " ", "_")
+		_, err = conn.Subscribe(context.Background(), silent, func(context.Context, *nats.Msg) {})
+		require.NoError(t, err)
+		// A synchronous subscription on a second subject, for the cases that
+		// must send nothing: NextMsg waits for a delivery rather than racing an
+		// asynchronous handler.
+		unsent := silent + ".unsent"
+		unsentSub, err := conn.NatsConn().SubscribeSync(unsent)
+		require.NoError(t, err)
+		assertNothingSent := func(t *testing.T) {
+			t.Helper()
+			msg, err := unsentSub.NextMsg(100 * time.Millisecond)
+			assert.ErrorIs(t, err, nats.ErrTimeout, "the request must not be sent")
+			assert.Nil(t, msg)
+		}
+		require.NoError(t, conn.NatsConn().FlushTimeout(2*time.Second))
+
+		for name, request := range requests {
+			t.Run(name+"/"+pathName, func(t *testing.T) {
+				t.Run("timeout", func(t *testing.T) {
+					reply, err := request(context.Background(), conn, silent, 50*time.Millisecond)
+					assert.Nil(t, reply)
+					assert.ErrorIs(t, err, nats.ErrTimeout)
+					assert.ErrorIs(t, err, context.DeadlineExceeded)
+				})
+				t.Run("zero timeout", func(t *testing.T) {
+					_, err := request(context.Background(), conn, unsent, 0)
+					assert.ErrorIs(t, err, context.DeadlineExceeded)
+					assert.NotErrorIs(t, err, nats.ErrTimeout,
+						"no time to wait is not a timeout: a retry-on-timeout loop would spin")
+					assertNothingSent(t)
+				})
+				t.Run("caller deadline", func(t *testing.T) {
+					ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+					defer cancel()
+					_, err := request(ctx, conn, silent, 5*time.Second)
+					assert.ErrorIs(t, err, nats.ErrTimeout)
+					assert.ErrorIs(t, err, context.DeadlineExceeded)
+				})
+				t.Run("caller deadline equal to timeout", func(t *testing.T) {
+					ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+					defer cancel()
+					_, err := request(ctx, conn, silent, 200*time.Millisecond)
+					assert.ErrorIs(t, err, nats.ErrTimeout)
+					assert.ErrorIs(t, err, context.DeadlineExceeded)
+				})
+				t.Run("ctx already expired", func(t *testing.T) {
+					ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+					defer cancel()
+					_, err := request(ctx, conn, unsent, 5*time.Second)
+					assert.ErrorIs(t, err, context.DeadlineExceeded)
+					assert.NotErrorIs(t, err, nats.ErrTimeout,
+						"a spent budget is not a timeout: a retry-on-timeout loop would spin")
+					assertNothingSent(t)
+				})
+				t.Run("caller cancel", func(t *testing.T) {
+					ctx, cancel := context.WithCancel(context.Background())
+					time.AfterFunc(50*time.Millisecond, cancel)
+					_, err := request(ctx, conn, silent, 5*time.Second)
+					assert.ErrorIs(t, err, context.Canceled)
+					assert.NotErrorIs(t, err, nats.ErrTimeout)
+				})
+				t.Run("no responders", func(t *testing.T) {
+					_, err := request(context.Background(), conn, "test.request.nobody", time.Second)
+					assert.ErrorIs(t, err, nats.ErrNoResponders)
+					assert.NotErrorIs(t, err, nats.ErrTimeout)
+				})
+			})
+		}
 	}
 }
