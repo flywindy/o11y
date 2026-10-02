@@ -101,8 +101,27 @@ func WithRequireParentSpan(enabled bool) Option {
 // WithPoolName sets the application-defined connection-pool name used on Redis
 // pool metric samples.
 //
-// When omitted, Wrap synthesizes a process-unique name from the wrapped client
-// pointer. Cluster and Ring clients append each shard address to the base name.
+// When omitted, Wrap names the pool <base>-<n>. The base is
+// redis-<host>:<port> for a single-node client, redis-<socket-path> over a
+// Unix socket, redis-sentinel for a Sentinel failover client, and redis for
+// any other address. A Cluster or Ring client gets redis-cluster-<seed> or
+// redis-ring-<shard>, from the first configured seed address or shard name in
+// string order, or redis-cluster / redis-ring with none configured (a ring
+// filled later through SetAddrs, or a Sentinel client go-redis builds as a
+// ClusterClient), and appends each shard address to the name. The base is the
+// configured address, so set a name for a client configured with an address
+// that changes, such as a pod IP.
+//
+// <n> is the lowest number whose name no other live pool holds, including
+// names set with this option. A Wrap that fails before committing (not the
+// best-effort hook-install error, which keeps the wrapper), Unwrap, or the
+// client being garbage-collected gives the name back, and the next client on
+// that base takes the lowest name free: a single client rebuilt after Unwrap
+// gets its predecessor's name, while clients rebuilt together get the freed
+// names in the order they are wrapped. A client that is only closed keeps its
+// name until it is collected. A service that wraps its clients against each server in the same
+// order gets the same names on every run; set a name for clients wrapped
+// concurrently or lazily.
 func WithPoolName(name string) Option {
 	return func(cfg *config) {
 		cfg.poolName = name

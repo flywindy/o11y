@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"weak"
@@ -18,6 +20,53 @@ import (
 
 var wrappedClients sync.Map
 
+// poolNames numbers the pools Wrap names itself, so two clients pointed at
+// the same address do not collapse into one metric stream. The number replaces
+// the client's pointer address, which changed on every restart and rollout and
+// so started a new set of series each time.
+var poolNames = poolNameAllocator{held: map[string]int{}}
+
+// poolNameAllocator hands out <base>-<n> names, n being the lowest number
+// whose name no live wrapper holds. Numbering per base keeps a name
+// independent of clients wrapped against other servers, and giving a name back
+// when its wrapper goes away (a Wrap that fails before committing, Unwrap, the
+// client being collected) lets the next client on that base reuse it instead
+// of taking a new one: in a service that wraps its clients in the same order
+// at startup, each gets the same name run after run. Names set with WithPoolName are held
+// too, so a default name is never allocated on top of one.
+type poolNameAllocator struct {
+	mu   sync.Mutex
+	held map[string]int // live wrappers per pool name
+}
+
+// acquire holds and returns the lowest free <base>-<n>.
+func (a *poolNameAllocator) acquire(base string) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for n := 1; ; n++ {
+		if name := fmt.Sprintf("%s-%d", base, n); a.held[name] == 0 {
+			a.held[name] = 1
+			return name
+		}
+	}
+}
+
+// hold records a caller-chosen name.
+func (a *poolNameAllocator) hold(name string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.held[name]++
+}
+
+// release gives back one hold on name, taken by acquire or hold.
+func (a *poolNameAllocator) release(name string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.held[name]--; a.held[name] <= 0 {
+		delete(a.held, name)
+	}
+}
+
 type wrapEntry struct {
 	mu       sync.Mutex
 	ref      clientRef
@@ -25,6 +74,28 @@ type wrapEntry struct {
 	disabled atomic.Bool
 	reg      metric.Registration
 	cleanup  runtime.Cleanup
+	// poolName is the name the entry holds in poolNames; empty before Wrap
+	// takes one and once it has been given back.
+	poolName string
+}
+
+// detach turns the entry's instrumentation off and gives back what it holds:
+// installed hooks observe disabled and emit nothing, the metric callback is
+// unregistered, the pool name is returned to poolNames, and the GC cleanup is
+// cancelled (a no-op when detach runs from that cleanup). The caller holds
+// e.mu and then removes the entry from wrappedClients.
+func (e *wrapEntry) detach() {
+	e.disabled.Store(true)
+	if e.reg != nil {
+		_ = e.reg.Unregister()
+	}
+	if e.poolName != "" {
+		poolNames.release(e.poolName)
+		e.poolName = ""
+	}
+	if e.done {
+		e.cleanup.Stop()
+	}
 }
 
 type cleanupArg struct {
@@ -57,6 +128,7 @@ type clientOps interface {
 	key() uintptr
 	ref() clientRef
 	target(poolName string) poolTarget
+	defaultPoolNameBase() string
 	install(ctx context.Context, p hookParams) error
 	addCleanup(arg cleanupArg) runtime.Cleanup
 }
@@ -105,6 +177,28 @@ func (o singleOps) ref() clientRef {
 func (o singleOps) target(poolName string) poolTarget {
 	return singlePoolTarget{client: weak.Make(o.client), poolName: poolName}
 }
+
+// sentinelAddr is the Options.Addr go-redis gives a Sentinel failover client
+// in place of a server address.
+const sentinelAddr = "FailoverClient"
+
+// defaultPoolNameBase is redis-<host>:<port> from the client's address,
+// redis-<path> for a Unix socket, redis-sentinel for a Sentinel failover
+// client, whose options carry neither its master's address nor its name, and
+// redis for any other address, such as one with an empty host.
+func (o singleOps) defaultPoolNameBase() string {
+	opt := o.client.Options()
+	switch {
+	case opt.Network == "unix":
+		return "redis-" + opt.Addr
+	case opt.Addr == sentinelAddr:
+		return "redis-sentinel"
+	}
+	if parsed := parseAddress(opt.Addr); parsed.host != "" && parsed.port > 0 {
+		return "redis-" + opt.Addr
+	}
+	return "redis"
+}
 func (o singleOps) install(_ context.Context, p hookParams) error {
 	addClientHook(o.client, p.tp, p.operationDuration, p.connectionCreate, p.cfg, p.poolName, p.disabled)
 	return nil
@@ -124,6 +218,18 @@ func (o clusterOps) ref() clientRef {
 func (o clusterOps) target(poolName string) poolTarget {
 	return clusterPoolTarget{client: weak.Make(o.client), poolName: poolName}
 }
+
+// defaultPoolNameBase is redis-cluster-<seed>, the first configured seed
+// address in string order, so clusters number independently of each other; a
+// cluster configured without seeds (ClusterSlots alone, which includes every
+// Sentinel client go-redis builds through NewFailoverClusterClient) gives
+// redis-cluster. Each shard's pool name appends the shard's own address to it.
+func (o clusterOps) defaultPoolNameBase() string {
+	if addrs := o.client.Options().Addrs; len(addrs) > 0 {
+		return "redis-cluster-" + slices.Min(addrs)
+	}
+	return "redis-cluster"
+}
 func (o clusterOps) install(ctx context.Context, p hookParams) error {
 	return installShardedHooks(ctx, p, o.client.OnNewNode, o.client.ForEachShard)
 }
@@ -141,6 +247,16 @@ func (o ringOps) ref() clientRef {
 }
 func (o ringOps) target(poolName string) poolTarget {
 	return ringPoolTarget{client: weak.Make(o.client), poolName: poolName}
+}
+
+// defaultPoolNameBase is redis-ring-<shard>, the first configured shard name
+// in string order, for the same reason as a cluster's; a ring with no configured
+// shards gives redis-ring.
+func (o ringOps) defaultPoolNameBase() string {
+	if addrs := o.client.Options().Addrs; len(addrs) > 0 {
+		return "redis-ring-" + slices.Min(slices.Collect(maps.Keys(addrs)))
+	}
+	return "redis-ring"
 }
 func (o ringOps) install(ctx context.Context, p hookParams) error {
 	return installShardedHooks(ctx, p, o.client.OnNewNode, o.client.ForEachShard)
@@ -273,13 +389,7 @@ func Wrap(
 		// runtime.AddCleanup callback evicted the stale entry. Tear the stale
 		// state down deterministically and restart.
 		if !entry.ref.matches(rdb) {
-			entry.disabled.Store(true)
-			if entry.reg != nil {
-				_ = entry.reg.Unregister()
-			}
-			if entry.done {
-				entry.cleanup.Stop()
-			}
+			entry.detach()
 			wrappedClients.CompareAndDelete(key, entry)
 			entry.mu.Unlock()
 			continue
@@ -293,8 +403,11 @@ func Wrap(
 
 		cfg := newConfig(opts)
 		if cfg.poolName == "" {
-			cfg.poolName = fmt.Sprintf("redis-%x", key)
+			cfg.poolName = poolNames.acquire(ops.defaultPoolNameBase())
+		} else {
+			poolNames.hold(cfg.poolName)
 		}
+		entry.poolName = cfg.poolName
 
 		meter := mp.Meter(instrumentationName, metric.WithSchemaURL(semconv.SchemaURL))
 		operationDuration, instErr := meter.Float64Histogram(
@@ -303,18 +416,21 @@ func Wrap(
 			metric.WithUnit("s"),
 		)
 		if instErr != nil {
+			entry.detach()
 			wrappedClients.CompareAndDelete(key, entry)
 			entry.mu.Unlock()
 			return rdb, fmt.Errorf("redis wrap: create operation duration histogram: %w", instErr)
 		}
 		pool, instErr := newPoolMetrics(meter)
 		if instErr != nil {
+			entry.detach()
 			wrappedClients.CompareAndDelete(key, entry)
 			entry.mu.Unlock()
 			return rdb, instErr
 		}
 		reg, instErr := pool.register(ops.target(cfg.poolName), &entry.disabled)
 		if instErr != nil {
+			entry.detach()
 			wrappedClients.CompareAndDelete(key, entry)
 			entry.mu.Unlock()
 			return rdb, instErr
@@ -376,13 +492,7 @@ func Unwrap(rdb goredis.UniversalClient) {
 	if !entry.ref.matches(rdb) {
 		return
 	}
-	entry.disabled.Store(true)
-	if entry.reg != nil {
-		_ = entry.reg.Unregister()
-	}
-	if entry.done {
-		entry.cleanup.Stop()
-	}
+	entry.detach()
 	wrappedClients.CompareAndDelete(key, entry)
 	runtime.KeepAlive(rdb)
 }
@@ -412,10 +522,7 @@ func cleanupWrappedClient(arg cleanupArg) {
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 	if !entry.ref.alive() && entry.ref == arg.ref {
-		entry.disabled.Store(true)
-		if entry.reg != nil {
-			_ = entry.reg.Unregister()
-		}
+		entry.detach()
 		wrappedClients.CompareAndDelete(arg.key, entry)
 	}
 }

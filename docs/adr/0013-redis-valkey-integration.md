@@ -237,6 +237,8 @@ func WithAttributes(attrs ...attribute.KeyValue) Option
 //
 // When omitted, the wrapper synthesises a process-unique default of
 // "redis-<uintptr-hex>" derived from the concrete client pointer.
+// (Superseded by the 2026-10-02 amendment: "redis-<host>:<port>-<n>"
+// and kin, <n> the lowest number whose name is free.)
 // For Cluster / Ring topologies the per-shard label is the
 // composed value "<top-level-pool-name>/<shard-Addr>" — see §7
 // group B for why per-shard discrimination is required even when
@@ -248,7 +250,9 @@ func WithAttributes(attrs ...attribute.KeyValue) Option
 // if they wrap distinct logical pools that may resolve to the same
 // host/port (sidecar deployments, multiple db numbers, fixtures),
 // otherwise the OTel async-callback uniqueness contract is
-// violated.
+// violated. (The rule is about names callers supply: defaults are
+// distinct on their own, before and after the 2026-10-02
+// amendment.)
 func WithPoolName(name string) Option
 
 // MetricViews returns the metric.Views this package needs registered
@@ -412,7 +416,9 @@ top-level pool-name is that string; otherwise the wrapper
 synthesises a default of `redis-<uintptr-hex>` using the
 concrete client pointer (the same value the §10 dedup map keys
 on), which guarantees uniqueness across `Wrap` calls in the
-same process. For Cluster / Ring, the per-shard pool-name
+same process. *(Superseded by the 2026-10-02 amendment: the
+pointer changed on every restart, so the default is now numbered
+per server address.)* For Cluster / Ring, the per-shard pool-name
 appends the shard's address as a suffix:
 `<top-level-pool-name>/<shard-Addr>`. Within a single
 `*redis.ClusterClient`, distinct shards already have distinct
@@ -1644,8 +1650,9 @@ On every `go-redis` / `redisotel` version change:
     supplying `WithPoolName`. On the next observation cycle,
     assert that two distinct `db.client.connection.count` time
     series exist — one per `Wrap` — each carrying its own
-    synthesised `db.client.connection.pool.name = "redis-<hex>"`
-    derived from the concrete pointer. A regression that
+    synthesised `db.client.connection.pool.name` (since the
+    2026-10-02 amendment `redis-<host>:<port>-<n>`, previously
+    `"redis-<hex>"` derived from the concrete pointer). A regression that
     omitted pool-name entirely would collapse the two pools
     into a single colliding series and violate the OTel
     async-callback uniqueness contract.
@@ -1973,3 +1980,103 @@ On every `go-redis` / `redisotel` version change:
   At that point a follow-up ADR can amend §2 back to a pure-T2
   facade and delete the SDK-owned hook. Track redisotel releases
   per the "Audit discipline for upstream bumps" section above.
+
+---
+
+## Amendment (2026-10-02) — a restart-stable default pool name; the used gauge floored at zero
+
+### Default pool name
+
+The §7 group B default, `redis-<uintptr-hex>` from the concrete client
+pointer, was unique within a process but changed on every restart and
+rollout: each deployment started a new set of `db.client.connection.*`
+series, the old ones went stale, and no dashboard could key on the label.
+Most services never set `WithPoolName`, so most pools were affected.
+
+The default is now `<base>-<n>`. The base is:
+
+- `redis-<host>:<port>` for a single-node client, `Options.Addr` when it
+  parses as `server.address` / `server.port` do, or `redis-<socket-path>`
+  over a Unix socket (`redis` for any other address, such as one with an
+  empty host);
+- `redis-cluster-<seed>` or `redis-ring-<shard>` for a Cluster or Ring
+  client, which has no single address: the first configured seed address
+  or shard name in string order, both fixed by configuration
+  (`redis-cluster` / `redis-ring` when none is configured — a ring filled
+  later through `SetAddrs`, or a Sentinel client go-redis builds as a
+  `ClusterClient` with `ClusterSlots` alone, through
+  `NewFailoverClusterClient` or the `NewUniversalClient` paths that call
+  it). Per-shard names still append `/<shard-Addr>`;
+- `redis-sentinel` for a Sentinel failover `*redis.Client`, whose
+  `Options.Addr` is the `FailoverClient` placeholder and whose options keep
+  neither the master's address nor its name. The placeholder is a go-redis
+  internal; `TestDefaultPoolNameBase` pins it, so an upstream rename fails
+  that test on the bump rather than silently renaming Sentinel pools.
+
+`<n>` is the lowest number whose name no live wrapper holds. Two clients on
+one address keep separate series as before. Numbering per base, rather than
+with one process-wide sequence, keeps a pool's name independent of how many
+clients were wrapped against other servers before it (Sentinel clients for
+different masters share one base, the one case the options cannot tell
+apart).
+Names set with `WithPoolName` are held in the same table, so a default is
+never allocated on top of an explicit name that is already registered (an
+explicit name registered after a default it equals still collides; choosing
+one is the caller's call). A wrapper gives its name back when it goes away —
+a `Wrap` that fails before committing (the best-effort hook-install error
+commits and keeps it), `Unwrap`, or the runtime cleanup after the client is
+collected — so a retry after a transient failure gets the name a clean run
+would have, and a single client rebuilt after a failover (`Unwrap`, `Close`,
+`NewClient`, `Wrap`) takes over its predecessor's name and series instead of
+starting a new one. Numbering is lowest-free, not per client: clients
+rebuilt together get the freed names in the order they are wrapped, which
+can swap two pools' series if that order differs from the original. A client that is only closed, not unwrapped,
+keeps its name until the garbage collector runs its cleanup: go-redis has no
+close hook to release it sooner. An idempotent repeat of `Wrap` on an
+already-wrapped client does not take a number. A service that wraps its
+clients against each server in the same order gets the same names on every
+run; clients wrapped concurrently or lazily get numbers in whatever order the
+scheduler decides, and should set `WithPoolName`.
+
+The base is the configured address, not a resolved one: a client
+configured with a service DNS name keeps its name when the pods behind it
+move, while one configured with a pod IP gets a new name whenever that IP
+changes, as its `server.address` does. Such a client should set
+`WithPoolName`.
+
+A reused name is a new source for the same series. The pool gauges simply
+continue, but the monotonic `db.client.connection.timeouts` restarts from
+the new pool's zero within the same stream, which a cumulative backend such
+as Prometheus reads as a counter reset (`rate` / `increase` absorb it) and a
+delta exporter reports as one negative delta. A client rebuilt under an
+explicit `WithPoolName` has always behaved this way; reusing default names
+trades that one-off reset for series that continue across a rebuild instead
+of starting anew.
+
+The table is process-wide, like the §10 dedup map, not per `MeterProvider`:
+two SDK instances in one process wrapping clients against the same server
+number each other's pools. That is rare enough not to justify keying the
+table on a provider, whose dynamic type need not be comparable.
+
+ADR 0014 adopted a process-wide sequence (`mongo-<host>-<n>`) for
+`mongo.Instrument`, citing this package's pointer-based name as the thing to
+avoid. Redis numbers per base and reuses freed numbers because `Unwrap` and
+re-`Wrap` of a rebuilt client is a supported lifecycle here; aligning mongo
+is left to that package.
+
+The §10 dedup map still keys on the client pointer; only the label changed.
+Renaming the default renames the series of every pool that relied on it,
+which the CHANGELOG lists under Migration.
+
+### `db.client.connection.count{state="used"}`
+
+The used count was `int64(TotalConns - IdleConns)`, a subtraction of two
+`uint32` before widening. go-redis reads the two under separate lock
+acquisitions, so `IdleConns` can momentarily exceed `TotalConns`, and the
+subtraction then wraps to about 4.29e9 — one scrape reporting a saturated
+pool, enough to page anyone alerting on it. The count is now computed in
+`int64` with idle capped at the total, so used is never negative and the
+`used` and `idle` series always sum to the pool total. The `idle` series had
+the same read skew and could exceed the total; it is capped by the same
+rule.
+
