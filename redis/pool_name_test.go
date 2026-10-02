@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -60,29 +61,47 @@ func TestDefaultPoolNameBase(t *testing.T) {
 	}
 }
 
-// TestPoolNameAllocator pins the numbering: the lowest free number per base,
+// TestPoolNameTable pins the numbering: the lowest free number per base,
 // bases independent of each other, a returned number handed out again, and a
 // caller-chosen name never handed out on top of.
-func TestPoolNameAllocator(t *testing.T) {
-	a := poolNameAllocator{held: map[string]int{}}
+func TestPoolNameTable(t *testing.T) {
+	tbl := poolNameTable{}
 
-	assert.Equal(t, "redis-a-1", a.acquire("redis-a"))
-	assert.Equal(t, "redis-a-2", a.acquire("redis-a"))
-	assert.Equal(t, "redis-b-1", a.acquire("redis-b"), "another base's names do not shift this one's")
+	assert.Equal(t, "redis-a-1", tbl.acquire("redis-a"))
+	assert.Equal(t, "redis-a-2", tbl.acquire("redis-a"))
+	assert.Equal(t, "redis-b-1", tbl.acquire("redis-b"), "another base's names do not shift this one's")
 
-	a.release("redis-a-1")
-	assert.Equal(t, "redis-a-1", a.acquire("redis-a"), "a returned number is reused")
+	tbl.release("redis-a-1")
+	assert.Equal(t, "redis-a-1", tbl.acquire("redis-a"), "a returned number is reused")
 
-	a.hold("redis-a-3")
-	a.hold("redis-a-3")
-	assert.Equal(t, "redis-a-4", a.acquire("redis-a"), "a name set with WithPoolName is skipped")
-	a.release("redis-a-3")
-	assert.Equal(t, "redis-a-5", a.acquire("redis-a"), "a name stays held while any wrapper still holds it")
+	tbl.hold("redis-a-3")
+	tbl.hold("redis-a-3")
+	assert.Equal(t, "redis-a-4", tbl.acquire("redis-a"), "a name set with WithPoolName is skipped")
+	tbl.release("redis-a-3")
+	assert.Equal(t, "redis-a-5", tbl.acquire("redis-a"), "a name stays held while any wrapper still holds it")
 
 	for _, name := range []string{"redis-a-1", "redis-a-2", "redis-b-1", "redis-a-3", "redis-a-4", "redis-a-5"} {
-		a.release(name)
+		tbl.release(name)
 	}
-	assert.Empty(t, a.held, "a name no wrapper holds is dropped")
+	assert.Empty(t, tbl, "a name no wrapper holds is dropped")
+}
+
+// TestPoolNameRegistryScopes checks each MeterProvider numbers its own pools,
+// value-typed providers share one scope, and an empty table is dropped.
+func TestPoolNameRegistryScopes(t *testing.T) {
+	r := poolNameRegistry{tables: map[any]poolNameTable{}}
+	mpA, mpB := sdkmetric.NewMeterProvider(), sdkmetric.NewMeterProvider()
+	a, b := poolNameScope(mpA), poolNameScope(mpB)
+
+	assert.Equal(t, "redis-h-1", r.acquire(a, "redis-h"))
+	assert.Equal(t, "redis-h-1", r.acquire(b, "redis-h"), "another provider's pools do not shift this one's")
+	assert.Equal(t, poolNameScope(noop.NewMeterProvider()), poolNameScope(failingMeterProvider{}),
+		"value-typed providers share one scope")
+
+	r.release(a, "redis-h-1")
+	r.release(b, "redis-h-1")
+	r.release(b, "redis-h-1") // an extra release is harmless
+	assert.Empty(t, r.tables, "a scope holding no names is dropped")
 }
 
 // seriesPoolNames returns the db.client.connection.pool.name values on the
@@ -150,18 +169,28 @@ func TestCollectedClientReturnsPoolName(t *testing.T) {
 		client := goredis.NewClient(&goredis.Options{Addr: "pool-name-gc.invalid:6379"})
 		_, err := Wrap(client, tp, mp)
 		require.NoError(t, err)
-		poolNames.mu.Lock()
-		held := poolNames.held[name]
-		poolNames.mu.Unlock()
-		require.Equal(t, 1, held, "Wrap holds the name")
+		require.Equal(t, 1, poolNames.held(poolNameScope(mp), name), "Wrap holds the name")
 		require.NoError(t, client.Close())
 	}()
 	require.Eventually(t, func() bool {
 		runtime.GC()
-		poolNames.mu.Lock()
-		defer poolNames.mu.Unlock()
-		return poolNames.held[name] == 0
+		return poolNames.held(poolNameScope(mp), name) == 0
 	}, 5*time.Second, 10*time.Millisecond, "the collected client's name must be given back")
+}
+
+// TestWrapDefaultPoolNamesPerProvider wraps a client on one address under
+// each of two MeterProviders: each provider exports its own pool as -1.
+func TestWrapDefaultPoolNamesPerProvider(t *testing.T) {
+	const addr = "pool-name-provider.invalid:6379"
+	for range 2 {
+		tp, _, mp, reader := newRedisTestProviders()
+		client := goredis.NewClient(&goredis.Options{Addr: addr})
+		t.Cleanup(func() { _ = client.Close() })
+		t.Cleanup(func() { Unwrap(client) })
+		_, err := Wrap(client, tp, mp)
+		require.NoError(t, err)
+		assert.Equal(t, map[string]struct{}{"redis-" + addr + "-1": {}}, seriesPoolNames(t, reader))
+	}
 }
 
 // TestWrapExplicitPoolNameIsHeld checks Wrap holds a WithPoolName name, so a
@@ -205,18 +234,36 @@ func (failingMeter) Float64Histogram(string, ...metric.Float64HistogramOption) (
 	return nil, errors.New("histogram unavailable")
 }
 
+// flakyMeterProvider fails instrument creation while fail is set and
+// otherwise delegates to the embedded provider.
+type flakyMeterProvider struct {
+	*sdkmetric.MeterProvider
+	fail atomic.Bool
+}
+
+func (p *flakyMeterProvider) Meter(name string, opts ...metric.MeterOption) metric.Meter {
+	if p.fail.Load() {
+		return failingMeter{}
+	}
+	return p.MeterProvider.Meter(name, opts...)
+}
+
 // TestWrapFailureReturnsPoolName checks a Wrap that fails before committing
 // gives its default name's number back, so a retry, and every pool named after
 // it, gets the name a clean run would have.
 func TestWrapFailureReturnsPoolName(t *testing.T) {
 	tp, _, mp, reader := newRedisTestProviders()
+	// One provider for both calls, so both draw on the same name table.
+	flaky := &flakyMeterProvider{MeterProvider: mp}
+	flaky.fail.Store(true)
 	client := goredis.NewClient(&goredis.Options{Addr: "pool-name-failure.invalid:6379"})
 	t.Cleanup(func() { _ = client.Close() })
 	t.Cleanup(func() { Unwrap(client) })
 
-	_, err := Wrap(client, tp, failingMeterProvider{})
+	_, err := Wrap(client, tp, flaky)
 	require.Error(t, err)
-	_, err = Wrap(client, tp, mp)
+	flaky.fail.Store(false)
+	_, err = Wrap(client, tp, flaky)
 	require.NoError(t, err)
 	assert.Equal(t, map[string]struct{}{"redis-pool-name-failure.invalid:6379-1": {}}, seriesPoolNames(t, reader))
 }

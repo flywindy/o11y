@@ -2036,7 +2036,10 @@ close hook to release it sooner. An idempotent repeat of `Wrap` on an
 already-wrapped client does not take a number. A service that wraps its
 clients against each server in the same order gets the same names on every
 run; clients wrapped concurrently or lazily get numbers in whatever order the
-scheduler decides, and should set `WithPoolName`.
+scheduler decides, and a client replaced overlap-first — the new one wrapped
+while the old one still holds its name — gets the next number, then `-1`
+again after a restart. No numbering scheme can tell a replacement from a
+second client, so all three cases should set `WithPoolName`.
 
 The base is the configured address, not a resolved one: a client
 configured with a service DNS name keeps its name when the pods behind it
@@ -2053,10 +2056,14 @@ explicit `WithPoolName` has always behaved this way; reusing default names
 trades that one-off reset for series that continue across a rebuild instead
 of starting anew.
 
-The table is process-wide, like the §10 dedup map, not per `MeterProvider`:
-two SDK instances in one process wrapping clients against the same server
-number each other's pools. That is rare enough not to justify keying the
-table on a provider, whose dynamic type need not be comparable.
+Names are counted per `MeterProvider`, so each SDK instance numbers only the
+pools it exports, and a second instance in the process does not shift the
+first one's names. The registry of per-provider tables is package state for
+the same reason as the §10 dedup map — go-redis clients have nowhere to hang
+it — and a provider's table is dropped once it holds no names. A provider
+is keyed by identity when it is a pointer (as the SDK's is); value-typed
+providers, such as the no-op one, share one table, which avoids using a
+possibly non-comparable value as a map key.
 
 ADR 0014 adopted a process-wide sequence (`mongo-<host>-<n>`) for
 `mongo.Instrument`, citing this package's pointer-based name as the thing to
