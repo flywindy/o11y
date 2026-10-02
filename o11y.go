@@ -462,10 +462,10 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		}
 		mpInternal, meterProviderPublic = mp, mp
 		if cfg.metricsOTLPEndpoint == "" {
-			// On the Prometheus pull path the public provider sanitizes
-			// instrumentation-scope attributes so a meter created with one
-			// that collides with otelprom's own scope labels cannot poison
-			// its families; see metrics.GuardScopeAttributes. OTLP carries
+			// On the Prometheus pull path the public provider drops, with a
+			// WARN, instrumentation-scope attributes that collide with
+			// otelprom's own scope labels or with each other; see
+			// metrics.GuardScopeAttributes. OTLP carries
 			// scope attributes separately and needs no such guard.
 			meterProviderPublic = metrics.GuardScopeAttributes(mp, slog.New(stdoutHandler))
 		}
@@ -499,8 +499,11 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		// Wrap the OTLP handler with a minimum-level gate so that both outputs
 		// honour the same logLevel. Without this, the otelslog bridge would emit
 		// records at all levels regardless of the configured threshold.
+		// The error-string wrapper keeps slog.Any("error", err) an "error"
+		// attribute on the OTLP copy, as on stdout, instead of the bridge's
+		// exception.* promotion (see o11ylog.ErrorStringHandler).
 		otelHandler := &leveledHandler{
-			Handler: otelslog.NewHandler("github.com/flywindy/o11y", otelOpts...),
+			Handler: o11ylog.NewErrorStringHandler(otelslog.NewHandler("github.com/flywindy/o11y", otelOpts...)),
 			min:     cfg.logLevel,
 		}
 		logHandler := o11ylog.NewMultiHandler(otelHandler, stdoutHandler)

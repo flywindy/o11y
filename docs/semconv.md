@@ -83,7 +83,7 @@ option shapes the HTTP client and datastore histograms below.
 
 | Key | Type | Notes |
 |---|---|---|
-| `http.request.method` | string | e.g. `GET`, `POST`. |
+| `http.request.method` | string | e.g. `GET`, `POST`. A method outside the standard set is recorded as `_OTHER` (otelhttp / otelgin v0.71.0; v0.68.0 recorded `GET`), with the raw value in `http.request.method_original` on the span. |
 | `http.route` | string | Normalized route template (e.g. `/users/:id`), never the raw URL path. Export cardinality is capped via `WithMaxUniqueRoutes` (default 1000); ordinary overflow collapses to `"other"`, while SDK aggregation overflow uses `otel.metric.overflow=true`. |
 | `http.response.status_code` | int | Must be `attribute.Int`, not `attribute.String`. |
 | `otel.metric.overflow` | bool | Emitted by the OTel SDK when the aggregation cardinality limit is reached. This is an SDK safety valve, not a semconv HTTP label. |
@@ -92,8 +92,9 @@ option shapes the HTTP client and datastore histograms below.
 
 The canonical `o11ygin.Middleware` chain records each entry of
 `gin.Context.Errors` as one `exception` event (`span.RecordError`) carrying
-the key below, in `c.Errors` order. `otelgin` would record each entry again,
-without the key; the chain keeps `c.Errors` from it so it does not. A request
+the key below, in `c.Errors` order. The chain keeps `c.Errors` from `otelgin`,
+which therefore adds no `error.type` of its own to the span (`otelgin` v0.68.0
+would have recorded each entry again; v0.71.0 would set `error.type`). A request
 the chain's filter excludes (`WithFilter`, `WithSkipPaths`) gets no event.
 `o11ygin.ErrorRecorder`, used on its own without `Middleware`, records the
 same event. The key is on the `exception` event, not on the span itself, and
@@ -124,7 +125,7 @@ Histogram boundaries use the SDK's configured latency buckets.
 
 | Key | Type | Notes |
 |---|---|---|
-| `http.request.method` | string | e.g. `GET`, `POST`. |
+| `http.request.method` | string | e.g. `GET`, `POST`. On the `http` otelhttp facade a method outside the standard set is recorded as `_OTHER` with the raw value in `http.request.method_original` on the span, and so is an empty `Request.Method` (without the original) — v0.68.0 recorded both as `GET`. The `resty` wrapper records the method upper-cased as given, an empty one as `GET`. |
 | `http.route` | string | Resty only, opt-in through `resty.WithRouteFromContext` and `resty.WithMetricRouteEnabled(true)`. Must be a caller-supplied route template, never the raw URL path. Export cardinality is capped through `WithMaxUniqueRoutes`. |
 | `http.response.status_code` | int | Response-path metric label and span attribute. |
 | `http.request.resend_count` | int | Resty spans only; emitted on retry attempts after the first attempt. |
@@ -871,7 +872,7 @@ Data Model attributes automatically.
 | `gin.error.type` | `gin` wrapper | SDK-owned rendering of gin's own error classification, which no semconv key describes: v1.39.0 has no `gin.*` namespace, and `error.type` names the error's type rather than the framework's bind/render/private/public bitmask. Carried on the `exception` event only, never as a metric label, so it adds no cardinality. Retire it if gin's classification ever gains a semconv equivalent. |
 | `pyroscope.profile.id` | `github.com/grafana/otel-profiling-go` (`otelpyroscope` v0.5.1) | Upstream-owned span attribute the SDK inherits by wrapping its TracerProvider; the SDK neither sets nor rewrites it. semconv v1.39.0 has a `profile.*` namespace (`profile.frame.type`) but nothing that identifies a profile from a span, so there is no current key to normalize to. A T2-style wrapper has no seam to rename it without also breaking Grafana's trace-to-profile lookup, which keys on this exact name. |
 | `cassandra.query.attempts`, `cassandra.connection.attempts`, `cassandra.query.attempt` | `cassandra` wrapper | SDK-owned names for the client-side attempt/retry/speculative-execution signal, which server-side exporters cannot provide. semconv v1.39.0 defines no attempts metric or attribute; kept package-local (per ADR 0019 §7.B) so they are easy to retire/rename if semconv later standardizes one. |
-| `o11y.export.failures` | root package exporter wrappers | SDK-owned instrument name. semconv v1.39.0 describes SDK self-metrics for exporters (`otel.sdk.exporter.span.exported`, `otel.sdk.exporter.log.exported`, `otel.sdk.exporter.metric_data_point.exported`, status Development) that count exported *items* and carry `error.type` on failure. The pinned OTLP/HTTP exporters (otlptracehttp / otlpmetrichttp v1.44.0, otlploghttp v0.19.0) already emit them, but only behind the experimental `OTEL_GO_X_OBSERVABILITY=true` opt-in and only on the **global** MeterProvider (`otel.GetMeterProvider()`), which this SDK never sets (ADR 0003); an application that wires the global to `sdk.MeterProvider()` and enables the flag gets both families on the same provider, item-level next to batch-level, with no name overlap. This counter needs no opt-in and keeps a package-local name so the two can coexist. Its attribute is the semconv `otel.component.type`. Mitigation: retire once the exporters' self-metrics are on by default and stable, at which point the item-level metrics cover the same alert. |
+| `o11y.export.failures` | root package exporter wrappers | SDK-owned instrument name. semconv v1.39.0 describes SDK self-metrics for exporters (`otel.sdk.exporter.span.exported`, `otel.sdk.exporter.log.exported`, `otel.sdk.exporter.metric_data_point.exported`, status Development) that count exported *items* and carry `error.type` on failure. The pinned OTLP/HTTP exporters (otlptracehttp / otlpmetrichttp v1.46.0, otlploghttp v0.22.0) already emit them, but only behind the experimental `OTEL_GO_X_OBSERVABILITY=true` opt-in and only on the **global** MeterProvider (`otel.GetMeterProvider()`), which this SDK never sets (ADR 0003); an application that wires the global to `sdk.MeterProvider()` and enables the flag gets both families on the same provider, item-level next to batch-level, with no name overlap. This counter needs no opt-in and keeps a package-local name so the two can coexist. Its attribute is the semconv `otel.component.type`. Mitigation: retire once the exporters' self-metrics are on by default and stable, at which point the item-level metrics cover the same alert. |
 
 Any new deviation must list:
 

@@ -51,14 +51,19 @@ func ErrorRecorder() ginframework.HandlerFunc {
 // chainErrors is the canonical chain's error handler. It runs inside otelgin,
 // directly after otelgin's own handler.
 //
-// otelgin v0.68.0, on unwind, sets the span status to Error with
-// c.Errors.String() and calls span.RecordError for every c.Errors entry
-// (gin.go). It cannot add gin's bind/render/private/public classification, and
-// an exception event cannot be amended once recorded. So this handler records
+// otelgin, on unwind, sets the span status to Error with c.Errors.String()
+// and, since v0.71.0, sets error.type from the errors (v0.68.0 called
+// span.RecordError for every entry instead). It cannot add gin's
+// bind/render/private/public classification, and an exception event cannot be
+// amended once recorded. So this handler records
 // each entry as the exception event itself, carrying gin.error.type, sets the
 // status to Error with c.Errors.String() as otelgin would when any entry has
 // an error, and then hides c.Errors from otelgin — moving them under
-// hiddenKey — so otelgin records nothing a second time. On a 5xx response
+// hiddenKey. With v0.68.0 that kept otelgin from recording every error a
+// second time; with v0.71.0 its effects are that otelgin neither sets
+// error.type nor, on a 5xx, puts c.Errors.String() back as the status
+// description, which keeps the emitted span unchanged (ADR 0010, 2026-10-02
+// note). On a 5xx response
 // otelgin still sets the status from the HTTP code afterwards, Error with an
 // empty description, which replaces this one; the messages stay on the
 // exception events. The chain's
@@ -109,8 +114,9 @@ func restoreErrors(c *ginframework.Context, hiddenKey *chainKey) {
 
 // recordTypedExceptions records each entry with an error as an exception event
 // carrying gin.error.type. An entry with a nil Err — c.Error(&gin.Error{...})
-// appends one — is skipped: there is no error to record, and otelgin's
-// RecordError(nil) records nothing either.
+// appends one — is skipped: there is no error to record. (otelgin v0.68.0's
+// RecordError(nil) recorded nothing either; v0.71.0 would set error.type for
+// it, but the chain hides c.Errors from otelgin.)
 func recordTypedExceptions(span trace.Span, errs []*ginframework.Error) {
 	for _, ge := range errs {
 		if ge.Err != nil {

@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/flywindy/o11y/internal/exportstats"
@@ -535,6 +536,12 @@ func initPrometheus(ctx context.Context, cfg Config, res *resource.Resource, vie
 func initOTLP(ctx context.Context, cfg Config, res *resource.Resource, views []sdkmetric.View) (*sdkmetric.MeterProvider, Closer, error) {
 	expOpts := []otlpmetrichttp.Option{
 		otlpmetrichttp.WithEndpointURL(cfg.MetricsOTLPEndpoint),
+	}
+	// Since v1.45 the exporter sends to "/" when the endpoint URL has no
+	// path; keep a bare endpoint ("http://collector:4318") on the OTLP
+	// default path, as it was before.
+	if u, err := url.Parse(cfg.MetricsOTLPEndpoint); err == nil && u.Path == "" {
+		expOpts = append(expOpts, otlpmetrichttp.WithURLPath("/v1/metrics"))
 	}
 	if len(cfg.OTLPHeaders) > 0 {
 		expOpts = append(expOpts, otlpmetrichttp.WithHeaders(cfg.OTLPHeaders))

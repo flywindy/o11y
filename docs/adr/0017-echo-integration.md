@@ -35,8 +35,10 @@ applied this to gin via
 This ADR applies the same policy to echo via
 `go.opentelemetry.io/contrib/instrumentation/github.com/labstack/echo/otelecho`,
 which lives in the same OpenTelemetry contrib monorepo and ships on the
-same release train (v0.68.0) already pinned for `otelgin`, `otelhttp`,
-and the runtime metrics package.
+same release train (v0.68.0 when this ADR was accepted; v0.71.0 since the
+2026-10-02 OpenTelemetry bump) already pinned for `otelgin`, `otelhttp`,
+and the runtime metrics package. The v0.68.0 findings below were verified
+against that version; re-verify them at adoption on the current train.
 
 ### Why echo is not just "gin with different imports"
 
@@ -485,7 +487,8 @@ The follow-up (code) PR, after this ADR is accepted:
 1. Add `echo/` (`middleware.go`, `errors.go`, `options.go`, `doc.go`,
    tests covering Decision 6's matrix + the `WithFilter` inversion).
 2. Add `github.com/labstack/echo/v4` and the `otelecho` contrib package
-   to `go.mod`, pinned to the v0.68.0 train; run the ADR 0008 §7 gate
+   to `go.mod`, pinned to the train `otelgin` / `otelhttp` are on (v0.71.0
+   at the time of writing); run the ADR 0008 §7 gate
    and add `echo/` to its include-list.
 3. Update ADR 0003 / ADR 0008 tables (Decision 10).
 4. Add `examples/echo/main.go` mirroring `examples/gin/main.go`
