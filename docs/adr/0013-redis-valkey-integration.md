@@ -2020,7 +2020,9 @@ clients were wrapped against other servers before it (Sentinel clients for
 different masters share one base, the one case the options cannot tell
 apart).
 Names set with `WithPoolName` are held in the same table, so a default is
-never allocated on top of an explicit name that is already registered (an
+never allocated on top of an explicit name that is already registered, nor
+as a Cluster / Ring base one of whose `<base>/<shard-Addr>` names an
+explicit name already is (an
 explicit name registered after a default it equals still collides; choosing
 one is the caller's call). A wrapper gives its name back when it goes away —
 a `Wrap` that fails before committing (the best-effort hook-install error

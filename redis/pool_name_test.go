@@ -83,6 +83,10 @@ func TestPoolNameAllocator(t *testing.T) {
 		a.release(name)
 	}
 	assert.Empty(t, a.held, "a name no wrapper holds is dropped")
+
+	a.hold("redis-ring-primary-1/cache:6379")
+	assert.Equal(t, "redis-ring-primary-2", a.acquire("redis-ring-primary"),
+		"a base whose per-shard name a caller already chose is skipped")
 }
 
 // seriesPoolNames returns the db.client.connection.pool.name values on the

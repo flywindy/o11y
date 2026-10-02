@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"weak"
@@ -33,7 +34,8 @@ var poolNames = poolNameAllocator{held: map[string]int{}}
 // client being collected) lets the next client on that base reuse it instead
 // of taking a new one: in a service that wraps its clients in the same order
 // at startup, each gets the same name run after run. Names set with WithPoolName are held
-// too, so a default name is never allocated on top of one.
+// too, so a default name is never allocated on top of one, nor a Cluster or
+// Ring base whose per-shard name (<base>/<shard-addr>) one already is.
 type poolNameAllocator struct {
 	mu   sync.Mutex
 	held map[string]int // live wrappers per pool name
@@ -44,11 +46,27 @@ func (a *poolNameAllocator) acquire(base string) string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for n := 1; ; n++ {
-		if name := fmt.Sprintf("%s-%d", base, n); a.held[name] == 0 {
+		if name := fmt.Sprintf("%s-%d", base, n); a.free(name) {
 			a.held[name] = 1
 			return name
 		}
 	}
+}
+
+// free reports whether name can be handed out: no wrapper holds it, and no
+// caller-chosen name holds one of the per-shard names a Cluster or Ring
+// derives from it (<name>/<shard-addr>). The caller holds a.mu.
+func (a *poolNameAllocator) free(name string) bool {
+	if a.held[name] > 0 {
+		return false
+	}
+	prefix := name + "/"
+	for held := range a.held {
+		if strings.HasPrefix(held, prefix) {
+			return false
+		}
+	}
+	return true
 }
 
 // hold records a caller-chosen name.
