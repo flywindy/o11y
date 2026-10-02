@@ -2056,14 +2056,18 @@ explicit `WithPoolName` has always behaved this way; reusing default names
 trades that one-off reset for series that continue across a rebuild instead
 of starting anew.
 
-Names are counted per `MeterProvider`, so each SDK instance numbers only the
-pools it exports, and a second instance in the process does not shift the
-first one's names. The registry of per-provider tables is package state for
-the same reason as the §10 dedup map — go-redis clients have nowhere to hang
-it — and a provider's table is dropped once it holds no names. A provider
-is keyed by identity when it is a pointer (as the SDK's is); value-typed
-providers, such as the no-op one, share one table, which avoids using a
-possibly non-comparable value as a map key.
+The table is process-wide, like the §10 dedup map, not per `MeterProvider`,
+so two SDK instances in one process wrapping clients against the same
+server number each other's pools. Scoping it per provider was tried and
+reverted: provider identity does not identify an export pipeline. Two
+decorators forwarding to one underlying `MeterProvider` are distinct
+values, so per-provider tables gave both pools `-1` and the shared exporter
+received two `db.client.connection.count` points with identical attributes
+— a duplicate series, which is a correctness failure, where a shifted
+number in a second SDK is only a stability cost. Keying on the `Meter`
+instead fails the same way for a decorator that wraps each `Meter` call. A
+process-wide table guarantees a default name is unique wherever its pool is
+exported.
 
 ADR 0014 adopted a process-wide sequence (`mongo-<host>-<n>`) for
 `mongo.Instrument`, citing this package's pointer-based name as the thing to

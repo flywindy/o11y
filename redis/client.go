@@ -24,99 +24,46 @@ var wrappedClients sync.Map
 // the same address do not collapse into one metric stream. The number replaces
 // the client's pointer address, which changed on every restart and rollout and
 // so started a new set of series each time.
-var poolNames = poolNameRegistry{tables: map[any]poolNameTable{}}
+var poolNames = poolNameAllocator{held: map[string]int{}}
 
-// poolNameRegistry keeps one poolNameTable per MeterProvider, so each SDK
-// instance numbers only the pools it exports: a second SDK in the process
-// does not shift the first one's names. Like wrappedClients it is package
-// state only because go-redis clients have nowhere to hang it; a table is
-// dropped as soon as it holds no names.
-type poolNameRegistry struct {
-	mu     sync.Mutex
-	tables map[any]poolNameTable
+// poolNameAllocator hands out <base>-<n> names, n being the lowest number
+// whose name no live wrapper holds. Numbering per base keeps a name
+// independent of clients wrapped against other servers, and giving a name back
+// when its wrapper goes away (a Wrap that fails before committing, Unwrap, the
+// client being collected) lets the next client on that base reuse it instead
+// of taking a new one: in a service that wraps its clients in the same order
+// at startup, each gets the same name run after run. Names set with WithPoolName are held
+// too, so a default name is never allocated on top of one.
+type poolNameAllocator struct {
+	mu   sync.Mutex
+	held map[string]int // live wrappers per pool name
 }
 
-// poolNameScope returns the registry key for mp: the provider itself when it
-// is a pointer, which compares by identity and cannot panic as a map key, or
-// one shared key for any other provider (a value type such as the no-op
-// provider, whose instances are indistinguishable anyway).
-func poolNameScope(mp metric.MeterProvider) any {
-	if reflect.ValueOf(mp).Kind() == reflect.Pointer {
-		return mp
-	}
-	return sharedPoolNameScope{}
-}
-
-type sharedPoolNameScope struct{}
-
-// acquire holds and returns the lowest free <base>-<n> in scope.
-func (r *poolNameRegistry) acquire(scope any, base string) string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.table(scope).acquire(base)
-}
-
-// hold records a caller-chosen name in scope.
-func (r *poolNameRegistry) hold(scope any, name string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.table(scope).hold(name)
-}
-
-// release gives back one hold on name in scope, taken by acquire or hold.
-func (r *poolNameRegistry) release(scope any, name string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if t := r.tables[scope]; t != nil {
-		t.release(name)
-		if len(t) == 0 {
-			delete(r.tables, scope)
-		}
-	}
-}
-
-// held reports how many live wrappers hold name in scope.
-func (r *poolNameRegistry) held(scope any, name string) int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.tables[scope][name]
-}
-
-// table returns scope's table, creating it. The caller holds r.mu.
-func (r *poolNameRegistry) table(scope any) poolNameTable {
-	t := r.tables[scope]
-	if t == nil {
-		t = poolNameTable{}
-		r.tables[scope] = t
-	}
-	return t
-}
-
-// poolNameTable hands out <base>-<n> names, n being the lowest number whose
-// name no live wrapper holds, counting live wrappers per name. Numbering per
-// base keeps a name independent of clients wrapped against other servers, and
-// giving a name back when its wrapper goes away (a Wrap that fails before
-// committing, Unwrap, the client being collected) lets the next client on
-// that base reuse it instead of taking a new one: in a service that wraps its
-// clients in the same order at startup, each gets the same name run after
-// run. Names set with WithPoolName are held too, so a default name is never
-// allocated on top of one.
-type poolNameTable map[string]int
-
-func (t poolNameTable) acquire(base string) string {
+// acquire holds and returns the lowest free <base>-<n>.
+func (a *poolNameAllocator) acquire(base string) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	for n := 1; ; n++ {
-		if name := fmt.Sprintf("%s-%d", base, n); t[name] == 0 {
-			t[name] = 1
+		if name := fmt.Sprintf("%s-%d", base, n); a.held[name] == 0 {
+			a.held[name] = 1
 			return name
 		}
 	}
 }
 
-func (t poolNameTable) hold(name string) { t[name]++ }
+// hold records a caller-chosen name.
+func (a *poolNameAllocator) hold(name string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.held[name]++
+}
 
-func (t poolNameTable) release(name string) {
-	if t[name]--; t[name] <= 0 {
-		delete(t, name)
+// release gives back one hold on name, taken by acquire or hold.
+func (a *poolNameAllocator) release(name string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.held[name]--; a.held[name] <= 0 {
+		delete(a.held, name)
 	}
 }
 
@@ -127,10 +74,9 @@ type wrapEntry struct {
 	disabled atomic.Bool
 	reg      metric.Registration
 	cleanup  runtime.Cleanup
-	// poolName is the name the entry holds in poolNames under poolNameScope;
-	// empty before Wrap takes one and once it has been given back.
-	poolName      string
-	poolNameScope any
+	// poolName is the name the entry holds in poolNames; empty before Wrap
+	// takes one and once it has been given back.
+	poolName string
 }
 
 // detach turns the entry's instrumentation off and gives back what it holds:
@@ -144,7 +90,7 @@ func (e *wrapEntry) detach() {
 		_ = e.reg.Unregister()
 	}
 	if e.poolName != "" {
-		poolNames.release(e.poolNameScope, e.poolName)
+		poolNames.release(e.poolName)
 		e.poolName = ""
 	}
 	if e.done {
@@ -456,13 +402,12 @@ func Wrap(
 		}
 
 		cfg := newConfig(opts)
-		scope := poolNameScope(mp)
 		if cfg.poolName == "" {
-			cfg.poolName = poolNames.acquire(scope, ops.defaultPoolNameBase())
+			cfg.poolName = poolNames.acquire(ops.defaultPoolNameBase())
 		} else {
-			poolNames.hold(scope, cfg.poolName)
+			poolNames.hold(cfg.poolName)
 		}
-		entry.poolName, entry.poolNameScope = cfg.poolName, scope
+		entry.poolName = cfg.poolName
 
 		meter := mp.Meter(instrumentationName, metric.WithSchemaURL(semconv.SchemaURL))
 		operationDuration, instErr := meter.Float64Histogram(

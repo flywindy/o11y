@@ -24,11 +24,10 @@ adopters can plan their upgrades.
   `redis-cluster-<seed>-<n>` / `redis-ring-<shard>-<n>` for a Cluster or Ring
   client (shards still append `/<addr>`), and `redis-sentinel-<n>` for a
   Sentinel failover client (see `WithPoolName` for the rest), where `<n>` is
-  the lowest number whose name no other live pool on the same MeterProvider
-  holds: two clients on one address stay distinct, a service that wraps its
-  clients against each server in the same order gets the same names every
-  run, and a single client rebuilt after `Unwrap` continues its predecessor's
-  series.
+  the lowest number whose name no other live pool holds: two clients on one
+  address stay distinct, a service that wraps its clients against each server
+  in the same order gets the same names every run, and a single client
+  rebuilt after `Unwrap` continues its predecessor's series.
 - `redis`: `db.client.connection.count{state="used"}` can no longer report
   about 4.29e9. It subtracted two `uint32` pool counters that go-redis reads
   under separate locks before widening them, so an idle count read

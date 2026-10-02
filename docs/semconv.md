@@ -501,8 +501,8 @@ failover client, and `redis` for any other address; `redis-cluster-<seed>` or
 address or shard name in string order), or `redis-cluster` / `redis-ring`
 with none configured, which includes a Sentinel client go-redis builds as a
 `ClusterClient`.
-`<n>` is the lowest number whose name no other live pool on the same
-MeterProvider holds. Cluster and Ring append `/<shard-addr>` per shard. The `used` and `idle` states of
+`<n>` is the lowest number whose name no other live pool holds. Cluster and
+Ring append `/<shard-addr>` per shard. The `used` and `idle` states of
 `db.client.connection.count` always sum to the pool total: idle is capped at
 the total and used floored at zero.
 

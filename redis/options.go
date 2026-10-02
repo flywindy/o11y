@@ -112,17 +112,19 @@ func WithRequireParentSpan(enabled bool) Option {
 // configured address, so set a name for a client configured with an address
 // that changes, such as a pod IP.
 //
-// <n> is the lowest number whose name no other live pool wrapped with the same
-// MeterProvider holds, including names set with this option. A Wrap that fails before committing (not the
+// <n> is the lowest number whose name no other live pool holds, including
+// names set with this option. A Wrap that fails before committing (not the
 // best-effort hook-install error, which keeps the wrapper), Unwrap, or the
 // client being garbage-collected gives the name back, and the next client on
 // that base takes the lowest name free: a single client rebuilt after Unwrap
 // gets its predecessor's name, while clients rebuilt together get the freed
 // names in the order they are wrapped. A client that is only closed keeps its
-// name until it is collected. A service that wraps its clients against each
-// server in the same order gets the same names on every run; set a name for
-// clients wrapped concurrently or lazily, or replaced by wrapping the new
-// client before unwrapping the old one, which then gets the next number.
+// name until it is collected. Names are unique across the process, so pools
+// wrapped by separate SDK instances also number against each other. A service
+// that wraps its clients against each server in the same order gets the same
+// names on every run; set a name for clients wrapped concurrently or lazily,
+// or replaced by wrapping the new client before unwrapping the old one, which
+// then gets the next number.
 func WithPoolName(name string) Option {
 	return func(cfg *config) {
 		cfg.poolName = name
