@@ -323,6 +323,50 @@ to switch from the Prometheus pull model to OTLP push (useful for serverless
 deployments that cannot be scraped). See the
 [options reference](../README.md#using-the-sdk) for the full metrics option set.
 
+**Flushing without shutting down.** On the push path, metrics leave on the
+periodic reader's interval (60s by default), and spans and log records on
+their batchers' schedules. A serverless runtime can freeze or reclaim the
+process between invocations, so call `ForceFlush` before a handler returns:
+
+```go
+func handle(ctx context.Context, event Event) error {
+    defer func() {
+        flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+        defer cancel()
+        if err := obs.ForceFlush(flushCtx); err != nil {
+            // Not obs.Logger: its OTLP copy would wait in the batcher that
+            // was just flushed and be lost if the runtime freezes now.
+            fmt.Fprintf(os.Stderr, "telemetry flush failed: %v\n", err)
+        }
+    }()
+    // ... handle the event ...
+    return nil
+}
+```
+
+`ForceFlush` flushes the trace and log batchers concurrently, then, on the
+push path, the metrics collected so far (on the Prometheus pull path metrics
+are read at scrape time, so it flushes only traces and logs). The deadline is
+shared between the two stages: the trace and log flush gets half the time
+left when metrics follow, and metrics get the rest. A flush whose share runs
+out returns the context's error, and the data in flight is not guaranteed to
+leave before the runtime freezes the process: the trace batcher keeps
+exporting on a goroutine of its own, the log batcher stops, and the metric
+reader keeps exporting in the background without reporting the result. Give
+`ForceFlush` a deadline that covers a collector round trip or two. An export
+failure the trace or log flush has counted by the time it returns ships with
+the metric export; one that is still in flight when its share runs out is
+counted later. The profiler is not
+flushed — Pyroscope uploads on its own 15s schedule. Errors are returned
+joined, with endpoint credentials and header values removed, and are not
+logged by the SDK. Once `Shutdown` has started, `ForceFlush` does nothing.
+`Shutdown` waits for a `ForceFlush` already running for up to one share of
+its deadline, so the components after it keep their time; a flush that runs
+past that may return an error from a component that has shut down. Without
+a deadline `Shutdown` does not wait and leaves the flush to the components'
+own shutdown. Keep calling `Shutdown` at exit: `ForceFlush`
+does not stop the exporters or the scrape server.
+
 **Exemplars** are enabled automatically (OTel SDK default trace-based filter). When Prometheus is deployed with `--enable-feature=exemplar-storage` (included in [`k8s/infrastructure/base/prometheus.yaml`](../k8s/infrastructure/base/prometheus.yaml)), Grafana can navigate from a histogram bucket directly to the correlated trace in Tempo. The measurement context must contain an active sampled span; exemplar trace IDs are stored as exemplar metadata (`trace_id` / `span_id`), not as metric labels, so they do not create high-cardinality time series. `trace_id` and `span_id` are also the only labels an exemplar carries: attributes an SDK view filters off a series are suppressed on the exemplar too, so neither a dropped attribute nor a key the reserved-label guard removed reaches the exposition, and the exemplar stays well inside the 128-rune limit OpenMetrics imposes on it.
 
 **Kubernetes pods** must opt in to scraping with the annotation:

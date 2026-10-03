@@ -96,6 +96,11 @@ type SDK struct {
 	meterProviderPublic    metric.MeterProvider
 	shutdowns              []func(context.Context) error
 
+	// ForceFlush's work: the trace and log providers, flushed together, then
+	// the meter provider on the OTLP push path (nil otherwise).
+	flushSignals []func(context.Context) error
+	flushMetrics func(context.Context) error
+
 	// Diagnostics for OTel's own error and message paths; see ErrorHandler
 	// and Logr.
 	errorHandler *otelErrorHandler
@@ -108,6 +113,14 @@ type SDK struct {
 
 	shutdownOnce sync.Once
 	shutdownErr  error
+
+	// flushMu guards shutdownStarted and the Add side of flushing, so a
+	// ForceFlush either starts before Shutdown marks the SDK as shutting
+	// down, and Shutdown waits for it, or sees the mark and does nothing.
+	flushMu         sync.Mutex
+	shutdownStarted bool
+	flushesRunning  int
+	flushing        sync.WaitGroup
 }
 
 // TracerProvider returns the SDK's tracer provider interface.
@@ -156,12 +169,28 @@ func (s *SDK) Meter(name string) metric.Meter {
 // whose share runs out is reported as timed out; what happens to its queue
 // then differs per batcher, see shutdownSequence.
 //
+// A ForceFlush already running when Shutdown starts is waited for first, for
+// at most one share of the deadline (counted as one more component), so it
+// is not cut off by components closing under it. Without a deadline it does
+// not wait and leaves a flush in progress to the components' own Shutdown, as
+// before ForceFlush existed: the trace and log batchers finish it first, the
+// metric reader cancels it.
+//
 // Shutdown is idempotent: subsequent calls return the same joined error
 // without rerunning any closer. Callers may safely register Shutdown in
 // multiple defer chains (for example, both in main and in a signal handler)
 // without risking double-shutdown of underlying exporters.
 func (s *SDK) Shutdown(ctx context.Context) error {
 	s.shutdownOnce.Do(func() {
+		s.flushMu.Lock()
+		s.shutdownStarted = true
+		running := s.flushesRunning
+		s.flushMu.Unlock()
+		if _, ok := ctx.Deadline(); ok && running > 0 {
+			waitCtx, cancel := shutdownBudget(ctx, len(s.shutdowns)+1)
+			waitFlushes(waitCtx, &s.flushing)
+			cancel()
+		}
 		var errs []error
 		for i, fn := range s.shutdowns {
 			closerCtx, cancel := shutdownBudget(ctx, len(s.shutdowns)-i)
@@ -176,6 +205,104 @@ func (s *SDK) Shutdown(ctx context.Context) error {
 		s.shutdownErr = errors.Join(errs...)
 	})
 	return s.shutdownErr
+}
+
+// ForceFlush exports what the SDK has buffered without shutting anything
+// down: the spans and log records the batchers hold, then, on the OTLP
+// metrics push path (WithMetricsOTLPEndpoint), the metrics collected so far.
+// It is for processes that may be frozen or killed between units of work — a
+// serverless handler calls it before returning — where waiting for the
+// batchers' schedules, or for Shutdown at exit, can lose the data. On the
+// default Prometheus pull path metrics are read at scrape time, so only
+// traces and logs are flushed.
+//
+// Traces and logs flush concurrently, then metrics, so an export failure the
+// trace or log flush has counted by the time it returns ships with that
+// metric export. ctx's deadline is shared between the two stages as Shutdown
+// shares it between components: the first stage gets half the time left when
+// metrics follow, and metrics get whatever remains. A flush whose share runs
+// out returns the context's error; the upstream providers then differ on the
+// data in flight — the trace batcher keeps exporting on a goroutine of its
+// own, the log batcher stops, and the metric reader keeps exporting in the
+// background without reporting the result. The profiler is not flushed:
+// Pyroscope uploads on its own schedule.
+//
+// Errors are joined, with the configured endpoints' credentials and header
+// values removed as in Shutdown, and returned without being logged. Once
+// Shutdown has started ForceFlush does nothing and returns nil. Shutdown
+// waits for a ForceFlush already running for up to one share of its own
+// deadline; a flush still running past that sees components close under it
+// and may return a shut-down component's error or flush only part of the
+// data.
+func (s *SDK) ForceFlush(ctx context.Context) error {
+	s.flushMu.Lock()
+	if s.shutdownStarted {
+		s.flushMu.Unlock()
+		return nil
+	}
+	s.flushesRunning++
+	s.flushing.Add(1)
+	s.flushMu.Unlock()
+	defer func() {
+		s.flushMu.Lock()
+		s.flushesRunning--
+		s.flushMu.Unlock()
+		s.flushing.Done()
+	}()
+
+	var errs []error
+	if len(s.flushSignals) > 0 {
+		stages := 1
+		if s.flushMetrics != nil {
+			stages = 2
+		}
+		stageCtx, cancel := shutdownBudget(ctx, stages)
+		errs = append(errs, flushConcurrently(stageCtx, s.flushSignals)...)
+		cancel()
+	}
+	if s.flushMetrics != nil {
+		if err := s.flushMetrics(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	for i, err := range errs {
+		errs[i] = s.redactError(err)
+	}
+	return errors.Join(errs...)
+}
+
+// flushConcurrently runs every flusher under ctx at once and returns their
+// errors in flusher order.
+func flushConcurrently(ctx context.Context, flushers []func(context.Context) error) []error {
+	results := make([]error, len(flushers))
+	var wg sync.WaitGroup
+	for i, fn := range flushers {
+		wg.Go(func() { results[i] = fn(ctx) })
+	}
+	wg.Wait()
+	var errs []error
+	for _, err := range results {
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errs
+}
+
+// waitFlushes waits for the in-flight ForceFlush calls tracked by wg, or
+// until ctx is done, whichever comes first. When ctx ends first, the helper
+// goroutine stays until those flushes return, which closing the components
+// right afterwards makes prompt.
+func waitFlushes(ctx context.Context, wg *sync.WaitGroup) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
 }
 
 // redactError returns err with the configured endpoints' credentials and the
@@ -275,13 +402,19 @@ func profilingStartFailureText(cfg *Config, err error) string {
 // server stops just before the meter provider so no scrape races the final
 // collection.
 func shutdownSequence(profiler, traces, logs, metricsServer, meter func(context.Context) error) []func(context.Context) error {
-	seq := make([]func(context.Context) error, 0, 5)
-	for _, fn := range []func(context.Context) error{profiler, traces, logs, metricsServer, meter} {
+	return nonNil(profiler, traces, logs, metricsServer, meter)
+}
+
+// nonNil returns fns without the nil entries, in order: a pillar that is not
+// enabled contributes no closer or flusher.
+func nonNil(fns ...func(context.Context) error) []func(context.Context) error {
+	out := make([]func(context.Context) error, 0, len(fns))
+	for _, fn := range fns {
 		if fn != nil {
-			seq = append(seq, fn)
+			out = append(out, fn)
 		}
 	}
-	return seq
+	return out
 }
 
 // closeAll runs the given closers in order on Init's failure paths, skipping
@@ -379,7 +512,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	var tpInternal *sdktrace.TracerProvider
 	tracerProviderPublic := oteltrace.TracerProvider(tracenoop.NewTracerProvider())
 	prop := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{})
-	var tpShutdown func(context.Context) error
+	var tpShutdown, tpFlush func(context.Context) error
 
 	if cfg.traceEnabled {
 		var spanProcessors []sdktrace.SpanProcessor
@@ -397,7 +530,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		// Installing it eagerly would annotate spans with pyroscope.profile.id
 		// even when profiling.Start later fails on the warn-and-continue path,
 		// producing dangling identifiers that point at no real profile.
-		tpShutdown = tp.Shutdown
+		tpShutdown, tpFlush = tp.Shutdown, tp.ForceFlush
 	}
 
 	// 3. Build the stdout JSON handler. It is shared by the dual-output (log
@@ -475,7 +608,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	// 5. Initialize LoggerProvider and build the dual-output logger.
 	//    When log is disabled, only the stdout handler is active; no OTLP
 	//    connection is attempted and no LoggerProvider is started.
-	var lpShutdown func(context.Context) error
+	var lpShutdown, lpFlush func(context.Context) error
 	var logger *slog.Logger
 
 	if cfg.logEnabled {
@@ -484,7 +617,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 			closeAll(ctx, metricsCloser, mpShutdown, tpShutdown)
 			return nil, initErr
 		}
-		lpShutdown = lp.Shutdown
+		lpShutdown, lpFlush = lp.Shutdown, lp.ForceFlush
 
 		// Dual-output logger:
 		//   a) OTLP handler (otelslog bridge) → OTel Collector → Loki
@@ -605,6 +738,14 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	}
 
 	shutdowns := shutdownSequence(profilerCloser, tpShutdown, lpShutdown, metricsCloser, mpShutdown)
+	// Metrics are flushed only on the push path: no pull-path reader
+	// implements ForceFlush, so it would take a share of the deadline for
+	// nothing.
+	var mpFlush func(context.Context) error
+	if mpInternal != nil && cfg.metricsOTLPEndpoint != "" {
+		mpFlush = mpInternal.ForceFlush
+	}
+	flushSignals := nonNil(tpFlush, lpFlush)
 
 	// Both diagnostics write to stdout only: an OTel-internal error about the
 	// OTLP log pipeline must not be queued behind the batch that is failing.
@@ -628,6 +769,8 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		meterProviderInternal:  mpInternal,
 		meterProviderPublic:    meterProviderPublic,
 		shutdowns:              shutdowns,
+		flushSignals:           flushSignals,
+		flushMetrics:           mpFlush,
 		errorHandler:           errorHandler,
 		logr:                   newLogr(slog.New(stdoutHandler), diagnosticEndpoints, diagnosticSecrets(cfg)),
 		diagnosticEndpoints:    diagnosticEndpoints,
