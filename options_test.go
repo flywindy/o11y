@@ -615,7 +615,7 @@ func TestBuildResource_MergeOrder(t *testing.T) {
 	// providerRes; the neutralized keys must win that merge so the span
 	// never carries the environment's value.
 	exp := tracetest.NewInMemoryExporter()
-	tp := sdktrace.NewTracerProvider(sdktrace.WithResource(providerRes), sdktrace.WithSyncer(exp))
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())), sdktrace.WithResource(providerRes), sdktrace.WithSyncer(exp))
 	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
 	_, span := tp.Tracer("test").Start(context.Background(), "op")
 	span.End()

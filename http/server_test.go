@@ -38,7 +38,7 @@ func TestNewServerHandler_ThreadsProvidersAndPropagator(t *testing.T) {
 		)),
 	)
 	spanRecorder := tracetest.NewSpanRecorder()
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spanRecorder))
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())), sdktrace.WithSpanProcessor(spanRecorder))
 	prop := propagation.TraceContext{}
 
 	var handlerTraceID trace.TraceID
@@ -85,7 +85,7 @@ func TestNewServerHandler_ThreadsProvidersAndPropagator(t *testing.T) {
 
 func TestNewServerHandler_DefaultSpanNameWithoutServeMuxPattern(t *testing.T) {
 	spanRecorder := tracetest.NewSpanRecorder()
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spanRecorder))
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())), sdktrace.WithSpanProcessor(spanRecorder))
 	mp := sdkmetric.NewMeterProvider()
 	prop := propagation.TraceContext{}
 
@@ -104,7 +104,7 @@ func TestNewServerHandler_DefaultSpanNameWithoutServeMuxPattern(t *testing.T) {
 
 func TestNewServerHandler_DefaultSpanNamePrefixesPatternWithoutMethod(t *testing.T) {
 	spanRecorder := tracetest.NewSpanRecorder()
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spanRecorder))
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())), sdktrace.WithSpanProcessor(spanRecorder))
 	mp := sdkmetric.NewMeterProvider()
 	prop := propagation.TraceContext{}
 
@@ -134,6 +134,7 @@ func TestNewServerHandler_BaggageTrustBoundaryControlsEntrySpan(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			spanRecorder := tracetest.NewSpanRecorder()
 			tp := sdktrace.NewTracerProvider(
+				sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())),
 				sdktrace.WithSpanProcessor(baggageattrs.NewWhitelist("app.order.id").NewSpanProcessor()),
 				sdktrace.WithSpanProcessor(spanRecorder),
 			)
