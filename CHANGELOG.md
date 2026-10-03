@@ -13,6 +13,16 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+### Added
+
+- `SDK.ForceFlush(ctx)` exports the buffered spans and log records
+  (concurrently), then the metrics collected so far on the OTLP push path,
+  without shutting the SDK down — for serverless handlers and other
+  processes that may be frozen or killed between units of work. It shares
+  the deadline between those two stages, returns redacted, joined errors,
+  and does nothing once `Shutdown` has started; `Shutdown` waits for a
+  `ForceFlush` already running for up to one share of its deadline.
+
 ### Security
 
 - Bump OpenTelemetry Go to v1.46.0 (log modules v0.22.0, contrib v0.71.0,

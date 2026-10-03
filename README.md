@@ -151,6 +151,12 @@ func main() {
 }
 ```
 
+A process that can be frozen or killed between units of work, such as a
+serverless handler, should also call `obs.ForceFlush(ctx)` before each
+invocation returns: it exports what the batchers hold (and, with
+`WithMetricsOTLPEndpoint`, the metrics so far) without shutting the SDK down.
+See the [guide](docs/guide.md#metrics) for details.
+
 **Available options:**
 
 _Required — Init returns an error if any of these are missing:_
