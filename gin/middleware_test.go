@@ -327,7 +327,7 @@ func newTestEnv(t *testing.T, extraMetricKeys ...attribute.Key) *testEnv {
 		)),
 	)
 	spanRecorder := tracetest.NewSpanRecorder()
-	tracerProvider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spanRecorder))
+	tracerProvider := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())), sdktrace.WithSpanProcessor(spanRecorder))
 	return &testEnv{
 		reader:         reader,
 		spanRecorder:   spanRecorder,

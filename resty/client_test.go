@@ -483,10 +483,7 @@ func TestNilRouteContextKeyDoesNotPanic(t *testing.T) {
 }
 
 func TestResponseErrorPreservesHTTPStatusCode(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
-	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	sr := tracetest.NewSpanRecorder()
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	tp, mp, sr, reader := testProvidersWithReader()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte("too large"))
@@ -536,10 +533,7 @@ func TestResponseMiddlewareErrorFinishesSpanAsError(t *testing.T) {
 }
 
 func TestRouteFromContextControlsSpanNameAndMetricRoute(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
-	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	sr := tracetest.NewSpanRecorder()
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	tp, mp, sr, reader := testProvidersWithReader()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -623,7 +617,7 @@ func testProviders() (trace.TracerProvider, *sdkmetric.MeterProvider, *tracetest
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	sr := tracetest.NewSpanRecorder()
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())), sdktrace.WithSpanProcessor(sr))
 	return tp, mp, sr
 }
 
@@ -633,7 +627,7 @@ func testProvidersWithReader() (trace.TracerProvider, *sdkmetric.MeterProvider, 
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	sr := tracetest.NewSpanRecorder()
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())), sdktrace.WithSpanProcessor(sr))
 	return tp, mp, sr, reader
 }
 

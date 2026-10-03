@@ -17,7 +17,7 @@ import (
 
 func TestSetUserRecordsUserNameOnCurrentSpan(t *testing.T) {
 	sr := tracetest.NewSpanRecorder()
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())), sdktrace.WithSpanProcessor(sr))
 	t.Cleanup(func() {
 		require.NoError(t, tp.Shutdown(context.Background()))
 	})
@@ -33,7 +33,7 @@ func TestSetUserRecordsUserNameOnCurrentSpan(t *testing.T) {
 
 func TestSetUserEmptyNameDoesNotRecordUserName(t *testing.T) {
 	sr := tracetest.NewSpanRecorder()
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())), sdktrace.WithSpanProcessor(sr))
 	t.Cleanup(func() {
 		require.NoError(t, tp.Shutdown(context.Background()))
 	})
