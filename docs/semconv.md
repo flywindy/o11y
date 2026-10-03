@@ -494,6 +494,19 @@ Spans and metrics are emitted by the SDK-owned
 
 Histogram boundaries come from the SDK's configured latency buckets (`WithHistogramBuckets`, default `DefaultLatencyBuckets()`), shared with the HTTP histograms — the option is one knob for all of them.
 
+`db.client.connection.pool.name` is `redis.WithPoolName` when set. Otherwise
+it is `<base>-<n>`: the base is `redis-<host>:<port>` for a single-node client,
+`redis-<socket-path>` over a Unix socket, `redis-sentinel` for a Sentinel
+failover client, and `redis` for any other address; `redis-cluster-<seed>` or
+`redis-ring-<shard>` for a Cluster or Ring client (the first configured seed
+address or shard name in string order), or `redis-cluster` / `redis-ring`
+with none configured, which includes a Sentinel client go-redis builds as a
+`ClusterClient`.
+`<n>` is the lowest number whose name no other live pool holds. Cluster and
+Ring append `/<shard-addr>` per shard. The `used` and `idle` states of
+`db.client.connection.count` always sum to the pool total: idle is capped at
+the total and used floored at zero.
+
 ### Explicitly NOT Emitted by Default
 
 | Key | Reason |

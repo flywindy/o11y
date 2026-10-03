@@ -914,6 +914,29 @@ if err := rdb.Set(ctx, "health", "ok", 0).Err(); err != nil {
 }
 ```
 
+`WithPoolName` sets `db.client.connection.pool.name` on the pool metrics. When
+it is omitted, Wrap names the pool `redis-<host>:<port>-<n>`
+(`redis-<socket-path>-<n>` over a Unix socket; `redis-sentinel-<n>` for
+Sentinel failover clients; `redis-cluster-<seed>-<n>` and
+`redis-ring-<shard>-<n>` for Cluster and Ring clients, from the first
+configured seed address or shard name in string order, with `/<shard-addr>`
+appended per shard; `redis-cluster-<n>` / `redis-ring-<n>` with none
+configured, including a Sentinel client go-redis builds as a `ClusterClient`;
+`redis-<n>` for any other address), `<n>` being the lowest number whose name no
+other live pool holds. The base is the configured address, so a client
+configured with an address that changes, such as a pod IP, should set
+`WithPoolName`.
+Call `Unwrap` before discarding a client you rebuild, and the next client on
+that base takes the lowest freed name: a single rebuilt client continues its
+predecessor's series, while clients rebuilt together get the freed names in
+the order they are wrapped. A client that is only closed keeps its name until
+it is garbage-collected. Names are unique across the process, so separate SDK
+instances number against each other. The name is stable across restarts only
+while clients against the same server are wrapped in the same order; set
+`WithPoolName` for any client wrapped concurrently or lazily, replaced
+overlap-first (the new client wrapped before the old one is unwrapped, so it
+gets the next number), or whose series a dashboard or alert keys on.
+
 `db.query.text` is off by default because Redis commands often contain key
 names or values that may be sensitive. Enable it only when that data is safe
 for your trace backend:

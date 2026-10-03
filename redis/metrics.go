@@ -157,16 +157,28 @@ func (t ringPoolTarget) observe(ctx context.Context, p *poolMetrics, observer me
 	})
 }
 
+// connectionCounts splits the pool's connections into used and idle. go-redis
+// reads TotalConns and IdleConns under separate lock acquisitions, so IdleConns
+// can briefly exceed TotalConns; subtracting the uint32 values before widening
+// would then wrap to about 4.29e9 and report a saturated pool for one scrape.
+// Idle is capped at the total and used floored at zero, so the two states
+// always sum to the total.
+func connectionCounts(stats *goredis.PoolStats) (used, idle int64) {
+	total := int64(stats.TotalConns)
+	idle = min(int64(stats.IdleConns), total)
+	return total - idle, idle
+}
+
 func (p *poolMetrics) observeClient(observer metric.Observer, client *goredis.Client, poolName string) {
 	stats := client.PoolStats()
 	opt := client.Options()
 	attrs := poolAttrs(poolName, opt.Addr)
+	used, idle := connectionCounts(stats)
 
-	used := int64(stats.TotalConns - stats.IdleConns)
 	observer.ObserveInt64(p.count, used, metric.WithAttributes(append(attrs,
 		semconv.DBClientConnectionStateUsed,
 	)...))
-	observer.ObserveInt64(p.count, int64(stats.IdleConns), metric.WithAttributes(append(attrs,
+	observer.ObserveInt64(p.count, idle, metric.WithAttributes(append(attrs,
 		semconv.DBClientConnectionStateIdle,
 	)...))
 	if idleMax, ok := maxIdleConnections(opt); ok {

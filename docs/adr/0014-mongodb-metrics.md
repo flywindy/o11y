@@ -408,8 +408,9 @@ implementing PRs:
    `server.address` / `server.port`. Net: within mongo, the operation metric is
    keyed by `network.peer.*` and the pool metrics by `server.*` — accepted (see
    Q1 wart); document it on `MetricViews`.
-3. **Default pool name (confirmed)** — redis derives `redis-%x` from the client
-   pointer; our `mongo.Connect` builds the client, so synthesize
+3. **Default pool name (confirmed)** — redis derived `redis-%x` from the client
+   pointer (since ADR 0013's 2026-10-02 amendment it uses
+   `redis-<host>:<port>-<n>`, numbered per server address); our `mongo.Connect` builds the client, so synthesize
    `mongo-<primary-host>-<n>` from the parsed URI, where `<n>` is a process-local
    sequence that keeps separate clients on the same host from collapsing into one
    stream, and let `WithPoolName` override. (A monotonic sequence is used rather
