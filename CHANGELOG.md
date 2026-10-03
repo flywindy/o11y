@@ -83,6 +83,24 @@ adopters can plan their upgrades.
 
 ### Fixed
 
+- `redis`: a pool Wrap names itself keeps its name across restarts. The
+  default `db.client.connection.pool.name` was `redis-<hex>`, the wrapped
+  client's pointer address, which changed on every restart and rollout and so
+  started a new set of `db.client.connection.*` series each time; most
+  services never set `WithPoolName`. It is now `redis-<host>:<port>-<n>` for a
+  single-node client (`redis-<socket-path>-<n>` over a Unix socket),
+  `redis-cluster-<seed>-<n>` / `redis-ring-<shard>-<n>` for a Cluster or Ring
+  client (shards still append `/<addr>`), and `redis-sentinel-<n>` for a
+  Sentinel failover client (see `WithPoolName` for the rest), where `<n>` is
+  the lowest number whose name no other live pool holds: two clients on one
+  address stay distinct, a service that wraps its clients against each server
+  in the same order gets the same names every run, and a single client
+  rebuilt after `Unwrap` continues its predecessor's series.
+- `redis`: `db.client.connection.count{state="used"}` can no longer report
+  about 4.29e9. It subtracted two `uint32` pool counters that go-redis reads
+  under separate locks before widening them, so an idle count read
+  momentarily ahead of the total wrapped around. Idle is now capped at the
+  total and used floored at zero, so the two states sum to the pool total.
 - `nats`: `Conn.Request` and `Conn.RequestMsg` now report a timeout the way
   native `nats.Conn.Request` does. They bound the wait with a context derived
   from `ctx`, and nats.go's context-based request returns that context's
@@ -159,6 +177,15 @@ adopters can plan their upgrades.
   `request {subject}` span still records the upstream error,
   `context deadline exceeded`: otel-nats records it before the facade can
   classify it.
+- **redis: pools without `WithPoolName` get new names, once.**
+  `db.client.connection.pool.name` changes from `redis-<hex>` to
+  `redis-<host>:<port>-<n>` (single node), `redis-cluster-<seed>-<n>`,
+  `redis-ring-<shard>-<n>`, `redis-sentinel-<n>`, `redis-<socket-path>-<n>`,
+  or for clients with no usable address `redis-cluster-<n>`,
+  `redis-ring-<n>` or `redis-<n>`, so their
+  `db.client.connection.*` series are renamed on this upgrade. The old name
+  already changed on every restart, so nothing could have keyed on it; set
+  `WithPoolName` for a name chosen rather than derived.
 
 ---
 

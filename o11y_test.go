@@ -7,7 +7,6 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -304,7 +303,6 @@ func TestInit_SamplingPrecedence(t *testing.T) {
 	t.Run("env sampler applies when typed option unset", func(t *testing.T) {
 		srv := testutil.FakeOTLPServer(t)
 		t.Setenv("OTEL_TRACES_SAMPLER", "always_off")
-		unsetEnvForTest(t, "OTEL_TRACES_SAMPLER_ARG")
 
 		sdk, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
 		require.NoError(t, err)
@@ -317,7 +315,6 @@ func TestInit_SamplingPrecedence(t *testing.T) {
 	t.Run("typed sampling ratio overrides env sampler", func(t *testing.T) {
 		srv := testutil.FakeOTLPServer(t)
 		t.Setenv("OTEL_TRACES_SAMPLER", "always_off")
-		unsetEnvForTest(t, "OTEL_TRACES_SAMPLER_ARG")
 
 		opts := append(commonOpts(srv.URL), o11y.WithSamplingRatio(1.0))
 		sdk, err := o11y.Init(context.Background(), opts...)
@@ -330,8 +327,6 @@ func TestInit_SamplingPrecedence(t *testing.T) {
 
 	t.Run("default sampler samples when env and typed option unset", func(t *testing.T) {
 		srv := testutil.FakeOTLPServer(t)
-		unsetEnvForTest(t, "OTEL_TRACES_SAMPLER")
-		unsetEnvForTest(t, "OTEL_TRACES_SAMPLER_ARG")
 
 		sdk, err := o11y.Init(context.Background(), commonOpts(srv.URL)...)
 		require.NoError(t, err)
@@ -359,7 +354,6 @@ func TestInit_WithTraceSampler(t *testing.T) {
 	t.Run("nil sampler preserves env", func(t *testing.T) {
 		srv := testutil.FakeOTLPServer(t)
 		t.Setenv("OTEL_TRACES_SAMPLER", "always_off")
-		unsetEnvForTest(t, "OTEL_TRACES_SAMPLER_ARG")
 
 		opts := append(commonOpts(srv.URL), o11y.WithTraceSampler(nil))
 		sdk, err := o11y.Init(context.Background(), opts...)
@@ -372,8 +366,6 @@ func TestInit_WithTraceSampler(t *testing.T) {
 
 	t.Run("nil sampler keeps an earlier sampling ratio", func(t *testing.T) {
 		srv := testutil.FakeOTLPServer(t)
-		unsetEnvForTest(t, "OTEL_TRACES_SAMPLER")
-		unsetEnvForTest(t, "OTEL_TRACES_SAMPLER_ARG")
 
 		// A wrapper that maps its own config onto options commonly appends
 		// WithTraceSampler(nil) for "no custom sampler". That must be a
@@ -394,21 +386,6 @@ func startRootSpanSampled(sdk *o11y.SDK) bool {
 	_, span := sdk.Tracer("sampling-test").Start(context.Background(), "root")
 	defer span.End()
 	return span.SpanContext().IsSampled()
-}
-
-// unsetEnvForTest removes an environment variable for the current test and
-// restores its previous state during cleanup.
-func unsetEnvForTest(t *testing.T, key string) {
-	t.Helper()
-	oldValue, hadOldValue := os.LookupEnv(key)
-	require.NoError(t, os.Unsetenv(key))
-	t.Cleanup(func() {
-		if hadOldValue {
-			_ = os.Setenv(key, oldValue)
-			return
-		}
-		_ = os.Unsetenv(key)
-	})
 }
 
 // TestInit_AcceptsExtremeValidBuckets ensures very small and very large
@@ -461,6 +438,11 @@ func TestInit_OTLPHeadersForwarded(t *testing.T) {
 
 	requests := srv.Requests()
 	require.NotEmpty(t, requests, "exporter should have made at least one OTLP request")
+	var paths []string
+	for _, r := range requests {
+		paths = append(paths, r.Path)
+	}
+	require.Contains(t, paths, "/v1/traces", "the span exporter must have sent, or the header check below proves nothing about it")
 
 	// Verify every captured request carries every configured header — not
 	// just at least one. An existential check would silently miss a

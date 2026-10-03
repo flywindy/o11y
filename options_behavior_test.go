@@ -14,21 +14,10 @@ import (
 	"github.com/flywindy/o11y/internal/testutil"
 )
 
-// pinPillarEnv clears the O11Y_*_ENABLED toggles Init reads from the
-// environment, so a developer's or CI's shell cannot switch a pillar off
-// underneath these tests.
-func pinPillarEnv(t *testing.T) {
-	t.Helper()
-	for _, key := range []string{"O11Y_TRACE_ENABLED", "O11Y_METRICS_ENABLED", "O11Y_LOG_ENABLED", "O11Y_PROFILING_ENABLED"} {
-		t.Setenv(key, "")
-	}
-}
-
 // TestWithLogLevel checks the level reaches the SDK's Logger: records below
 // it are disabled, records at or above it are enabled, and the default is
 // INFO when the option is not given.
 func TestWithLogLevel(t *testing.T) {
-	pinPillarEnv(t)
 	srv := testutil.FakeOTLPServer(t)
 	ctx := context.Background()
 
@@ -73,7 +62,6 @@ func TestWithLogLevel(t *testing.T) {
 // TestWithRuntimeMetrics scrapes /metrics with runtime metrics on (the
 // default) and off: the Go runtime instruments must appear only when enabled.
 func TestWithRuntimeMetrics(t *testing.T) {
-	pinPillarEnv(t)
 	srv := testutil.FakeOTLPServer(t)
 
 	for _, tc := range []struct {
@@ -111,7 +99,6 @@ func TestWithRuntimeMetrics(t *testing.T) {
 // the given endpoint's /v1/metrics, and the Prometheus scrape server is not
 // started.
 func TestWithMetricsOTLPEndpoint(t *testing.T) {
-	pinPillarEnv(t)
 	traces := testutil.FakeOTLPServer(t)
 	metricsSrv := testutil.NewCapturingOTLPServer(t)
 	addr := testutil.FreeAddr(t)
@@ -165,7 +152,6 @@ func TestDefaultLatencyBuckets(t *testing.T) {
 // process-global and uploads on a 15s schedule, which a unit test cannot wait
 // on or safely share.
 func TestWithProfilingAuthHeaders_ReachesInit(t *testing.T) {
-	pinPillarEnv(t)
 	srv := testutil.FakeOTLPServer(t)
 	opts := append(commonOpts(srv.URL),
 		o11y.WithProfilingEnabled(true),

@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/exemplar"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -46,7 +47,7 @@ func esStub(t *testing.T, status int) *httptest.Server {
 // the supplied provider rather than the OTel global.
 func recordingProvider() (trace.TracerProvider, *tracetest.SpanRecorder) {
 	rec := tracetest.NewSpanRecorder()
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())), sdktrace.WithSpanProcessor(rec))
 	return tp, rec
 }
 
@@ -65,7 +66,11 @@ func noopMeter() metric.MeterProvider { return metricnoop.NewMeterProvider() }
 // collect the db.client.operation.duration samples the facade records.
 func recordingMeter(views ...sdkmetric.View) (metric.MeterProvider, *sdkmetric.ManualReader) {
 	reader := sdkmetric.NewManualReader()
-	return sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader), sdkmetric.WithView(views...)), reader
+	// An explicit exemplar filter: without one the SDK reads
+	// OTEL_METRICS_EXEMPLAR_FILTER, and the exemplar assertions need the
+	// default trace-based filter.
+	return sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader), sdkmetric.WithView(views...),
+		sdkmetric.WithExemplarFilter(exemplar.TraceBasedFilter)), reader
 }
 
 // collectDuration collects the reader and returns the

@@ -87,6 +87,7 @@ func TestContextWithUserEmptyNameNoops(t *testing.T) {
 func TestSpanProcessorCopiesUserBaggageOnStart(t *testing.T) {
 	sr := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())),
 		sdktrace.WithSpanProcessor(baggageattrs.NewWhitelist(baggageattrs.UserNameKey).NewSpanProcessor()),
 		sdktrace.WithSpanProcessor(sr),
 	)
@@ -106,6 +107,7 @@ func TestSpanProcessorCopiesUserBaggageOnStart(t *testing.T) {
 func TestSpanProcessorDoesNotOverrideExplicitStartAttribute(t *testing.T) {
 	sr := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())),
 		sdktrace.WithSpanProcessor(baggageattrs.NewWhitelist(baggageattrs.UserNameKey).NewSpanProcessor()),
 		sdktrace.WithSpanProcessor(sr),
 	)
@@ -355,6 +357,7 @@ func TestBaggageParseBudgetBehavior(t *testing.T) {
 func TestSpanProcessorAllowsLaterAttributeOverride(t *testing.T) {
 	sr := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())),
 		sdktrace.WithSpanProcessor(baggageattrs.NewWhitelist("app.order.id").NewSpanProcessor()),
 		sdktrace.WithSpanProcessor(sr),
 	)
