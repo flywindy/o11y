@@ -13,6 +13,64 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+### Security
+
+- Bump OpenTelemetry Go to v1.46.0 (log modules v0.22.0, contrib v0.71.0,
+  Prometheus exporter v0.68.0) for GO-2026-6505 (`otel/sdk`, `otlptrace`,
+  `otlptracehttp` before v1.45.0) and GO-2026-6615 (`otel/sdk/log` before
+  v0.21.0). Since v1.45.0 the OTLP/HTTP trace and metric exporters send to `/`
+  when the endpoint URL has no path; the SDK now sets `/v1/traces` and
+  `/v1/metrics` for such an endpoint, so `WithOTLPEndpoint("http://host:4318")`
+  and `WithMetricsOTLPEndpoint` keep reaching the collector; for traces and
+  metrics an explicit path, `/` included, is used as given, as before (logs
+  keep their rule: no path or `/` means `/v1/logs`).
+
+  Other upstream changes are held back so the emitted telemetry stays as it
+  was: the slog bridge (otelslog v0.20) would move an error-valued attribute
+  such as `slog.Any("error", err)` into `exception.message` /
+  `exception.type` on the OTLP copy, so the SDK now renders it as a string
+  attribute under its own key first (`err.Error()`, as the earlier bridge
+  did); and the trace exporter, which now
+  reads `OTEL_EXPORTER_OTLP_(TRACES_)PROTOCOL`, is pinned to protobuf like the
+  log and metric exporters. Upstream changes that do reach the output:
+  - `http`, `gin` (otelhttp / otelgin v0.71.0): a request with a non-standard
+    method (e.g. `PROPFIND`) is recorded as `http.request.method="_OTHER"`
+    with `http.request.method_original`, where v0.68.0 recorded `GET`; on the
+    `http` client an empty `Request.Method` (which `net/http` sends as GET)
+    is recorded as `_OTHER` too, with no original value.
+  - `http` client (`NewTransport`, and `minio` with HTTP child spans, which
+    sends through it): `network.protocol.version` comes from the response, a
+    transport error adds `error.type` to `http.client.request.duration`, and
+    the wrapped `RoundTripper`'s result is checked as `net/http.Client`
+    checks it — `(nil, nil)` and a non-HEAD response with
+    `ContentLength > 0` but a nil `Body` become errors, and any other nil
+    `Body` becomes `http.NoBody`.
+  - OTLP logs (otelslog v0.20 / log SDK v0.22): an attribute with an empty
+    key is dropped before export, nested empty-key groups are flattened to
+    the top level (only one level was before), and `dropped_attributes_count`
+    is exported instead of always `0`. `OTEL_LOGRECORD_ATTRIBUTE_COUNT_LIMIT=0`
+    now drops every log attribute, where v0.19 read `0` as no limit; unset
+    it, or set a large value, to keep attributes. The log exporter also
+    rejects a request over 64 MiB, as the trace and metric exporters
+    already did; such a batch is dropped and counted in
+    `o11y.export.failures`.
+  - Prometheus pull (exporter v0.68.0): label values, `target_info`
+    included, are formatted with `attribute.Value.String()`. Plain string,
+    integer and bool values are unchanged; slices and non-finite floats are
+    not (`[true false]` → `[true,false]`, `+Inf` → `Infinity`, string slices
+    no longer HTML-escaped, float slices in shortest form such as `1e-06`).
+  - Resource `schema_url` on every signal: the SDK's resource detectors now
+    use semconv v1.43.0, so it changes from
+    `https://opentelemetry.io/schemas/1.41.0` to `.../1.43.0`. The SDK's own
+    attribute keys stay pinned to v1.39.0.
+  - Histogram exemplars (`sdk/metric` v1.46): each bucket now keeps a
+    randomly sampled measurement per collection interval instead of the most
+    recent one, so the exemplar trace linked from a bucket is a random
+    sampled request rather than the latest.
+  - Transitive bumps the new versions require, including
+    `go.mongodb.org/mongo-driver/v2` v2.7.0 → v2.8.1 and
+    `prometheus/client_golang` v1.23.2 → v1.24.1.
+
 ### Fixed
 
 - `redis`: a pool Wrap names itself keeps its name across restarts. The

@@ -243,7 +243,7 @@ The ADR 0003 §"Approved integrations" table is updated in the same PR:
 
 | Library | Version | Verified | Behavior | Notes |
 |---|---|---|---|---|
-| `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` | v0.68.0 | ✅ | Reads globals as fallback only; never sets. | See ADR 0009 |
+| `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` | v0.71.0 | ✅ | Reads globals as fallback only; never sets. | See ADR 0009 |
 
 ### 5. Migration checklist (ship in the implementation PR)
 

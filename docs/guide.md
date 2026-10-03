@@ -312,8 +312,8 @@ minutes) naming the family to fix. The same rule applies one level up: an
 instrumentation-scope attribute passed to `Meter(name, WithInstrumentationAttributes(...))`
 whose key normalizes to `name`, `version` or `schema_url`, or to the same
 label as another scope attribute, is dropped at meter creation with a `WARN`,
-because the exporter would otherwise emit that `otel_scope_*` label twice on
-every family of the meter. Neither guard applies on the OTLP push path
+so the `otel_scope_*` labels are predictable: left to itself the exporter
+drops the reserved ones silently and joins colliding values with `;`. Neither guard applies on the OTLP push path
 (`WithMetricsOTLPEndpoint`): OTLP carries resource and scope attributes
 separately from datapoint attributes, so there is nothing to collide with and
 attributes are exported untouched.

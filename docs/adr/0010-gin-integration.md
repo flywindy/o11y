@@ -487,3 +487,18 @@ nested chains; two answers from a non-deterministic filter).
 - A request a filter excludes (for example `/healthz` under
   `WithSkipPaths`) no longer gets exception events on an outer span;
   before this amendment `ErrorRecorder` recorded them there.
+
+### Note (2026-10-02) — otelgin v0.71.0
+
+`otelgin` v0.71.0 no longer calls `span.RecordError` for each `c.Errors`
+entry. On unwind it sets the status to Error with `c.Errors.String()` and
+sets `error.type`: the error's type for a single entry, `_OTHER` for
+several. The chain still hides `c.Errors` from it, so the emitted spans
+are unchanged by the upgrade: one typed `exception` event per gin error,
+recorded by the chain, and no `error.type` from `otelgin`. Hiding is no
+longer what prevents a duplicate exception. Its remaining effects are to
+withhold `otelgin`'s `error.type` and, on a 5xx response, to leave the
+status description empty: `otelgin` sets the status from the HTTP code
+first and only then, when it sees `c.Errors`, replaces it with
+`c.Errors.String()` (Decision 3). Letting both through is a separate,
+output-changing decision left for a follow-up.

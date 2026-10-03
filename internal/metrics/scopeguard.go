@@ -15,14 +15,20 @@ import (
 //
 // otelprom renders every scope attribute as otel_scope_<normalized key>
 // beside its fixed otel_scope_name / otel_scope_version /
-// otel_scope_schema_url labels, with no de-duplication. A scope attribute
-// named "name", or two scope attributes that normalize to the same label
-// ("app.tier" and "app_tier"), therefore fail every family of that meter at
-// gather time — and, unlike datapoint attributes, scope attributes never pass
-// through a stream's AttributeFilter, so the reserved-key views cannot help.
+// otel_scope_schema_url labels. At v0.65.0 a scope attribute named "name"
+// therefore failed every family of that meter at gather time, and two scope
+// attributes that normalize to the same label ("app.tier" and "app_tier")
+// are joined into one label value — and, unlike datapoint attributes, scope
+// attributes never pass through a stream's AttributeFilter, so the
+// reserved-key views cannot help.
 // The wrapper drops such attributes at Meter creation, keeps the rest, and
 // logs each drop once at WARN when logger is non-nil. Meters created without
 // scope attributes pass straight through.
+//
+// The pinned otelprom v0.68.0 itself skips scope attributes that map to the
+// fixed labels, so it no longer fails a family over them. The guard is kept
+// for its logged handling, which leaves the exported scope labels as they
+// were before the bump.
 func GuardScopeAttributes(mp metric.MeterProvider, logger *slog.Logger) metric.MeterProvider {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)

@@ -52,6 +52,54 @@ func TestInitTracer_ExportsWithHeaders(t *testing.T) {
 	assert.Equal(t, "op", extra.Ended()[0].Name())
 }
 
+// TestInitTracer_URLPath pins where spans are sent: a bare endpoint goes to
+// the OTLP default /v1/traces, and an explicit path, the root included, is
+// used as given.
+func TestInitTracer_URLPath(t *testing.T) {
+	for _, tc := range []struct {
+		name, suffix, want string
+	}{
+		{"bare endpoint", "", "/v1/traces"},
+		{"root path", "/", "/"},
+		{"custom path", "/otlp/traces", "/otlp/traces"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := testutil.NewCapturingOTLPServer(t)
+			tp, _, err := InitTracer(context.Background(), srv.URL+tc.suffix, nil, testResource(), sdktrace.AlwaysSample(), nil)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+			_, span := tp.Tracer("test").Start(context.Background(), "op")
+			span.End()
+			require.NoError(t, tp.ForceFlush(context.Background()))
+
+			requests := srv.Requests()
+			require.NotEmpty(t, requests)
+			assert.Equal(t, tc.want, requests[0].Path)
+		})
+	}
+}
+
+// TestInitTracer_IgnoresProtocolEnv checks spans stay protobuf-encoded when
+// the environment asks for http/json, which the trace exporter honours since
+// v1.46 but the log and metric exporters do not.
+func TestInitTracer_IgnoresProtocolEnv(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
+	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/json")
+	srv := testutil.NewCapturingOTLPServer(t)
+	tp, _, err := InitTracer(context.Background(), srv.URL, nil, testResource(), sdktrace.AlwaysSample(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+	_, span := tp.Tracer("test").Start(context.Background(), "op")
+	span.End()
+	require.NoError(t, tp.ForceFlush(context.Background()))
+
+	requests := srv.Requests()
+	require.NotEmpty(t, requests)
+	assert.Equal(t, "application/x-protobuf", requests[0].Header.Get("Content-Type"))
+}
+
 // TestInitTracer_CountsExportFailures points the exporter at a server that
 // rejects everything (400 is not retried) and checks the failure is counted
 // under traces.
