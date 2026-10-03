@@ -685,6 +685,38 @@ func TestInitMeter_OTLPHeadersAttached(t *testing.T) {
 	}
 }
 
+// TestInitMeter_OTLPURLPath pins where the push path sends: a bare endpoint
+// goes to the OTLP default /v1/metrics, and an explicit path, the root
+// included, is used as given.
+func TestInitMeter_OTLPURLPath(t *testing.T) {
+	for _, tc := range []struct {
+		name, suffix, want string
+	}{
+		{"bare endpoint", "", "/v1/metrics"},
+		{"root path", "/", "/"},
+		{"custom path", "/otlp/metrics", "/otlp/metrics"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := testutil.NewCapturingOTLPServer(t)
+			mp, _, err := metrics.InitMeter(context.Background(), metrics.Config{
+				ServiceName:         "test-svc",
+				Namespace:           "platform",
+				MetricsOTLPEndpoint: srv.URL + tc.suffix,
+				HistogramBuckets:    []float64{1},
+			})
+			require.NoError(t, err)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			require.NoError(t, mp.ForceFlush(ctx))
+			_ = mp.Shutdown(ctx)
+
+			requests := srv.Requests()
+			require.NotEmpty(t, requests)
+			assert.Equal(t, tc.want, requests[0].Path)
+		})
+	}
+}
+
 // TestInitMeter_MaxUniqueCollectionsCapsCassandraTables pins the export-boundary
 // cap for db.collection.name on the Cassandra client metrics. The label is on by
 // default (ADR 0019 §7, 2026-07-29 amendment) and a Cassandra schema is

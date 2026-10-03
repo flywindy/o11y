@@ -7,6 +7,7 @@ package trace
 import (
 	"context"
 	"fmt"
+	"net/url"
 
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
@@ -32,6 +33,16 @@ func InitTracer(ctx context.Context, endpoint string, headers map[string]string,
 	// 1. OTLP HTTP trace exporter
 	expOpts := []otlptracehttp.Option{
 		otlptracehttp.WithEndpointURL(endpoint),
+		// Since v1.46 the exporter reads OTEL_EXPORTER_OTLP_(TRACES_)PROTOCOL
+		// and switches to JSON for http/json; the log and metric exporters do
+		// not. Keep traces on protobuf with the other two signals.
+		otlptracehttp.WithEncoding(otlptracehttp.EncodingProtobuf),
+	}
+	// Since v1.45 the exporter sends to "/" when the endpoint URL has no
+	// path; keep the documented bare form ("http://localhost:4318") on the
+	// OTLP default path, as it was before.
+	if u, err := url.Parse(endpoint); err == nil && u.Path == "" {
+		expOpts = append(expOpts, otlptracehttp.WithURLPath("/v1/traces"))
 	}
 	if len(headers) > 0 {
 		expOpts = append(expOpts, otlptracehttp.WithHeaders(headers))

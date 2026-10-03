@@ -26,8 +26,8 @@ import (
 // when nothing reports the count.
 func InitLogger(ctx context.Context, endpoint string, headers map[string]string, res *resource.Resource, failures *exportstats.Recorder) (*sdklog.LoggerProvider, error) {
 	// otlploghttp.WithEndpointURL does not append a default path when none is
-	// provided (unlike otlptracehttp). Explicitly set /v1/logs so that a bare
-	// endpoint like "http://localhost:4318" routes correctly to the collector.
+	// provided. Explicitly set /v1/logs so that a bare endpoint like
+	// "http://localhost:4318" routes correctly to the collector.
 	logEndpoint, err := logEndpointURL(endpoint)
 	if err != nil {
 		// Neither the value nor the parser's message is repeated: a
@@ -69,8 +69,10 @@ func InitLogger(ctx context.Context, endpoint string, headers map[string]string,
 
 // logEndpointURL returns the full OTLP log endpoint URL.
 // If the caller-supplied endpoint has no path (or only "/"), the default
-// /v1/logs path is appended. This mirrors the behaviour of otlptracehttp,
-// which applies its /v1/traces default automatically.
+// /v1/logs path is appended; a trailing slash is trimmed. The trace and metric
+// setup differs on "/": it adds /v1/traces and /v1/metrics only when the URL
+// has no path at all, and sends to "/" as given, matching what those
+// exporters did before v1.45.
 func logEndpointURL(endpoint string) (string, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil {

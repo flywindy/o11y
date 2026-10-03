@@ -11,9 +11,9 @@ import (
 // Middleware returns the canonical gin middleware chain for o11y tracing:
 // otelgin, which opens the server span, followed by a handler that records
 // each gin.Context.Errors entry as one exception event carrying
-// gin.error.type. otelgin would record each entry again on its own; the chain
-// keeps it from doing so, and every middleware outside the chain still sees
-// c.Errors as the handlers left them. A request excluded by WithFilter or
+// gin.error.type. The chain keeps c.Errors from otelgin, which therefore sets
+// neither its error status description nor error.type from them, and every
+// middleware outside the chain still sees c.Errors as the handlers left them. A request excluded by WithFilter or
 // WithSkipPaths is not instrumented by the chain at all. Do not add
 // ErrorRecorder after it.
 //

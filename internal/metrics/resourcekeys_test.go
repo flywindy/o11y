@@ -134,8 +134,8 @@ func TestTargetInfoCollector(t *testing.T) {
 		attribute.String("__meta__", "dropped"),
 		attribute.String("...", "dropped"),
 		attribute.Int("process.pid", 42),
-		attribute.BoolSlice("app.flags", []bool{true, false}), // otelprom renders slices with Emit
-		attribute.Float64("app.ratio", math.Inf(1)),           // and non-finite floats as +Inf
+		attribute.BoolSlice("app.flags", []bool{true, false}), // otelprom v0.68 renders slices with String
+		attribute.Float64("app.ratio", math.Inf(1)),           // and non-finite floats as Infinity
 	)
 	c, err := newTargetInfoCollector(res)
 	require.NoError(t, err)
@@ -160,7 +160,7 @@ func TestTargetInfoCollector(t *testing.T) {
 		"telemetry_sdk_name": "opentelemetry",
 		"app_x":              "first",
 		"process_pid":        "42",
-		"app_flags":          "[true false]",
-		"app_ratio":          "+Inf",
+		"app_flags":          "[true,false]",
+		"app_ratio":          "Infinity",
 	}, labels)
 }
