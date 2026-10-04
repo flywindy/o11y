@@ -5,7 +5,7 @@
 **Relates to**: ADR 0002 (metrics strategy and cardinality), ADR 0003
 (global-state policy), ADR 0004 / 0022 (NATS integration and facade), ADR 0006
 (semconv pin), ADR 0008 (instrumentation sourcing), ADR 0024 (telemetry must
-not change work lifetimes), ADR 0026 (dependency direction), ADR 0027
+not change work lifetimes), ADR 0026 (dependency direction, Accepted Option A), ADR 0027
 (SDK-owned metrics over an existing trace integration)
 
 ## Context
@@ -15,6 +15,10 @@ does not accept a MeterProvider or record application processing metrics.
 The motivating consumer, `hmchangw/newchat`, implements those observations in
 `pkg/natsmetrics`: consumer loop state, delivery dispositions, processing
 duration, terminal failure evidence, publish failures, and RPC durations.
+It is the reference case for requirements and for the migration section, not
+the measure of this proposal's scope: the SDK serves every application on the
+facade, and its phase-1 surface is decided by the facade's delivery modes and
+by what o11y's own tests can prove (section 1).
 
 The reusable problem is larger than counting an Ack. Every integration must
 preserve the native message methods, distinguish failed acknowledgment calls
@@ -25,22 +29,23 @@ policy into the SDK is a separate responsibility with a different cost.
 
 ### Evidence baseline
 
-This proposal was researched against these remote `main` snapshots:
+This proposal was verified against these snapshots:
 
 | Repository | Commit | Relevant dependencies |
 |---|---|---|
-| o11y | [`e4aef2f1`](https://github.com/flywindy/o11y/tree/e4aef2f1fb611504bd1da260956acb86cc533487) | `otel-nats v0.9.1`, `nats.go v1.50.0`, OTel Go `v1.44.0`, semconv `v1.39.0` |
-| newchat | [`28b97da1`](https://github.com/hmchangw/newchat/tree/28b97da1eb1554ecdfe12ea76121f23bce446c8c) | `o11y v0.12.0`, `otel-nats v0.9.1`, `nats.go v1.50.0` |
+| o11y `main` (after v0.13.0) | [`8eaede0f`](https://github.com/flywindy/o11y/tree/8eaede0f1245a2b989615eba23189aff5c14b57b) | `otel-nats v0.9.1`, `nats.go v1.50.0`, OTel Go `v1.46.0`, semconv `v1.39.0` |
+| newchat, last public snapshot | [`28b97da1`](https://github.com/hmchangw/newchat/tree/28b97da1eb1554ecdfe12ea76121f23bce446c8c) | `o11y v0.12.0`, `otel-nats v0.9.1`, `nats.go v1.50.0` |
 
+newchat has since moved to private development. Its references below are
+frozen requirement evidence; no decision here depends on its current state.
 Implementation must refresh the integration baseline and candidate search.
-References to ADRs 0026 and 0027 below identify the verified remote documents.
 No runtime or benchmark results are claimed by this proposal.
 
 Relevant source evidence:
 
-- [NATS constructors](https://github.com/flywindy/o11y/blob/e4aef2f1fb611504bd1da260956acb86cc533487/nats/conn.go#L122)
+- [NATS constructors](https://github.com/flywindy/o11y/blob/8eaede0f1245a2b989615eba23189aff5c14b57b/nats/conn.go#L126)
   accept tracing dependencies only.
-- [JetStream facade](https://github.com/flywindy/o11y/blob/e4aef2f1fb611504bd1da260956acb86cc533487/nats/jetstream.go#L364)
+- [JetStream facade](https://github.com/flywindy/o11y/blob/8eaede0f1245a2b989615eba23189aff5c14b57b/nats/jetstream.go#L369)
   already owns consumer, iterator, and batch wrappers, including single-message
   `Next`. The older statement that `Next` cannot be wrapped is obsolete.
 - [newchat recorders](https://github.com/hmchangw/newchat/blob/28b97da1eb1554ecdfe12ea76121f23bce446c8c/pkg/natsmetrics/metrics.go#L175)
@@ -80,8 +85,10 @@ duration also explicitly excludes processing duration.
 4. Keep labels and recorder caches bounded before measurements reach OTel.
 5. Preserve SDK provider wiring and automatic view installation without adding
    NATS drivers to the root package's import graph.
-6. Give newchat a documented migration, including semantic changes, dashboards,
-   disabled-mode behavior, and tests that currently inspect application source.
+6. Give applications that already record these observations themselves
+   (newchat is the reference case) a documented migration, including semantic
+   changes, dashboards, disabled-mode behavior, and tests that currently
+   inspect application source.
 
 ## Proposed decisions
 
@@ -95,16 +102,29 @@ existing T2 facade; implement the missing metric layer as justified T3.
 | Observe a synchronous processing invocation and its message methods | SDK |
 | Normalize event types and cache bounded measurement options | SDK |
 | Record application-reported loop transitions and terminal failure evidence | SDK recorder; application supplies the facts |
+| Report each loop's ending, in every delivery mode including `Consume` | Application, through the mode-agnostic loop handle (section 3); no SDK-owned delivery wrapper |
 | Choose event vocabulary and declare business failure reasons | Application |
 | Semaphore, goroutines, WaitGroup, dispatch, retry, and shutdown sequencing | Application |
 | Demonstrate a bounded worker loop | SDK examples, without a worker-runner API |
-| Publish-failure and RPC recorders | Remain in newchat for phase 1 |
+| Publish-failure and RPC recorders | Remain in the application for phase 1 |
 
 This is the original "A plus a B example" direction, with A narrowed to its
 consumer half. It is not a promise to relocate every function currently in
 `pkg/natsmetrics`. In particular, delivery metadata used to make retry
 decisions is application behavior and must remain available when metrics are
 disabled.
+
+**How the phase-1 surface is chosen:** by the facade's delivery modes, not by
+any application's service inventory, under two rules. A mode-specific API is
+added only when an application cannot do the same with the mode-agnostic
+primitives (`Observe`, the loop handle, `Close`, `MarkTerminalFailure`). And
+everything added is proven inside o11y — contract tests against an embedded
+`nats-server` and a compiled example per mode — rather than by a downstream
+adoption. No mode passes the first rule in this phase: `Next`, `Messages` and
+the three batch modes need nothing mode-specific, and `Consume`'s ending is
+reported by the application too (Contract: Consume ending, section 5).
+Deferring costs nothing in compatibility: `ConsumerObserver` is a concrete
+type, so a later method or configuration field is additive.
 
 The phase-1 per-message disposition contract supports **AckExplicit**
 consumers. AckNone and AckAll need separate semantics: one AckAll call can
@@ -147,20 +167,16 @@ func (c *Conn) ConsumerObserver(ctx context.Context, consumer Consumer, cfg Cons
 type ConsumerMetricsConfig struct {
     Site       string
     EventTypes []string
-    // OnConsumeError receives what a jetstream.ConsumeErrHandler would, plus
-    // a loop-lifetime context; see the Consume wiring in section 5 for why it
-    // is a field rather than an option, and why it carries its own context.
-    OnConsumeError func(context.Context, jetstream.ConsumeContext, error)
 }
 
 func (o *ConsumerObserver) Observe(ctx context.Context, msg jetstream.Msg, eventType string, handle func(context.Context, jetstream.Msg) error) error
-func (o *ConsumerObserver) Consume(ctx context.Context, handler JetStreamMsgHandler, opts ...jetstream.PullConsumeOpt) (ConsumeContext, error)
 func (o *ConsumerObserver) StartLoop(ctx context.Context) *Loop
 func (l *Loop) End(ctx context.Context, err error)
 func (o *ConsumerObserver) Close(ctx context.Context) error
 func MarkTerminalFailure(ctx context.Context, reason TerminalReason)
 ```
 
+The same calls serve all six delivery modes; there is no per-mode method.
 Its configuration contains the optional site label and event-type allowlist.
 Stream, durable consumer name, and acknowledgment policy come from the bound
 consumer's setup metadata, not message subjects or payloads: `Consumer`
@@ -168,40 +184,31 @@ already exposes `Info(ctx)` and `CachedInfo()`, and `jetstream.ConsumerInfo`
 carries all three. Any necessary metadata lookup occurs at setup with the
 supplied context, never once per delivery.
 
-**Why it hangs off `Conn` and not off `Consumer`.** Two constraints meet here
-and only one shape satisfies both.
-
-`Consumer` is an exported interface, so adding a method to it is a breaking
-change for every external implementor — and a silent one for the implementors
-most likely to exist. An implementor that *embeds* the interface keeps
-compiling and gains a nil method that panics when the new one is called;
-newchat already has exactly that shape today
-(`search-sync-worker/consumer_source_test.go`, a `fakeO11yConsumer` embedding
-a nil `o11ynats.Consumer` and overriding only `Fetch`). This is the same
-hazard the test requirements below already guard for on `jetstream.Msg` —
-"embedding can silently inherit a new method" — and it applies to this ADR's
-own change.
-
-But a plain free function taking only the interface cannot work either,
-because construction needs state the interface does not carry: the
-MeterProvider, the resolved metrics toggle, and the per-connection identity
-registry section 6 requires. Reaching them by asserting the argument to the
-concrete facade type would fail for exactly the external and decorator
-implementors the free function was meant to protect, and a package-global
-registry is barred by ADR 0003.
-
-A method on `Conn` satisfies both. `Conn` is a concrete struct, so a new
-method on it breaks no one; it already holds the providers and the toggle; and
-it is the natural owner of a registry whose bound section 6 states *per
-connection*, which until now had no owner at all. The consumer arrives as an
-ordinary interface parameter, so any implementation — SDK, decorator or fake —
-can be observed.
+**Why it hangs off `Conn` and not off `Consumer`.** `Consumer` is an
+exported interface, so a new method on it breaks every external implementor —
+silently for one that embeds the interface, which keeps compiling and gains a
+nil method that panics when called (a test fake of exactly that shape exists
+in the reference application, `search-sync-worker/consumer_source_test.go`).
+A free function taking only the interface cannot work either: construction
+needs the MeterProvider, the resolved metrics toggle and the per-connection
+identity registry (section 6), and asserting the argument to the facade type
+to reach them would fail for the decorators and fakes it was meant to protect;
+a package-global registry is barred by ADR 0003. `Conn` is a concrete struct
+that already holds the providers and the toggle, so a method on it breaks no
+one and gives the per-connection registry its owner. The consumer stays an
+ordinary interface parameter, so any implementation can be observed.
 
 `Observe` invokes the application callback exactly once on the calling
 goroutine. Timing starts immediately before invocation and ends on return
 or panic unwinding. The timer excludes earlier queue/semaphore wait and
 includes work after an early Ack. It does not wait for broker redelivery or
 for goroutines that the callback starts and does not join.
+
+**`Observe` takes the delivery's own context** — the one `Next` returns,
+`FetchedMessage.Ctx` from a batch, or the context a `Consume` handler
+receives — never a loop-wide context. That context carries the facade's
+consumer span, so the histogram's exemplars and the handler's logs join the
+delivery's trace; a loop context would attach every sample to no trace.
 
 The callback receives a message wrapper and a context carrying observation
 state. That context retains the caller's cancellation, deadline, and trace
@@ -219,6 +226,20 @@ which is an **investigation signal, not proof of a defect**: a handler
 deliberately leaving a message to AckWait redelivery is a legitimate pattern
 landing in the same state.
 
+Two rules follow from the wrapper:
+
+- **Settle through the wrapper.** The `msg` the callback receives is the only
+  handle whose methods are observed. Retry and settlement helpers must be
+  given it, not the native message captured from the enclosing scope; a
+  helper that settles the native message leaves every disposition
+  `left_pending`.
+- **Return both errors.** After a failed attempt, return
+  `errors.Join(handlingErr, settleErr)`, which carries only the handling
+  error when settlement succeeded. The disposition already records whether
+  settlement succeeded, and section 5 classifies with `errors.Is`, so joining
+  keeps a cancellation's class where returning the settlement error alone
+  would turn every shutdown-time failure into `_OTHER`.
+
 For an existing callback with no error result, an adapter can call it and
 return nil. That reports only the errors the adapter exposes; it does not
 discover swallowed failures. `MarkTerminalFailure` is the explicit way for
@@ -230,7 +251,8 @@ This is the authoritative statement of loop liveness. Other sections reference
 it and must not restate it.
 
 - **A loop handle is the unit of liveness.** `StartLoop` returns one and adds
-  `+1`; `End` is idempotent and subtracts that `+1`. Two loops on one observer
+  `+1`. `End` is first-wins: the first call subtracts that `+1` and records
+  its error (section 5); later calls do nothing. Two loops on one observer
   read 2, and ending one leaves the other counted.
 - **Every handle from one observer carries the same labels**, because labels
   come from the bound consumer. The gauge counts loops, it does not
@@ -244,6 +266,18 @@ it and must not restate it.
   from an error, which is what keeps error classification out of the business
   of deciding whether consumption stopped, and removes any ordering hazard
   between an asynchronous failure and a separate "started" call.
+- **On shutdown, end before stopping.** The application calls
+  `End(ctx, nil)` before `Stop` or `Drain` on the iterator or consume handle.
+  Stopping makes the receive call fail — `Next` returns
+  `jetstream.ErrMsgIteratorClosed` — and because `End` is first-wins, the
+  loop's own later `End` with that error does nothing instead of recording a
+  receive error on every deploy. The rule is an ordering, not a list of
+  shutdown errors.
+- **The handle observes; it never acts.** It does not restart a loop, change
+  readiness, or stop delivery. An application that also guards its loops —
+  failing readiness or restarting the process when one dies — reports to that
+  guard and to `End` from the same site with the same error, so the two never
+  disagree about whether or why a loop ended.
 - **A handle never ended leaks its `+1` until the observer closes.** `Close`
   ends every handle the observer still holds, as a normal ending with no
   failure sample — the observer cannot know why a loop the application forgot
@@ -253,12 +287,12 @@ it and must not restate it.
 
 This is the authoritative statement of `Close`. Section 6 references it.
 
-- Idempotent; after it returns the observer records nothing, and later calls on
-  it are no-ops rather than errors.
+- Idempotent. A call that starts after `Close` returns records nothing and is
+  a no-op rather than an error. An `Observe` entered before `Close` — one that
+  already holds its wrapper — is not cut short: it completes and records.
 - Ends every loop handle the observer still holds (see the Loop contract).
-- Does **not** wait for in-flight `Observe` calls. An `Observe` already running
-  completes and records normally; the application owns that ordering, which is
-  the same division the rest of this ADR draws.
+- Does **not** wait for in-flight `Observe` calls. The application owns that
+  ordering, which is why the worked example closes after `wg.Wait()`.
 - Releases **observer-local measurement-option caches only**. The
   per-connection registry keeps the admitted identity tuple and its canonical
   vocabulary for the life of the connection, because section 6 has a
@@ -270,9 +304,9 @@ This is the authoritative statement of `Close`. Section 6 references it.
 - Takes a context because it records.
 
 All six delivery paths — `Consume`, `Messages`, `Next`, `Fetch`, `FetchBytes`,
-`FetchNoWait` — share this `Observe` contract; where each mode's *ending* comes
-from is section 5. `Observe` goes inside the actual worker, after admission,
-as the worked example shows.
+`FetchNoWait` — share this `Observe` contract and need no mode-specific SDK
+call; where each mode's *ending* comes from is section 5. `Observe` goes
+inside the actual worker, after admission, as the worked example shows.
 
 Calling a delivery API alone measures nothing. The SDK must not finalize a
 previous message when the next one is fetched, a batch channel closes, an
@@ -288,9 +322,10 @@ exactly-once ledger.
 #### Worked example: the ordering the contracts require
 
 The contracts above are about ordering, so one example is worth more than the
-prose it replaces. This is a bounded-concurrency batch worker — the shape all
-five newchat consumers use — showing admission, `Observe`, the loop boundary
-and shutdown in the order the contracts demand.
+prose it replaces. This bounded-concurrency worker uses the `Messages`
+iterator, the mode that leaves the most to the application: concurrency, the
+receive-error filter, and shutdown ordering. Every mode uses the same calls;
+only the source of the ending differs (section 5).
 
 ```go
 obs, err := conn.ConsumerObserver(ctx, cons, o11ynats.ConsumerMetricsConfig{
@@ -300,65 +335,73 @@ obs, err := conn.ConsumerObserver(ctx, cons, o11ynats.ConsumerMetricsConfig{
 if err != nil {
     return err
 }
-defer obs.Close(context.WithoutCancel(ctx)) // ends any loop still open
+iter, err := cons.Messages(ctx, jetstream.PullMaxMessages(2*cfg.MaxWorkers))
+if err != nil {
+    return err
+}
 
-loop := obs.StartLoop(ctx) // ONE handle for the whole worker, not per batch
+loop := obs.StartLoop(ctx) // ONE handle for the whole worker
 sem := make(chan struct{}, cfg.MaxWorkers)
 var wg sync.WaitGroup
 
-for {
-    batch, err := cons.Fetch(ctx, cfg.BatchSize)
-    if err != nil { // setup failed: this loop is over
-        loop.End(ctx, err)
-        break
-    }
-
-    for msg := range batch.Messages() {
+go func() {
+    for {
+        msgCtx, msg, err := iter.Next()
+        if err != nil {
+            if errors.Is(err, jetstream.ErrNoHeartbeat) {
+                continue // the iterator is intact; not an ending (section 5)
+            }
+            loop.End(ctx, err) // does nothing if shutdown already ended the loop
+            // Report err to the application's own loop guard here, if it has one.
+            return
+        }
         sem <- struct{}{} // admission FIRST — the timer must not include this wait
         wg.Add(1)
-        go func(msg jetstream.Msg) {
+        go func() {
             defer func() { <-sem; wg.Done() }()
+            _ = obs.Observe(msgCtx, msg, classify(msg), handleOne) // the delivery's context
+        }()
+    }
+}()
 
-            // Observe wraps the real work, inside the worker, after admission.
-            _ = obs.Observe(ctx, msg, classify(msg),
-                func(ctx context.Context, msg jetstream.Msg) error {
-                    if err := handle(ctx, msg); err != nil {
-                        if permanent(err) {
-                            o11ynats.MarkTerminalFailure(ctx, o11ynats.TerminalPermanent)
-                            return msg.Term() // settle before returning
-                        }
-                        return msg.NakWithDelay(backoff())
-                    }
-                    return msg.Ack()
-                })
-        }(msg)
-    }
+// Shutdown, in this order:
+loop.End(ctx, nil) // a normal ending, recorded before Stop makes Next fail
+iter.Stop()
+wg.Wait()          // in-flight Observe calls finish and record
+_ = obs.Close(ctx) // nothing is in flight any more
 
-    // Read the batch error on the OUTER loop. An ordinary finite batch closing
-    // its channel is not an ending; only a non-nil error is.
-    if err := batch.Error(); err != nil {
-        loop.End(ctx, err)
-        break
+// msg is the observing wrapper: settle through it, never the native message.
+func handleOne(ctx context.Context, msg jetstream.Msg) error {
+    herr := handle(ctx, msg)
+    if herr == nil {
+        return msg.Ack()
     }
-    if ctx.Err() != nil { // normal shutdown: ends the loop, records no failure
-        loop.End(ctx, ctx.Err())
-        break
+    if permanent(herr) {
+        o11ynats.MarkTerminalFailure(ctx, o11ynats.TerminalPermanent)
+        return errors.Join(herr, msg.Term())
     }
+    return errors.Join(herr, msg.NakWithDelay(backoff()))
 }
-
-wg.Wait() // in-flight Observe calls finish and record; Close does not wait for them
 ```
 
-Four things this pins that prose kept getting wrong:
+Four things this pins:
 
-1. `StartLoop` is outside the `for`. Inside it, the gauge would drop to zero
-   between batches and fire the `< 1` liveness alert on a healthy worker.
+1. `StartLoop` is called once, outside the receive loop. A handle per batch or
+   per message would drop the gauge to zero between pulls and fire the `< 1`
+   liveness alert on a healthy worker.
 2. `sem <- struct{}{}` precedes `Observe`, so admission wait is outside the
    timer — the boundary section 4 defines.
-3. `batch.Error()` is read on the outer loop, and only a non-nil value ends
-   the loop.
-4. `wg.Wait()` is the application's, not `Close`'s. `Close` ends loops and
-   releases caches; waiting for in-flight work is the application's ordering.
+3. A receive error either does not end the loop, and is filtered where it is
+   received, or it does, and `End` and any application guard hear about it
+   from that one site.
+4. Shutdown ends the loop before stopping the iterator, and closes the
+   observer after `wg.Wait()`. The first keeps `ErrMsgIteratorClosed` out of
+   `receive.errors`; the second means `Close` never races an in-flight
+   `Observe`.
+
+For the batch modes, `End` moves to the outer loop's `batch.Error()`; for
+`Consume`, to the application's `Closed()` watcher (section 5). The compiled
+examples required below become the maintained version of this snippet.
 
 ### 4. Disposition and failure semantics
 
@@ -404,8 +447,10 @@ classified the attempt as unsuccessful and has evidence that its configured
 budget is exhausted; it is not synthesized merely from a delivery number.
 Unknown reasons normalize to `internal`. The first declaration per observed
 invocation wins, and one failure sample is emitted at completion.
-Declarations after completion are ignored. Nested observation of the same
-active wrapper reuses the outer observation and still invokes the nested
+Declarations after completion are ignored. Nested observation — `Observe`
+called with a `msg` that is already this observer's active wrapper, recognised
+by the wrapper's identity rather than by anything in the context — reuses the
+outer observation and still invokes the nested
 callback, without starting another timer or recording another completion.
 Concurrent observations of different deliveries remain supported. Do not
 deduplicate separate redeliveries by broker message ID: each is an attempt.
@@ -421,17 +466,11 @@ affected messages, so counting them as work would put a number on the metric
 that nothing in the process knows.
 
 They are not dropped, though — they move to their own instrument in the same
-phase (section 5). An earlier draft deferred that instrument until it had "a
-named reader and an explicit event-count contract"; both already exist and the
-draft simply did not check. The reader is newchat's live dashboard panel
-`sum by (reason) (rate(chat_nats_terminal_failures_total[$__rate_interval]))`,
-whose description enumerates `stream_unavailable` among the reasons it exists
-to show, and the producer is `LoopFailed` in `pkg/natsmetrics`. The
-event-count contract is what excluding them from the per-work counter already
-implies: **one sample per loop-failure event, never per affected message.**
-Deferring would therefore not have postponed a speculative instrument; it
-would have deleted a signal that is wired end to end today, and replaced it
-with logs — which is a downgrade for alerting, not an equivalent.
+phase (section 5), with **one sample per loop-failure event, never per
+affected message.** Dropping them would delete a signal applications already
+alert on: the reference application's dashboard breaks these reasons out of
+its terminal-failure family today, and logs are a downgrade for alerting, not
+an equivalent.
 
 Broker MaxDeliver and Term advisories remain independent evidence [S4]. Never
 sum these sources, or the receive-error counter, as a count of lost work.
@@ -468,12 +507,11 @@ the SDK recognises what it can:
 | `jetstream.ErrStreamNotFound`, `ErrNoStreamResponse`, `ErrServerShutdown`, `ErrConnectionClosed`, `nats.ErrConnectionClosed`, `nats.ErrDisconnected`, `nats.ErrNoResponders` | `stream_unavailable` |
 | everything else | `internal` |
 
-**This is a refinement, not an enumeration.** An earlier draft promised a total
-mapping over the client's error surface; that promise cannot be kept, because
-the surface is not enumerable from outside and moves with every `nats.go`
-release. `internal` is the honest default, adding a row is not a breaking
-change, and nothing depends on the table being complete — the loop already
-ended, because the caller said so. Classification is the opposite of
+**This is a refinement, not an enumeration.** The client's error surface is
+not enumerable from outside and moves with every `nats.go` release, so
+`internal` is the honest default and adding a row is not a breaking change.
+Nothing depends on the table being complete — the loop already ended,
+because the caller said so. Classification is the opposite of
 processing failures, where only the application knows whether work was
 abandoned and so the application declares the reason.
 
@@ -481,32 +519,47 @@ abandoned and so the application declares the reason.
 
 | Mode | The ending | Cause available? |
 |---|---|---|
-| `Next`, `Messages` | the returned error; a routine `nats.ErrTimeout` from an idle poll is not an ending, so the loop continues and `End` is not called | yes — the error *is* the ending |
+| `Next`, `Messages` | the returned error, except two that end nothing: `nats.ErrTimeout` from an idle `Next` poll, and `jetstream.ErrNoHeartbeat` from `Messages`, which `nats.go` reports **without** stopping the iterator (`jetstream/pull.go`). The application continues past both and reports neither to `End` nor to any loop guard; treating a missed heartbeat as a death ends every worker's loop at once on a JetStream leader election | yes |
 | `Fetch`, `FetchBytes`, `FetchNoWait` | `batch.Error()` once the messages channel closes, read on the **application's outer loop**, not per batch; the direct return covers setup only. Read the facade's `messageBatch.Error()`, which already suppresses the `context.Canceled` an explicit `Stop` produces | yes |
-| `Consume` | `ConsumeContext.Closed()` | **usually no** — see the contract below |
+| `Consume` | `ConsumeContext.Closed()`, watched by the application | **usually no** — see the contract below |
 
 #### Contract: Consume ending
 
 This is the authoritative statement for `Consume`. It is deliberately weaker
-than the other two modes, and the weakness is the contract rather than a gap
-to be closed later.
+than the other modes, and the weakness is the contract rather than a gap to be
+closed later. The application reports this ending like every other, with no
+SDK-owned wrapper:
+
+```go
+loop := obs.StartLoop(ctx)
+cc, err := cons.Consume(ctx, func(msgCtx context.Context, msg jetstream.Msg) {
+    _ = obs.Observe(msgCtx, msg, classify(msg), handleOne)
+})
+if err != nil {
+    loop.End(ctx, err)
+    return err
+}
+go func() { <-cc.Closed(); loop.End(ctx, nil) }() // cause unknown: the gauge falls, no receive error
+
+// Shutdown: loop.End(ctx, nil), then cc.Stop() or cc.Drain().
+```
 
 1. **`Closed()` proves this `Consume` ended. It does not prove it failed.**
    The pinned channel is a bare `<-chan struct{}` and carries no cause.
-2. **The observer retains evidence of an application-initiated stop.** It owns
-   the `ConsumeContext` it returns, so `Stop`/`Drain` called by the
-   application is known. The handle handed to `OnConsumeError` must be the
-   same wrapper — the native `ConsumeErrHandlerFunc` receives a full
-   `ConsumeContext`, so an unwrapped one would let a stop from inside the
-   callback bypass this evidence.
-3. **The last observed error is diagnostic only.** It is never automatically
-   the cause of the closure. The client reports non-terminal errors through
-   the same callback, and stops itself on paths that carry no error at all —
-   `StopAfter` reaching its limit is a normal ending with no application call
-   and no error. Pairing a close with whatever error came before it would
+2. **An application-initiated stop is already ended.** Under the Loop
+   contract the application calls `End(ctx, nil)` before `Stop`/`Drain`, so
+   the closure that follows finds the loop ended and the watcher's `End` does
+   nothing. A stop issued from inside a `jetstream.ConsumeErrHandler` follows
+   the same rule.
+3. **The last error a `ConsumeErrHandler` saw is diagnostic only.** It is
+   never the cause of the closure. The client reports non-terminal errors
+   through the same callback, and stops itself on paths that carry no error at
+   all — `StopAfter` reaching its limit is a normal ending with no application
+   call and no error. Pairing a close with whatever error came before it would
    report that as a failure.
-4. **An ending without sufficient evidence is unknown, not a failure.** It
-   records no `receive.errors` sample. Unknown endings are not stuffed into a
+4. **An ending without sufficient evidence is unknown, not a failure.** The
+   watcher ends it with `nil`: the `loops` gauge falls and no
+   `receive.errors` sample is recorded. Unknown endings are not stuffed into a
    failure count to make the instrument look complete in every mode.
 
 The operational consequence, which Q4 must be decided on: in `Consume` mode
@@ -517,24 +570,12 @@ stop — which the liveness expressions in the migration section already cover.
 Do not read the absence of receive-error samples as evidence that a `Consume`
 loop is healthy.
 
-The observer owns the `Consume` call for a second reason too: the handler
-cannot be composed through options. `PullConsumeOpt` declares one unexported
-method, so an opaque option cannot be inspected, and
-`ConsumeErrHandler.configureConsume` is a plain assignment — options do not
-merge, and no ordering preserves both the SDK's handler and the caller's.
-
-```go
-// ConsumerMetricsConfig gains:
-//   OnConsumeError func(context.Context, jetstream.ConsumeContext, error)
-func (o *ConsumerObserver) Consume(ctx context.Context, handler JetStreamMsgHandler, opts ...jetstream.PullConsumeOpt) (ConsumeContext, error)
-```
-
-`OnConsumeError` carries its own context because it fires long after
-registration; capturing a request-scoped registration context would be
-cancelled before the callback runs, so the observer supplies one detached from
-it (`obsctx.Detach`, ADR 0024). A `jetstream.ConsumeErrHandler` passed in
-`opts` to this `Consume` is silently overwritten — undetectable by the API, so
-it is a documented rule with a lint rule behind it: use `OnConsumeError`.
+**No SDK-owned `Consume` wrapper in this phase.** The four rules hold with
+`Observe` and the loop handle alone, so a wrapper that owned the `Consume`
+call would record nothing the wiring above does not. It would also have to
+replace the caller's `ConsumeErrHandler`: `PullConsumeOpt` options do not
+merge, so no ordering preserves both handlers. It is deferred with a trigger
+(Deferred work).
 
 Receive errors and processing failures answer different questions and must
 never be summed: one counts work that will get no further attempt, the other
@@ -548,7 +589,14 @@ it is one of `context.Canceled`, `context.DeadlineExceeded`,
 `handler_aborted`, or `_OTHER`. The context sentinels apply to the returned
 error, not merely a context that became canceled after successful work.
 Arbitrary error strings/types are not label values. A terminal declaration
-with a nil callback error uses `_OTHER`.
+with a nil callback error uses `_OTHER`. The context sentinels are matched
+with `errors.Is`, so a callback that joins a settlement error to its handling
+error (section 3) keeps the handling error's class.
+
+The share of samples carrying an error class is a **per-attempt** failure
+ratio: a handler that schedules a retry and returns its error counts.
+It is not a measure of abandoned work, which is `processing.failures`; an SLO
+about lost work belongs on that instrument.
 
 The histogram carries the event type and error class, **not disposition**.
 The disposition counter answers a different breakdown and remains useful;
@@ -678,22 +726,21 @@ Required bounds:
    their immutable label configuration. Do not intern arbitrary names from
    message metadata into a process-global map. Admission and the frozen
    vocabulary last for the connection; `Close` releases observer-local caches
-   only (Contract: Observer Close, section 3). Repeated setup for the same tuple reuses its frozen vocabulary; incompatible
-   vocabulary for that tuple is a setup error, not a growing union of values.
+   only (Contract: Observer Close, section 3). Repeated setup for the same
+   tuple reuses its frozen vocabulary; incompatible vocabulary for that tuple
+   is a setup error, not a growing union of values.
 4. Proposed defaults are 16 configured event values per identity and 16
    distinct identities per connection. Including `unknown`, the largest
    instrument then has at most `16 * 17 * 6 = 1,632` label combinations per
-   connection. These defaults are acceptance item Q3, not measured optima —
-   but they are no longer unanchored. Counted at the evidence baseline,
-   newchat declares **14 named event types plus `unknown`** and registers
-   **5 consumer identities** across its services, so the identity default has
-   ample headroom while the event default leaves two spare slots for a
-   service that registers the whole vocabulary. That is the intended shape
-   rather than a near-miss: an identity's allowlist is meant to carry the
-   event types that consumer actually sees, not the application's full
-   taxonomy, and a service approaching the limit is evidence of over-
-   registration before it is evidence of a low limit. Raising the default is
-   not the first response — recalculate item 6 and the fleet budget first.
+   connection. These defaults are acceptance item Q3, not measured optima. For
+   scale, the reference application declared 14 named event types plus
+   `unknown` in total, and an identity's allowlist is meant to carry only the
+   event types that consumer sees, not the application's whole taxonomy. The
+   identity limit is reached first by a process that opens one consumer per
+   partition or per remote peer; size it from such a process rather than from
+   a fleet average. A service near either limit is evidence of
+   over-registration before it is evidence of a low limit: recalculate item 6
+   and the fleet budget before raising a default.
 5. Multiple connections sharing a MeterProvider and multiple process replicas
    multiply the budget. The per-connection cap does not establish a global
    series bound. Retain the OTel aggregation cap, account for all connections
@@ -793,12 +840,12 @@ process." Borrowing a standard instrument name is what creates that exposure,
 and a second messaging integration in one process is the case that would hit
 it. The same scoping discipline applies here for the same reason.
 
-This applies Option A locally, as accepted ADR 0027 did. ADR 0026 itself is
-still Proposed at the evidence baseline; do not mark its broader refactor
-accepted as a side effect. Extend the root forbidden dependency prefixes to
-`github.com/nats-io/` and `github.com/akira-core/`. The guarantee is no new
-root-to-NATS-driver dependency, not byte-for-byte identical binaries or
-independent module version selection.
+This follows ADR 0026's accepted Option A — leaf views in `internal/views` — as
+ADR 0027 did; ADR 0026's Option B remains open and is not decided here. Extend
+the root forbidden dependency prefixes to `github.com/nats-io/` and
+`github.com/akira-core/`. The guarantee is no new root-to-NATS-driver
+dependency, not byte-for-byte identical binaries or independent module version
+selection.
 
 ## Semconv and global-state verification
 
@@ -831,13 +878,16 @@ global-state verification is claimed before the implementation exists.
 
 ## Migration and compatibility
 
+The reference migration is newchat's `pkg/natsmetrics` at its last public
+snapshot; the same mapping applies to any application recorder of that shape.
+
 | newchat baseline | Proposed replacement | Semantic change |
 |---|---|---|
 | `chat.nats.consumer.loop.up` | `o11y.nats.consumer.loops` | Application-reported loop count; not connectivity or handler cancellation |
 | `chat.nats.consumer.messages` | `o11y.nats.consumer.dispositions` | Completed invocation; failed settlement calls do not freeze a later successful disposition |
 | `chat.nats.consumer.processing.duration` | `messaging.process.duration` | Full callback duration and an error breakdown instead of disposition labels. Boundaries are unchanged — newchat already builds this histogram with `o11y.DefaultLatencyBuckets()`, which section 5 keeps — so a bucket-bound query keeps *parsing*, and that is the trap: what lands in those buckets now measures a different span of time (Q2). Re-evaluate every SLO over this family rather than porting it, and scope queries by version through the rollout |
 | `chat.nats.terminal.failures` | `o11y.nats.consumer.processing.failures` **and** `o11y.nats.consumer.receive.errors` | The one family splits in two — see the reason-by-reason mapping below. A panel that today breaks the single family down `by (reason)` must query both and must not sum them |
-| `chat.nats.publish.failures` and the two RPC histograms | Keep in newchat | No phase-1 ownership/name change |
+| `chat.nats.publish.failures` and the two RPC histograms | Keep in the application | No phase-1 ownership/name change |
 
 Where each `reason` value goes, because the split is not a clean partition:
 
@@ -865,31 +915,23 @@ map to the scoped/standard attributes in section 6. The processing histogram
 does not retain an outcome label. Operator queries must be reviewed against
 these mappings, not transformed by a prefix replacement alone.
 
-**Phase-1 inventory, counted at the evidence baseline.** Three numbers, because
-they are different sizes and the ADR previously quoted only the largest:
-
-| | Count |
-|---|---|
-| Services with a consumer to migrate | **5** — `message-gatekeeper`, `broadcast-worker`, `message-worker`, `notification-worker`, `room-worker` |
-| Consumer registrations (`ConsumerConfig` sites) | **5** |
-| Shared entry points to modify | **1** — `pkg/natsmetrics/loop.go`, which all five already go through |
-
-The "fifteen services" figure quoted elsewhere in earlier drafts is the whole
-`pkg/natsmetrics` import surface, which includes the publish and RPC recorders
-this phase defers. The shared loop is what makes the migration small: the
-observer calls land in one helper rather than in five hand-written loops.
-
-That lowers the **cost**; it is not what makes the SDK/application split
-correct. The split rests on which side can see what — the SDK holds the
-`jetstream.Msg` interface and its own pinned error surface, the application
-holds business failure, event vocabulary and scheduling — and that argument
-does not change with the number of call sites. A larger N would make this
-migration more expensive without making the boundary wrong.
+**Rollout order is the application's decision.** The SDK does not prescribe
+which consumers migrate first; three properties of a consumer decide its risk.
+One that already has application-side metrics changes semantics on migration:
+its dashboards and alerts are rewritten (below) and old and new series are not
+summable during the rollout, but its processing volume can be compared across
+the cutover. One with no metrics gains them without breaking anything, and has
+no baseline to compare against. A process that opens many consumers — one per
+partition or remote peer — exercises the identity limit (section 6) and
+belongs late. Starting with one low-volume, non-critical consumer per delivery
+mode an application uses gives each mode's wiring a real run before the
+critical paths depend on it.
 
 Implement SDK behavior first with characterization tests, then migrate AP
 call sites in a separate change. Keep scheduling, retry policy, panic guards,
-and any required delivery-metadata context bridge in the AP. A newchat handler
-that swallows a terminal failure must explicitly preserve that declaration.
+and any required delivery-metadata context bridge in the AP. An application
+handler that swallows a terminal failure must explicitly preserve that
+declaration.
 
 ### What phase 1 leaves behind in the application
 
@@ -988,15 +1030,24 @@ recording is enabled by default.
 
 At acceptance/implementation, update:
 
-- `nats/doc.go`: T2 tracing facade plus justified-T3 consumer metrics.
+- `nats/doc.go`: T2 tracing facade plus justified-T3 consumer metrics, added
+  with the code. The file already carries `// Tier: T2`, so
+  `scripts/check_integrations.go` passes with or without the T3 annotation;
+  the implementation's review must check it.
 - ADR 0008's NATS row and the qualification for pinned Development messaging
   conventions; amendments to ADRs 0004/0022 for the metric/API surface.
 - `docs/semconv.md`: instruments, custom keys, stream/subscription mapping,
   and the endpoint-label limitation. Do not list these as emitted before code lands.
 - Driver-free views, root wiring, dependency-prefix gate, provider/toggle tests.
-- `README.md`, `docs/guide.md`, `examples/README.md`, JetStream examples, and
-  CHANGELOG: the breaking `Connect` signature, `WithMetricsEnabled`, and the
-  explicit processing-boundary requirement.
+- `examples/jetstream/`: a new `Messages`-iterator worker built from section
+  3's example, and `subscriber` (`Consume`) and `fetch-worker` (`Fetch`)
+  converted to the observer, so every mode the facade offers has a compiled
+  example. CI's example build is what keeps this ADR's snippets from drifting
+  from the API; once the examples exist, they are authoritative over the
+  snippets here.
+- `README.md`, `docs/guide.md`, `examples/README.md`, and CHANGELOG: the
+  breaking `Connect` signature, `WithMetricsEnabled`, and the explicit
+  processing-boundary requirement.
 
 Required behavior tests, with a ManualReader and native-message fakes:
 
@@ -1007,13 +1058,13 @@ Required behavior tests, with a ManualReader and native-message fakes:
    semaphore wait; an early Ack does not stop the processing timer.
 3. Ack/DoubleAck failure followed by success; repeated terminal calls; Term
    failure; handler error without disposition; cancellation; abnormal unwind;
-   Ack followed by panic; concurrent state access under `-race`.
-4. Shutdown ordering, stated per mode because `Drain` means different things.
-   Native `ConsumeContext.Drain` (the `Consume` mode only) stops admission
-   while already-admitted deliveries finish; it does **not** wait for
-   goroutines the callback dispatched, which is the application's `wg.Wait()`
-   in the worked example. For `Messages`, `Next` and the batch modes there is
-   no native drain at all — the application stops fetching. In every mode,
+   Ack followed by panic; concurrent state access under `-race`. Nested
+   observation is recognised by wrapper identity, not by context.
+4. Shutdown ordering. `ConsumeContext.Drain` and `MessagesContext.Drain`
+   both stop receiving and let already-received deliveries through; neither
+   waits for goroutines the application dispatched, which is the
+   application's `wg.Wait()` in the worked example. `Next` and the batch modes
+   have no native drain — the application stops fetching. In every mode,
    iterator or batch closure does not finalize handlers, `Close` does not wait
    for in-flight `Observe` calls (Contract: Observer Close), and an abandoned
    unobserved message produces no fabricated completion sample.
@@ -1029,36 +1080,39 @@ Required behavior tests, with a ManualReader and native-message fakes:
 8. Scope-specific views preserve exact labels, units, explicit overrides, and
    default buckets on both Prometheus and OTLP. Root dependency checks keep
    NATS drivers out. AP scrape/registry migration has explicit coverage.
-9. The receive-error classifier is total and pinned: each sentinel in section
-   5's table maps to its stated reason, an unrecognised error is `internal`,
+9. The receive-error classifier is pinned: each sentinel in section 5's
+   table maps to its stated reason, an unrecognised error is `internal`,
    and `context.Canceled`/`context.DeadlineExceeded` end the loop while
    recording no sample. An unrecognised error must not change any behaviour
    beyond its label, so the suite proves the table is refinement rather than
    contract.
-10. Every delivery mode reaches `End` by its own route: `Next`/`Messages`
-    from the returned error, with a routine `nats.ErrTimeout` leaving the
-    loop open; the batch modes from `batch.Error()` after the channel closes,
-    with a `Stop`-induced `context.Canceled` producing no sample; `Consume`
-    from `ConsumeContext.Closed()`. Two loops on one observer read 2, and
-    ending one leaves the other counted.
-11. `OnConsumeError` fires for terminal and non-terminal errors alike, with a
-    context that outlives a cancelled registration context, and a
-    `jetstream.ConsumeErrHandler` passed in `opts` does not suppress the
-    observer's own recording.
+10. Every delivery mode reaches `End` by its own route, exercised against an
+    embedded `nats-server`: `Next`/`Messages` from the returned error, with
+    `nats.ErrTimeout` and `jetstream.ErrNoHeartbeat` leaving the loop open;
+    the batch modes from `batch.Error()` after the channel closes, with a
+    `Stop`-induced `context.Canceled` producing no sample; `Consume` from the
+    application's `Closed()` watcher. `End(ctx, nil)` before `Stop` leaves the
+    later `ErrMsgIteratorClosed` unrecorded. Two loops on one observer read 2,
+    and ending one leaves the other counted.
+11. Error classes are matched with `errors.Is`: a callback returning
+    `errors.Join(context.Canceled, settleErr)` records the cancellation
+    class, while the disposition records the failed settlement.
 12. The Loop and Observer Close contracts, with their counter-examples: one
     handle survives many batches and the gauge does not dip between them; two
     loops on one observer read 2; a handle never ended is closed by `Close` as
-    a normal ending with no failure sample; `Close` is idempotent, records
-    nothing afterwards, leaves the identity admitted and its vocabulary intact
-    so a replacement still gets the frozen vocabulary and still rejects an
-    incompatible one, and cycling observers does not raise the
+    a normal ending with no failure sample; `Close` is idempotent, a call
+    starting after it records nothing while an `Observe` entered before it
+    completes and records, and it leaves the identity admitted and its
+    vocabulary intact so a replacement still gets the frozen vocabulary and
+    still rejects an incompatible one; cycling observers does not raise the
     admitted-identity count.
-13. The Consume ending contract's four rules, each with its counter-example:
-    an application `Stop` records no failure; a `StopAfter` limit reached
-    after an earlier recoverable error records **no** failure, and in
-    particular not that error; a stop called from inside `OnConsumeError`
-    still counts as application-initiated; and a close with no evidence
-    records nothing rather than a synthetic reason.
+13. The Consume ending contract's four rules through the documented wiring,
+    against an embedded `nats-server`: an application stop preceded by
+    `End(ctx, nil)` records no failure; a `StopAfter` limit reached after an
+    earlier recoverable error records **no** failure, and in particular not
+    that error; a stop issued from a `ConsumeErrHandler` behaves as an
+    application stop; and a closure with no application stop lowers the
+    `loops` gauge while recording no receive error.
 14. The Disabled contract: an `AckNone` consumer constructs successfully with
     metrics off and fails setup with metrics on, while a malformed event
     allowlist fails in both.
@@ -1075,14 +1129,18 @@ it does not claim those implementation gates have passed.
 
 - **Publish failures and publisher vocabulary:** migrate together when the
   bounded destination/operation contract and readers are agreed. That trigger
-  needs a named owner at acceptance; without one the phase-1 duplication below
-  has no one to end it. A failures-
+  needs a named owner at acceptance; without one the phase-1 duplication
+  (What phase 1 leaves behind) has no one to end it. A failures-
   only counter has no acceptance denominator. Stream depth is not cumulative
   accepted publishes; Core NATS local publish success is not delivery. Keep
   newchat's documented blind spots explicit [S6].
-- **RPC metrics:** revisit after newchat's route-declared vocabulary change
-  ([PR #475](https://github.com/hmchangw/newchat/pull/475), open at research
-  time) settles and response-envelope failure classification is specified.
+- **RPC metrics:** revisit once response-envelope failure classification is
+  specified. The route-declared method vocabulary this also waited on has
+  landed in newchat ([PR #483](https://github.com/hmchangw/newchat/pull/483)).
+- **SDK-owned `Consume` wrapper:** add it as a `ConsumerObserver` method —
+  additive, since the type is concrete — when a named reader needs a
+  measurement only a `ConsumeErrHandler` can see, such as receive errors that
+  do not end the loop.
 - **Automatic delivery/client-operation instruments:** add when a named
   reader needs them, with handoff/buffer/abandonment boundaries defined for
   all modes. This is where the standard consumed/sent/operation instruments
@@ -1100,29 +1158,29 @@ and bounded custom disposition/failure dimensions make the measurements
 explainable. Root consumers do not acquire a NATS driver dependency merely
 because the SDK installs these views.
 
-The costs are a breaking provider argument, an explicit observation call at
-the processing boundary, maintained SDK-owned metric code, and a substantive
-AP query migration. Automatic instrumentation cannot cover work whose
-lifetime the application never exposes. Crash losses, broker acceptance, and
-business completion still require their own evidence. The existing four
-consumer families change semantics; this proposal is not a mechanical move
-of `pkg/natsmetrics`.
+The costs are a breaking provider argument, an explicit observation call at the
+processing boundary, a few lines of loop-ending wiring per delivery mode,
+maintained SDK-owned metric code, and a substantive AP query migration.
+Automatic instrumentation cannot cover work whose lifetime the application
+never exposes. Crash losses, broker acceptance, and business completion still
+require their own evidence. The existing four consumer families change
+semantics; this proposal is not a mechanical move of `pkg/natsmetrics`.
 
 ## Open decisions before acceptance
 
 | ID | Decision | Recommended position in this draft |
 |---|---|---|
-| Q1 | May processing observation require an explicit synchronous wrapper inside the actual worker? | Yes. Keep dispatch/lifetime control in AP code and avoid implicit completion guesses. |
-| Q2 | Preserve newchat's first-disposition timing or adopt full processing timing and completion-time disposition? | Adopt the definitions above; treat the migration as a semantic change. If preservation wins, use a custom duration name and revise the table before acceptance. |
+| Q1 | May processing observation require an explicit synchronous wrapper inside the actual worker? | Yes, with loop endings reported by the application in every mode, `Consume` included, through one mode-agnostic API (section 1). Keep dispatch/lifetime control in AP code and avoid implicit completion guesses. |
+| Q2 | Preserve an existing recorder's first-disposition timing (newchat's) or adopt full processing timing and completion-time disposition? | Adopt the definitions above; treat the migration as a semantic change. If preservation wins, use a custom duration name and revise the table before acceptance. |
 | Q3 | Are the consumer-only scope, 16-event/16-identity default limits, stream/subscription mapping, and endpoint-label omission acceptable for the first release? | Start with this bounded profile, validate it against real consumer inventories, and explicitly record the limitations. Do not raise limits without recalculating fleet/histogram cost. |
-| Q4 | Is the consumer migration acceptable given the failure signal it actually preserves, while publisher/RPC stay in newchat? | Qualified yes. Five instruments, but decide on what they carry, not that they exist: `receive.errors` is strong for `Next`/`Messages`/batch and **usually records nothing under `Consume`**, where the ending is authoritative but its cause is not (Contract: Consume ending, section 5). If that degradation is unacceptable, the honest alternative is to declare `receive.errors` unsupported for `Consume` rather than to fill it with unknown endings. |
+| Q4 | Is the consumer migration acceptable given the failure signal it actually preserves, while publisher/RPC stay in the application? | Qualified yes. Five instruments, but decide on what they carry, not that they exist: `receive.errors` is strong for `Next`/`Messages`/batch and **usually records nothing under `Consume`**, where the ending is authoritative but its cause is not (Contract: Consume ending, section 5). If that degradation is unacceptable, the honest alternative is to declare `receive.errors` unsupported for `Consume` rather than to fill it with unknown endings. |
 
 ### Q2 in detail: what each answer costs
 
-Q2 is the only one of the four that cannot be answered from this document as
-first drafted, because it asks an owner to accept a cost the draft describes
-but never totals. It bundles three independent changes, and the bundle — not
-any single element — is what makes the migration unmechanical:
+Q2 is the only one of the four that sections 3-5 cannot answer alone, because
+it asks an owner to accept a cost they describe but do not total. It bundles
+three independent changes, and the bundle — not any single element — is what
+makes the migration unmechanical:
 
 | | Preserve newchat's semantics | Adopt the definitions in sections 3-5 |
 |---|---|---|
@@ -1136,13 +1194,13 @@ any single element — is what makes the migration unmechanical:
 The asymmetry is that preservation is cheap exactly once and then permanent:
 keeping first-disposition timing forecloses the standard instrument name for
 the life of the integration, because the convention defines that instrument as
-the full processing operation. Adopting costs one reviewed migration, whose
-real size is in the inventory below rather than the whole `pkg/natsmetrics`
-surface.
+the full processing operation. Adopting costs one reviewed migration per
+application recorder.
 
 This draft recommends adopting. The recommendation is not free and should not
-be accepted as though it were: whoever accepts Q2 is accepting that the
-newchat migration PR is a re-reasoning of every consumer query, not a rename.
+be accepted as though it were: whoever accepts Q2 is accepting that an
+application's migration is a re-reasoning of every consumer query, not a
+rename.
 
 API names and the exact consumer-binding option layout should be reviewed
 with the first implementation, while preserving the contracts in sections
@@ -1162,5 +1220,6 @@ with the first implementation, while preserving the contracts in sections
   [cardinality implications](https://opentelemetry.io/blog/2026/cardinality-limits-in-opentelemetry/),
   and [Prometheus instrumentation practices](https://prometheus.io/docs/practices/instrumentation/).
 - [S6: newchat publish-failure evidence boundary](https://github.com/hmchangw/newchat/blob/28b97da1eb1554ecdfe12ea76121f23bce446c8c/pkg/natsmetrics/metrics.go#L589).
-- [ADR 0026 at the research baseline](https://github.com/flywindy/o11y/blob/e4aef2f1fb611504bd1da260956acb86cc533487/docs/adr/0026-sdk-integration-dependency-direction.md)
-  and [ADR 0027 at the research baseline](https://github.com/flywindy/o11y/blob/e4aef2f1fb611504bd1da260956acb86cc533487/docs/adr/0027-elasticsearch-metrics.md).
+- [ADR 0026](https://github.com/flywindy/o11y/blob/8eaede0f1245a2b989615eba23189aff5c14b57b/docs/adr/0026-sdk-integration-dependency-direction.md)
+  (Accepted, Option A, 2026-09-11) and
+  [ADR 0027](https://github.com/flywindy/o11y/blob/8eaede0f1245a2b989615eba23189aff5c14b57b/docs/adr/0027-elasticsearch-metrics.md).
