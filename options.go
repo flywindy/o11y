@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/flywindy/o11y/internal/baggageattrs"
 	"github.com/flywindy/o11y/internal/metrics"
@@ -65,8 +66,14 @@ type Config struct {
 	serviceVersion string
 	environment    string
 	otlpEndpoint   string
-	otlpHeaders    map[string]string
-	logLevel       slog.Level
+	// otlpEndpointSet records that WithOTLPEndpoint was given a non-empty
+	// value, so the standard OTEL_EXPORTER_OTLP_*ENDPOINT variables apply
+	// only when not.
+	otlpEndpointSet bool
+	// resolvedOTLP is where traces and logs go, resolved once by Init.
+	resolvedOTLP otlpEndpoints
+	otlpHeaders  map[string]string
+	logLevel     slog.Level
 
 	// Resource attributes added by WithResourceAttributes, on top of the
 	// service identity above and the detected host / process / SDK set.
@@ -142,7 +149,27 @@ func WithEnvironment(env string) Option {
 
 // WithOTLPEndpoint sets the OTLP/HTTP collector endpoint used for traces and
 // logs. The endpoint must be reachable by the SDK's process (no proxy is
-// configured by this package).
+// configured by this package), and must be an http:// or https:// URL with a
+// host; Init rejects anything else.
+//
+// When the option is not given, the standard variables apply, with the OTel
+// specification's precedence: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT and
+// OTEL_EXPORTER_OTLP_LOGS_ENDPOINT over OTEL_EXPORTER_OTLP_ENDPOINT, and with
+// none of them set, http://localhost:4318. The option itself always wins
+// over the variables. A signal variable is used as given, minus any
+// trailing slash, and gets /v1/traces or /v1/logs when it has no path (the
+// specification would send to "/"); the generic one is a base URL the
+// signal's path is appended to. Values are trimmed, the same rules apply to
+// traces and logs, and the URL's scheme decides TLS for both:
+// OTEL_EXPORTER_OTLP_INSECURE and its TRACES_ / LOGS_ variants have no
+// effect. A variable the endpoint comes from must meet the same http(s)
+// and host requirement, and is rejected when OTEL_EXPORTER_OTLP_PROTOCOL
+// (or the signal's PROTOCOL variable) asks for grpc, since this SDK sends
+// OTLP over HTTP only. The endpoint is trimmed, as the variables are, and
+// an empty one undoes the option, so
+// WithOTLPEndpoint(os.Getenv("COLLECTOR_URL")) falls back to the variables
+// and the default when COLLECTOR_URL is unset, as WithMetricsOTLPEndpoint("")
+// leaves metrics on the pull path.
 //
 // Production note: prefer https:// in production deployments. The default
 // http://localhost:4318 is intended for local development against an OTel
@@ -155,8 +182,13 @@ func WithEnvironment(env string) Option {
 // Datadog, ...), pair this option with WithOTLPHeaders to attach the API
 // token / Bearer header to every OTLP request.
 func WithOTLPEndpoint(endpoint string) Option {
+	endpoint = strings.TrimSpace(endpoint)
 	return func(c *Config) {
-		c.otlpEndpoint = endpoint
+		if endpoint == "" {
+			c.otlpEndpoint, c.otlpEndpointSet = defaultOTLPEndpoint, false
+			return
+		}
+		c.otlpEndpoint, c.otlpEndpointSet = endpoint, true
 	}
 }
 
@@ -435,10 +467,15 @@ func appendResourceAttribute(c *Config, kv attribute.KeyValue) []attribute.KeyVa
 // to OTLP push. When set, the /metrics HTTP server is not started and metrics
 // are exported via OTLP/HTTP to the given endpoint. Use this for serverless
 // environments (Lambda, Cloud Run) where exposing a scrape port is not
-// possible. When unset, the default Prometheus pull model is used.
+// possible. When unset or blank, the default Prometheus pull model is used.
+// The endpoint is trimmed and must be an http:// or https:// URL with a
+// host; Init rejects
+// anything else. The OTEL_EXPORTER_OTLP_*ENDPOINT variables do not stand in
+// for this option.
 //
 // Example: o11y.WithMetricsOTLPEndpoint("http://collector:4318")
 func WithMetricsOTLPEndpoint(endpoint string) Option {
+	endpoint = strings.TrimSpace(endpoint)
 	return func(c *Config) {
 		c.metricsOTLPEndpoint = endpoint
 	}
@@ -744,7 +781,7 @@ func WithMaxUniqueCollections(n int) Option {
 // builds its logger.
 func defaultConfig() *Config {
 	cfg := &Config{
-		otlpEndpoint:         "http://localhost:4318",
+		otlpEndpoint:         defaultOTLPEndpoint,
 		logLevel:             slog.LevelInfo,
 		metricsAddr:          DefaultMetricsAddr,
 		runtimeMetrics:       true,

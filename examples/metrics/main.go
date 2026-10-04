@@ -45,7 +45,9 @@ func main() {
 		o11y.WithServiceVersion("0.1.0"),
 		o11y.WithEnvironment("development"),
 		o11y.WithServiceNamespace("platform"),
-		o11y.WithOTLPEndpoint("http://localhost:4318"),
+		// Traces and logs go to OTEL_EXPORTER_OTLP_ENDPOINT when it is set, else to
+		// http://localhost:4318; WithOTLPEndpoint would override both. Metrics
+		// go only where WithMetricsOTLPEndpoint below says.
 		// Push metrics via OTLP instead of exposing a Prometheus scrape endpoint.
 		// The OTel Collector forwards them to Prometheus via remote write.
 		o11y.WithMetricsOTLPEndpoint("http://localhost:4318"),

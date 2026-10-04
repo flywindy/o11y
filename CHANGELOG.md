@@ -83,6 +83,41 @@ adopters can plan their upgrades.
 
 ### Fixed
 
+- `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and
+  `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` are honoured when `WithOTLPEndpoint` is
+  not given. The SDK always passed its `http://localhost:4318` default to the
+  exporters, which override the variables, so a service deployed with the
+  standard variables (the OTel Operator, a Helm chart) and no option sent
+  traces and logs to localhost while `Init` still validated the variables.
+  The precedence is now the specification's: `WithOTLPEndpoint`, then the
+  signal variable, then the generic one (a base URL, with `/v1/traces` or
+  `/v1/logs` appended), then `http://localhost:4318`. `Init` resolves the
+  variables itself, so traces and logs read them alike: trimmed, the URL's
+  scheme deciding TLS (`OTEL_EXPORTER_OTLP_INSECURE` has no effect, as it had
+  none with the option), and a signal variable used as given minus a
+  trailing slash, with `/v1/traces` or `/v1/logs` when it has no path or
+  only `/` (where the specification sends to `/`). The `WithOTLPEndpoint`
+  value is trimmed too, and a blank one now undoes the option, so the
+  variables still apply. The README and the
+  examples no longer pass
+  `WithOTLPEndpoint("http://localhost:4318")`, which would override the
+  variables in copied code (the profiling example keeps its own
+  `OTLP_ENDPOINT` override). Metrics are unchanged: the push path still takes
+  its endpoint from `WithMetricsOTLPEndpoint` only.
+- An OTLP endpoint without an `http://` or `https://` scheme and a host now
+  fails `Init`, naming the option or variable but not the value.
+  `WithOTLPEndpoint("collector:4318")` parsed with `collector` as its scheme
+  and no host and left an exporter whose every export failed with
+  `http: no Host in request URL`; `"10.0.0.7:4318"` failed with only "not a
+  valid URL". The same rule applies to `WithMetricsOTLPEndpoint` and to the
+  endpoint variable traces or logs are sent to; a variable the option
+  overrides keeps only the check it had before (with traces on, the trace
+  exporter's endpoint variables must parse). `WithMetricsOTLPEndpoint`
+  trims its value as `WithOTLPEndpoint` now does, so one value read from
+  the environment can feed both. Such a variable also fails `Init` when
+  `OTEL_EXPORTER_OTLP_PROTOCOL` (or the signal's protocol variable) asks for
+  `grpc`: the SDK sends OTLP over HTTP only.
+
 - `redis`: a pool Wrap names itself keeps its name across restarts. The
   default `db.client.connection.pool.name` was `redis-<hex>`, the wrapped
   client's pointer address, which changed on every restart and rollout and so
@@ -158,6 +193,16 @@ adopters can plan their upgrades.
   reports its connection count once instead of per state.
 
 ### Migration
+
+- **o11y: the OTLP endpoint variables now take effect without
+  `WithOTLPEndpoint`.** A service that sets `OTEL_EXPORTER_OTLP_ENDPOINT` (or
+  the `TRACES_` / `LOGS_` variant) and does not pass `WithOTLPEndpoint` sends
+  traces and logs there instead of to `http://localhost:4318`. Check the
+  variables your manifests inject before upgrading; pass `WithOTLPEndpoint`
+  to keep a fixed endpoint. An endpoint without an `http://` or `https://`
+  scheme and a host, from the option or from such a variable, now fails
+  `Init` instead of producing an exporter that never sends, and so does
+  such a variable next to `OTEL_EXPORTER_OTLP_PROTOCOL=grpc`.
 
 - **gin: a 5xx span with gin errors now has an empty status description**
   (it was `c.Errors.String()`, e.g. `Error #01: database down`). otelgin sets

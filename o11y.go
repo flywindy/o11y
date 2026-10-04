@@ -492,6 +492,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	if err := validateOTLPExporterEnv(cfg); err != nil {
 		return nil, err
 	}
+	resolveOTLPEndpoints(cfg)
 	if err := validateConfiguredEndpoints(cfg); err != nil {
 		return nil, err
 	}
@@ -519,7 +520,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		if whitelist.Len() > 0 {
 			spanProcessors = append(spanProcessors, whitelist.NewSpanProcessor())
 		}
-		tp, p, initErr := trace.InitTracer(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, providerRes, cfg.sampler, exportFailures, spanProcessors...)
+		tp, p, initErr := trace.InitTracer(ctx, cfg.resolvedOTLP.trace.url, cfg.otlpHeaders, providerRes, cfg.sampler, exportFailures, spanProcessors...)
 		if initErr != nil {
 			return nil, initErr
 		}
@@ -612,7 +613,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	var logger *slog.Logger
 
 	if cfg.logEnabled {
-		lp, initErr := o11ylog.InitLogger(ctx, cfg.otlpEndpoint, cfg.otlpHeaders, providerRes, exportFailures)
+		lp, initErr := o11ylog.InitLogger(ctx, cfg.resolvedOTLP.log.url, cfg.otlpHeaders, providerRes, exportFailures)
 		if initErr != nil {
 			closeAll(ctx, metricsCloser, mpShutdown, tpShutdown)
 			return nil, initErr
@@ -749,11 +750,11 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 
 	// Both diagnostics write to stdout only: an OTel-internal error about the
 	// OTLP log pipeline must not be queued behind the batch that is failing.
-	// Both redact the configured endpoints and the header values the
+	// Both redact the endpoints (see diagnosticEndpoints) and the header values the
 	// exporters may echo back (see diagnosticSecrets).
-	diagnosticEndpoints := []string{cfg.otlpEndpoint, cfg.metricsOTLPEndpoint, cfg.profilingEndpoint}
-	errorHandler := newOTelErrorHandler(slog.New(stdoutHandler), diagnosticEndpoints...)
-	errorHandler.secrets = diagnosticSecrets(cfg)
+	redactEndpoints, secrets := diagnosticEndpoints(cfg), diagnosticSecrets(cfg)
+	errorHandler := newOTelErrorHandler(slog.New(stdoutHandler), redactEndpoints...)
+	errorHandler.secrets = secrets
 
 	return &SDK{
 		Logger:     logger,
@@ -772,9 +773,9 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 		flushSignals:           flushSignals,
 		flushMetrics:           mpFlush,
 		errorHandler:           errorHandler,
-		logr:                   newLogr(slog.New(stdoutHandler), diagnosticEndpoints, diagnosticSecrets(cfg)),
-		diagnosticEndpoints:    diagnosticEndpoints,
-		diagnosticSecrets:      diagnosticSecrets(cfg),
+		logr:                   newLogr(slog.New(stdoutHandler), redactEndpoints, secrets),
+		diagnosticEndpoints:    redactEndpoints,
+		diagnosticSecrets:      secrets,
 	}, nil
 }
 

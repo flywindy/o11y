@@ -362,27 +362,31 @@ func writeTestKeyPair(t *testing.T, dir string) (certPath, keyPath string) {
 // error that names the option and the parser's reason but never the value,
 // and that only an endpoint an enabled OTLP exporter uses is checked.
 func TestValidateConfiguredEndpoints(t *testing.T) {
+	validateEndpoints := func(cfg *Config) error {
+		resolveOTLPEndpoints(cfg)
+		return validateConfiguredEndpoints(cfg)
+	}
 	// #nosec G101 -- fabricated fixture endpoint, not a live credential
 	// nosemgrep: gosec.G101-1
 	const bad = "http://user:secret%zz@collector:4318"
 
-	err := validateConfiguredEndpoints(&Config{traceEnabled: true, otlpEndpoint: bad})
+	err := validateEndpoints(&Config{traceEnabled: true, otlpEndpointSet: true, otlpEndpoint: bad})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "WithOTLPEndpoint is not a valid URL")
 	assert.NotContains(t, err.Error(), "secret", "the value stays out of the error")
 	assert.NotContains(t, err.Error(), "%zz", "and so does the parser's message, which quotes the escape")
 
-	err = validateConfiguredEndpoints(&Config{traceEnabled: true, otlpEndpoint: "http://collector:BearerSecret"})
+	err = validateEndpoints(&Config{traceEnabled: true, otlpEndpointSet: true, otlpEndpoint: "http://collector:BearerSecret"})
 	require.Error(t, err)
 	assert.NotContains(t, err.Error(), "BearerSecret", "the parser quotes a non-numeric port in its message")
 
-	err = validateConfiguredEndpoints(&Config{metricsEnabled: true, metricsOTLPEndpoint: bad})
+	err = validateEndpoints(&Config{metricsEnabled: true, metricsOTLPEndpoint: bad})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "WithMetricsOTLPEndpoint is not a valid URL")
 	assert.NotContains(t, err.Error(), "secret")
 
-	require.NoError(t, validateConfiguredEndpoints(&Config{metricsEnabled: true, otlpEndpoint: bad}), "no trace or log exporter uses the OTLP endpoint")
-	require.NoError(t, validateConfiguredEndpoints(&Config{traceEnabled: true, logEnabled: true, otlpEndpoint: "http://collector:4318", metricsEnabled: true, metricsOTLPEndpoint: "http://collector:4318"}))
+	require.NoError(t, validateEndpoints(&Config{metricsEnabled: true, otlpEndpointSet: true, otlpEndpoint: bad}), "no trace or log exporter uses the OTLP endpoint")
+	require.NoError(t, validateEndpoints(&Config{traceEnabled: true, logEnabled: true, otlpEndpointSet: true, otlpEndpoint: "http://collector:4318", metricsEnabled: true, metricsOTLPEndpoint: "http://collector:4318"}))
 }
 
 // TestValidateConfiguredHeaders pins that a configured header name that is
@@ -798,7 +802,9 @@ func TestDiagnosticSecrets_CoversEndpointDerivedBasicAuth(t *testing.T) {
 	// nosemgrep: hardcoded-credential-literal,gosec.G101-1
 	const profiles = "http://bob:pr0filePass@pyroscope:4040"
 
-	secrets := diagnosticSecrets(&Config{otlpEndpoint: traces, profilingEndpoint: profiles})
+	cfg := &Config{traceEnabled: true, otlpEndpoint: traces, otlpEndpointSet: true, profilingEndpoint: profiles}
+	resolveOTLPEndpoints(cfg)
+	secrets := diagnosticSecrets(cfg)
 
 	for _, endpoint := range []string{traces, profiles} {
 		derived := redact.BasicAuthHeader(endpoint)
