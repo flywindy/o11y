@@ -18,6 +18,7 @@ import (
 	"maps"
 	"math"
 	"os"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -1002,6 +1003,16 @@ func validateHistogramBuckets(buckets []float64) error {
 		return errors.New("histogram buckets must not be empty (use WithHistogramBuckets " +
 			"to override, or accept the default)")
 	}
+	return checkHistogramBoundaries(buckets)
+}
+
+// checkHistogramBoundaries holds the boundary rules validateHistogramBuckets
+// and validateHistogramBucketOverrides share, with error text that names
+// neither option, so each caller adds its own context.
+func checkHistogramBoundaries(buckets []float64) error {
+	if len(buckets) == 0 {
+		return errors.New("histogram buckets must not be empty")
+	}
 	for i, b := range buckets {
 		if math.IsNaN(b) || math.IsInf(b, 0) {
 			return fmt.Errorf("histogram bucket[%d] = %v must be a finite number", i, b)
@@ -1019,11 +1030,16 @@ func validateHistogramBuckets(buckets []float64) error {
 	return nil
 }
 
+// instrumentNamePattern is the OTel API's instrument-name syntax: a letter,
+// then up to 254 letters, digits, '_', '.', '-' or '/'.
+var instrumentNamePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_./-]{0,254}$`)
+
 // validateHistogramBucketOverrides checks every WithInstrumentHistogramBuckets
-// entry: the name must be a non-blank exact instrument name, since views match
-// it literally and a wildcard would silently match nothing, and the boundaries
-// must pass validateHistogramBuckets. Names are checked in sorted order so the
-// reported error does not depend on map iteration.
+// entry: the name must be a valid OTel instrument name, since views match it
+// literally and anything else — a wildcard, stray whitespace — would silently
+// match nothing, and the boundaries must pass checkHistogramBoundaries. Names
+// are checked in sorted order so the reported error does not depend on map
+// iteration.
 func validateHistogramBucketOverrides(overrides map[string][]float64) error {
 	for _, name := range slices.Sorted(maps.Keys(overrides)) {
 		if strings.TrimSpace(name) == "" {
@@ -1034,7 +1050,12 @@ func validateHistogramBucketOverrides(overrides map[string][]float64) error {
 			return fmt.Errorf("histogram bucket override for %q: wildcard instrument names are not "+
 				"supported; name each instrument exactly", name)
 		}
-		if err := validateHistogramBuckets(overrides[name]); err != nil {
+		if !instrumentNamePattern.MatchString(name) {
+			return fmt.Errorf("histogram bucket override for %q: not a valid OTel instrument name "+
+				"(a letter, then up to 254 of [A-Za-z0-9_./-]); use the instrument's OTel name, "+
+				"not its Prometheus family name", name)
+		}
+		if err := checkHistogramBoundaries(overrides[name]); err != nil {
 			return fmt.Errorf("histogram bucket override for %q: %w", name, err)
 		}
 	}

@@ -13,6 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/flywindy/o11y"
 	"github.com/flywindy/o11y/internal/testutil"
@@ -117,6 +119,10 @@ func TestInit_RejectsInvalidInstrumentHistogramBuckets(t *testing.T) {
 		{"blank name", "  ", []float64{1}, "instrument name must not be empty"},
 		{"star wildcard", "rpc.*.call.duration", []float64{1}, "wildcard"},
 		{"question wildcard", "rpc.server.call.duratio?", []float64{1}, "wildcard"},
+		{"surrounding space", " rpc.server.call.duration", []float64{1}, "not a valid OTel instrument name"},
+		{"inner space", "rpc server duration", []float64{1}, "not a valid OTel instrument name"},
+		{"leading digit", "1rpc.duration", []float64{1}, "not a valid OTel instrument name"},
+		{"too long", "a" + strings.Repeat("b", 255), []float64{1}, "not a valid OTel instrument name"},
 		{"empty buckets", "rpc.server.call.duration", nil, "must not be empty"},
 		{"unsorted", "rpc.server.call.duration", []float64{30, 1}, "strictly increasing"},
 		{"non-positive", "rpc.server.call.duration", []float64{0, 1}, "must be strictly positive"},
@@ -129,6 +135,8 @@ func TestInit_RejectsInvalidInstrumentHistogramBuckets(t *testing.T) {
 			_, err := o11y.Init(context.Background(), opts...)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tc.want)
+			assert.NotContains(t, err.Error(), "use WithHistogramBuckets",
+				"an override error must not point at the shared option")
 			if strings.TrimSpace(tc.instrument) != "" {
 				assert.Contains(t, err.Error(), tc.instrument)
 			}
@@ -201,4 +209,47 @@ func TestWithHistogramBuckets_DefaultCoversRPCDurations(t *testing.T) {
 	}
 	want = append(want, "+Inf")
 	assert.Equal(t, want, scrapeBucketBounds(t, addr, "rpc_server_call_duration_seconds"))
+}
+
+// TestWithInstrumentHistogramBuckets_AcceptsGrammarEdges pins names at the
+// edges of the OTel instrument-name grammar that Init must accept.
+func TestWithInstrumentHistogramBuckets_AcceptsGrammarEdges(t *testing.T) {
+	srv := testutil.FakeOTLPServer(t)
+	for _, name := range []string{
+		"a",
+		"App/Queue-Wait_time.seconds",
+		"a" + strings.Repeat("b", 254),
+	} {
+		opts := append(commonOpts(srv.URL), o11y.WithInstrumentHistogramBuckets(name, []float64{1}))
+		sdk, err := o11y.Init(t.Context(), opts...)
+		require.NoError(t, err, name)
+		testutil.MustShutdown(t.Context(), t, sdk)
+	}
+}
+
+// TestRPCMetricViews pins the public re-export services that build their own
+// MeterProvider use: it claims the two semconv RPC histograms in seconds and
+// gives them the boundaries passed in.
+func TestRPCMetricViews(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader),
+		sdkmetric.WithView(o11y.RPCMetricViews([]float64{1, 30})...))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+
+	for _, name := range []string{"rpc.server.call.duration", "rpc.client.call.duration"} {
+		h, err := mp.Meter("app").Float64Histogram(name, metric.WithUnit("s"),
+			metric.WithExplicitBucketBoundaries(o11y.DefaultLatencyBuckets()...))
+		require.NoError(t, err)
+		h.Record(t.Context(), 2)
+	}
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+	require.Len(t, rm.ScopeMetrics, 1)
+	require.Len(t, rm.ScopeMetrics[0].Metrics, 2)
+	for _, m := range rm.ScopeMetrics[0].Metrics {
+		h, ok := m.Data.(metricdata.Histogram[float64])
+		require.True(t, ok, m.Name)
+		assert.Equal(t, []float64{1, 30}, h.DataPoints[0].Bounds, m.Name)
+	}
 }

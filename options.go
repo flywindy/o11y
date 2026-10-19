@@ -540,26 +540,33 @@ func WithHistogramBuckets(buckets []float64) Option {
 	}
 }
 
-// WithInstrumentHistogramBuckets gives the histogram named instrument its own
-// bucket boundaries, overriding both WithHistogramBuckets and any boundaries
-// the instrument advises when it is created
-// (metric.WithExplicitBucketBoundaries). Use it for a latency histogram whose
-// range the shared set does not cover — a request/reply call with a 30s
-// timeout, say, whose slow tail would otherwise all land in the +Inf bucket
-// above the default 10s boundary.
+// WithInstrumentHistogramBuckets gives the latency histogram named instrument
+// its own bucket boundaries, in seconds, overriding both WithHistogramBuckets
+// and any boundaries the instrument advises when it is created
+// (metric.WithExplicitBucketBoundaries).
 //
-// It applies to any histogram recorded through the SDK's MeterProvider, not
-// only those WithHistogramBuckets covers: an application's own instrument
-// takes it the same way as http.server.request.duration. Where the SDK does
-// have a view for the instrument, only that view's boundaries change; its
-// attribute allow-list, if it has one, keeps applying. The override covers every instrumentation scope that
-// records the name, so db.client.operation.duration reshapes the redis,
-// mongo, cassandra and elasticsearch histograms together.
+// Use it where the instrument's author cannot or should not choose: a
+// histogram the SDK already has a view for (one of the WithHistogramBuckets
+// list, reshaped alone instead of with the rest of that list), or one a
+// third-party library records with boundaries that do not fit this service.
+// An instrument the application creates itself can usually just advise the
+// boundaries it wants, unless WithHistogramBuckets covers its name.
 //
-// instrument is matched exactly and case-sensitively; wildcards are rejected.
-// Boundaries follow the same rules as WithHistogramBuckets. A later call for
-// the same instrument replaces an earlier one. Instruments of another kind
-// that share the name are unaffected.
+// Where the SDK has a view for the instrument, only that view's boundaries
+// change; its attribute allow-list, if it has one, keeps applying and no
+// second stream appears. Any other histogram of that name gets a view of its
+// own. The override covers every instrumentation scope that records the name,
+// so db.client.operation.duration reshapes the redis, mongo, cassandra and
+// elasticsearch histograms together.
+//
+// instrument is the OTel instrument name (rpc.server.call.duration), not the
+// Prometheus family it renders as (rpc_server_call_duration_seconds). It is
+// matched exactly and case-sensitively; Init rejects wildcards and anything
+// outside the OTel instrument-name syntax, since such a name would silently
+// match nothing. Boundaries follow the same rules as WithHistogramBuckets. A
+// later call for the same instrument replaces an earlier one. Instruments of
+// another kind that share the name, and views that drop the instrument or
+// choose a non-explicit aggregation, are unaffected.
 //
 // Prefer extending the default set (DefaultLatencyBuckets plus higher
 // boundaries) over replacing it: the boundaries the two sets share keep
@@ -639,7 +646,10 @@ func WithExemplars(enabled bool) Option {
 	}
 }
 
-// WithDisableDefaultViews disables SDK-managed HTTP metric views.
+// WithDisableDefaultViews disables SDK-managed HTTP metric views: their
+// attribute allow-lists and their WithHistogramBuckets boundaries. The
+// datastore and RPC views stay, and WithInstrumentHistogramBuckets overrides
+// still apply, an HTTP instrument included.
 func WithDisableDefaultViews() Option {
 	return func(c *Config) {
 		c.disableDefaultViews = true
