@@ -25,6 +25,18 @@ adopters can plan their upgrades.
 
 ### Security
 
+- Raise the minimum Go version to 1.26 (`go 1.26.0` in `go.mod`) and bump
+  `golang.org/x/net` to v0.61.0 (with `x/crypto` v0.58.0, `x/sync` v0.24.0,
+  `x/sys` v0.49.0 and `x/text` v0.43.0). Go 1.25 left support when Go 1.27
+  shipped on 2026-08-19 (its last release, go1.25.14, came out the same
+  day), and no 1.25.x release fixes GO-2026-6599, 6600, 6603, 6605, 6607,
+  6608, 6610, 6611, 6612, 6613 and 6617 (`net/http`, `net/textproto`,
+  `crypto/tls`, `html/template`; fixed in go1.26.9); the `x/net` fixes for
+  the ones it shares (v0.60.0 and later) themselves require Go 1.26. The
+  stdlib fixes reach a binary only through the toolchain that builds it:
+  `go 1.26.0` admits go1.26.0–1.26.8, which still carry them, so build with
+  go1.26.9 or later. CI's govulncheck now runs on go1.26.9.
+
 - Bump OpenTelemetry Go to v1.46.0 (log modules v0.22.0, contrib v0.71.0,
   Prometheus exporter v0.68.0) for GO-2026-6505 (`otel/sdk`, `otlptrace`,
   `otlptracehttp` before v1.45.0) and GO-2026-6615 (`otel/sdk/log` before
@@ -158,6 +170,15 @@ adopters can plan their upgrades.
   reports its connection count once instead of per state.
 
 ### Migration
+
+- **Go 1.26 or later is required.** With the default `GOTOOLCHAIN=auto`,
+  `go get` on this release raises the dependent module's `go` line to
+  1.26.0 and switches to a Go 1.26 toolchain, downloading it if needed.
+  With `GOTOOLCHAIN=local` — the default in the official `golang` Docker
+  images — a Go 1.25 toolchain stops instead, with
+  `github.com/flywindy/o11y@vX requires go >= 1.26.0 (running go 1.25.x;
+  GOTOOLCHAIN=local)`. Move CI images and Dockerfiles to go1.26.9 or later
+  (which also carries the stdlib fixes above) before upgrading.
 
 - **gin: a 5xx span with gin errors now has an empty status description**
   (it was `c.Errors.String()`, e.g. `Error #01: database down`). otelgin sets

@@ -19,7 +19,7 @@ so that every log entry is automatically enriched with `traceId` and `spanId`.
 
 | Layer | Choice | Notes |
 |---|---|---|
-| Language | Go 1.25+ | Use standard library where possible |
+| Language | Go 1.26+ | Use standard library where possible |
 | Tracing | OpenTelemetry Go SDK (OTLP/HTTP) | Not gRPC — keep it simple for local dev |
 | Logging | `log/slog` + `otelslog` bridge | Dual output: OTLP/HTTP → Loki (full OTel Log Data Model) and JSON stdout; `OtelSlogHandler` injects traceId / spanId on stdout path |
 | Metrics | Prometheus pull (`:2112`) or OTLP push | Pull: k8s pods scraped by Prometheus; Push: `WithMetricsOTLPEndpoint` for local dev / serverless |

@@ -14,11 +14,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Review this pin when Go publishes a new 1.25.x security patch.
-  # go1.25.13 fixes seven stdlib advisories that go1.25.12 is affected by,
-  # including GO-2026-6088 (encoding/xml recursion depth), GO-2026-5972
-  # (encoding/asn1 recursion depth), and GO-2026-5026 (x/net/idna Punycode).
-  GOVULNCHECK_GOTOOLCHAIN: go1.25.13
+  # Review this pin when Go publishes a new 1.26.x security patch.
+  # go1.26.9 fixes eleven stdlib advisories (GO-2026-6599/6600/6603/6605/
+  # 6607/6608/6610/6611/6612/6613/6617 in net/http, net/textproto,
+  # crypto/tls and html/template) that no 1.25.x release fixes: Go 1.25
+  # left support when Go 1.27 shipped on 2026-08-19.
+  GOVULNCHECK_GOTOOLCHAIN: go1.26.9
 
 jobs:
   test:
@@ -30,7 +31,7 @@ jobs:
 
       # Tests run on the Go version declared in go.mod so we exercise
       # exactly the stdlib surface our minimum-supported toolchain ships.
-      # govulncheck (in the vuln job below) uses a patched Go 1.25 toolchain
+      # govulncheck (in the vuln job below) uses a patched Go 1.26 toolchain
       # so it sees stdlib CVE fixes on our supported Go line.
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
@@ -95,13 +96,13 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
-      # govulncheck must see a patched Go 1.25 stdlib so vulnerability matches
+      # govulncheck must see a patched Go 1.26 stdlib so vulnerability matches
       # reflect what a freshly-built binary on our supported Go line would link.
       # Use setup-go for cache/path setup, then force the exact patched toolchain
-      # through GOTOOLCHAIN because setup-go's 1.25.x manifest can lag releases.
+      # through GOTOOLCHAIN because setup-go's 1.26.x manifest can lag releases.
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
         with:
-          go-version: '1.25.x'
+          go-version: '1.26.x'
           check-latest: true
           cache: true
 
