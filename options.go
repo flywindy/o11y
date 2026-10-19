@@ -103,6 +103,10 @@ type Config struct {
 	extraHTTPServerAttrKeys []string
 	exemplars               bool
 
+	// histogramBucketOverrides maps an instrument name to the boundaries
+	// WithInstrumentHistogramBuckets set for it.
+	histogramBucketOverrides map[string][]float64
+
 	// Feature toggles. Trace, metrics, and log default to true; profiling
 	// defaults to false because it is an opt-in fourth signal. All four can
 	// be overridden via WithTraceEnabled / WithMetricsEnabled /
@@ -514,10 +518,9 @@ func WithRuntimeMetrics(enabled bool) Option {
 // take resolution from exactly the range a datastore histogram lives in. How
 // much is a question about the deployment — a network hop, a loaded server or
 // a large value moves it — so read the datastore panels after changing these,
-// rather than assuming the effect from the HTTP ones. There is no
-// per-signal form of this option and no way to add a view through Init, so a
-// service that needs different boundaries for one of these has to build its
-// own MeterProvider.
+// rather than assuming the effect from the HTTP ones. To give one histogram
+// different boundaries without reshaping the rest, use
+// WithInstrumentHistogramBuckets instead.
 //
 // WithDisableDefaultViews does not narrow this. It drops the SDK's HTTP views
 // only; the datastore views are installed as extra views and keep whatever
@@ -529,6 +532,42 @@ func WithRuntimeMetrics(enabled bool) Option {
 func WithHistogramBuckets(buckets []float64) Option {
 	return func(c *Config) {
 		c.histogramBuckets = cloneFloat64s(buckets)
+	}
+}
+
+// WithInstrumentHistogramBuckets gives the histogram named instrument its own
+// bucket boundaries, overriding both WithHistogramBuckets and any boundaries
+// the instrument advises when it is created
+// (metric.WithExplicitBucketBoundaries). Use it for a latency histogram whose
+// range the shared set does not cover — a request/reply call with a 30s
+// timeout, say, whose slow tail would otherwise all land in the +Inf bucket
+// above the default 10s boundary.
+//
+// It applies to any histogram recorded through the SDK's MeterProvider, not
+// only those the SDK installs a view for: an application- or library-defined
+// instrument such as rpc.server.call.duration takes it the same way as
+// http.server.request.duration. Where the SDK does have a view for the
+// instrument, only that view's boundaries change; its attribute allow-list
+// keeps applying. The override covers every instrumentation scope that
+// records the name, so db.client.operation.duration reshapes the redis,
+// mongo, cassandra and elasticsearch histograms together.
+//
+// instrument is matched exactly and case-sensitively; wildcards are rejected.
+// Boundaries follow the same rules as WithHistogramBuckets. A later call for
+// the same instrument replaces an earlier one. Instruments of another kind
+// that share the name are unaffected.
+//
+// Prefer extending the default set (DefaultLatencyBuckets plus higher
+// boundaries) over replacing it: the boundaries the two sets share keep
+// percentiles comparable with other services, and SLO bounds stay on a
+// boundary. Each extra boundary adds one _bucket series per attribute set.
+func WithInstrumentHistogramBuckets(instrument string, buckets []float64) Option {
+	buckets = cloneFloat64s(buckets)
+	return func(c *Config) {
+		if c.histogramBucketOverrides == nil {
+			c.histogramBucketOverrides = make(map[string][]float64)
+		}
+		c.histogramBucketOverrides[instrument] = cloneFloat64s(buckets)
 	}
 }
 

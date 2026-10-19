@@ -15,6 +15,14 @@ adopters can plan their upgrades.
 
 ### Added
 
+- `WithInstrumentHistogramBuckets(name, buckets)` gives one histogram its own
+  bucket boundaries, matched by exact instrument name in every scope. It
+  overrides `WithHistogramBuckets` and the instrument's own advisory
+  boundaries, so it reaches histograms the SDK has no view for — e.g. an
+  application's `rpc.server.call.duration` whose 30s timeout lies past the
+  default 10s top boundary. On an SDK-viewed instrument only the boundaries
+  change; the view's attribute allow-list keeps applying. `Init` rejects an
+  empty or wildcard name and invalid boundaries.
 - `SDK.ForceFlush(ctx)` exports the buffered spans and log records
   (concurrently), then the metrics collected so far on the OTLP push path,
   without shutting the SDK down — for serverless handlers and other

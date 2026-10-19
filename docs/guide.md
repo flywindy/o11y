@@ -401,10 +401,31 @@ widening the buckets for a slow HTTP endpoint takes resolution from the range
 those histograms live in. Where exactly they sit is a question about the
 deployment — a network hop, a loaded server or a large value all move it — so
 read the datastore panels after changing these, rather than assuming the
-effect from the HTTP ones. There is no per-signal form of the option and no way to add a view
-through `Init`, so a service that needs different boundaries for one of these
-histograms has to build its own MeterProvider. Keeping the default everywhere
-is also what makes cross-service P99 comparisons hold.
+effect from the HTTP ones. Keeping the default everywhere is also what makes
+cross-service P99 comparisons hold.
+
+To reshape one histogram without touching the rest, use
+`WithInstrumentHistogramBuckets(name, buckets)`. It matches the instrument name
+exactly, in every scope that records it, and beats both `WithHistogramBuckets`
+and the boundaries an instrument advises at creation — so it also reaches
+histograms the SDK installs no view for, such as an application's own
+`rpc.server.call.duration`:
+
+```go
+// Request/reply handlers time out at 30s: keep the shared boundaries and
+// add the tail above 10s, so the slow calls stop collapsing into +Inf.
+rpcBuckets := append(o11y.DefaultLatencyBuckets(), 15, 20, 30)
+sdk, err := o11y.Init(ctx,
+    // ... required options ...
+    o11y.WithInstrumentHistogramBuckets("rpc.server.call.duration", rpcBuckets),
+    o11y.WithInstrumentHistogramBuckets("rpc.client.call.duration", rpcBuckets),
+)
+```
+
+On an instrument the SDK does have a view for, only that view's boundaries
+change; its attribute allow-list keeps applying and no second stream appears.
+Extending the default set rather than replacing it keeps the shared boundaries
+— and so percentile comparisons and SLO bounds below 10s — intact.
 
 `WithDisableDefaultViews()` drops the SDK's HTTP views alone. The datastore
 views are installed as extra views, so they keep both their label allowlists

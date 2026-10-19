@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math"
 	"os"
 	"slices"
@@ -467,6 +468,9 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	if err := validateHistogramBuckets(cfg.histogramBuckets); err != nil {
 		return nil, err
 	}
+	if err := validateHistogramBucketOverrides(cfg.histogramBucketOverrides); err != nil {
+		return nil, err
+	}
 	if err := configureSampler(cfg); err != nil {
 		return nil, err
 	}
@@ -561,13 +565,14 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 
 	if cfg.metricsEnabled {
 		mp, closer, initErr := metrics.InitMeter(ctx, metrics.Config{
-			Resource:            res,
-			MetricsOTLPEndpoint: cfg.metricsOTLPEndpoint,
-			OTLPHeaders:         cfg.otlpHeaders,
-			MetricsAddr:         cfg.metricsAddr,
-			RuntimeMetrics:      cfg.runtimeMetrics,
-			HistogramBuckets:    cfg.histogramBuckets,
-			DisableDefaultViews: cfg.disableDefaultViews,
+			Resource:                 res,
+			MetricsOTLPEndpoint:      cfg.metricsOTLPEndpoint,
+			OTLPHeaders:              cfg.otlpHeaders,
+			MetricsAddr:              cfg.metricsAddr,
+			RuntimeMetrics:           cfg.runtimeMetrics,
+			HistogramBuckets:         cfg.histogramBuckets,
+			HistogramBucketOverrides: cfg.histogramBucketOverrides,
+			DisableDefaultViews:      cfg.disableDefaultViews,
 			// Every integration's views come from the driver-free internal/views
 			// package, so composing them here does not link gocql, minio-go,
 			// the mongo driver, go-redis, or the go-elasticsearch client into
@@ -1008,6 +1013,28 @@ func validateHistogramBuckets(buckets []float64) error {
 				"histogram buckets must be strictly increasing: bucket[%d]=%v is not greater than bucket[%d]=%v",
 				i, b, i-1, buckets[i-1],
 			)
+		}
+	}
+	return nil
+}
+
+// validateHistogramBucketOverrides checks every WithInstrumentHistogramBuckets
+// entry: the name must be a non-blank exact instrument name, since views match
+// it literally and a wildcard would silently match nothing, and the boundaries
+// must pass validateHistogramBuckets. Names are checked in sorted order so the
+// reported error does not depend on map iteration.
+func validateHistogramBucketOverrides(overrides map[string][]float64) error {
+	for _, name := range slices.Sorted(maps.Keys(overrides)) {
+		if strings.TrimSpace(name) == "" {
+			return errors.New("histogram bucket override: instrument name must not be empty " +
+				"(WithInstrumentHistogramBuckets)")
+		}
+		if strings.ContainsAny(name, "*?") {
+			return fmt.Errorf("histogram bucket override for %q: wildcard instrument names are not "+
+				"supported; name each instrument exactly", name)
+		}
+		if err := validateHistogramBuckets(overrides[name]); err != nil {
+			return fmt.Errorf("histogram bucket override for %q: %w", name, err)
 		}
 	}
 	return nil
