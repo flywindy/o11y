@@ -363,9 +363,11 @@ func validateOTLPExporterEnv(cfg *Config) error {
 	return nil
 }
 
+// checkURL applies the exporters' own rule to an ENDPOINT variable they
+// parse: url.Parse must accept it, or the exporter echoes the raw value.
 func checkURL(v string) (string, bool) {
 	if _, err := url.Parse(v); err != nil {
-		return "it is not a valid URL", true
+		return problemInvalidURL, true
 	}
 	return "", false
 }
@@ -480,31 +482,55 @@ func checkClientKeyPair(keyVar string, verbatim bool) func(string) (string, bool
 	}
 }
 
-// validateConfiguredEndpoints rejects a malformed endpoint given through
-// WithOTLPEndpoint or WithMetricsOTLPEndpoint before any exporter is built.
-// The pinned trace and metric exporters' WithEndpointURL reports a URL it
+// validateConfiguredEndpoints rejects an endpoint an enabled OTLP exporter
+// would send to before any exporter is built: the WithOTLPEndpoint value or
+// the endpoint variable that stands in for it (as resolveOTLPEndpoints left
+// them in cfg), and a
+// WithMetricsOTLPEndpoint value. One that does not parse is rejected because
+// the pinned trace and metric exporters' WithEndpointURL reports a URL it
 // cannot parse through OTel's global logger with the raw text attached and
 // then keeps their fallback endpoint, so Init would succeed while a
-// credential in the URL's userinfo reached stderr. Only an endpoint an
-// enabled OTLP exporter will use is checked, and the error names the
-// option only: neither the value nor the parser's message, which quotes
-// the offending part of the URL (a port, an escape, a host character),
-// is repeated.
+// credential in the URL's userinfo reached stderr; one without an http(s)
+// scheme or a host (see endpointProblem), or a variable a protocol
+// variable marks as a gRPC endpoint (see resolveEndpoint), because the
+// exporter would never send. The error names the option or variable only: neither the value nor
+// the parser's message, which quotes the offending part of the URL (a port,
+// an escape, a host character), is repeated.
 func validateConfiguredEndpoints(cfg *Config) error {
-	type configured struct{ option, value string }
-	var endpoints []configured
-	if cfg.traceEnabled || cfg.logEnabled {
-		endpoints = append(endpoints, configured{"WithOTLPEndpoint", cfg.otlpEndpoint})
+	for _, c := range []struct {
+		enabled bool
+		signal  string
+		e       signalEndpoint
+	}{
+		{cfg.traceEnabled, traceSignal.name, cfg.resolvedOTLP.trace},
+		{cfg.logEnabled, logSignal.name, cfg.resolvedOTLP.log},
+	} {
+		switch {
+		case !c.enabled:
+		case c.e.problem != "" && c.e.fromEnv():
+			return envEndpointError(c.e.source, c.signal, c.e.problem)
+		case c.e.problem != "":
+			return configuredEndpointError("WithOTLPEndpoint", c.e.problem)
+		case c.e.grpcVar != "":
+			return grpcEndpointError(c.e.source, c.e.grpcVar, c.signal)
+		}
 	}
 	if cfg.metricsEnabled && cfg.metricsOTLPEndpoint != "" {
-		endpoints = append(endpoints, configured{"WithMetricsOTLPEndpoint", cfg.metricsOTLPEndpoint})
-	}
-	for _, e := range endpoints {
-		if _, err := url.Parse(e.value); err != nil {
-			return fmt.Errorf("o11y: the endpoint given to %s is not a valid URL; the OTLP exporters would report its raw text through OTel's global logger while Init builds them, so the option is rejected instead, and neither the value nor the parser's message, which quotes part of it, is repeated here", e.option)
+		if problem := endpointProblem(cfg.metricsOTLPEndpoint); problem != "" {
+			return configuredEndpointError("WithMetricsOTLPEndpoint", problem)
 		}
 	}
 	return nil
+}
+
+// configuredEndpointError keeps the long-standing message for an option
+// value that does not parse, which explains why it is rejected rather than
+// left to the exporters, and uses endpointError for any other problem.
+func configuredEndpointError(option, problem string) error {
+	if problem == problemInvalidURL {
+		return fmt.Errorf("o11y: the endpoint given to %s is not a valid URL; the OTLP exporters would report its raw text through OTel's global logger while Init builds them, so the option is rejected instead, and neither the value nor the parser's message, which quotes part of it, is repeated here", option)
+	}
+	return endpointError(option, problem)
 }
 
 // validateConfiguredHeaders rejects a header name given through
@@ -647,7 +673,7 @@ func diagnosticSecrets(cfg *Config) []string {
 	// a collector that echoed the header back into a non-2xx body — which both
 	// exporters put into the error they return. authHeaderSecrets does the
 	// same for the profiling endpoint; the two lists are meant to agree.
-	for _, endpoint := range []string{cfg.otlpEndpoint, cfg.metricsOTLPEndpoint, cfg.profilingEndpoint} {
+	for _, endpoint := range diagnosticEndpoints(cfg) {
 		basic := redact.BasicAuthHeader(endpoint)
 		if basic == "" {
 			continue

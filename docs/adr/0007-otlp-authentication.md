@@ -43,6 +43,17 @@ obs, _ := o11y.Init(ctx,
 )
 ```
 
+> **Note (2026-10-19): this endpoint does not reach Grafana Cloud as written.**
+> A `WithOTLPEndpoint` value with a path is used as given, so the example
+> sends both traces and logs to `/otlp`, while the gateway expects
+> `/otlp/v1/traces` and `/otlp/v1/logs`. One option serves both signals, so
+> no single value gets both paths right. Leave the option unset and set
+> `OTEL_EXPORTER_OTLP_ENDPOINT=https://otlp-gateway-prod.grafana.net/otlp`
+> instead: that variable is a base URL the SDK appends each signal's path to
+> (see the guide's [OTLP endpoint](../guide.md#otlp-endpoint) section).
+> Making `WithOTLPEndpoint` a base URL too is a breaking change left for a
+> later minor release. The headers decision recorded here is unaffected.
+
 The headers are plumbed through `internal/trace`, `internal/log`, and
 `internal/metrics` to each exporter's `WithHeaders(...)` constructor. The map
 is treated as additive — multiple `WithOTLPHeaders` calls merge rather than

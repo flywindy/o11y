@@ -14,6 +14,13 @@ For SDK setup and the `Init` options reference, see the [README](../README.md).
 
 All `go run` commands below are run from the **repository root**.
 
+Where an example below says it sends traces and logs to
+`http://localhost:4318`, that is the SDK default: the examples do not pass
+`WithOTLPEndpoint`, so an `OTEL_EXPORTER_OTLP_ENDPOINT` (or `_TRACES_` /
+`_LOGS_`) variable exported in your shell redirects traces and logs, while
+OTLP metrics still go where `WithMetricsOTLPEndpoint` says. Unset those
+variables to follow the instructions as written.
+
 ## Prerequisites
 
 Before running any example, start the kind cluster and deploy the monitor stack:

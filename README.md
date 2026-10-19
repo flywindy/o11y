@@ -125,7 +125,9 @@ func main() {
         o11y.WithServiceVersion("1.0.0"),          // required
         o11y.WithEnvironment("production"),        // required; see canonical values below
         o11y.WithServiceNamespace("platform"),     // required; maps to k8s namespace / team
-        o11y.WithOTLPEndpoint("http://localhost:4318"),
+        // Traces and logs go to OTEL_EXPORTER_OTLP_TRACES_ENDPOINT /
+        // OTEL_EXPORTER_OTLP_LOGS_ENDPOINT, else OTEL_EXPORTER_OTLP_ENDPOINT, else
+        // http://localhost:4318. WithOTLPEndpoint(url) overrides them all.
         // Optional: reduce head sampling on high-throughput producers.
         // o11y.WithSamplingRatio(0.001),
         // Optional: enable continuous profiling. In-cluster, prefer
@@ -183,7 +185,7 @@ _OTLP (shared by traces and logs):_
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `WithOTLPEndpoint(url)` | `http://localhost:4318` | OTLP/HTTP collector endpoint for traces and logs |
+| `WithOTLPEndpoint(url)` | `http://localhost:4318` | OTLP/HTTP collector endpoint for traces and logs; an `http://` or `https://` URL with a host, trimmed. When unset or blank, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` (full URLs; `/v1/traces` or `/v1/logs` is added when there is no path) or `OTEL_EXPORTER_OTLP_ENDPOINT` (a base URL; `/v1/traces` and `/v1/logs` are appended) apply, then the default. See [OTLP endpoint](docs/guide.md#otlp-endpoint) |
 | `WithOTLPHeaders(map[string]string)` | `nil` | Headers attached to every OTLP/HTTP request (auth tokens, multi-tenant routing) |
 
 _Tracing:_
@@ -206,7 +208,7 @@ _Metrics:_
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `WithMetricsOTLPEndpoint(url)` | `""` | Switch metrics to OTLP push (serverless); when unset, Prometheus pull on `:2112` is used |
+| `WithMetricsOTLPEndpoint(url)` | `""` | Switch metrics to OTLP push (serverless); an `http://` or `https://` URL with a host, trimmed. When unset or blank, Prometheus pull on `:2112` is used; the `OTEL_EXPORTER_OTLP_*ENDPOINT` variables never stand in for it |
 | `WithMetricsAddr(addr)` | `:2112` | Prometheus `/metrics` scrape address |
 | `WithRuntimeMetrics(bool)` | `true` | Collect Go runtime metrics (goroutines, GC, memory) |
 | `WithHistogramBuckets([]float64)` | SLO defaults | Override the boundaries of **every** latency histogram the SDK installs a view for, not HTTP alone: `http.server.request.duration`, `http.client.request.duration`, `db.client.operation.duration` (redis, mongo, cassandra, elasticsearch), `db.client.connection.create_time` (redis, mongo, cassandra) and `minio.client.operation.duration`. A datastore's latency profile is not an HTTP service's, so buckets chosen for HTTP make those histograms coarser rather than merely different. See `DefaultLatencyBuckets()` |

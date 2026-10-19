@@ -25,6 +25,7 @@ For project setup, the `Init` options reference, and feature toggles, see the
     - [Logging Guidelines](#logging-guidelines)
   - [Metrics](#metrics)
   - [Profiling](#profiling)
+  - [OTLP endpoint](#otlp-endpoint)
   - [Export failures & OTel diagnostics](#export-failures--otel-diagnostics)
 - [Integrations](#integrations)
   - [HTTP](#http)
@@ -449,6 +450,48 @@ Important caveats:
   goroutine is captured in the service-level profile, but it is not linked to
   the span unless the application propagates pprof labels explicitly.
 
+## OTLP endpoint
+
+Traces and logs go to one OTLP/HTTP collector. `Init` picks it in the
+OpenTelemetry specification's order:
+
+1. `WithOTLPEndpoint(url)`, when given with a non-empty value;
+2. `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`,
+   each for its own signal;
+3. `OTEL_EXPORTER_OTLP_ENDPOINT`, a base URL: `/v1/traces` and `/v1/logs`
+   are appended to its path (`http://collector:4318/otlp` sends to
+   `/otlp/v1/traces`);
+4. `http://localhost:4318`.
+
+So a service deployed with the variables the OTel Operator or a Helm chart
+injects needs no option, and one that passes `WithOTLPEndpoint` keeps that
+endpoint whatever the environment says. `WithOTLPEndpoint("")` undoes the
+option, so `WithOTLPEndpoint(os.Getenv("COLLECTOR_URL"))` falls back to
+the variables when `COLLECTOR_URL` is unset.
+
+A signal variable is a full URL: it loses a trailing slash, and one with
+no path, or just `/`, gets `/v1/traces` or `/v1/logs` (where the
+specification would send to `/`). The option keeps its own rules, which
+differ by signal: traces add `/v1/traces` only to a URL with no path at
+all (`http://c:4318/` sends to `/`), while logs also treat `/` as no path
+and drop a trailing slash. The exporters send to the URL's host and path
+only, whichever supplied it; a query string is not sent. Both signals read
+the variables the same way: trimmed, and with the URL's scheme deciding TLS, so
+`OTEL_EXPORTER_OTLP_INSECURE` and its `TRACES_` / `LOGS_` variants have no
+effect. Whatever supplies the endpoint, it must be an `http://` or
+`https://` URL with a host: `collector:4318` or `10.0.0.7:4318` fails
+`Init` with an error that names the option or variable but not the value.
+So does an endpoint variable that `OTEL_EXPORTER_OTLP_PROTOCOL` (or the
+signal's `TRACES_` / `LOGS_` protocol variable) marks as gRPC: the SDK
+sends OTLP over HTTP only, and a gRPC port would refuse every export.
+A variable the option overrides is not held to these rules; the one check
+it still gets is the one it had before: with traces on,
+`OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` must
+parse as URLs, since the trace exporter reads them anyway (see below).
+`WithMetricsOTLPEndpoint` follows the same rule, but the variables never
+stand in for it: the OTLP metrics push path goes only where that option
+says.
+
 ## Export failures & OTel diagnostics
 
 The OTel SDK's batchers — the `BatchSpanProcessor`, the log `BatchProcessor`
@@ -611,7 +654,9 @@ positive integers.
 The endpoints given to `WithOTLPEndpoint` and
 `WithMetricsOTLPEndpoint` get the same check, since the trace and metric
 exporters echo a URL they cannot parse the same way and then fall back to
-their default endpoint. The error names the variable or option and the
+their default endpoint; they, and the variable traces or logs are sent to,
+must also be `http://` or `https://` URLs with a host (see
+[OTLP endpoint](#otlp-endpoint)). The error names the variable or option and the
 pair's position, not the text, and not the parser's message either, which
 quotes the offending part of a URL. A header name given to
 `WithOTLPHeaders` or `WithProfilingAuthHeaders` must be an HTTP token for
