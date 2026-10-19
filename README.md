@@ -207,7 +207,7 @@ _Metrics:_
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `WithMetricsOTLPEndpoint(url)` | `""` | Switch metrics to OTLP push (serverless); when unset, Prometheus pull on `:2112` is used |
+| `WithMetricsOTLPEndpoint(url)` | `""` | Switch metrics to OTLP push (serverless); an `http://` or `https://` URL with a host, trimmed. When unset or blank, Prometheus pull on `:2112` is used; the `OTEL_EXPORTER_OTLP_*ENDPOINT` variables never stand in for it |
 | `WithMetricsAddr(addr)` | `:2112` | Prometheus `/metrics` scrape address |
 | `WithRuntimeMetrics(bool)` | `true` | Collect Go runtime metrics (goroutines, GC, memory) |
 | `WithHistogramBuckets([]float64)` | SLO defaults | Override the boundaries of **every** latency histogram the SDK installs a view for, not HTTP alone: `http.server.request.duration`, `http.client.request.duration`, `db.client.operation.duration` (redis, mongo, cassandra, elasticsearch), `db.client.connection.create_time` (redis, mongo, cassandra) and `minio.client.operation.duration`. A datastore's latency profile is not an HTTP service's, so buckets chosen for HTTP make those histograms coarser rather than merely different. See `DefaultLatencyBuckets()` |
