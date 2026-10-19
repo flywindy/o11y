@@ -110,8 +110,7 @@ adopters can plan their upgrades.
   trailing slash, with `/v1/traces` or `/v1/logs` when it has no path or
   only `/` (where the specification sends to `/`). The `WithOTLPEndpoint`
   value is trimmed too, and a blank one now undoes the option, so the
-  variables still apply. The README and the
-  examples no longer pass
+  variables still apply. The README and the examples no longer pass
   `WithOTLPEndpoint("http://localhost:4318")`, which would override the
   variables in copied code (the profiling example keeps its own
   `OTLP_ENDPOINT` override). Metrics are unchanged: the push path still takes
