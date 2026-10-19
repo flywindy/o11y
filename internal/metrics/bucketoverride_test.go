@@ -221,3 +221,70 @@ func TestInitMeter_BucketOverrideFillsViewWithoutAggregation(t *testing.T) {
 		bucketBounds(body, "app_filtered_duration_seconds"), body)
 	assert.NotContains(t, body, "app_secret", "the view's attribute filter must still apply")
 }
+
+// TestInitMeter_BucketOverrideKeepsApplicationAttributes pins that the view an
+// override adds for an unviewed instrument filters nothing the application
+// set: every attribute that reached the series before still does, while the
+// Prometheus path's reserved-key guard keeps applying on top.
+func TestInitMeter_BucketOverrideKeepsApplicationAttributes(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.RuntimeMetrics = false
+	cfg.HistogramBucketOverrides = map[string][]float64{
+		"rpc.server.call.duration": {1, 30},
+	}
+	mp := startMeter(t, cfg)
+
+	hist, err := mp.Meter("app").Float64Histogram("rpc.server.call.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	hist.Record(context.Background(), 20, metric.WithAttributes(
+		attribute.String("site", "site-a"),
+		attribute.String("rpc.system.name", "nats"),
+		attribute.String("rpc.method", "room.create"),
+		attribute.String("error.type", "timeout"),
+		attribute.String("service.name", "evil"),
+	))
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	var count string
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "rpc_server_call_duration_seconds_count{") {
+			count = line
+		}
+	}
+	require.NotEmpty(t, count, body)
+	for _, label := range []string{`site="site-a"`, `rpc_system_name="nats"`, `rpc_method="room.create"`, `error_type="timeout"`} {
+		assert.Contains(t, count, label)
+	}
+	assert.NotContains(t, body, "evil", "the reserved-key guard must still apply")
+	assert.Equal(t, []string{"1", "30", "+Inf"}, bucketBounds(body, "rpc_server_call_duration_seconds"))
+}
+
+// TestInitMeter_BucketOverrideKeepsExtraHTTPServerKeys pins that an override
+// on http.server.request.duration leaves the allow-list, including keys a
+// caller promoted with ExtraHTTPServerAttrKeys, exactly as it was.
+func TestInitMeter_BucketOverrideKeepsExtraHTTPServerKeys(t *testing.T) {
+	addr := testutil.FreeAddr(t)
+	cfg := baseConfig(addr)
+	cfg.RuntimeMetrics = false
+	cfg.ExtraHTTPServerAttrKeys = []string{"app_name"}
+	cfg.HistogramBucketOverrides = map[string][]float64{
+		"http.server.request.duration": {1, 30},
+	}
+	mp := startMeter(t, cfg)
+
+	hist, err := mp.Meter("app").Float64Histogram("http.server.request.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	hist.Record(context.Background(), 20, metric.WithAttributes(
+		semconv.HTTPRequestMethodKey.String("POST"),
+		semconv.HTTPRoute("/v1/chat"),
+		semconv.HTTPResponseStatusCode(http.StatusOK),
+		attribute.String("app_name", "line-bot"),
+		attribute.String("bot_name", "not-allow-listed"),
+	))
+
+	body := testutil.ScrapeMetrics(t.Context(), t, addr)
+	assert.Contains(t, body, `app_name="line-bot"`)
+	assert.NotContains(t, body, "bot_name", "keys outside the allow-list stay filtered")
+	assert.Equal(t, []string{"1", "30", "+Inf"}, bucketBounds(body, "http_server_request_duration_seconds"))
+}
