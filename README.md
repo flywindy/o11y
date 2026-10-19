@@ -125,8 +125,9 @@ func main() {
         o11y.WithServiceVersion("1.0.0"),          // required
         o11y.WithEnvironment("production"),        // required; see canonical values below
         o11y.WithServiceNamespace("platform"),     // required; maps to k8s namespace / team
-        // Traces and logs go to OTEL_EXPORTER_OTLP_ENDPOINT when it is set, else to
-        // http://localhost:4318. WithOTLPEndpoint(url) overrides both.
+        // Traces and logs go to OTEL_EXPORTER_OTLP_TRACES_ENDPOINT /
+        // OTEL_EXPORTER_OTLP_LOGS_ENDPOINT, else OTEL_EXPORTER_OTLP_ENDPOINT, else
+        // http://localhost:4318. WithOTLPEndpoint(url) overrides them all.
         // Optional: reduce head sampling on high-throughput producers.
         // o11y.WithSamplingRatio(0.001),
         // Optional: enable continuous profiling. In-cluster, prefer
@@ -184,7 +185,7 @@ _OTLP (shared by traces and logs):_
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `WithOTLPEndpoint(url)` | `http://localhost:4318` | OTLP/HTTP collector endpoint for traces and logs; an `http://` or `https://` URL with a host. When unset, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` (full URLs; `/v1/traces` or `/v1/logs` is added when there is no path) or `OTEL_EXPORTER_OTLP_ENDPOINT` (a base URL; `/v1/traces` and `/v1/logs` are appended) apply, then the default. See [OTLP endpoint](docs/guide.md#otlp-endpoint) |
+| `WithOTLPEndpoint(url)` | `http://localhost:4318` | OTLP/HTTP collector endpoint for traces and logs; an `http://` or `https://` URL with a host, trimmed. When unset or blank, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` (full URLs; `/v1/traces` or `/v1/logs` is added when there is no path) or `OTEL_EXPORTER_OTLP_ENDPOINT` (a base URL; `/v1/traces` and `/v1/logs` are appended) apply, then the default. See [OTLP endpoint](docs/guide.md#otlp-endpoint) |
 | `WithOTLPHeaders(map[string]string)` | `nil` | Headers attached to every OTLP/HTTP request (auth tokens, multi-tenant routing) |
 
 _Tracing:_
