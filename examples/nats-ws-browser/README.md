@@ -17,7 +17,7 @@ Both services export spans to the same OTel Collector and Tempo. In Grafana Temp
 
 - kind + kubectl
 - Node.js 20+ and npm
-- Go 1.25+
+- Go 1.26+
 
 ## 1. Start the infrastructure
 

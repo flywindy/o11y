@@ -16,7 +16,7 @@ A lightweight Go SDK for standardized observability, integrating OpenTelemetry (
 
 This project provides a "Context-First" observability layer for Go applications, ensuring that every log entry is automatically enriched with `traceId` and `spanId`.
 
-- **Language**: Go 1.25+
+- **Language**: Go 1.26+
 - **Tracing**: OpenTelemetry Go SDK (OTLP/HTTP)
 - **Logging**: Go `slog` with dual output — OTLP/HTTP via `otelslog` bridge (→ Loki) and JSON stdout (→ Alloy)
 - **Metrics**: Prometheus pull (default `:2112`) or OTLP push (`WithMetricsOTLPEndpoint`)
@@ -58,7 +58,7 @@ Prometheus scraping also only works inside the cluster; locally, scrape `:2112/m
 Before running the infrastructure, ensure you have the following installed:
 
 - [Docker](https://www.docker.com/get-started)
-- [Go 1.25+](https://go.dev/doc/install)
+- [Go 1.26+](https://go.dev/doc/install)
 - [kind](https://kind.sigs.k8s.io/docs/user/quick-start/) (Kubernetes in Docker)
 - [kubectl](https://kubernetes.io/docs/tasks/tools/)
 
