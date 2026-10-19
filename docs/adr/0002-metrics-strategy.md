@@ -194,3 +194,74 @@ met, and is never a substitute for the cap in (4).
 **Unchanged.** §7's prohibition is untouched for genuinely unbounded dimensions:
 user ids, request ids, trace ids, raw URL paths, per-request subjects and reply
 inboxes must never be metric label values, regardless of any cap.
+
+---
+
+## Amendment (2026-10-19) — §9: what the shared latency buckets cover
+
+§9 was written when the SDK's only bucket view was HTTP, and has not tracked
+the integrations since. It also misstated the fallback: a histogram no view
+claims keeps the boundaries it advised at creation, or, if it advised none,
+OTel's default **explicit** set `[0, 5, 10, 25, 50, 75, 100, 250, 500, 750,
+1000, 2500, 5000, 7500, 10000]` — not exponential boundaries. That default is
+millisecond-scale, so a seconds histogram on it puts every value under 5s in
+one bucket. This amendment replaces §9's scope statement.
+
+**The shared set.** `WithHistogramBuckets` (default `DefaultLatencyBuckets()`,
+`[0.005 … 10]` seconds, which is Prometheus client_golang's `DefBuckets` and a
+subset of the boundaries semconv recommends for HTTP and RPC durations) sets
+the boundaries of:
+
+- `http.server.request.duration` and `http.client.request.duration`;
+- `db.client.operation.duration` (redis, mongo, cassandra, elasticsearch) and
+  `db.client.connection.create_time` (redis, mongo, cassandra);
+- `minio.client.operation.duration`;
+- `rpc.server.call.duration` and `rpc.client.call.duration`.
+
+**RPC views claim instruments the SDK does not record.** Applications record
+the RPC pair (for example over NATS request/reply), so the views match the
+name in every scope rather than one integration's scope. That makes them
+override boundaries the instrument's author advised. Per the OTel metrics SDK
+specification a view takes precedence over advisory parameters, and the View
+is the layer meant for whoever owns the MeterProvider — which `Init` is. The
+reason to take it: a service's request/reply latency and its HTTP latency are
+the same kind of measurement, and only one bucket set lets one percentile,
+one recording rule and one SLO bound apply to both. Three constraints keep the
+override narrow:
+
+1. The views set boundaries only. RPC label sets belong to the recording code,
+   so there is no attribute allow-list to strip a caller's dimensions.
+2. They match only the semconv unit, `s`. A recorder on the pre-v1.39
+   millisecond unit, or with no unit, keeps its own boundaries.
+3. They pin the semconv v1.39.0 names (`rpc.*.call.duration`, a Release
+   Candidate). A semconv upgrade must re-check them; a rename would otherwise
+   leave the views silently matching nothing.
+
+**Per-instrument overrides.** `WithInstrumentHistogramBuckets(name, buckets)`
+gives one instrument its own boundaries, ahead of both the shared set and the
+instrument's advisory. Precedence is therefore: override, then the shared set
+(for the instruments listed above), then the instrument's advisory, then OTel's
+default.
+
+An override for an instrument the SDK already has a view for replaces that
+view's boundaries in place rather than adding a view. The OTel Go SDK keeps the
+stream of the first view that matches an instrument, so a second view would
+either be ignored or, ordered first, drop the original view's attribute
+allow-list. Only an instrument no view claims gets a view of its own. Names are
+exact OTel instrument names; wildcards are rejected, because a pattern that
+widens later can silently start reshaping histograms nobody meant to touch,
+and exact names can be relaxed to patterns later without breaking callers.
+
+**Changing the set.** Extend the default set at the tail (for example `15, 20,
+30` for a 30s request timeout) rather than replacing it. Boundaries every
+service shares keep cross-service quantiles exact up to 10s even while only
+some services carry the extension. SLO thresholds belong on a boundary of the
+set. A boundary at the timeout makes `+Inf` minus that bucket the count of
+timed-out calls.
+
+**Not chosen: exponential (native) histograms.** They remove the bucket choice
+altogether, and Prometheus now recommends them, but on the Prometheus pull
+path they need Prometheus 3.8 or later, per-job `scrape_native_histograms` and
+protobuf scraping. They would also invalidate every dashboard, recording rule
+and alert written against `le`. Revisit as an opt-in once the backend path
+supports them end to end.

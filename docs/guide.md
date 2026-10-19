@@ -410,7 +410,11 @@ The two RPC histograms are on the list so a service's request/reply latency
 shares its boundaries with its HTTP latency: one percentile reads the same on
 both, and one recording rule fits both. No SDK integration records them, so
 their views set the boundaries only — they filter no attributes, and every
-label the recording code attaches reaches the series. A service whose calls
+label the recording code attaches reaches the series. They match only the
+semconv unit, `s`: a recorder still on the pre-v1.39 millisecond unit, or with
+no unit, keeps its own boundaries. Like any view, they replace the boundaries
+an instrument advised at creation, so an application that advised its own set
+on these names now gets the SDK's. A service whose calls
 can run past 10s (say a 30s request timeout) extends the set once and both
 families follow:
 
@@ -424,10 +428,19 @@ sdk, err := o11y.Init(ctx,
 ```
 
 Extending the default set rather than replacing it keeps the shared boundaries
-— and so percentile comparisons and SLO bounds below 10s — intact. Dashboards
-that aggregate one family across services (`sum by (le)`) still need every
-service on the same set, since a boundary only some services export skews the
-quantile.
+— and so percentile comparisons and SLO bounds below 10s — intact. A boundary
+at the timeout itself (`30` above) also makes `+Inf` minus `le="30"` the count
+of calls that hit it. Each extra boundary adds one `_bucket` series per
+attribute set, and the per-stream cardinality limit counts attribute sets, not
+buckets, so it never folds them into overflow.
+
+When a dashboard aggregates one family across services (`sum by (le)`) and
+only some services extend the set, quantiles at or below 10s stay exact, but
+anything above reads a partial `le="15"`…`le="30"` with no warning (Prometheus
+flags the repaired monotonicity at most). Keep services that are aggregated
+together on the same set, or have Prometheus convert classic histograms to
+native ones (`convert_classic_histograms_to_nhcb`), which reconciles them to
+the boundaries all inputs share.
 
 To reshape one histogram without touching the rest — `WithHistogramBuckets`
 also moves the datastore histograms — use
@@ -449,7 +462,15 @@ above, so prefer `WithHistogramBuckets` when both should follow.
 
 `WithDisableDefaultViews()` drops the SDK's HTTP views alone. The datastore
 and RPC views are installed as extra views, so they keep their boundaries (and
-the datastore views their label allowlists).
+the datastore views their label allowlists), and
+`WithInstrumentHistogramBuckets` overrides still apply.
+
+A service that builds its own MeterProvider registers the same views itself:
+each datastore package's `MetricViews(buckets)`, and `o11y.RPCMetricViews(buckets)`
+for the RPC pair. To reshape one instrument there, pass that integration's
+`MetricViews` its own set, or add an `sdkmetric.NewView` for an instrument no
+other view claims — the SDK keeps only the first view that matches an
+instrument, so a second view for an already-viewed name is ignored.
 
 ## Profiling
 
