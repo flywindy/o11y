@@ -275,9 +275,6 @@ adopters can plan their upgrades.
   `db.client.connection.*` series are renamed on this upgrade. The old name
   already changed on every restart, so nothing could have keyed on it; set
   `WithPoolName` for a name chosen rather than derived.
-
----
-
 - **RPC call-duration histograms: `le` series change.** A service that
   records `rpc.server.call.duration` or `rpc.client.call.duration` in seconds
   now exports the `WithHistogramBuckets` set (`DefaultLatencyBuckets()` unless
@@ -289,6 +286,8 @@ adopters can plan their upgrades.
   that name the old `le` values. On the OTLP push path with
   `OTEL_EXPORTER_OTLP_METRICS_DEFAULT_HISTOGRAM_AGGREGATION=base2_exponential_bucket_histogram`,
   these two histograms are now explicit-bucket rather than exponential.
+
+---
 
 ## [0.13.0] - 2026-09-22
 
