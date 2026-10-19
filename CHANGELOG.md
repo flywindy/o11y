@@ -18,11 +18,10 @@ adopters can plan their upgrades.
 - `WithInstrumentHistogramBuckets(name, buckets)` gives one histogram its own
   bucket boundaries, matched by exact instrument name in every scope. It
   overrides `WithHistogramBuckets` and the instrument's own advisory
-  boundaries, so it reaches histograms the SDK has no view for — e.g. an
-  application's `rpc.server.call.duration` whose 30s timeout lies past the
-  default 10s top boundary. On an SDK-viewed instrument only the boundaries
-  change; the view's attribute allow-list keeps applying. `Init` rejects an
-  empty or wildcard name and invalid boundaries.
+  boundaries, so it also reaches histograms the SDK has no view for. On an
+  SDK-viewed instrument only the boundaries change; the view's attribute
+  allow-list keeps applying. `Init` rejects an empty or wildcard name and
+  invalid boundaries.
 - `SDK.ForceFlush(ctx)` exports the buffered spans and log records
   (concurrently), then the metrics collected so far on the OTLP push path,
   without shutting the SDK down — for serverless handlers and other
@@ -30,6 +29,19 @@ adopters can plan their upgrades.
   the deadline between those two stages, returns redacted, joined errors,
   and does nothing once `Shutdown` has started; `Shutdown` waits for a
   `ForceFlush` already running for up to one share of its deadline.
+
+### Changed
+
+- `WithHistogramBuckets` (and its default, `DefaultLatencyBuckets()`) now also
+  sets the boundaries of `rpc.server.call.duration` and
+  `rpc.client.call.duration`, whatever records them, so request/reply latency
+  shares its buckets with HTTP latency and a 30s-timeout service widens both
+  with one option. The views set boundaries only and filter no attributes, and
+  `WithDisableDefaultViews` leaves them in place. A histogram of either name
+  that advised its own boundaries, or advised none and so had OTel's
+  millisecond-scale `[0 … 10000]`, now exports the SDK's set instead: its
+  `le` series change, and queries or recording rules that name the old `le`
+  values need updating.
 
 ### Security
 

@@ -4,12 +4,14 @@ import (
 	"context"
 	"math"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/flywindy/o11y"
@@ -132,4 +134,71 @@ func TestInit_RejectsInvalidInstrumentHistogramBuckets(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestWithHistogramBuckets_CoversRPCDurations pins that the shared boundaries
+// reach the semconv RPC duration histograms even though the SDK does not
+// record them itself: they beat the instrument's advisory boundaries, keep
+// every application attribute, and survive WithDisableDefaultViews, while a
+// per-instrument override still wins over them.
+func TestWithHistogramBuckets_CoversRPCDurations(t *testing.T) {
+	srv := testutil.FakeOTLPServer(t)
+	addr := testutil.FreeAddr(t)
+
+	opts := append(commonOpts(srv.URL),
+		o11y.WithMetricsAddr(addr),
+		o11y.WithRuntimeMetrics(false),
+		o11y.WithDisableDefaultViews(),
+		o11y.WithHistogramBuckets([]float64{0.5, 10, 30}),
+		o11y.WithInstrumentHistogramBuckets("rpc.client.call.duration", []float64{1, 60}),
+	)
+	sdk, err := o11y.Init(t.Context(), opts...)
+	require.NoError(t, err)
+	defer testutil.MustShutdown(t.Context(), t, sdk)
+
+	meter := sdk.Meter("app")
+	advisory := metric.WithExplicitBucketBoundaries(o11y.DefaultLatencyBuckets()...)
+	server, err := meter.Float64Histogram("rpc.server.call.duration", metric.WithUnit("s"), advisory)
+	require.NoError(t, err)
+	server.Record(t.Context(), 20, metric.WithAttributes(
+		attribute.String("site", "site-a"),
+		attribute.String("rpc.method", "room.create"),
+	))
+	client, err := meter.Float64Histogram("rpc.client.call.duration", metric.WithUnit("s"), advisory)
+	require.NoError(t, err)
+	client.Record(t.Context(), 20)
+
+	assert.Equal(t, []string{"0.5", "10", "30", "+Inf"},
+		scrapeBucketBounds(t, addr, "rpc_server_call_duration_seconds"))
+	assert.Equal(t, []string{"1", "60", "+Inf"},
+		scrapeBucketBounds(t, addr, "rpc_client_call_duration_seconds"))
+
+	body, err := testutil.TryScrapeMetrics(t.Context(), addr)
+	require.NoError(t, err)
+	assert.Contains(t, body, `site="site-a"`)
+	assert.Contains(t, body, `rpc_method="room.create"`)
+}
+
+// TestWithHistogramBuckets_DefaultCoversRPCDurations pins that without the
+// option an RPC duration histogram created with no advisory gets the SDK's
+// default boundaries rather than OTel's millisecond-scale [0 … 10000].
+func TestWithHistogramBuckets_DefaultCoversRPCDurations(t *testing.T) {
+	srv := testutil.FakeOTLPServer(t)
+	addr := testutil.FreeAddr(t)
+
+	opts := append(commonOpts(srv.URL), o11y.WithMetricsAddr(addr), o11y.WithRuntimeMetrics(false))
+	sdk, err := o11y.Init(t.Context(), opts...)
+	require.NoError(t, err)
+	defer testutil.MustShutdown(t.Context(), t, sdk)
+
+	hist, err := sdk.Meter("app").Float64Histogram("rpc.server.call.duration", metric.WithUnit("s"))
+	require.NoError(t, err)
+	hist.Record(t.Context(), 0.2)
+
+	want := make([]string, 0, len(o11y.DefaultLatencyBuckets())+1)
+	for _, b := range o11y.DefaultLatencyBuckets() {
+		want = append(want, strconv.FormatFloat(b, 'g', -1, 64))
+	}
+	want = append(want, "+Inf")
+	assert.Equal(t, want, scrapeBucketBounds(t, addr, "rpc_server_call_duration_seconds"))
 }

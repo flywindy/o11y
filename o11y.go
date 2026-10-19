@@ -586,6 +586,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 				views.Minio(cfg.histogramBuckets),
 				views.Mongo(cfg.histogramBuckets),
 				views.Redis(cfg.histogramBuckets),
+				views.RPC(cfg.histogramBuckets),
 			),
 			MaxUniqueRoutes:         cfg.maxUniqueRoutes,
 			MaxUniqueCollections:    cfg.maxUniqueCollections,

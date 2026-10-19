@@ -510,7 +510,12 @@ func WithRuntimeMetrics(enabled bool) Option {
 //     elasticsearch facades;
 //   - db.client.connection.create_time, for the redis, mongo and cassandra
 //     pools;
-//   - minio.client.operation.duration.
+//   - minio.client.operation.duration;
+//   - rpc.server.call.duration and rpc.client.call.duration, which no SDK
+//     integration records: whatever records them (an application's own
+//     request/reply instrumentation, say) gets these boundaries, so its RPC
+//     latency stays comparable with its HTTP latency. These views set the
+//     boundaries only and filter no attributes.
 //
 // A datastore's latency profile is usually not an HTTP service's: its
 // operations tend to sit at the low end of an HTTP-shaped set, where a
@@ -523,8 +528,8 @@ func WithRuntimeMetrics(enabled bool) Option {
 // WithInstrumentHistogramBuckets instead.
 //
 // WithDisableDefaultViews does not narrow this. It drops the SDK's HTTP views
-// only; the datastore views are installed as extra views and keep whatever
-// boundaries are configured here.
+// only; the datastore and RPC views are installed as extra views and keep
+// whatever boundaries are configured here.
 //
 // Defaults to DefaultLatencyBuckets; override only when your service has a
 // genuinely different latency profile. Changing these from the package default
@@ -544,11 +549,10 @@ func WithHistogramBuckets(buckets []float64) Option {
 // above the default 10s boundary.
 //
 // It applies to any histogram recorded through the SDK's MeterProvider, not
-// only those the SDK installs a view for: an application- or library-defined
-// instrument such as rpc.server.call.duration takes it the same way as
-// http.server.request.duration. Where the SDK does have a view for the
-// instrument, only that view's boundaries change; its attribute allow-list
-// keeps applying. The override covers every instrumentation scope that
+// only those WithHistogramBuckets covers: an application's own instrument
+// takes it the same way as http.server.request.duration. Where the SDK does
+// have a view for the instrument, only that view's boundaries change; its
+// attribute allow-list, if it has one, keeps applying. The override covers every instrumentation scope that
 // records the name, so db.client.operation.duration reshapes the redis,
 // mongo, cassandra and elasticsearch histograms together.
 //
