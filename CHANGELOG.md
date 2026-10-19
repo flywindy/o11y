@@ -28,7 +28,7 @@ adopters can plan their upgrades.
 - Raise the minimum Go version to 1.26 (`go 1.26.0` in `go.mod`) and bump
   `golang.org/x/net` to v0.61.0 (with `x/crypto` v0.58.0, `x/sync` v0.24.0,
   `x/sys` v0.49.0 and `x/text` v0.43.0). Go 1.25 left support when Go 1.27
-  shipped on 2026-08-18 (its last release, go1.25.14, came out the same
+  shipped on 2026-08-19 (its last release, go1.25.14, came out the same
   day), and no 1.25.x release fixes GO-2026-6599, 6600, 6603, 6605, 6607,
   6608, 6610, 6611, 6612, 6613 and 6617 (`net/http`, `net/textproto`,
   `crypto/tls`, `html/template`; fixed in go1.26.9); the `x/net` fixes for

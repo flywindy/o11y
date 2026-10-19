@@ -18,7 +18,7 @@ env:
   # go1.26.9 fixes eleven stdlib advisories (GO-2026-6599/6600/6603/6605/
   # 6607/6608/6610/6611/6612/6613/6617 in net/http, net/textproto,
   # crypto/tls and html/template) that no 1.25.x release fixes: Go 1.25
-  # left support when Go 1.27 shipped on 2026-08-18.
+  # left support when Go 1.27 shipped on 2026-08-19.
   GOVULNCHECK_GOTOOLCHAIN: go1.26.9
 
 jobs:
