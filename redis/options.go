@@ -119,12 +119,15 @@ func WithRequireParentSpan(enabled bool) Option {
 // that base takes the lowest name free: a single client rebuilt after Unwrap
 // gets its predecessor's name, while clients rebuilt together get the freed
 // names in the order they are wrapped. A client that is only closed keeps its
-// name until it is collected. Names are unique across the process, so pools
-// wrapped by separate SDK instances also number against each other. A service
-// that wraps its clients against each server in the same order gets the same
-// names on every run; set a name for clients wrapped concurrently or lazily,
-// or replaced by wrapping the new client before unwrapping the old one, which
-// then gets the next number.
+// name until it is collected. Generated names are unique across the process,
+// so pools wrapped by separate SDK instances also number against each other.
+// A name set with this option is used as given and not deduplicated: another
+// client given the same name, or already holding it as a generated name,
+// reports under that one name too, and the two cannot be told apart on the
+// pool metrics. A service that wraps its clients against each
+// server in the same order gets the same names on every run; set a name for
+// clients wrapped concurrently or lazily, or replaced by wrapping the new
+// client before unwrapping the old one, which then gets the next number.
 func WithPoolName(name string) Option {
 	return func(cfg *config) {
 		cfg.poolName = name
