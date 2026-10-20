@@ -13,6 +13,38 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+---
+
+## [0.14.0] - 2026-10-20
+
+### Upgrade notes
+
+The Migration section below has the details; the items that change what a
+service sees on rollout are:
+
+- **Go 1.26.0 or later is required** to build against this release
+  (go1.26.9 or later recommended: it carries the stdlib security fixes).
+- **`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and
+  `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` now take effect** for traces and logs
+  when the service does not pass `WithOTLPEndpoint` (metrics still push only
+  where `WithMetricsOTLPEndpoint` says). An endpoint traces or logs are sent
+  to that has no `http(s)` scheme and host now fails `Init`, and so does an
+  endpoint taken from one of these variables while the signal's protocol
+  variable asks for `grpc`.
+- **RPC call-duration histograms** recorded in seconds take the
+  `WithHistogramBuckets` boundaries: their `le` series change, and on the
+  OTLP push path with exponential aggregation configured they become
+  explicit-bucket histograms.
+- **Redis pools without `WithPoolName`** get new names, once.
+- **NATS request timeouts** must be compared with `errors.Is`.
+- **gin**: with the canonical `Middleware` chain, exception-event volume
+  halves (a duplicate is gone) and server spans with gin errors gain
+  `error.type`. Do not add `ErrorRecorder()` after `Middleware(...)`.
+- **OpenTelemetry v1.46** (see Security) changes some output: non-standard
+  HTTP methods are recorded as `_OTHER`, `OTEL_LOGRECORD_ATTRIBUTE_COUNT_LIMIT=0`
+  now drops every log attribute, some Prometheus label values are formatted
+  differently, and the resource `schema_url` moves to 1.43.0.
+
 ### Added
 
 - `WithInstrumentHistogramBuckets(name, buckets)` gives one latency histogram
@@ -58,8 +90,9 @@ adopters can plan their upgrades.
   `crypto/tls`, `html/template`; fixed in go1.26.9); the `x/net` fixes for
   the ones it shares (v0.60.0 and later) themselves require Go 1.26. The
   stdlib fixes reach a binary only through the toolchain that builds it:
-  `go 1.26.0` admits go1.26.0–1.26.8, which still carry them, so build with
-  go1.26.9 or later. CI's govulncheck now runs on go1.26.9.
+  `go 1.26.0` admits go1.26.0–1.26.8, which build fine but still carry
+  them, so go1.26.9 or later is recommended. CI's govulncheck now runs on
+  go1.26.9.
 
 - Bump OpenTelemetry Go to v1.46.0 (log modules v0.22.0, contrib v0.71.0,
   Prometheus exporter v0.68.0) for GO-2026-6505 (`otel/sdk`, `otlptrace`,
@@ -245,8 +278,9 @@ adopters can plan their upgrades.
   With `GOTOOLCHAIN=local` — the default in the official `golang` Docker
   images — a Go 1.25 toolchain stops instead, with
   `github.com/flywindy/o11y@vX requires go >= 1.26.0 (running go 1.25.x;
-  GOTOOLCHAIN=local)`. Move CI images and Dockerfiles to go1.26.9 or later
-  (which also carries the stdlib fixes above) before upgrading.
+  GOTOOLCHAIN=local)`. Move CI images and Dockerfiles to Go 1.26 before
+  upgrading; any 1.26.x builds, and go1.26.9 or later is recommended because
+  only it carries the stdlib fixes above.
 
 - **o11y: the OTLP endpoint variables now take effect without
   `WithOTLPEndpoint`.** A service that sets `OTEL_EXPORTER_OTLP_ENDPOINT` (or
