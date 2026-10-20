@@ -1,4 +1,4 @@
-.PHONY: all test lint adr-check vuln examples bench cover fmt tidy clean help \
+.PHONY: all test lint adr-check semconv-check vuln examples bench cover fmt tidy clean help \
         tools sast sast-gosec sast-gosec-cred sast-semgrep sast-semgrep-test \
         sast-directives
 
@@ -125,11 +125,15 @@ help: ## List available targets
 test: ## Run unit tests with the race detector and coverage
 	$(GO) test -race -covermode=atomic -coverprofile=$(COVERAGE) $(PKGS)
 
-lint: adr-check ## Run ADR integration gate and golangci-lint (must be installed)
+lint: adr-check semconv-check ## Run ADR integration gate, semconv literal check and golangci-lint (must be installed)
 	golangci-lint run --timeout=5m $(PKGS)
 
 adr-check: ## Run ADR 0008 integration policy gate
 	$(GO) run ./scripts/check_integrations.go
+
+semconv-check: ## Reject semconv attribute keys written as string literals in SDK code
+	$(GO) test ./scripts/check_semconv_literals.go ./scripts/check_semconv_literals_test.go
+	$(GO) run ./scripts/check_semconv_literals.go
 
 vuln: ## Scan dependencies for known vulnerabilities
 	govulncheck $(PKGS)

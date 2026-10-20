@@ -30,6 +30,11 @@ inspection. Any exception must be recorded in the integration ADR.
 
 1. **No string literals for SDK-owned semconv keys.** Always reference the
    constant from the pinned semconv package where the package exposes one.
+   `make semconv-check` (`scripts/check_semconv_literals.go`, run by the ADR
+   Check workflow) rejects any string literal in SDK code that equals a key
+   the pinned package declares. `_test.go` files, the root `examples/`
+   directory and generated files are exempt: a test pins the wire string on
+   purpose.
 2. **New attribute? Update this catalog.** The PR reviewer checks that this
    file lists any new key introduced in the diff.
 3. **Deviations require explicit justification** in the "Deviations"
