@@ -1086,18 +1086,21 @@ predecessor's series, while clients rebuilt together get the freed names in
 the order they are wrapped. A client that is only closed keeps its name until
 it is garbage-collected. Generated names are unique across the process, so
 separate SDK instances number against each other. A non-empty name set with
-`WithPoolName` is used as given and not deduplicated (an empty one is
-ignored, and `Wrap` generates a name): another client given the same name, or
-already holding it as a generated name, reports under that one name too. The
-pool metrics also carry `server.address` and `server.port`, so such clients
-stay apart only where those differ; two on the same server share one series,
-and so do two Sentinel failover clients, whose address is go-redis's
-placeholder `FailoverClient` whichever deployment they reach. The name is
-stable across restarts only while clients against the same server are wrapped
-in the same order; set
-`WithPoolName` for any client wrapped concurrently or lazily, replaced
-overlap-first (the new client wrapped before the old one is unwrapped, so it
-gets the next number), or whose series a dashboard or alert keys on.
+`WithPoolName` is not deduplicated (an empty one is ignored, and `Wrap`
+generates a name): it may equal a name given to, or generated for, another
+client. A single-node client reports under the name as given; a Cluster or
+Ring client reports each shard as `<name>/<shard-address>`. A pool-metric
+series is identified by that emitted name together with `server.address` and
+`server.port`, so pools whose emitted names and server attributes all match
+share one series and cannot be told apart: two single-node clients given one
+name on the same server, two clusters given one name with a shard at the same
+address, or two Sentinel failover clients given one name, whose address is
+go-redis's placeholder `FailoverClient` whichever deployment they reach. The
+name is stable across restarts only while clients against the same server are
+wrapped in the same order; set `WithPoolName` for any client wrapped
+concurrently or lazily, replaced overlap-first (the new client wrapped before
+the old one is unwrapped, so it gets the next number), or whose series a
+dashboard or alert keys on.
 
 `db.query.text` is off by default because Redis commands often contain key
 names or values that may be sensitive. Enable it only when that data is safe
