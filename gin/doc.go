@@ -9,10 +9,9 @@
 // The otelgin middleware opens the server span. The chain's second handler
 // records each gin.Context.Errors entry as one exception event carrying the
 // gin.error.type attribute, making gin error categories queryable without
-// adding high-cardinality metric labels, and keeps c.Errors from otelgin, so
-// the exception events come from that handler alone (on a 5xx response
-// otelgin still sets the status from the HTTP code afterwards).
-// gin.Recovery should be registered
+// adding high-cardinality metric labels. otelgin records no exception event
+// of its own; it sets the span status to Error with c.Errors.String() and
+// sets error.type from the errors. gin.Recovery should be registered
 // inside that chain so recovered panics still produce complete HTTP status
 // attributes and metrics.
 //

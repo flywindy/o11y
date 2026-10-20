@@ -38,6 +38,7 @@ func TestMiddleware_MatrixRow01_HappyPath(t *testing.T) {
 	assert.Equal(t, http.StatusOK, result.statusCode)
 	assertSpanShape(t, result.span, http.MethodGet, testRoute, http.StatusOK)
 	assertSpanStatus(t, result.span, codes.Unset, "")
+	assertSpanAttrMissing(t, result.span, semconv.ErrorTypeKey)
 	assertTypedErrorEvents(t, result.span)
 	assertMetricStatusCodes(t, result.metrics, "200")
 }
@@ -50,6 +51,7 @@ func TestMiddleware_MatrixRow02_JSON400WithoutError(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, result.statusCode)
 	assertSpanShape(t, result.span, http.MethodGet, testRoute, http.StatusBadRequest)
 	assertSpanStatus(t, result.span, codes.Unset, "")
+	assertSpanAttrMissing(t, result.span, semconv.ErrorTypeKey)
 	assertTypedErrorEvents(t, result.span)
 	assertMetricStatusCodes(t, result.metrics, "400")
 }
@@ -62,6 +64,7 @@ func TestMiddleware_MatrixRow03_AbortWithError400(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, result.statusCode)
 	assertSpanShape(t, result.span, http.MethodGet, testRoute, http.StatusBadRequest)
 	assertSpanStatus(t, result.span, codes.Error, "Error #01: invalid request\n")
+	assertSpanAttr(t, result.span, semconv.ErrorTypeKey, "*errors.errorString")
 	assertTypedErrorEvents(t, result.span, typedError{message: "invalid request", errorType: "public"})
 	assertMetricStatusCodes(t, result.metrics, "400")
 }
@@ -73,9 +76,11 @@ func TestMiddleware_MatrixRow04_AbortWithError500(t *testing.T) {
 
 	assert.Equal(t, http.StatusInternalServerError, result.statusCode)
 	assertSpanShape(t, result.span, http.MethodGet, testRoute, http.StatusInternalServerError)
-	assertSpanStatus(t, result.span, codes.Error, "") // 5xx: otelgin's status-code description wins; messages are on the exception events
+	assertSpanStatus(t, result.span, codes.Error, "Error #01: database down\n")
+	assertSpanAttr(t, result.span, semconv.ErrorTypeKey, "*errors.errorString")
 	assertTypedErrorEvents(t, result.span, typedError{message: "database down", errorType: "private"})
 	assertMetricStatusCodes(t, result.metrics, "500")
+	assertMetricAttrMissing(t, result.metrics, semconv.ErrorTypeKey) // error.type is on the span only
 }
 
 func TestMiddleware_MatrixRow05_MultipleErrorsThenAbort500(t *testing.T) {
@@ -86,7 +91,8 @@ func TestMiddleware_MatrixRow05_MultipleErrorsThenAbort500(t *testing.T) {
 
 	assert.Equal(t, http.StatusInternalServerError, result.statusCode)
 	assertSpanShape(t, result.span, http.MethodGet, testRoute, http.StatusInternalServerError)
-	assertSpanStatus(t, result.span, codes.Error, "") // 5xx: otelgin's status-code description wins; messages are on the exception events
+	assertSpanStatus(t, result.span, codes.Error, "Error #01: first failure\nError #02: second failure\n")
+	assertSpanAttr(t, result.span, semconv.ErrorTypeKey, semconv.ErrorTypeOther.Value.AsString())
 	assertTypedErrorEvents(t, result.span,
 		typedError{message: "first failure", errorType: "public"},
 		typedError{message: "second failure", errorType: "private"},
@@ -102,6 +108,7 @@ func TestMiddleware_MatrixRow06_PanicWithDefaultRecovery(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, result.statusCode)
 	assertSpanShape(t, result.span, http.MethodGet, testRoute, http.StatusInternalServerError)
 	assertSpanStatus(t, result.span, codes.Error, "")
+	assertSpanAttrMissing(t, result.span, semconv.ErrorTypeKey)
 	assertTypedErrorEvents(t, result.span)
 	assertMetricStatusCodes(t, result.metrics, "500")
 }
@@ -113,7 +120,8 @@ func TestMiddleware_MatrixRow07_PanicWithCustomRecoveryPushingError(t *testing.T
 
 	assert.Equal(t, http.StatusInternalServerError, result.statusCode)
 	assertSpanShape(t, result.span, http.MethodGet, testRoute, http.StatusInternalServerError)
-	assertSpanStatus(t, result.span, codes.Error, "") // 5xx: otelgin's status-code description wins; messages are on the exception events
+	assertSpanStatus(t, result.span, codes.Error, "Error #01: panic: boom\n")
+	assertSpanAttr(t, result.span, semconv.ErrorTypeKey, "*errors.errorString")
 	assertTypedErrorEvents(t, result.span, typedError{message: "panic: boom", errorType: "private"})
 	assertMetricStatusCodes(t, result.metrics, "500")
 }
@@ -126,6 +134,7 @@ func TestMiddleware_MatrixRow08_PanicWithCustomRecoverySwallowingAs200(t *testin
 	assert.Equal(t, http.StatusOK, result.statusCode)
 	assertSpanShape(t, result.span, http.MethodGet, testRoute, http.StatusOK)
 	assertSpanStatus(t, result.span, codes.Unset, "")
+	assertSpanAttrMissing(t, result.span, semconv.ErrorTypeKey)
 	assertTypedErrorEvents(t, result.span)
 	assertMetricStatusCodes(t, result.metrics, "200")
 }
@@ -139,6 +148,7 @@ func TestMiddleware_MatrixRow09_AbortWithoutError204(t *testing.T) {
 	assert.Equal(t, http.StatusNoContent, result.statusCode)
 	assertSpanShape(t, result.span, http.MethodGet, testRoute, http.StatusNoContent)
 	assertSpanStatus(t, result.span, codes.Unset, "")
+	assertSpanAttrMissing(t, result.span, semconv.ErrorTypeKey)
 	assertTypedErrorEvents(t, result.span)
 	assertMetricStatusCodes(t, result.metrics, "204")
 }
@@ -160,6 +170,7 @@ func TestMiddleware_MatrixRow10_InvertedRecoveryOrderProducesIncompleteSpan(t *t
 	assertSpanAttr(t, result.span, semconv.HTTPRequestMethodKey, http.MethodGet)
 	assertSpanAttr(t, result.span, semconv.HTTPRouteKey, testRoute)
 	assertSpanAttrMissing(t, result.span, semconv.HTTPResponseStatusCodeKey)
+	assertSpanAttrMissing(t, result.span, semconv.ErrorTypeKey)
 	assertSpanStatus(t, result.span, codes.Unset, "")
 	// The panic unwinds through otelgin before recovery runs, so the OTel SDK's
 	// span.End records it as an exception event of its own. No c.Errors entry
@@ -410,8 +421,8 @@ func assertSpanAttrMissing(t *testing.T, span sdktrace.ReadOnlySpan, key attribu
 // leaves on the server span for want, in c.Errors order: exactly one exception
 // event per error, each carrying its message and gin.error.type, and no other
 // event. Counting every event, not only the typed ones, is what catches a
-// second exception for the same error — the one otelgin records unless the
-// chain keeps c.Errors from it.
+// second exception for the same error — the one otelgin v0.68.0 recorded, and
+// would again if an upgrade brought its RecordError back.
 func assertTypedErrorEvents(t *testing.T, span sdktrace.ReadOnlySpan, want ...typedError) {
 	t.Helper()
 	var got []typedError
@@ -454,6 +465,28 @@ func assertMetricStatusCodes(t *testing.T, rm metricdata.ResourceMetrics, want .
 		}
 	}
 	assert.ElementsMatch(t, want, got)
+}
+
+// assertMetricAttrMissing checks no http.server.request.duration data point
+// carries key, and that there is at least one data point to check.
+func assertMetricAttrMissing(t *testing.T, rm metricdata.ResourceMetrics, key attribute.Key) {
+	t.Helper()
+	points := 0
+	for _, scope := range rm.ScopeMetrics {
+		for _, metric := range scope.Metrics {
+			if metric.Name != "http.server.request.duration" {
+				continue
+			}
+			histogram, ok := metric.Data.(metricdata.Histogram[float64])
+			require.True(t, ok)
+			for _, point := range histogram.DataPoints {
+				points++
+				_, found := point.Attributes.Value(key)
+				assert.False(t, found, "unexpected metric attribute %s", key)
+			}
+		}
+	}
+	require.NotZero(t, points, "no http.server.request.duration data point")
 }
 
 func assertMetricAttr(t *testing.T, rm metricdata.ResourceMetrics, key attribute.Key, want string) {
