@@ -79,6 +79,9 @@ adopters can plan their upgrades.
   did); and the trace exporter, which now
   reads `OTEL_EXPORTER_OTLP_(TRACES_)PROTOCOL`, is pinned to protobuf like the
   log and metric exporters. Upstream changes that do reach the output:
+  - `gin` (otelgin v0.71.0): a server span with gin errors gains
+    `error.type`, and the status stays Error with `c.Errors.String()` on a
+    5xx; see the `gin` entry under Fixed.
   - `http`, `gin` (otelhttp / otelgin v0.71.0): a request with a non-standard
     method (e.g. `PROPFIND`) is recorded as `http.request.method="_OTHER"`
     with `http.request.method_original`, where v0.68.0 recorded `GET`; on the
@@ -195,13 +198,20 @@ adopters can plan their upgrades.
   included did it again, so every `c.Error` / `c.AbortWithError` left two
   `exception` events on the server span — one with `gin.error.type`, one
   without — and exception counts in Tempo, and any alert built on them, read
-  twice the real number. The chain now records the typed exception itself and
-  keeps `c.Errors` from otelgin while otelgin finishes, putting them back as
-  soon as it returns, so middleware outside the chain still sees every error.
-  The event that remains is the typed one v0.13.0 already emitted, so
-  queries need no change. **Exception-event volume from gin errors halves on
-  rollout**; that step down on a dashboard is the correction, not a drop in
-  errors. A request excluded by `WithFilter`
+  twice the real number. The chain now records the typed exception itself,
+  and otelgin v0.71.0 (see Security) records none of its own. The event that
+  remains is the typed one v0.13.0 already emitted, so queries need no
+  change, and the span status stays Error with `c.Errors.String()` as its
+  description, 5xx included, as in v0.13.0. **Exception-event volume from
+  gin errors halves on rollout**; that step down on a dashboard is the
+  correction, not a drop in errors. A server span with gin errors also gains
+  `error.type`, set by otelgin with semconv's `ErrorType` helper for a single
+  error (`*errors.errorString` for an `errors.New` one; see that function
+  for the full rule) and `_OTHER` for several; it is on the span only, not
+  on `http.server.request.duration`. A span whose `c.Errors` holds only
+  entries with a nil `Err` is marked Error (description
+  `Error #01: %!s(<nil>)`) with `error.type` `_OTHER`, and gets no exception
+  event; on a 5xx, v0.13.0's chain panicked on such an entry instead. A request excluded by `WithFilter`
   / `WithSkipPaths` is left alone by the whole chain: under an outer span (an
   engine served through `o11yhttp.NewServerHandler`) it no longer gets
   exception events there. The filters are now evaluated once per request,
@@ -211,7 +221,7 @@ adopters can plan their upgrades.
   except that a `c.Errors` entry with a nil `Err` (`c.Error(&gin.Error{...})`)
   is skipped instead of panicking on a 5xx response, and the status
   description comes from the last entry that has an error. See ADR 0010's
-  2026-09-26 amendment.
+  2026-09-26 amendment and 2026-10-20 note.
 
 - `redis`: the four pool attributes it wrote as string literals now reference
   their semconv v1.39.0 constants (`DBClientConnectionPoolName`,
@@ -248,12 +258,6 @@ adopters can plan their upgrades.
   `Init` instead of producing an exporter that never sends, and so does
   such a variable next to `OTEL_EXPORTER_OTLP_PROTOCOL=grpc`.
 
-- **gin: a 5xx span with gin errors now has an empty status description**
-  (it was `c.Errors.String()`, e.g. `Error #01: database down`). otelgin sets
-  the status from the HTTP code after the chain has recorded the errors, and
-  now nothing follows it. The messages are on the span's `exception` events;
-  a search or alert on the status message of a 5xx must read
-  `event.exception.message` instead. 4xx spans keep the description.
 - **gin: do not add `o11ygin.ErrorRecorder()` after
   `o11ygin.Middleware(...)`** — that records every error twice.
 - **nats: compare request errors with `errors.Is`, not `==`.** A timeout

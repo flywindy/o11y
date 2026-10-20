@@ -874,8 +874,11 @@ router.GET("/fail", func(c *gin.Context) {
 Each error pushed via `c.Error` / `c.AbortWithError` appears on the server span
 as one `exception` event carrying `gin.error.type` (`bind`, `render`,
 `private`, `public`, …); `{ event:name = "exception" && event.gin.error.type =
-"bind" }` finds it. On a 5xx response the span status is Error with an empty
-description; the error messages are on the exception events. A request
+"bind" }` finds it. The span status is Error with the errors' messages
+(`c.Errors.String()`) as its description, and the span carries `error.type`:
+for a single error, what semconv's `ErrorType` helper derives from it
+(`*errors.errorString` for an `errors.New` error); `_OTHER` for several.
+A request
 excluded by `WithFilter` or `WithSkipPaths` is not instrumented by the chain,
 so it gets no event. Use `o11ygin.ErrorRecorder()` only in a chain
 without `Middleware` — for example a gin engine served through

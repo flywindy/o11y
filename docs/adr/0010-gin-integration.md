@@ -193,8 +193,9 @@ ADR 0009 §2 still apply as defense in depth (in particular, gin's
 
 > Updated by the 2026-09-26 amendment: slot `[1]` is the chain's error
 > handler, no longer `ErrorRecorder`. It records each `c.Errors` entry
-> as the exception event and keeps `c.Errors` from otelgin, which would
-> record each entry again; slot `[0]` puts them back once otelgin returns.
+> as the exception event. Updated again by the 2026-10-20 note: the chain
+> no longer keeps `c.Errors` from otelgin, which (v0.71.0) records no
+> exception of its own but sets the status description and `error.type`.
 
 `otelgin.Middleware`, `ErrorRecorder`, and `gin.Recovery()` form a
 three-layer stack whose ordering determines correctness. The
@@ -222,17 +223,15 @@ Execution order on a request:
      the response writer. Control then returns up the chain
      **normally** (the default `gin.Recovery` does not re-panic).
    - The chain's error handler's post-`c.Next()` code runs, reads
-     `c.Errors`, records one `exception` event per entry carrying
-     `gin.error.type`, sets status Error with `c.Errors.String()`, and
-     moves `c.Errors` aside. With the default `gin.Recovery`, `c.Errors`
+     `c.Errors` and records one `exception` event per entry carrying
+     `gin.error.type`. With the default `gin.Recovery`, `c.Errors`
      is empty after a panic (Recovery does not push the panic into
      `c.Errors`), so the handler is a no-op for that case.
    - `otelgin`'s post-`c.Next()` code reads `c.Writer.Status()` (now
-     500), sets the OTel span status from it (for a 5xx this replaces
-     the description with an empty one) and the
-     `http.response.status_code` attribute. It finds `c.Errors` empty,
-     so it records no exception. Then `defer span.End()` fires.
-   - Slot `[0]` puts `c.Errors` back before control leaves the chain.
+     500), sets the OTel span status from it and the
+     `http.response.status_code` attribute. When `c.Errors` is not empty
+     it then sets status Error with `c.Errors.String()` and `error.type`
+     (v0.71.0; it records no exception). Then `defer span.End()` fires.
 
 The end-state span for a panic in canonical order: status `Error`
 (from the 500 status code), `http.response.status_code=500`, but
@@ -254,21 +253,22 @@ The PR adds tests covering each row. Each test asserts the recorded
 span attributes, span status, the typed exception events the chain records,
 and the `http.server.request.duration` sample for the request.
 
-Because the chain sets span status to Error whenever `c.Errors` is
-non-empty, as `otelgin` v0.68.0 would, `AbortWithError(400, err)` produces
-an Error span even though plain 4xx responses remain Unset. On a 5xx,
-`otelgin`'s status-code-derived status (Error, empty description) replaces
-that description; the messages are on the exception events.
+Because `otelgin` sets span status to Error with `c.Errors.String()`
+whenever `c.Errors` is non-empty, `AbortWithError(400, err)` produces an
+Error span even though plain 4xx responses remain Unset, and a 5xx with
+errors keeps that description over the status-code-derived one. It also
+sets `error.type` on the span then: the error's type for one entry,
+`_OTHER` for several.
 
 | # | Scenario | Recovery present | Custom recovery | Handler outcome | Expected span status | Expected `c.Errors` surfaced | Expected metric `status_code` |
 |---|---|---|---|---|---|---|---|
 | 1 | Happy path | `gin.Recovery()` | n/a | 200 OK | Unset | none | 200 |
 | 2 | 4xx via `c.JSON(400, ...)` | `gin.Recovery()` | n/a | 400 | Unset | none | 400 |
-| 3 | 4xx via `c.AbortWithError(400, err)` | `gin.Recovery()` | n/a | 400 | Error, message = `c.Errors.String()` | one `exception` event with `gin.error.type` | 400 |
-| 4 | 5xx via `c.AbortWithError(500, err)` | `gin.Recovery()` | n/a | 500 | Error, description empty (5xx) | one `exception` event with `gin.error.type` | 500 |
-| 5 | Multiple `c.Error(err1)` + `c.AbortWithError(500, err2)` | `gin.Recovery()` | n/a | 500 | Error, description empty (5xx) | one typed `exception` event per error, in order | 500 |
+| 3 | 4xx via `c.AbortWithError(400, err)` | `gin.Recovery()` | n/a | 400 | Error, message = `c.Errors.String()`; `error.type` = the error's type | one `exception` event with `gin.error.type` | 400 |
+| 4 | 5xx via `c.AbortWithError(500, err)` | `gin.Recovery()` | n/a | 500 | Error, message = `c.Errors.String()`; `error.type` = the error's type | one `exception` event with `gin.error.type` | 500 |
+| 5 | Multiple `c.Error(err1)` + `c.AbortWithError(500, err2)` | `gin.Recovery()` | n/a | 500 | Error, message = `c.Errors.String()`; `error.type` = `_OTHER` | one typed `exception` event per error, in order | 500 |
 | 6 | Handler panics, default Recovery | `gin.Recovery()` | n/a | 500 | Error (from status code), description **empty** — panic was swallowed by inner Recovery before any tracing layer saw it | none (`gin.Recovery` does not push panic into `c.Errors`) | 500 |
-| 7 | Handler panics, custom Recovery that **does** push into `c.Errors` | none | custom that calls `c.Error(panicErr); c.AbortWithStatus(500)` | 500 | Error | one typed `exception` event for the panic value | 500 |
+| 7 | Handler panics, custom Recovery that **does** push into `c.Errors` | none | custom that calls `c.Error(panicErr); c.AbortWithStatus(500)` | 500 | Error, message = `c.Errors.String()`; `error.type` = the error's type | one typed `exception` event for the panic value | 500 |
 | 8 | Handler panics, custom Recovery that swallows the panic and writes 200 | none | custom that recovers and `c.JSON(200, fallback)` | 200 | Unset | none | 200 |
 | 9 | `c.Abort()` without error, status 204 | `gin.Recovery()` | n/a | 204 | Unset | none | 204 |
 | 10 | Inverted order: `gin.Recovery()` outermost, then `Middleware(...)` (handler panics) | `gin.Recovery()` | n/a | 500 (panic, recovered by outer Recovery) | **Span exists but is incomplete**: opened by otelgin's pre-`c.Next()` code, ended by its `defer span.End()`, but `status_code` attribute and span status are **not set** because otelgin's post-`c.Next()` code was skipped by the propagating panic. The chain's error handler is also skipped; the OTel SDK's `span.End` records the propagating panic as one `exception` event. | none | **not recorded** (otelgin's metric is also written post-`c.Next()`, which never ran) |
@@ -380,6 +380,8 @@ added to otelgin's event after the fact.
 ### Decision
 
 1. **The chain records the exception; `otelgin` does not see `c.Errors`.**
+   *(The hiding, the status the chain set and the restoring wrapper were
+   removed by the 2026-10-20 note; the typed exception is unchanged.)*
    `Middleware`'s second handler records each `c.Errors` entry as one
    `exception` event carrying `gin.error.type` — the event shape v0.13.0
    already emitted — and sets status Error with `c.Errors.String()`, as
@@ -391,7 +393,8 @@ added to otelgin's event after the fact.
    gin's logger, an error-response middleware — sees `c.Errors` exactly
    as the handlers left them. Nothing but `otelgin`'s own unwind runs
    while they are aside.
-2. **What this relies on in `otelgin`.** v0.68.0 reads `c.Errors` in one
+2. **What this relies on in `otelgin`.** *(Moot since the 2026-10-20
+   note: the chain no longer hides `c.Errors`.)* v0.68.0 reads `c.Errors` in one
    place only, the status-and-`RecordError` block after `c.Next()`; its
    metrics and attributes do not use it. The matrix pins the outcome
    rather than the reading: it counts every event on the span and
@@ -399,7 +402,9 @@ added to otelgin's event after the fact.
    outer middleware sees every error. An `otelgin` upgrade that reads
    `c.Errors` elsewhere, or stops relying on it, fails those tests
    instead of changing what services emit.
-3. **5xx status description.** `otelgin` sets the status from the HTTP
+3. **5xx status description.** *(Reversed by the 2026-10-20 note: the
+   chain no longer hides `c.Errors`, so the description is
+   `c.Errors.String()` again.)* `otelgin` sets the status from the HTTP
    code before it looks at `c.Errors`; for a 5xx that is Error with an
    empty description, which replaces the chain's (equal codes do not
    keep the earlier one). Before this amendment `otelgin`'s own
@@ -466,7 +471,9 @@ description, was also considered and rejected. That span is the one
 longer the SDK's (breaking any type assertion on it), and every call the
 application makes on it would pass through code that has to tell
 `otelgin`'s calls from the application's. Keeping `c.Errors` aside during
-`otelgin`'s unwind touches nothing the application can observe.
+`otelgin`'s unwind touches nothing the application can observe. (That
+hiding was itself removed by the 2026-10-20 note, once `otelgin` v0.71.0
+stopped recording exceptions.)
 
 Two ways of handling filtered requests were rejected as well:
 recording on whatever span is active (a second exception whenever that
@@ -484,6 +491,7 @@ nested chains; two answers from a non-deterministic filter).
 - Queries need no change: the typed `exception` event is the one v0.13.0
   emitted. Only the untyped duplicate disappears.
 - A 5xx span with gin errors has an empty status description (Decision 3).
+  *(No longer: see the 2026-10-20 note.)*
 - A request a filter excludes (for example `/healthz` under
   `WithSkipPaths`) no longer gets exception events on an outer span;
   before this amendment `ErrorRecorder` recorded them there.
@@ -502,3 +510,40 @@ status description empty: `otelgin` sets the status from the HTTP code
 first and only then, when it sees `c.Errors`, replaces it with
 `c.Errors.String()` (Decision 3). Letting both through is a separate,
 output-changing decision left for a follow-up.
+
+### Note (2026-10-20) — the chain stops hiding `c.Errors`
+
+The follow-up the 2026-10-02 note left open. Hiding `c.Errors` from
+`otelgin` existed to stop v0.68.0 recording each error a second time;
+v0.71.0 records none, so the chain now leaves `c.Errors` alone and the
+wrapper and its private key are gone. Against v0.13.0, which shipped
+v0.68.0 and no hiding, the canonical chain's span:
+
+- keeps one typed `exception` event per gin error, recorded by the chain
+  (the duplicate the 2026-09-26 amendment removed stays removed);
+- keeps the status Error with `c.Errors.String()` as its description on a
+  5xx as on a 4xx, as v0.13.0 did — Decision 3's empty description never
+  ships;
+- gains `error.type`, set by `otelgin` with semconv's `ErrorType` helper (`go.opentelemetry.io/otel/semconv/v1.43.0`, which `otelgin` imports; its godoc defines the value — `*errors.errorString` for an `errors.New` error) for a single entry, and `_OTHER` for several. It is on
+  the span only; `otelgin`'s request-duration metric does not read
+  `c.Errors`. It does not follow semconv's HTTP-server rule for
+  `error.type` — it is set on a 4xx with gin errors, and on a 5xx it names
+  the error rather than the status code — so `docs/semconv.md` lists it
+  under Deviations. gin's own bind/render/private/public classification
+  stays on `gin.error.type`.
+
+A request whose `c.Errors` holds only nil-`Err` entries
+(`c.Error(&gin.Error{...})`) now gets status Error, with gin's rendering
+`Error #01: %!s(<nil>)` as the description, and `error.type` `_OTHER`
+from `otelgin`; the chain records no exception for it. On a 4xx that is
+the status v0.13.0's `otelgin` v0.68.0 set; on a 5xx v0.13.0's
+`ErrorRecorder` panicked on such an entry (fixed by the 2026-09-26
+amendment, Decision 6), so the span v0.13.0 left was incomplete.
+
+Every matrix row asserts the status description and the presence or
+absence of `error.type`, for errors built with `errors.New`, which pins
+what `otelgin` does with `c.Errors`; how `ErrorType` names other error
+types is semconv's and is not re-tested here. Row 4 also asserts
+`error.type` stays off the request-duration metric under the SDK's
+default HTTP view, whose allow-list keeps it off whatever a later
+`otelgin` records.

@@ -82,10 +82,10 @@ func TestMiddleware_LeavesApplicationExceptionsAlone(t *testing.T) {
 	assertSpanStatus(t, result.span, codes.Error, "Error #01: invalid id\n")
 }
 
-// TestMiddleware_OuterMiddlewareSeesErrors checks that keeping c.Errors from
-// otelgin is invisible outside the chain: a middleware registered before
-// Middleware, like gin's logger or an error-response middleware, still finds
-// every error the handlers pushed, in order.
+// TestMiddleware_OuterMiddlewareSeesErrors checks the chain leaves c.Errors
+// as the handlers left it: a middleware registered before Middleware, like
+// gin's logger or an error-response middleware, finds every error the
+// handlers pushed, in order.
 func TestMiddleware_OuterMiddlewareSeesErrors(t *testing.T) {
 	env := newTestEnv(t)
 	var seen []string
@@ -201,8 +201,8 @@ func TestMiddleware_ContextSwapDownstream(t *testing.T) {
 // TestMiddleware_NestedChains installs Middleware on the engine and again on a
 // group, with each chain tracing or filtering the request. Every span carries
 // exactly one typed exception event per error, and a chain that filtered the
-// request adds nothing: neither chain acts on the other's span, filter answer
-// or hidden errors.
+// request adds nothing: neither chain acts on the other's span or filter
+// answer.
 func TestMiddleware_NestedChains(t *testing.T) {
 	for _, tc := range []struct {
 		outerFiltered, innerFiltered bool
@@ -266,10 +266,12 @@ func TestMiddleware_HandleContextKeepsTracedFlag(t *testing.T) {
 	assertTypedErrorEvents(t, spans[0], typedError{message: "not ready", errorType: "public"})
 }
 
-// TestMiddleware_NilErrOnlyLeavesStatusUnset pushes only a nil-Err entry on a
-// 4xx response. There is no error to record, so the chain neither records an
-// exception nor marks the span Error, as ErrorRecorder does.
-func TestMiddleware_NilErrOnlyLeavesStatusUnset(t *testing.T) {
+// TestMiddleware_NilErrOnlyRecordsNoException pushes only a nil-Err entry on
+// a 4xx response. There is no error to record, so the chain records no
+// exception; otelgin still sees a c.Errors entry and marks the span Error with
+// error.type _OTHER, as v0.13.0's otelgin v0.68.0 marked it Error — with
+// gin's rendering of the nil Err as the description.
+func TestMiddleware_NilErrOnlyRecordsNoException(t *testing.T) {
 	env := newTestEnv(t)
 	router := ginframework.New()
 	router.Use(o11ygin.Middleware(testService, env.tracerProvider, env.meterProvider, propagation.TraceContext{})...)
@@ -282,14 +284,14 @@ func TestMiddleware_NilErrOnlyLeavesStatusUnset(t *testing.T) {
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, testPath, nil))
 	result := env.finish(t, rec)
 
-	assertSpanStatus(t, result.span, codes.Unset, "")
+	assertSpanStatus(t, result.span, codes.Error, "Error #01: %!s(<nil>)\n")
+	assertSpanAttr(t, result.span, semconv.ErrorTypeKey, semconv.ErrorTypeOther.Value.AsString())
 	assert.Empty(t, result.span.Events())
 }
 
 // TestMiddleware_LeavesNoKey checks the chain removes every entry it puts in
-// c.Keys — the traced flag its filter writes and the errors it sets aside —
-// so c.Keys holds nothing of the chain's after the request, with or without
-// filters.
+// c.Keys — the traced flag its filter writes — so c.Keys holds nothing of the
+// chain's after the request, with or without filters.
 func TestMiddleware_LeavesNoKey(t *testing.T) {
 	for name, opts := range map[string][]o11ygin.Option{
 		"no filters":   nil,

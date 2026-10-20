@@ -52,8 +52,9 @@ exists rather than a one-line "do what 0010 did":
    handler in the chain because `otelgin` exposes no error hook. (`otelgin`
    v0.68.0 does record each `c.Errors` entry as an `exception` event itself,
    but cannot add gin's error classification; since ADR 0010's 2026-09-26
-   amendment the SDK's handler records the typed exception and keeps
-   `c.Errors` from `otelgin` so it is not recorded twice.)
+   amendment the SDK's handler records the typed exception, and since
+   `otelgin` v0.71.0 records none of its own (ADR 0010's 2026-10-20 note)
+   no error is recorded twice.)
    Echo is the opposite: handlers **return** `error`, the error
    propagates back up the middleware chain, and a centralized
    `Echo.HTTPErrorHandler` turns it into a response. `otelecho`
@@ -241,8 +242,10 @@ Error classification (`echo.error.kind`):
 
 Rationale for naming: this mirrors ADR 0010's choice of a
 framework-specific dotted key (`gin.error.type`) rather than reusing
-OTel's `error.type` (which is reserved for transport/protocol class
-names). `echo.http_error.code` is deliberately **span-only**, never a
+OTel's `error.type`, which names an error's type, not a framework's
+classification of it. (Since ADR 0010's 2026-10-20 note, `otelgin` itself
+also sets `error.type` on gin spans with errors; the framework
+classification still lives on `gin.error.type`.) `echo.http_error.code` is deliberately **span-only**, never a
 metric label — it would duplicate `http.response.status_code` on the
 metric and risk cardinality. The genuinely new signal echo gives us is
 `*echo.HTTPError.Internal`: the underlying cause that the client never
