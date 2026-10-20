@@ -1084,9 +1084,16 @@ Call `Unwrap` before discarding a client you rebuild, and the next client on
 that base takes the lowest freed name: a single rebuilt client continues its
 predecessor's series, while clients rebuilt together get the freed names in
 the order they are wrapped. A client that is only closed keeps its name until
-it is garbage-collected. Names are unique across the process, so separate SDK
-instances number against each other. The name is stable across restarts only
-while clients against the same server are wrapped in the same order; set
+it is garbage-collected. Generated names are unique across the process, so
+separate SDK instances number against each other. A non-empty name set with
+`WithPoolName` replaces the generated `<base>-<n>`, shard addresses still
+appended for a Cluster or Ring client, and is not deduplicated; an empty name
+is ignored. The pool metrics tell pools apart only by the reported pool name,
+`server.address` and `server.port`, so pools that match on all three report
+into the same series: give each client its own name. A Sentinel failover
+client reports `server.address` as go-redis's placeholder `FailoverClient`,
+whatever deployment it reaches. The name is stable across restarts only while
+clients against the same server are wrapped in the same order; set
 `WithPoolName` for any client wrapped concurrently or lazily, replaced
 overlap-first (the new client wrapped before the old one is unwrapped, so it
 gets the next number), or whose series a dashboard or alert keys on.

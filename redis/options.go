@@ -119,9 +119,16 @@ func WithRequireParentSpan(enabled bool) Option {
 // that base takes the lowest name free: a single client rebuilt after Unwrap
 // gets its predecessor's name, while clients rebuilt together get the freed
 // names in the order they are wrapped. A client that is only closed keeps its
-// name until it is collected. Names are unique across the process, so pools
-// wrapped by separate SDK instances also number against each other. A service
-// that wraps its clients against each server in the same order gets the same
+// name until it is collected. Generated names are unique across the process,
+// so pools wrapped by separate SDK instances also number against each other.
+// A non-empty name set with this option replaces the generated <base>-<n>,
+// shard addresses still appended for a Cluster or Ring client, and is not
+// deduplicated; an empty name is ignored. The pool metrics tell pools apart
+// only by the reported pool name, server.address and server.port, so pools
+// that match on all three report into the same series: give each client its
+// own name. A Sentinel failover client reports server.address as go-redis's
+// placeholder FailoverClient, whatever deployment it reaches. A service that
+// wraps its clients against each server in the same order gets the same
 // names on every run; set a name for clients wrapped concurrently or lazily,
 // or replaced by wrapping the new client before unwrapping the old one, which
 // then gets the next number.
