@@ -28,8 +28,9 @@ service sees on rollout are:
   `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` now take effect** for traces and logs
   when the service does not pass `WithOTLPEndpoint` (metrics still push only
   where `WithMetricsOTLPEndpoint` says). An endpoint traces or logs are sent
-  to that has no `http(s)` scheme and host, or whose signal's protocol
-  variable asks for `grpc`, now fails `Init`.
+  to that has no `http(s)` scheme and host now fails `Init`, and so does an
+  endpoint taken from one of these variables while the signal's protocol
+  variable asks for `grpc`.
 - **RPC call-duration histograms** recorded in seconds take the
   `WithHistogramBuckets` boundaries: their `le` series change, and on the
   OTLP push path with exponential aggregation configured they become
