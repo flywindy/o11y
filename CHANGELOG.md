@@ -13,6 +13,17 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+### Added
+
+- CI gate for `docs/semconv.md` Enforcement Rule 1: `make semconv-check`
+  (`scripts/check_semconv_literals.go`, run by the ADR Check workflow and by
+  `make lint`) fails when SDK code writes a semconv attribute key as a string
+  literal instead of using the pinned `semconv/v1.39.0` constant. The key set
+  is read from the pinned package itself. `_test.go` files, the root
+  `examples/` directory and generated files are exempt. The five literals it
+  found (`service.name` on the stdout logger and the four identity keys in the
+  baggage reservation list) now use the constants; output is unchanged.
+
 ---
 
 ## [0.14.0] - 2026-10-20

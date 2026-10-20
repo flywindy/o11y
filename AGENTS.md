@@ -94,6 +94,7 @@ go mod tidy
 
 # Lint
 go vet ./...
+make semconv-check           # semconv attribute keys must use the pinned constants
 
 # Test
 go test ./...

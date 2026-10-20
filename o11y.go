@@ -544,7 +544,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	//    it is built before the MeterProvider so the Prometheus handler can
 	//    report scrape errors through it: the OTLP logger does not exist yet at
 	//    that point, and stdout is collected in-cluster anyway.
-	stdoutAttrs := []slog.Attr{slog.String("service.name", cfg.serviceName)}
+	stdoutAttrs := []slog.Attr{slog.String(string(semconv.ServiceNameKey), cfg.serviceName)}
 	if cfg.environment != "" {
 		stdoutAttrs = append(stdoutAttrs, slog.String("environment", cfg.environment))
 	}
