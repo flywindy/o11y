@@ -121,21 +121,17 @@ func WithRequireParentSpan(enabled bool) Option {
 // names in the order they are wrapped. A client that is only closed keeps its
 // name until it is collected. Generated names are unique across the process,
 // so pools wrapped by separate SDK instances also number against each other.
-// A non-empty name set with this option is not deduplicated (an empty one is
-// ignored, and Wrap generates a name): it may equal a name given to, or
-// generated for, another client. A single-node client reports under the name
-// as given; a Cluster or Ring client reports each shard as
-// <name>/<shard-address>. A pool-metric series is identified by that emitted
-// name together with server.address and server.port, so pools whose emitted
-// names and server attributes all match share one series and cannot be told
-// apart: two single-node clients given one name on the same server, two
-// clusters given one name with a shard at the same address, or two Sentinel
-// failover clients given one name, whose address is go-redis's placeholder
-// FailoverClient whichever deployment they reach. A service that wraps its
-// clients against each server in the same order gets the same names on every
-// run; set a name for clients wrapped concurrently or lazily, or replaced by
-// wrapping the new client before unwrapping the old one, which then gets the
-// next number.
+// A non-empty name set with this option replaces the generated <base>-<n>,
+// shard addresses still appended for a Cluster or Ring client, and is not
+// deduplicated; an empty name is ignored. The pool metrics tell pools apart
+// only by the reported pool name, server.address and server.port, so pools
+// that match on all three report into the same series: give each client its
+// own name. A Sentinel failover client reports server.address as go-redis's
+// placeholder FailoverClient, whatever deployment it reaches. A service that
+// wraps its clients against each server in the same order gets the same
+// names on every run; set a name for clients wrapped concurrently or lazily,
+// or replaced by wrapping the new client before unwrapping the old one, which
+// then gets the next number.
 func WithPoolName(name string) Option {
 	return func(cfg *config) {
 		cfg.poolName = name
