@@ -1088,8 +1088,11 @@ it is garbage-collected. Generated names are unique across the process, so
 separate SDK instances number against each other. A name set with
 `WithPoolName` is used as given and not deduplicated: another client given
 the same name, or already holding it as a generated name, reports under that
-one name too, and the two cannot be told apart on the pool metrics. The name is stable across restarts only
-while clients against the same server are wrapped in the same order; set
+one name too. Clients on different servers stay apart through
+`server.address` and `server.port`, but two such clients on the same server
+report into the same pool-metric series and cannot be told apart. The name is
+stable across restarts only while clients against the same server are wrapped
+in the same order; set
 `WithPoolName` for any client wrapped concurrently or lazily, replaced
 overlap-first (the new client wrapped before the old one is unwrapped, so it
 gets the next number), or whose series a dashboard or alert keys on.

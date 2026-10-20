@@ -123,11 +123,13 @@ func WithRequireParentSpan(enabled bool) Option {
 // so pools wrapped by separate SDK instances also number against each other.
 // A name set with this option is used as given and not deduplicated: another
 // client given the same name, or already holding it as a generated name,
-// reports under that one name too, and the two cannot be told apart on the
-// pool metrics. A service that wraps its clients against each
-// server in the same order gets the same names on every run; set a name for
-// clients wrapped concurrently or lazily, or replaced by wrapping the new
-// client before unwrapping the old one, which then gets the next number.
+// reports under that one name too. Clients on different servers stay apart
+// through server.address and server.port, but two such clients on the same
+// server report into the same pool-metric series and cannot be told apart. A
+// service that wraps its clients against each server in the same order gets
+// the same names on every run; set a name for clients wrapped concurrently or
+// lazily, or replaced by wrapping the new client before unwrapping the old
+// one, which then gets the next number.
 func WithPoolName(name string) Option {
 	return func(cfg *config) {
 		cfg.poolName = name
