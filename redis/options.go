@@ -121,15 +121,18 @@ func WithRequireParentSpan(enabled bool) Option {
 // names in the order they are wrapped. A client that is only closed keeps its
 // name until it is collected. Generated names are unique across the process,
 // so pools wrapped by separate SDK instances also number against each other.
-// A name set with this option is used as given and not deduplicated: another
+// A non-empty name set with this option is used as given and not
+// deduplicated (an empty one is ignored, and Wrap generates a name): another
 // client given the same name, or already holding it as a generated name,
-// reports under that one name too. Clients on different servers stay apart
-// through server.address and server.port, but two such clients on the same
-// server report into the same pool-metric series and cannot be told apart. A
-// service that wraps its clients against each server in the same order gets
-// the same names on every run; set a name for clients wrapped concurrently or
-// lazily, or replaced by wrapping the new client before unwrapping the old
-// one, which then gets the next number.
+// reports under that one name too. The pool metrics also carry
+// server.address and server.port, so such clients stay apart only where
+// those differ; two on the same server share one series, and so do two
+// Sentinel failover clients, whose address is go-redis's placeholder
+// FailoverClient whichever deployment they reach. A service that wraps its
+// clients against each server in the same order gets the same names on every
+// run; set a name for clients wrapped concurrently or lazily, or replaced by
+// wrapping the new client before unwrapping the old one, which then gets the
+// next number.
 func WithPoolName(name string) Option {
 	return func(cfg *config) {
 		cfg.poolName = name

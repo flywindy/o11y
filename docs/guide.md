@@ -1085,12 +1085,14 @@ that base takes the lowest freed name: a single rebuilt client continues its
 predecessor's series, while clients rebuilt together get the freed names in
 the order they are wrapped. A client that is only closed keeps its name until
 it is garbage-collected. Generated names are unique across the process, so
-separate SDK instances number against each other. A name set with
-`WithPoolName` is used as given and not deduplicated: another client given
-the same name, or already holding it as a generated name, reports under that
-one name too. Clients on different servers stay apart through
-`server.address` and `server.port`, but two such clients on the same server
-report into the same pool-metric series and cannot be told apart. The name is
+separate SDK instances number against each other. A non-empty name set with
+`WithPoolName` is used as given and not deduplicated (an empty one is
+ignored, and `Wrap` generates a name): another client given the same name, or
+already holding it as a generated name, reports under that one name too. The
+pool metrics also carry `server.address` and `server.port`, so such clients
+stay apart only where those differ; two on the same server share one series,
+and so do two Sentinel failover clients, whose address is go-redis's
+placeholder `FailoverClient` whichever deployment they reach. The name is
 stable across restarts only while clients against the same server are wrapped
 in the same order; set
 `WithPoolName` for any client wrapped concurrently or lazily, replaced
