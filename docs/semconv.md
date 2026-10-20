@@ -77,7 +77,9 @@ needs; the other two add only label bloat.
 Histogram boundaries use the SDK's configured latency buckets
 (`WithHistogramBuckets`), which default to
 `[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]` seconds. The same
-option shapes the HTTP client and datastore histograms below.
+option shapes the HTTP client and datastore histograms below, and the
+semconv RPC histograms (`rpc.server.call.duration`, `rpc.client.call.duration`,
+unit `s`) that applications record.
 
 ### Attributes
 

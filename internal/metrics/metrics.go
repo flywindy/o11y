@@ -76,6 +76,12 @@ type Config struct {
 	ExtraViews          []sdkmetric.View
 	MaxUniqueRoutes     int
 
+	// HistogramBucketOverrides maps an instrument name to the explicit bucket
+	// boundaries that histogram uses instead of HistogramBuckets or its own
+	// advisory boundaries, in every scope that records it. See
+	// applyHistogramBucketOverrides.
+	HistogramBucketOverrides map[string][]float64
+
 	// MaxUniqueCollections caps distinct db.collection.name values on the
 	// Cassandra and Elasticsearch client metrics at the export boundary,
 	// collapsing the overflow to "other", with an independent budget per
@@ -365,6 +371,7 @@ func InitMeter(ctx context.Context, cfg Config) (*sdkmetric.MeterProvider, Close
 
 	views := defaultViews(cfg)
 	views = append(views, cfg.ExtraViews...)
+	views = applyHistogramBucketOverrides(views, cfg.HistogramBucketOverrides)
 
 	var provider *sdkmetric.MeterProvider
 	var closer Closer

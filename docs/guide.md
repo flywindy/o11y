@@ -393,6 +393,8 @@ histogram the SDK installs a view for, which is more than the HTTP pair:
 | `db.client.operation.duration` | `redis`, `mongo`, `cassandra`, `elasticsearch` |
 | `db.client.connection.create_time` | `redis`, `mongo`, `cassandra` |
 | `minio.client.operation.duration` | `minio` |
+| `rpc.server.call.duration` | none — whatever records it (e.g. an application's request/reply instrumentation) |
+| `rpc.client.call.duration` | none — as above |
 
 The default set (`DefaultLatencyBuckets()`, `[0.005 … 10]` seconds) is shaped
 for HTTP request latency. Datastore operations tend to sit at the low end of
@@ -401,14 +403,74 @@ widening the buckets for a slow HTTP endpoint takes resolution from the range
 those histograms live in. Where exactly they sit is a question about the
 deployment — a network hop, a loaded server or a large value all move it — so
 read the datastore panels after changing these, rather than assuming the
-effect from the HTTP ones. There is no per-signal form of the option and no way to add a view
-through `Init`, so a service that needs different boundaries for one of these
-histograms has to build its own MeterProvider. Keeping the default everywhere
-is also what makes cross-service P99 comparisons hold.
+effect from the HTTP ones. Keeping the default everywhere is also what makes
+cross-service P99 comparisons hold.
+
+The two RPC histograms are on the list so a service's request/reply latency
+shares its boundaries with its HTTP latency: one percentile reads the same on
+both, and one recording rule fits both. No SDK integration records them, so
+their views set the boundaries only — they filter no attributes, and every
+label the recording code attaches reaches the series. They match only the
+semconv unit, `s`: a recorder still on the pre-v1.39 millisecond unit, or with
+no unit, keeps its own boundaries. Like any view, they replace the boundaries
+an instrument advised at creation, so an application that advised its own set
+on these names now gets the SDK's. A service whose calls
+can run past 10s (say a 30s request timeout) extends the set once and both
+families follow:
+
+```go
+// Keep the shared boundaries and add the tail above 10s, so slow calls stop
+// collapsing into +Inf. HTTP and RPC histograms both take this set.
+sdk, err := o11y.Init(ctx,
+    // ... required options ...
+    o11y.WithHistogramBuckets(append(o11y.DefaultLatencyBuckets(), 15, 20, 30)),
+)
+```
+
+Extending the default set rather than replacing it keeps the shared boundaries
+— and so percentile comparisons and SLO bounds below 10s — intact. A boundary
+at the timeout itself (`30` above) also makes `+Inf` minus `le="30"` the count
+of calls that hit it. Each extra boundary adds one `_bucket` series per
+attribute set, and the per-stream cardinality limit counts attribute sets, not
+buckets, so it never folds them into overflow.
+
+When a dashboard aggregates one family across services (`sum by (le)`) and
+only some services extend the set, quantiles at or below 10s stay exact, but
+anything above reads a partial `le="15"`…`le="30"` with no warning (Prometheus
+flags the repaired monotonicity at most). Keep services that are aggregated
+together on the same set, or have Prometheus convert classic histograms to
+native ones (`convert_classic_histograms_to_nhcb`), which reconciles them to
+the boundaries all inputs share.
+
+To reshape one histogram without touching the rest — `WithHistogramBuckets`
+also moves the datastore histograms — use
+`WithInstrumentHistogramBuckets(name, buckets)`. It matches the instrument name
+exactly, in every scope that records it, and beats both `WithHistogramBuckets`
+and the boundaries an instrument advises at creation, so it also reaches
+histograms the SDK installs no view for:
+
+```go
+// Only the RPC server histogram gets the 30s tail.
+o11y.WithInstrumentHistogramBuckets("rpc.server.call.duration",
+    append(o11y.DefaultLatencyBuckets(), 15, 20, 30)),
+```
+
+On an instrument the SDK does have a view for, only that view's boundaries
+change; its attribute allow-list keeps applying and no second stream appears.
+Reshaping one request-latency family alone gives up the HTTP/RPC comparability
+above, so prefer `WithHistogramBuckets` when both should follow.
 
 `WithDisableDefaultViews()` drops the SDK's HTTP views alone. The datastore
-views are installed as extra views, so they keep both their label allowlists
-and these boundaries.
+and RPC views are installed as extra views, so they keep their boundaries (and
+the datastore views their label allowlists), and
+`WithInstrumentHistogramBuckets` overrides still apply.
+
+A service that builds its own MeterProvider registers the same views itself:
+each datastore package's `MetricViews(buckets)`, and `o11y.RPCMetricViews(buckets)`
+for the RPC pair. To reshape one instrument there, pass that integration's
+`MetricViews` its own set, or add an `sdkmetric.NewView` for an instrument no
+other view claims — the SDK keeps only the first view that matches an
+instrument, so a second view for an already-viewed name is ignored.
 
 ## Profiling
 

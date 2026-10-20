@@ -15,8 +15,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math"
 	"os"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -467,6 +469,9 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 	if err := validateHistogramBuckets(cfg.histogramBuckets); err != nil {
 		return nil, err
 	}
+	if err := validateHistogramBucketOverrides(cfg.histogramBucketOverrides); err != nil {
+		return nil, err
+	}
 	if err := configureSampler(cfg); err != nil {
 		return nil, err
 	}
@@ -561,13 +566,14 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 
 	if cfg.metricsEnabled {
 		mp, closer, initErr := metrics.InitMeter(ctx, metrics.Config{
-			Resource:            res,
-			MetricsOTLPEndpoint: cfg.metricsOTLPEndpoint,
-			OTLPHeaders:         cfg.otlpHeaders,
-			MetricsAddr:         cfg.metricsAddr,
-			RuntimeMetrics:      cfg.runtimeMetrics,
-			HistogramBuckets:    cfg.histogramBuckets,
-			DisableDefaultViews: cfg.disableDefaultViews,
+			Resource:                 res,
+			MetricsOTLPEndpoint:      cfg.metricsOTLPEndpoint,
+			OTLPHeaders:              cfg.otlpHeaders,
+			MetricsAddr:              cfg.metricsAddr,
+			RuntimeMetrics:           cfg.runtimeMetrics,
+			HistogramBuckets:         cfg.histogramBuckets,
+			HistogramBucketOverrides: cfg.histogramBucketOverrides,
+			DisableDefaultViews:      cfg.disableDefaultViews,
 			// Every integration's views come from the driver-free internal/views
 			// package, so composing them here does not link gocql, minio-go,
 			// the mongo driver, go-redis, or the go-elasticsearch client into
@@ -581,6 +587,7 @@ func Init(ctx context.Context, opts ...Option) (*SDK, error) {
 				views.Minio(cfg.histogramBuckets),
 				views.Mongo(cfg.histogramBuckets),
 				views.Redis(cfg.histogramBuckets),
+				views.RPC(cfg.histogramBuckets),
 			),
 			MaxUniqueRoutes:         cfg.maxUniqueRoutes,
 			MaxUniqueCollections:    cfg.maxUniqueCollections,
@@ -996,6 +1003,16 @@ func validateHistogramBuckets(buckets []float64) error {
 		return errors.New("histogram buckets must not be empty (use WithHistogramBuckets " +
 			"to override, or accept the default)")
 	}
+	return checkHistogramBoundaries(buckets)
+}
+
+// checkHistogramBoundaries holds the boundary rules validateHistogramBuckets
+// and validateHistogramBucketOverrides share, with error text that names
+// neither option, so each caller adds its own context.
+func checkHistogramBoundaries(buckets []float64) error {
+	if len(buckets) == 0 {
+		return errors.New("histogram buckets must not be empty")
+	}
 	for i, b := range buckets {
 		if math.IsNaN(b) || math.IsInf(b, 0) {
 			return fmt.Errorf("histogram bucket[%d] = %v must be a finite number", i, b)
@@ -1008,6 +1025,38 @@ func validateHistogramBuckets(buckets []float64) error {
 				"histogram buckets must be strictly increasing: bucket[%d]=%v is not greater than bucket[%d]=%v",
 				i, b, i-1, buckets[i-1],
 			)
+		}
+	}
+	return nil
+}
+
+// instrumentNamePattern is the OTel API's instrument-name syntax: a letter,
+// then up to 254 letters, digits, '_', '.', '-' or '/'.
+var instrumentNamePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_./-]{0,254}$`)
+
+// validateHistogramBucketOverrides checks every WithInstrumentHistogramBuckets
+// entry: the name must be a valid OTel instrument name, since views match it
+// literally and anything else — a wildcard, stray whitespace — would silently
+// match nothing, and the boundaries must pass checkHistogramBoundaries. Names
+// are checked in sorted order so the reported error does not depend on map
+// iteration.
+func validateHistogramBucketOverrides(overrides map[string][]float64) error {
+	for _, name := range slices.Sorted(maps.Keys(overrides)) {
+		if strings.TrimSpace(name) == "" {
+			return errors.New("histogram bucket override: instrument name must not be empty " +
+				"(WithInstrumentHistogramBuckets)")
+		}
+		if strings.ContainsAny(name, "*?") {
+			return fmt.Errorf("histogram bucket override for %q: wildcard instrument names are not "+
+				"supported; name each instrument exactly", name)
+		}
+		if !instrumentNamePattern.MatchString(name) {
+			return fmt.Errorf("histogram bucket override for %q: not a valid OTel instrument name "+
+				"(a letter, then up to 254 of [A-Za-z0-9_./-]); use the instrument's OTel name, "+
+				"not its Prometheus family name", name)
+		}
+		if err := checkHistogramBoundaries(overrides[name]); err != nil {
+			return fmt.Errorf("histogram bucket override for %q: %w", name, err)
 		}
 	}
 	return nil

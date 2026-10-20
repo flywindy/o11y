@@ -15,6 +15,16 @@ adopters can plan their upgrades.
 
 ### Added
 
+- `WithInstrumentHistogramBuckets(name, buckets)` gives one latency histogram
+  its own bucket boundaries, matched by exact OTel instrument name in every
+  scope. It overrides `WithHistogramBuckets` and the instrument's own
+  advisory boundaries, so it also reaches histograms the SDK has no view for.
+  On an SDK-viewed instrument only the boundaries change; the view's
+  attribute allow-list keeps applying. `Init` rejects a name outside the OTel
+  instrument-name syntax (wildcards included) and invalid boundaries.
+- `RPCMetricViews(buckets)` re-exports the RPC call-duration views below for
+  services that build their own MeterProvider, as the datastore packages'
+  `MetricViews` do.
 - `SDK.ForceFlush(ctx)` exports the buffered spans and log records
   (concurrently), then the metrics collected so far on the OTLP push path,
   without shutting the SDK down — for serverless handlers and other
@@ -22,6 +32,20 @@ adopters can plan their upgrades.
   the deadline between those two stages, returns redacted, joined errors,
   and does nothing once `Shutdown` has started; `Shutdown` waits for a
   `ForceFlush` already running for up to one share of its deadline.
+
+### Changed
+
+- `WithHistogramBuckets` (and its default, `DefaultLatencyBuckets()`) now also
+  sets the boundaries of `rpc.server.call.duration` and
+  `rpc.client.call.duration` recorded in seconds, whatever records them
+  (ADR 0002 amendment), so request/reply latency
+  shares its buckets with HTTP latency and a 30s-timeout service widens both
+  with one option. The views set boundaries only and filter no attributes, and
+  `WithDisableDefaultViews` leaves them in place. A histogram of either name
+  that advised its own boundaries, or advised none and so had OTel's
+  millisecond-scale `[0 … 10000]`, now exports the SDK's set instead: its
+  `le` series change, and queries or recording rules that name the old `le`
+  values need updating.
 
 ### Security
 
@@ -251,6 +275,17 @@ adopters can plan their upgrades.
   `db.client.connection.*` series are renamed on this upgrade. The old name
   already changed on every restart, so nothing could have keyed on it; set
   `WithPoolName` for a name chosen rather than derived.
+- **RPC call-duration histograms: `le` series change.** A service that
+  records `rpc.server.call.duration` or `rpc.client.call.duration` in seconds
+  now exports the `WithHistogramBuckets` set (`DefaultLatencyBuckets()` unless
+  overridden) instead of the boundaries it advised with
+  `metric.WithExplicitBucketBoundaries` — or OTel's `[0 … 10000]` if it
+  advised none. Nothing changes for a service that already advised
+  `DefaultLatencyBuckets()`. To keep a different set, restate it with
+  `WithInstrumentHistogramBuckets`; then update queries and recording rules
+  that name the old `le` values. On the OTLP push path with
+  `OTEL_EXPORTER_OTLP_METRICS_DEFAULT_HISTOGRAM_AGGREGATION=base2_exponential_bucket_histogram`,
+  these two histograms are now explicit-bucket rather than exponential.
 
 ---
 
