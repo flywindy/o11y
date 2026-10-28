@@ -111,17 +111,17 @@ func reservedKeyReason(key string) (string, bool) {
 }
 
 var sdkReservedKeys = map[string]struct{}{
-	"deployment.environment.name": {},
-	"environment":                 {},
-	"level":                       {},
-	"msg":                         {},
-	"service.name":                {},
-	"service.namespace":           {},
-	"service.version":             {},
-	"source":                      {},
-	"spanId":                      {},
-	"time":                        {},
-	"traceId":                     {},
+	string(semconv.DeploymentEnvironmentNameKey): {},
+	"environment":                       {},
+	"level":                             {},
+	"msg":                               {},
+	string(semconv.ServiceNameKey):      {},
+	string(semconv.ServiceNamespaceKey): {},
+	string(semconv.ServiceVersionKey):   {},
+	"source":                            {},
+	"spanId":                            {},
+	"time":                              {},
+	"traceId":                           {},
 }
 
 // ContextWithValue returns a child context carrying key=value after enforcing

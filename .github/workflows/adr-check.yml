@@ -29,6 +29,11 @@ jobs:
       - name: check ADR integration policy
         run: go run ./scripts/check_integrations.go
 
+      - name: check semconv keys are not string literals
+        run: |
+          go test ./scripts/check_semconv_literals.go ./scripts/check_semconv_literals_test.go
+          go run ./scripts/check_semconv_literals.go
+
       - name: check generated semconv baggage reservations
         run: |
           go generate ./internal/baggageattrs
