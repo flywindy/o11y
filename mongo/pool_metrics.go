@@ -3,6 +3,7 @@ package mongo
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -261,6 +262,16 @@ func (t *poolTracker) state(address string) *poolState {
 	return state
 }
 
+// poolSize converts a driver pool-size option to the gauge's int64. A size
+// past math.MaxInt64 cannot be configured in practice; it is clamped rather
+// than allowed to wrap negative.
+func poolSize(v uint64) int64 {
+	if v > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(v)
+}
+
 // setOptions emits the deltas that move db.client.connection.idle.min and
 // db.client.connection.max to the pool's configured sizes. It remembers the
 // sizes ConnectionPoolCreated reported so a later ConnectionPoolReady, which
@@ -283,13 +294,13 @@ func (s *poolState) setOptions(ctx context.Context, metrics *poolMetrics, opts *
 		s.createdMax = opts.MaxPoolSize
 	}
 
-	minSize := int64(opts.MinPoolSize)
+	minSize := poolSize(opts.MinPoolSize)
 	if delta := minSize - s.emittedMin; delta != 0 {
 		metrics.idleMin.Add(ctx, delta, s.poolAddOpt...)
 		s.emittedMin = minSize
 	}
 
-	maxSize := int64(opts.MaxPoolSize)
+	maxSize := poolSize(opts.MaxPoolSize)
 	if maxSize == 0 {
 		if s.emittedMax != 0 {
 			metrics.max.Add(ctx, -s.emittedMax, s.poolAddOpt...)
