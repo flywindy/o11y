@@ -1037,7 +1037,7 @@ func TestWrapRedactsTheConfiguredRequestCredentials(t *testing.T) {
 
 	_, err := client.R().
 		SetAuthToken(token).
-		SetCookie(&http.Cookie{Name: "sess", Value: cookie}).
+		SetCookie(&http.Cookie{Name: "sess", Value: cookie}). // #nosec G124 -- request cookie fixture
 		Get("https://api.example.com/orders")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), token, "the premise: the token is in the error the hook is handed")
@@ -1165,7 +1165,7 @@ func TestWrapRefusesACredentialARedirectIntroduced(t *testing.T) {
 	tp, mp, sr := testProviders()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// #nosec G101 -- fabricated fixture credential, not a live one
+		// #nosec G101 G710 -- fabricated fixture credential, not a live one; the test server redirects on purpose
 		// nosemgrep: hardcoded-credential-literal,gosec.G101-1
 		http.Redirect(w, r, "http://alice:hunter2@"+r.Host+"/final", http.StatusFound)
 	}))
@@ -1278,7 +1278,7 @@ func TestWrapRedactsACookieTheJarAddedToARedirect(t *testing.T) {
 	// cookie on "/" would have been found either way.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/start" {
-			http.SetCookie(w, &http.Cookie{Name: "session", Value: sessionCookie, Path: "/final"})
+			http.SetCookie(w, &http.Cookie{Name: "session", Value: sessionCookie, Path: "/final"}) // #nosec G124 -- plain-HTTP test server fixture
 			http.Redirect(w, r, "/final", http.StatusFound)
 		}
 	}))
@@ -1348,7 +1348,7 @@ func TestWrapRedactsTheSerializedFormOfAJarCookie(t *testing.T) {
 	require.NoError(t, err)
 	base, err := url.Parse(srv.URL)
 	require.NoError(t, err)
-	jar.SetCookies(base, []*http.Cookie{{Name: "session", Value: held, Path: "/final"}})
+	jar.SetCookies(base, []*http.Cookie{{Name: "session", Value: held, Path: "/final"}}) // #nosec G124 -- plain-HTTP test server fixture
 
 	startURL, err := url.Parse(srv.URL + "/start")
 	require.NoError(t, err)
@@ -1396,7 +1396,7 @@ func TestWrapRefusesACredentialASameHostRedirectIntroduced(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/start" {
-			// #nosec G101 -- fabricated fixture credential, not a live one
+			// #nosec G101 G710 -- fabricated fixture credential, not a live one; the test server redirects on purpose
 			// nosemgrep: hardcoded-credential-literal,gosec.G101-1
 			http.Redirect(w, r, "http://alice:newsecret@"+r.Host+"/final", http.StatusFound)
 		}

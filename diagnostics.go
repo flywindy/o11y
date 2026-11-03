@@ -451,7 +451,7 @@ func checkHistogramAggregation(v string) (string, bool) {
 // checkCertificateFile applies the exporters' CA certificate rule: the
 // path must be readable and hold at least one PEM certificate.
 func checkCertificateFile(path string) (string, bool) {
-	pem, err := os.ReadFile(path)
+	pem, err := os.ReadFile(path) // #nosec G304 -- the operator's CERTIFICATE variable names it, and the exporter reads the same path
 	if err != nil {
 		return "the file it names cannot be read", true
 	}
@@ -467,11 +467,11 @@ func checkCertificateFile(path string) (string, bool) {
 // together form a valid key pair.
 func checkClientKeyPair(keyVar string, verbatim bool) func(string) (string, bool) {
 	return func(certPath string) (string, bool) {
-		cert, err := os.ReadFile(certPath)
+		cert, err := os.ReadFile(certPath) // #nosec G304 -- the operator's CLIENT_CERTIFICATE variable names it, and the exporter reads the same path
 		if err != nil {
 			return "the file it names cannot be read", true
 		}
-		key, err := os.ReadFile(envValue(keyVar, verbatim))
+		key, err := os.ReadFile(envValue(keyVar, verbatim)) // #nosec G304 G703 -- the operator's CLIENT_KEY variable names it, and the exporter reads the same path
 		if err != nil {
 			return "the file named by " + keyVar + " cannot be read", true
 		}
