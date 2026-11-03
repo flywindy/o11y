@@ -75,7 +75,7 @@ func main() {
 	})
 	mux.HandleFunc("/api/slow", func(w http.ResponseWriter, r *http.Request) {
 		// Simulate variable latency so the histogram has interesting shape.
-		time.Sleep(time.Duration(50+rand.IntN(200)) * time.Millisecond)
+		time.Sleep(time.Duration(50+rand.IntN(200)) * time.Millisecond) // #nosec G404 -- simulated latency, not a secret
 		_, _ = fmt.Fprintln(w, "ok")
 	})
 	mux.HandleFunc("/api/error", func(w http.ResponseWriter, r *http.Request) {
@@ -94,8 +94,9 @@ func main() {
 		}),
 	)
 
-	// Start the app server on :8080.
-	ln, err := net.Listen("tcp", ":8080")
+	// Start the app server on localhost:8080; only this process and a local
+	// curl call it.
+	ln, err := net.Listen("tcp", "localhost:8080")
 	if err != nil {
 		obs.Logger.ErrorContext(ctx, "failed to listen", slog.Any("error", err))
 		os.Exit(1)
@@ -130,7 +131,7 @@ func main() {
 			// Each synthetic request runs inside its own span so the histogram
 			// bucket carries an exemplar with the matching traceId.
 			reqCtx, span := tracer.Start(ctx, "synthetic-request")
-			path := paths[rand.IntN(len(paths))]
+			path := paths[rand.IntN(len(paths))] // #nosec G404 -- picks a synthetic request path, not a secret
 
 			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "http://localhost:8080"+path, nil)
 			if err != nil {
