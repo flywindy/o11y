@@ -24,6 +24,13 @@ adopters can plan their upgrades.
   found (`service.name` on the stdout logger and the four identity keys in the
   baggage reservation list) now use the constants; output is unchanged.
 
+### Security
+
+- GO-2026-6809 (`crypto/x509` distrusts compromised intermediate
+  certificates) is fixed in go1.26.10. Any Go 1.26.x still builds against
+  this SDK; go1.26.10 or later is now the recommended toolchain. CI's
+  govulncheck and the Makefile's tool builds run on go1.26.10.
+
 ---
 
 ## [0.14.0] - 2026-10-20
