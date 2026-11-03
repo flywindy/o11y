@@ -5,7 +5,7 @@
 //
 // Two scanners see these fixtures and neither silences the other:
 //
-//	#nosec G101                     gosec's own rule, run by `make sast-gosec-cred`
+//	#nosec G101                     gosec's own rule, run by `make sast-gosec`
 //	nosemgrep: gosec.G101-1         what an external scan reports, run nowhere here
 //	nosemgrep: hardcoded-credential-literal   this repo's rule, run by `make sast-semgrep`
 //
@@ -80,7 +80,7 @@ const selfName = "check_credential_directives.go"
 // fixtureDir holds the semgrep rules and their fixtures.
 const fixtureDir = ".semgrep"
 
-// gosecTags are the build tags GOSEC_CRED_FLAGS passes to gosec.
+// gosecTags are the build tags GOSEC_FLAGS passes to gosec.
 var gosecTags = []string{"integration"}
 
 // gosecExempt lists the files the toolchain excludes from `./...`, with the
