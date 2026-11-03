@@ -24,6 +24,31 @@ adopters can plan their upgrades.
   found (`service.name` on the stdout logger and the four identity keys in the
   baggage reservation list) now use the constants; output is unchanged.
 
+### Changed
+
+- `make sast` and the CI `sast` job run every gosec rule, not only the
+  hardcoded-credential rule (G101). The other rules reported 32 findings
+  (26 distinct sites; gosec reports a site twice when a package is also built
+  with its tests), and every one was triaged:
+  - Fixed: the integer conversions gosec flagged (G115) are bounds-checked.
+    These are the escape decoding in the redaction helper, whose output is
+    unchanged, and the MongoDB pool-size gauges, where a configured size past
+    `math.MaxInt64` is now clamped instead of wrapping negative.
+  - Fixed: the metrics example listens on `localhost:8080` instead of every
+    interface.
+  - Annotated with a `#nosec` that names the rule and the reason: reading the
+    certificate and key files the operator's `OTEL_EXPORTER_OTLP_*`
+    variables name (the exporter reads the same paths), the generated semconv
+    catalog being written world-readable, an ASCII-only byte conversion, the
+    example's simulated latency, and cookie and redirect test fixtures.
+
+### Security
+
+- GO-2026-6809 (`crypto/x509` distrusts compromised intermediate
+  certificates) is fixed in go1.26.10. Any Go 1.26.x still builds against
+  this SDK; go1.26.10 or later is now the recommended toolchain. CI's
+  govulncheck and the Makefile's tool builds run on go1.26.10.
+
 ---
 
 ## [0.14.0] - 2026-10-20

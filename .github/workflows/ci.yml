@@ -18,8 +18,9 @@ env:
   # go1.26.9 fixes eleven stdlib advisories (GO-2026-6599/6600/6603/6605/
   # 6607/6608/6610/6611/6612/6613/6617 in net/http, net/textproto,
   # crypto/tls and html/template) that no 1.25.x release fixes: Go 1.25
-  # left support when Go 1.27 shipped on 2026-08-19.
-  GOVULNCHECK_GOTOOLCHAIN: go1.26.9
+  # left support when Go 1.27 shipped on 2026-08-19. go1.26.10 adds the fix
+  # for GO-2026-6809 (crypto/x509 distrusts compromised intermediates).
+  GOVULNCHECK_GOTOOLCHAIN: go1.26.10
 
 jobs:
   test:
@@ -118,11 +119,9 @@ jobs:
           govulncheck ./...
 
   sast:
-    # gosec's credential half (G101) now blocks here; the rest of gosec still
-    # does not — see the note on GOSEC_FLAGS in the Makefile. Those remaining
-    # findings (G115, G304/G703, G404, G306, G102) need a human triage pass
-    # first, tracked separately, and `make sast-gosec` stays runnable for it.
-    name: sast (semgrep rules, credential directives, gosec G101)
+    # Every gosec rule blocks here — see the note on GOSEC_FLAGS in the
+    # Makefile.
+    name: sast (semgrep rules, credential directives, gosec)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -140,12 +139,12 @@ jobs:
       # Installs the pinned SAST toolchain (gosec, semgrep) via the Makefile
       # so CI and local `make sast` stay in lockstep. pipx is preinstalled on
       # ubuntu-latest; add its bin dir to PATH for the semgrep scan step.
-      # `make sast` now runs gosec's G101 gate, so the gosec binary this
-      # installs is load-bearing here rather than only for local triage.
+      # `make sast` runs every gosec rule, so the gosec binary this installs
+      # is load-bearing here.
       - name: Install SAST tools
         run: |
           make tools
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: SAST (semgrep rules, credential directives, gosec G101; fail on medium+)
+      - name: SAST (semgrep rules, credential directives, gosec; fail on medium+)
         run: make sast
