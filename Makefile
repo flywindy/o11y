@@ -65,6 +65,13 @@ endif
 # source file, test fixtures). A new finding is fixed or annotated the same
 # way, with the reason after "--" as every #nosec in the tree already has.
 #
+# -severity low and -confidence low: every finding blocks, including the
+# low-severity rules (G103 unsafe, G104 unhandled errors) a medium threshold
+# would filter out. No -quiet: gosec v2.26.1 returns success under -quiet
+# whenever no finding survives the filters, before it looks at the package
+# load and type-check errors it recorded, so code it could not analyse would
+# pass unscanned. Without it, those errors fail the scan.
+#
 # Generated files stay in scope. A finding in a checked-in generated file is
 # still on disk and an external scan reports it like any other, and a #nosec
 # there is erased by the next regeneration, so the fix belongs in the
@@ -78,7 +85,7 @@ endif
 # together. A new build tag is a new hole, so check_credential_directives
 # fails on one it does not know about, and on a //go:build ignore file not
 # listed in its gosecExempt.
-GOSEC_FLAGS := -quiet -severity medium -confidence low -tests=true \
+GOSEC_FLAGS := -severity low -confidence low -tests=true \
                -exclude-dir=.semgrep -tags integration
 
 # semgrep: only the repo-owned rules under .semgrep/ — no registry config, to

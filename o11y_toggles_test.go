@@ -85,7 +85,7 @@ func TestToggles_MetricsDisabled(t *testing.T) {
 	client := &http.Client{Timeout: 300 * time.Millisecond}
 	resp, probeErr := client.Get("http://" + metricsAddr + "/metrics")
 	if probeErr == nil {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		t.Fatal("Prometheus server should not be listening when metrics is disabled")
 	}
 }

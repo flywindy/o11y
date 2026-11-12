@@ -26,8 +26,10 @@ adopters can plan their upgrades.
 
 ### Changed
 
-- `make sast` and the CI `sast` job run every gosec rule, not only the
-  hardcoded-credential rule (G101). The other rules reported 32 findings
+- `make sast` and the CI `sast` job run every gosec rule at every severity,
+  not only the hardcoded-credential rule (G101), and fail when gosec reports
+  a package it could not analyse (no more `-quiet`, which hid those errors
+  whenever no finding was left). The other rules reported 32 findings
   (26 distinct sites; gosec reports a site twice when a package is also built
   with its tests), and every one was triaged:
   - Fixed: the integer conversions gosec flagged (G115) are bounds-checked.
@@ -41,6 +43,8 @@ adopters can plan their upgrades.
     variables name (the exporter reads the same paths), the generated semconv
     catalog being written world-readable, an ASCII-only byte conversion, the
     example's simulated latency, and cookie and redirect test fixtures.
+  - Fixed: two unchecked `resp.Body.Close()` errors (G104, a low-severity
+    rule), one in a test and one in the metrics example.
 
 ### Security
 
