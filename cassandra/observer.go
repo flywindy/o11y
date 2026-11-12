@@ -124,13 +124,17 @@ func (o *observer) ObserveQuery(ctx context.Context, q gocql.ObservedQuery) {
 		attrs = append(attrs, semconv.DBQueryText(q.Statement))
 	}
 
-	spanCtx := o.record(ctx, spanName(operation, table), tgt, srv, q.Start, q.End, q.Err, attrs)
+	// The metric labels use the contact point unless the caller opted into the
+	// per-coordinator breakdown, so series count does not scale with cluster size.
+	metricSrv := o.metricServer(srv)
+
+	spanCtx := o.record(ctx, spanName(operation, table), tgt, metricSrv, q.Start, q.End, q.Err, attrs)
 
 	// Increment by a fixed 1 per callback: each callback is exactly one attempt
 	// (ADR 0019 §7.B). Never add q.Metrics.Attempts — it is a cumulative
 	// per-host snapshot and would over-count retried/paged queries. Use the
 	// span's context so this counter's exemplar references the query span too.
-	o.inst.attempts.Add(spanCtx, 1, metric.WithAttributes(o.metricAttrs(tgt, srv, q.Err)...))
+	o.inst.attempts.Add(spanCtx, 1, metric.WithAttributes(o.metricAttrs(tgt, metricSrv, q.Err)...))
 }
 
 // ObserveConnect records connect-observer signals (ADR 0019 §7.C): a connection
@@ -173,11 +177,25 @@ func (o *observer) connectPeer(host *gocql.HostInfo) (string, int) {
 	return srv.host, srv.port
 }
 
+// metricServer resolves the server.* label for the query-path metrics from the
+// coordinator resolved for the span. By default it is the configured contact
+// point — one value per session — because token-aware routing spreads queries
+// over every node and a per-coordinator label would multiply the operation ×
+// keyspace × table × error series by the cluster's node count (ADR 0019 §7,
+// 2026-11-12 amendment). WithCoordinatorMetricLabel(true) keeps the coordinator.
+func (o *observer) metricServer(coordinator serverAddr) serverAddr {
+	if o.cfg.coordinatorMetricLabelEnabled {
+		return coordinator
+	}
+	return o.server
+}
+
 // record creates a completed CLIENT span from a finished observation snapshot
 // and records the operation-duration metric. It is shared by the query path and
 // the SDK-owned batch seam (ExecuteBatch). It returns the span's context so
 // callers can record additional metrics whose exemplars should reference this
-// operation's span (e.g. the per-attempt counter).
+// operation's span (e.g. the per-attempt counter). srv is the server recorded on
+// the duration metric only; the span's server.* arrives already built in attrs.
 func (o *observer) record(
 	ctx context.Context,
 	name string,
@@ -258,10 +276,10 @@ func (o *observer) baseAttrs(tgt target, srv serverAddr, host *gocql.HostInfo) [
 }
 
 // metricAttrs builds the bounded label set for db.client.operation.duration and
-// the attempts counter. srv is the server attributed to the observation (the
-// actual coordinator for queries; cardinality stays bounded because it is one of
-// the cluster's nodes — a fixed set — ADR 0019 §7). The MetricViews allow-keys
-// filter is the backstop.
+// the attempts counter. srv is the server label for the observation: the
+// configured contact point by default, or the actual coordinator when
+// WithCoordinatorMetricLabel(true) is set (see metricServer). The MetricViews
+// allow-keys filter is the backstop.
 //
 // db.collection.name is included by default (ADR 0019 §7 amendment): semconv
 // marks it Conditionally Required on db.client.operation.duration "if readily
@@ -291,7 +309,8 @@ func (o *observer) metricAttrs(tgt target, srv serverAddr, obsErr error) []attri
 	return attrs
 }
 
-// queryServer resolves the server.* attributed to a query observation: the actual
+// queryServer resolves the server.* attributed to a query span and to a connect
+// observation: the actual
 // coordinator from ObservedQuery.Host (token-aware routing sends a query to the
 // replica node, not necessarily the configured contact point), falling back to
 // the contact point when the driver supplies no usable host (ADR 0019 §7).

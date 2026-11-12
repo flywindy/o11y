@@ -45,6 +45,21 @@ adopters can plan their upgrades.
     example's simulated latency, and cookie and redirect test fixtures.
   - Fixed: two unchecked `resp.Body.Close()` errors (G104, a low-severity
     rule), one in a test and one in the metrics example.
+- **`cassandra`: `server_address` / `server_port` on the query metrics change
+  value and shed series.** `db.client.operation.duration` and
+  `cassandra.query.attempts` now label `server.address` / `server.port` with
+  the configured contact point instead of the coordinator that served each
+  attempt. Token-aware routing spreads queries over every node, so the
+  per-coordinator label multiplied each operation × keyspace × table × error
+  series — every histogram bucket of it — by the cluster's node count, and
+  opened new series whenever a node changed address. Dashboards and alerts that
+  group or filter these two metrics by `server_address` will see the per-node
+  series end and one series per contact point begin; totals across nodes are
+  unaffected. Spans still report the coordinator, and the connection metrics
+  (`db.client.connection.create_time`, `cassandra.connection.attempts`) stay
+  per-node. Pass the new `cassandra.WithCoordinatorMetricLabel(true)` to
+  `cassandra.NewSession` to keep the previous per-node labels. See ADR 0019
+  §7, 2026-11-12 amendment.
 
 ### Security
 

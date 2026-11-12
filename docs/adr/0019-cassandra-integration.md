@@ -127,6 +127,7 @@ type Option func(*config)
 
 func WithQueryText(enabled bool) Option        // default: false (see §6)
 func WithHostAttributes(enabled bool) Option   // default: false (see §5) — gates network.peer.* / cassandra.coordinator.*
+func WithCoordinatorMetricLabel(enabled bool) Option // default: false (see §7, 2026-11-12 amendment) — per-coordinator server.* on query metrics
 func WithPoolName(name string) Option          // connection-metric pool label; synthesized from the contact point when unset
 func WithAttributes(attrs ...attribute.KeyValue) Option
 ```
@@ -316,6 +317,13 @@ cluster's nodes — a fixed set per deployment, not a per-request address
 (ADR 0008 §3). Callers who want to keep these labels collapsed to the contact
 point can still aggregate them away downstream; the actual coordinator id/dc are
 additionally available on spans via `WithHostAttributes`.
+
+> **Superseded for the query-path metrics** by the
+> [2026-11-12 amendment](#amendment-2026-11-12--query-metrics-label-server-with-the-contact-point):
+> `db.client.operation.duration` and `cassandra.query.attempts` now carry the
+> contact point by default, and the coordinator only with
+> `WithCoordinatorMetricLabel(true)`. Spans and the connect metrics are
+> unchanged.
 
 **B. Retry / speculative-execution counter (v1 or fast-follow, Cassandra-unique)**
 
@@ -583,3 +591,80 @@ breaking error-rate grouping — worse than today's symmetric omission. MongoDB
 parity is consequently **upstream-first** and out of scope here; see the
 follow-up note in ADR 0014. Redis has no collection concept, and Elasticsearch's
 gap is an upstream limitation already recorded in ADR 0020 §4 ‡.
+
+---
+
+## Amendment (2026-11-12) — query metrics label `server.*` with the contact point
+
+§7.A labelled the query-path metrics with the coordinator that served each
+attempt and called that bounded "because the value is one of the cluster's nodes
+— a fixed set per deployment". This amendment changes the default to the
+configured contact point and makes the coordinator label opt-in.
+
+### Why the original reasoning was wrong
+
+"Bounded" was true and beside the point: the bound is the node count, and it
+*multiplies* every other dimension instead of adding to them.
+
+1. **Token-aware routing touches every node.** gocql sends each query to a
+   replica for its partition, so over any real workload every operation ×
+   keyspace × table × error combination is observed on every node. On
+   `db.client.operation.duration` each of those is a full histogram (one series
+   per bucket, plus sum and count). A service with 40 such combinations exports
+   40 histograms against a 3-node cluster and 4,000 against a 100-node one, with
+   no change in the application.
+2. **The set is not fixed over time.** Nodes are replaced, and on Kubernetes a
+   rescheduled pod usually returns with a new IP. Each new address opens a fresh
+   set of series while the old ones linger until they go stale, so the series
+   count over a retention window exceeds the node count.
+3. **The 2026-07-29 amendment compounded it.** Adding `db.collection.name` was
+   right, and that amendment already noted the label set "spends a per-node
+   cardinality multiplier on `server.address`, which semconv rates only
+   *Recommended*". The two multipliers stack; the Conditionally Required one is
+   the one to keep.
+4. **No export-boundary cap fits.** MongoDB's peer-address cap and
+   `WithMaxUniqueCollections` collapse overflow to `"other"`. Applied here that
+   would mix an arbitrary subset of healthy nodes into one bucket on every
+   cluster larger than the cap — it limits the damage without making the label
+   useful.
+
+### Decision
+
+- `db.client.operation.duration` and `cassandra.query.attempts` carry the
+  configured contact point as `server.address` / `server.port` — one value per
+  session, identifying the cluster the session talks to. This is what the batch
+  seam has always reported, so query and batch samples now share a series shape.
+- `cassandra.WithCoordinatorMetricLabel(true)` restores the per-coordinator
+  label on those two metrics for callers who want unsampled per-node latency
+  and accept the multiplier (small, address-stable clusters).
+- **Spans are unchanged.** `server.*` on a query span is still the coordinator;
+  spans have no series cost, and the metric exemplars link each data point to
+  the span that names the node.
+- **Connect metrics are unchanged.** `db.client.connection.create_time` and
+  `cassandra.connection.attempts` stay per-node. Their only other dimensions are
+  the pool name and `error.type`, so they grow linearly with the cluster rather
+  than multiplying the query dimensions, and "which node cannot be dialed" is
+  the question those metrics exist to answer.
+- No view change: `server.address` / `server.port` stay in the allow-keys
+  filters; only the value recorded changes.
+
+### What this gives up
+
+Unsampled per-node query latency is no longer available by default. Per-node
+diagnosis moves to spans (`server.*`, plus `cassandra.coordinator.*` with
+`WithHostAttributes`), which are sampled, and to the server-side exporter, which
+reports per-node latency without sampling and without a client-side multiplier.
+A node that is slow only as seen from one client is the case this loses; the
+opt-in covers it.
+
+`server.address` on these metrics is now the first configured contact point, not
+necessarily a node that served the sample. It reads as a cluster identity; with
+a list of bare IPs as contact points it is the first of them, which is stable
+but arbitrary. A DNS name or service name as the first contact point makes the
+label meaningful.
+
+### Migration
+
+Dashboards and alerts that group or filter the two query metrics by
+`server_address` see the per-node series end and one series per contact point
+begin. Sums and rates over all nodes are unaffected.

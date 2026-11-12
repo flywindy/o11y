@@ -1330,12 +1330,23 @@ high-cardinality and reveal schema topology; bound values are never captured.
 Enable it with `o11ycassandra.WithQueryText(true)` when that is safe for your
 trace backend.
 
-`server.address` / `server.port` identify the node that actually served the
-operation (the coordinator chosen by token-aware routing), falling back to the
-contact point when the driver reports no host. The coordinator's id and
-datacenter (`cassandra.coordinator.id` / `.dc`, plus `network.peer.*`) are
+On spans, `server.address` / `server.port` identify the node that actually
+served the operation (the coordinator chosen by token-aware routing), falling
+back to the contact point when the driver reports no host. The coordinator's id
+and datacenter (`cassandra.coordinator.id` / `.dc`, plus `network.peer.*`) are
 additional and off by default; enable them with
 `o11ycassandra.WithHostAttributes(true)`.
+
+On the query metrics (`db.client.operation.duration`,
+`cassandra.query.attempts`) the same two labels carry the **configured contact
+point** instead, so the series count does not grow with the number of nodes in
+the cluster. Make the first entry of `ClusterConfig.Hosts` a DNS or service name
+and the label reads as the cluster's identity. For per-node latency, follow the
+exemplar to the span or use the server-side exporter; to put the coordinator
+back on these metrics — multiplying their series by the node count — pass
+`o11ycassandra.WithCoordinatorMetricLabel(true)`. The connection metrics
+(`db.client.connection.create_time`, `cassandra.connection.attempts`) always
+report the node that was dialed.
 
 `db.collection.name` (the addressed table) is recorded **both on spans and as a
 metric label** on `db.client.operation.duration` and `cassandra.query.attempts`.

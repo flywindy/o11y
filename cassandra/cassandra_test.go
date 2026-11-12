@@ -223,7 +223,10 @@ func TestObserveQueryEmitsSemconvSpanAndDuration(t *testing.T) {
 	// db.collection.name is on by default and survives the allow-keys view
 	// (ADR 0019 §7, 2026-07-29 amendment).
 	assertHasAttr(t, dp.Attributes, semconv.DBCollectionName("messages_by_room"))
-	assertHasAttr(t, dp.Attributes, semconv.ServerAddress("10.0.0.5"))
+	// The metric is labelled with the contact point, not the coordinator the
+	// span reports, so series count does not scale with cluster size.
+	assertHasAttr(t, dp.Attributes, semconv.ServerAddress("127.0.0.1"))
+	assertHasAttr(t, dp.Attributes, semconv.ServerPort(9042))
 	assertMissingKey(t, dp.Attributes, semconv.NetworkPeerAddressKey)
 	assertMissingKey(t, dp.Attributes, semconv.CassandraCoordinatorIDKey)
 }
@@ -539,29 +542,84 @@ func TestWithAttributesDropsReservedKeys(t *testing.T) {
 	assert.NotContains(t, span.Attributes(), semconv.ServerAddress("evil.example.com"))
 }
 
-// TestObserveQueryAttributesToObservedHost: server.* on the span and the
-// operation metric is the node that actually ran the query (token-aware
-// routing), not the configured contact point.
-func TestObserveQueryAttributesToObservedHost(t *testing.T) {
-	obs, sr, reader := newTestObserver(t, config{})
+// TestObserveQueryServerAttribution: server.* on the span is always the node
+// that actually ran the query (token-aware routing). The query-path metrics
+// carry the configured contact point by default, so their series count does not
+// grow with the cluster, and the coordinator only with
+// WithCoordinatorMetricLabel(true).
+func TestObserveQueryServerAttribution(t *testing.T) {
+	tests := []struct {
+		name       string
+		opts       []Option
+		wantMetric attribute.KeyValue
+	}{
+		{
+			name:       "default labels metrics with the contact point",
+			wantMetric: semconv.ServerAddress("127.0.0.1"),
+		},
+		{
+			name:       "opt-in labels metrics with the coordinator",
+			opts:       []Option{WithCoordinatorMetricLabel(true)},
+			wantMetric: semconv.ServerAddress("10.0.0.5"),
+		},
+		{
+			name:       "explicit false keeps the contact point",
+			opts:       []Option{WithCoordinatorMetricLabel(false)},
+			wantMetric: semconv.ServerAddress("127.0.0.1"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obs, sr, reader := newTestObserver(t, newConfig(tt.opts))
+
+			start := time.Now()
+			obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+				Keyspace:  "chat",
+				Statement: "SELECT id FROM rooms WHERE id = ?",
+				Start:     start,
+				End:       start.Add(time.Millisecond),
+				Host:      testHost(t), // coordinator 10.0.0.5, not contact point 127.0.0.1
+			})
+
+			spans := sr.Ended()
+			require.Len(t, spans, 1)
+			assert.Contains(t, spans[0].Attributes(), semconv.ServerAddress("10.0.0.5"))
+			assert.NotContains(t, spans[0].Attributes(), semconv.ServerAddress("127.0.0.1"))
+
+			rm := collectMetrics(t, reader)
+			dur := metricByName(rm, "db.client.operation.duration").Data.(metricdata.Histogram[float64]).DataPoints
+			require.Len(t, dur, 1)
+			assertHasAttr(t, dur[0].Attributes, tt.wantMetric)
+			attempts := metricByName(rm, "cassandra.query.attempts").Data.(metricdata.Sum[int64]).DataPoints
+			require.Len(t, attempts, 1)
+			assertHasAttr(t, attempts[0].Attributes, tt.wantMetric)
+		})
+	}
+}
+
+// TestObserveQueryMetricSeriesIndependentOfClusterSize: queries served by
+// different coordinators land in one series per metric by default.
+func TestObserveQueryMetricSeriesIndependentOfClusterSize(t *testing.T) {
+	obs, _, reader := newTestObserver(t, config{})
 
 	start := time.Now()
-	obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
-		Keyspace:  "chat",
-		Statement: "SELECT id FROM rooms WHERE id = ?",
-		Start:     start,
-		End:       start.Add(time.Millisecond),
-		Host:      testHost(t), // coordinator 10.0.0.5, not contact point 127.0.0.1
-	})
-
-	spans := sr.Ended()
-	require.Len(t, spans, 1)
-	assert.Contains(t, spans[0].Attributes(), semconv.ServerAddress("10.0.0.5"))
-	assert.NotContains(t, spans[0].Attributes(), semconv.ServerAddress("127.0.0.1"))
+	for _, ip := range []string{"10.0.0.5", "10.0.0.6", "10.0.0.7"} {
+		obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+			Keyspace:  "chat",
+			Statement: "SELECT id FROM rooms WHERE id = ?",
+			Start:     start,
+			End:       start.Add(time.Millisecond),
+			Host:      (&gocql.HostInfo{}).SetConnectAddress(net.ParseIP(ip)),
+		})
+	}
 
 	rm := collectMetrics(t, reader)
-	dp := metricByName(rm, "db.client.operation.duration").Data.(metricdata.Histogram[float64]).DataPoints[0]
-	assertHasAttr(t, dp.Attributes, semconv.ServerAddress("10.0.0.5"))
+	dur := metricByName(rm, "db.client.operation.duration").Data.(metricdata.Histogram[float64]).DataPoints
+	require.Len(t, dur, 1)
+	assert.Equal(t, uint64(3), dur[0].Count)
+	attempts := metricByName(rm, "cassandra.query.attempts").Data.(metricdata.Sum[int64]).DataPoints
+	require.Len(t, attempts, 1)
+	assert.Equal(t, int64(3), attempts[0].Value)
 }
 
 func TestObserveConnectMetrics(t *testing.T) {

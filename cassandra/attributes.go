@@ -6,11 +6,11 @@ import (
 	"strings"
 )
 
-// serverAddr holds the logical server (configured contact point) used for the
-// server.address / server.port span attributes and metric labels. These are the
-// client's configured contact points — a small, fixed set per client instance,
-// not per-request peer addresses — so they are safe as metric labels without
-// exploding cardinality (ADR 0019 §7).
+// serverAddr is a server.address / server.port pair. The observer holds one for
+// the logical server (the configured contact point): a single value per client
+// instance, which is what the query-path metrics are labelled with by default
+// so their series count does not grow with the cluster (ADR 0019 §7). Query
+// spans and the connection metrics carry the per-node address instead.
 type serverAddr struct {
 	host string
 	port int
