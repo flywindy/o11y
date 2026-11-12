@@ -12,7 +12,7 @@ func TestGoUnescaped(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{`\x41`, "A"},
 		{`\xff`, "\xff"},
-		{`é`, "é"},
+		{`\u00e9`, "é"},
 		{`\U0001F600`, "😀"},
 		{`\U0010FFFF`, string(rune(utf8.MaxRune))},
 		{`\U00110000`, string(utf8.RuneError)},
@@ -29,8 +29,8 @@ func TestGoUnescaped(t *testing.T) {
 
 func TestJSONUnescaped(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
-		{`A`, "A"},
-		{`￿`, "￿"},
+		{`\u0041`, "A"},
+		{`\uFFFF`, "\uFFFF"},
 		{`\uD800`, string(utf8.RuneError)},
 		{`\uZZZZ`, `\uZZZZ`},
 	} {
