@@ -163,7 +163,7 @@ func normalizedMatchLen(key, want string) (matched int, complete bool) {
 		var out byte
 		switch {
 		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
-			out = byte(r)
+			out = byte(r) // #nosec G115 -- r is an ASCII letter or digit, per the case
 			prevUnderscore = false
 		case prevUnderscore:
 			continue // collapsed into the previous '_'

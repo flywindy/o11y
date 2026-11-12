@@ -1577,16 +1577,16 @@ func TestCookieRequestForms_MatchesWhatNetHTTPSends(t *testing.T) {
 		name   string
 		cookie http.Cookie
 	}{
-		// #nosec G101 -- fabricated fixture cookies, not live credentials
+		// #nosec G101 G124 -- fabricated fixture request cookies, not live credentials; a request cookie carries no Secure/HttpOnly/SameSite
 		// nosemgrep: hardcoded-credential-literal,gosec.G101-1
 		{"plain", http.Cookie{Name: "session", Value: "c00kie"}},
-		{"newline in the value", http.Cookie{Name: "session", Value: "sec\nret"}},
-		{"quote and semicolon", http.Cookie{Name: "session", Value: `a"b;c`}},
-		{"space", http.Cookie{Name: "session", Value: "a b"}},
-		{"comma", http.Cookie{Name: "session", Value: "a,b"}},
-		{"backslash", http.Cookie{Name: "session", Value: `a\\b`}},
-		{"quoted flag", http.Cookie{Name: "session", Value: "c00kie", Quoted: true}},
-		{"newline in the name", http.Cookie{Name: "ses\nsion", Value: "c00kie"}},
+		{"newline in the value", http.Cookie{Name: "session", Value: "sec\nret"}},    // #nosec G124 -- request cookie fixture
+		{"quote and semicolon", http.Cookie{Name: "session", Value: `a"b;c`}},        // #nosec G124 -- request cookie fixture
+		{"space", http.Cookie{Name: "session", Value: "a b"}},                        // #nosec G124 -- request cookie fixture
+		{"comma", http.Cookie{Name: "session", Value: "a,b"}},                        // #nosec G124 -- request cookie fixture
+		{"backslash", http.Cookie{Name: "session", Value: `a\\b`}},                   // #nosec G124 -- request cookie fixture
+		{"quoted flag", http.Cookie{Name: "session", Value: "c00kie", Quoted: true}}, // #nosec G124 -- request cookie fixture
+		{"newline in the name", http.Cookie{Name: "ses\nsion", Value: "c00kie"}},     // #nosec G124 -- request cookie fixture
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sent := &http.Request{Header: make(http.Header, 1)}
