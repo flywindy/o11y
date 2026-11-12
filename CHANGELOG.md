@@ -48,6 +48,12 @@ adopters can plan their upgrades.
   certificates) is fixed in go1.26.10. Any Go 1.26.x still builds against
   this SDK; go1.26.10 or later is now the recommended toolchain. CI's
   govulncheck and the Makefile's tool builds run on go1.26.10.
+- GO-2026-6859 (an HTTP/1 server crash from a `MaxBytesReader` header race
+  in `net/http`) is fixed in go1.26.11, which is now the recommended
+  toolchain; CI's govulncheck and the Makefile's tool builds move to it. Any
+  Go 1.26.x still builds against this SDK.
+- GO-2026-6865 (a panic on two-block frames in `klauspost/compress`, an
+  indirect dependency): `klauspost/compress` moves from v1.19.1 to v1.20.2.
 
 ---
 

@@ -19,8 +19,9 @@ env:
   # 6607/6608/6610/6611/6612/6613/6617 in net/http, net/textproto,
   # crypto/tls and html/template) that no 1.25.x release fixes: Go 1.25
   # left support when Go 1.27 shipped on 2026-08-19. go1.26.10 adds the fix
-  # for GO-2026-6809 (crypto/x509 distrusts compromised intermediates).
-  GOVULNCHECK_GOTOOLCHAIN: go1.26.10
+  # for GO-2026-6809 (crypto/x509 distrusts compromised intermediates), and
+  # go1.26.11 the one for GO-2026-6859 (net/http MaxBytesReader header race).
+  GOVULNCHECK_GOTOOLCHAIN: go1.26.11
 
 jobs:
   test:

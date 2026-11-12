@@ -25,7 +25,7 @@ GOBIN_DIR := $(shell $(GO) env GOBIN)
 ifeq ($(strip $(GOBIN_DIR)),)
 GOBIN_DIR := $(firstword $(subst :, ,$(shell $(GO) env GOPATH)))/bin
 endif
-TOOLS_GO_TOOLCHAIN := go1.26.10
+TOOLS_GO_TOOLCHAIN := go1.26.11
 GOSEC_VERSION      := v2.26.1
 SEMGREP_VERSION    := 1.163.0
 
