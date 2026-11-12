@@ -103,6 +103,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("format generated source: %w", err)
 	}
+	// #nosec G306 -- a checked-in Go source file, readable like every other one in the tree
 	if err := os.WriteFile("semconv_reserved_gen.go", formatted, 0o644); err != nil {
 		return fmt.Errorf("write catalog: %w", err)
 	}

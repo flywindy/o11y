@@ -61,7 +61,7 @@ correlated with `traceId` / `spanId`.
 go run examples/metrics/main.go
 ```
 
-The example starts an HTTP server on `:8080` and generates synthetic traffic every 500 ms. Metrics flow via OTLP/HTTP to the OTel Collector, which forwards them to Prometheus via remote write. It uses the same `localhost:4318` NodePort as traces and logs, so no extra metrics scrape port is needed for this example. Histogram buckets include exemplars linking each measurement to its trace.
+The example starts an HTTP server on `localhost:8080` and generates synthetic traffic every 500 ms. Metrics flow via OTLP/HTTP to the OTel Collector, which forwards them to Prometheus via remote write. It uses the same `localhost:4318` NodePort as traces and logs, so no extra metrics scrape port is needed for this example. Histogram buckets include exemplars linking each measurement to its trace.
 
 Open Grafana at `http://localhost:3000` and navigate to:
 - **Explore → Tempo** — producer and consumer spans linked across services

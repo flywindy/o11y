@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"math"
 	"net/http"
 	"net/textproto"
 	"net/url"
@@ -261,7 +262,11 @@ func jsonUnescaped(text string) string {
 	for i := 0; i < len(text); {
 		if i+6 <= len(text) && text[i] == '\\' && text[i+1] == 'u' {
 			if r, err := strconv.ParseUint(text[i+2:i+6], 16, 32); err == nil {
-				b.WriteRune(rune(r))
+				if r <= utf8.MaxRune { // always, for four digits; the bound is for gosec
+					b.WriteRune(rune(r))
+				} else {
+					b.WriteRune(utf8.RuneError)
+				}
 				i += 6
 				continue
 			}
@@ -316,10 +321,16 @@ func goUnescaped(text string) string {
 		}
 		if digits > 0 && i+2+digits <= len(text) {
 			if r, err := strconv.ParseUint(text[i+2:i+2+digits], 16, 32); err == nil {
-				if text[i+1] == 'x' {
+				// The bounds are what the digit counts already guarantee,
+				// except for an eight-digit \U value past the last rune,
+				// which strings.Builder would write as RuneError anyway.
+				switch {
+				case text[i+1] == 'x' && r <= math.MaxUint8:
 					b.WriteByte(byte(r))
-				} else {
+				case r <= utf8.MaxRune:
 					b.WriteRune(rune(r))
+				default:
+					b.WriteRune(utf8.RuneError)
 				}
 				i += 2 + digits
 				continue
