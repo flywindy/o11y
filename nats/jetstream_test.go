@@ -1176,3 +1176,81 @@ func TestJetStream_ManagementRoundTrip(t *testing.T) {
 	require.NoError(t, js.DeleteConsumer(ctx, streamName, consumerName))
 	require.NoError(t, js.DeleteStream(ctx, streamName))
 }
+
+// TestJetStream_Fetch_NegativeBatch verifies that a negative batch is an error
+// from Fetch and FetchNoWait, not the panic the native call raises when it
+// sizes a channel by it.
+func TestJetStream_Fetch_NegativeBatch(t *testing.T) {
+	_, url := startJetStreamServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	const streamName, subject, consumerName = "EVENTS_NB", "events.nb.created", "negative-batch-test"
+	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	require.NotPanics(t, func() {
+		_, err = cons.Fetch(context.Background(), -1)
+	})
+	require.ErrorContains(t, err, "batch must not be negative")
+	require.NotPanics(t, func() {
+		_, err = cons.FetchNoWait(context.Background(), -1)
+	})
+	require.ErrorContains(t, err, "batch must not be negative")
+}
+
+// TestJetStream_Messages_NextErrorReturnsCtx verifies that Next never returns
+// a nil ctx on its error path. Stop ends every iteration loop with an error
+// (jetstream.ErrMsgIteratorClosed), and a caller that logs that error with the
+// returned ctx must not get a nil one.
+func TestJetStream_Messages_NextErrorReturnsCtx(t *testing.T) {
+	_, url := startJetStreamServer(t)
+	tp, prop, _ := newTestProviders()
+
+	conn, err := o11ynats.Connect(context.Background(), url, tp, prop)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	js, err := conn.JetStream()
+	require.NoError(t, err)
+
+	const streamName, subject, consumerName = "EVENTS_NE", "events.ne.created", "next-error-test"
+	stream, err := js.CreateOrUpdateStream(context.Background(), jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{subject},
+	})
+	require.NoError(t, err)
+	cons, err := stream.CreateOrUpdateConsumer(context.Background(), jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		FilterSubject: subject,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+	})
+	require.NoError(t, err)
+
+	type ctxKey struct{}
+	regCtx := context.WithValue(context.Background(), ctxKey{}, "registration")
+	iter, err := cons.Messages(regCtx)
+	require.NoError(t, err)
+	iter.Stop()
+
+	ctx, msg, err := iter.Next()
+	require.Error(t, err)
+	assert.Nil(t, msg)
+	require.NotNil(t, ctx, "Next must not return a nil ctx on error")
+	assert.Equal(t, "registration", ctx.Value(ctxKey{}), "Next falls back to the ctx Messages was called with")
+}

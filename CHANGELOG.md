@@ -59,6 +59,20 @@ adopters can plan their upgrades.
 - GO-2026-6865 (a panic on two-block frames in `klauspost/compress`, an
   indirect dependency): `klauspost/compress` moves from v1.19.1 to v1.20.2.
 
+### Fixed
+
+- `nats`: `MessagesContext.Next` no longer returns a nil ctx on its error
+  path. The upstream iterator returns one there, including for the
+  `jetstream.ErrMsgIteratorClosed` that every `Stop` ends a loop with, so a
+  caller that logged the error with that ctx could panic. It now falls back to
+  the ctx `Messages` was called with, as `Consumer.Next` already did.
+- `nats`: `Consumer.Fetch` and `FetchNoWait` return an error for a negative
+  batch instead of panicking in the native call, which sizes a channel by it.
+  A batch of zero is passed through as before.
+- `nats`: `Inject` and `Extract` treat a nil message or propagator as a no-op
+  (`Extract` returns ctx unchanged) instead of panicking, as `Respond` and
+  `RequestMsg` already guard nil.
+
 ---
 
 ## [0.14.0] - 2026-10-20

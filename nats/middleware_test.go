@@ -171,3 +171,21 @@ func TestExtract_MultiValueBaggage(t *testing.T) {
 	assert.Equal(t, "v1", bag.Member("k1").Value(), "first baggage header instance's member must survive")
 	assert.Equal(t, "v2", bag.Member("k2").Value(), "second baggage header instance's member must survive")
 }
+
+// TestInjectExtract_NilArguments verifies that a nil message or propagator is
+// a no-op rather than a panic, as Respond and RequestMsg already guard nil.
+func TestInjectExtract_NilArguments(t *testing.T) {
+	ctx := ctxWithSpan(t, "4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7")
+
+	assert.NotPanics(t, func() { o11ynats.Inject(ctx, newProp(), nil) }, "nil msg")
+	msg := &gonnats.Msg{}
+	assert.NotPanics(t, func() { o11ynats.Inject(ctx, nil, msg) }, "nil prop")
+	assert.Nil(t, msg.Header, "Inject with a nil prop must leave the message untouched")
+
+	var got context.Context
+	assert.NotPanics(t, func() { got = o11ynats.Extract(ctx, newProp(), nil) }, "nil msg")
+	assert.Equal(t, ctx, got, "Extract with a nil msg must return ctx unchanged")
+	withHeader := &gonnats.Msg{Header: gonnats.Header{"Traceparent": []string{"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}}}
+	assert.NotPanics(t, func() { got = o11ynats.Extract(ctx, nil, withHeader) }, "nil prop")
+	assert.Equal(t, ctx, got, "Extract with a nil prop must return ctx unchanged")
+}
