@@ -320,9 +320,10 @@ additionally available on spans via `WithHostAttributes`.
 
 > **Superseded for the query-path metrics** by the
 > [2026-11-12 amendment](#amendment-2026-11-12--query-metrics-label-server-with-the-contact-point):
-> `db.client.operation.duration` and `cassandra.query.attempts` now carry the
-> contact point by default, and the coordinator only with
-> `WithCoordinatorMetricLabel(true)`. Spans and the connect metrics are
+> `db.client.operation.duration` and `cassandra.query.attempts` no longer carry
+> the coordinator by default, only with `WithCoordinatorMetricLabel(true)`; the
+> [2026-11-13 amendment](#amendment-2026-11-13--query-metrics-omit-server-by-default)
+> settles the default as no `server.*` at all. Spans and the connect metrics are
 > unchanged.
 
 **B. Retry / speculative-execution counter (v1 or fast-follow, Cassandra-unique)**
@@ -596,6 +597,12 @@ gap is an upstream limitation already recorded in ADR 0020 §4 ‡.
 
 ## Amendment (2026-11-12) — query metrics label `server.*` with the contact point
 
+> **Default superseded** by the
+> [2026-11-13 amendment](#amendment-2026-11-13--query-metrics-omit-server-by-default):
+> the query metrics now omit `server.*` instead of carrying the contact point.
+> The reasoning for dropping the coordinator label, the opt-in, and the
+> unchanged spans and connect metrics all stand.
+
 §7.A labelled the query-path metrics with the coordinator that served each
 attempt and called that bounded "because the value is one of the cluster's nodes
 — a fixed set per deployment". This amendment changes the default to the
@@ -676,3 +683,72 @@ contact point avoids this too.
 Dashboards and alerts that group or filter the two query metrics by
 `server_address` see the per-node series end and one series per contact point
 begin. Sums and rates over all nodes are unaffected.
+
+---
+
+## Amendment (2026-11-13) — query metrics omit `server.*` by default
+
+The 2026-11-12 amendment replaced the per-coordinator label on
+`db.client.operation.duration` and `cassandra.query.attempts` with the configured
+contact point. This amendment drops the label instead. It changes only which
+value the default records; the case against the coordinator label is unchanged.
+
+### Why the contact point was the wrong replacement
+
+That amendment's own "What this gives up" section listed both problems. Review
+of the change judged them worse than the amendment had:
+
+1. **It names a node that usually did not serve the sample.** With bare-IP
+   contact points — `gocql.NewCluster("10.0.0.1", "10.0.0.2", "10.0.0.3")` — all
+   of the cluster's query latency and `error.type` series sit under
+   `server_address="10.0.0.1"`. Someone filtering a slow panel by that label
+   investigates 10.0.0.1 when another coordinator is the slow one. semconv
+   defines `server.address` as the database host for the call, so this is also
+   off-spec.
+2. **It is one value per session, not per cluster.** Replicas that see
+   `ClusterConfig.Hosts` in different orders report different first entries for
+   the same cluster, splitting it across series and hiding replicas from an
+   alert pinned to one value.
+
+A stable DNS name as the first contact point avoids both, but the SDK cannot
+require one, and a label that is only correct under an unenforced convention is
+a label readers will trust when they should not.
+
+### Decision
+
+- `db.client.operation.duration` and `cassandra.query.attempts` carry **no**
+  `server.address` / `server.port` by default. semconv v1.39.0 rates both
+  *Recommended* on `db.client.operation.duration`, so omitting them is
+  conformant.
+- `WithCoordinatorMetricLabel(true)` labels a sample with the coordinator the
+  driver reported for it. It no longer falls back to the contact point when
+  there is none: under the opt-in the label means "the node that served this",
+  and a sample whose node is unknown carries no label rather than a guess.
+- **Batch samples carry no `server.*` in either mode**, because the batch seam
+  has no per-statement host. Before this amendment they carried the contact
+  point; leaving that in place would have made batches the only query-path
+  samples with the label by default.
+- Spans, the connect metrics, the allow-keys views and the synthesized pool
+  name are unchanged. Batch spans still report the contact point.
+
+### What this gives up
+
+Nothing on the two query metrics identifies the cluster any more.
+`db.client.connection.pool.name` does, but it is a connection-metric label only;
+semconv does not list it for `db.client.operation.duration`. A process holding
+sessions to two clusters that share a keyspace name therefore reports both into
+the same series, with no signal that it has. Telling them apart needs the
+opt-in, which costs the per-node multiplier. Most services talk to one cluster
+and lose nothing.
+
+A caller-supplied cluster name for these metrics would close that gap without
+the multiplier. It is not added here, to keep this change to the default alone;
+it is a new public option that can be added later without changing that default.
+
+### Migration
+
+Relative to the released behaviour (per-coordinator labels), `server_address` /
+`server_port` disappear from the two query metrics. Queries that group or filter
+on them need the label removed or the opt-in enabled; sums and rates across
+nodes are unaffected. The contact-point default of the 2026-11-12 amendment was
+never released, so nothing migrates from it.

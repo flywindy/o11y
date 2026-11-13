@@ -223,10 +223,11 @@ func TestObserveQueryEmitsSemconvSpanAndDuration(t *testing.T) {
 	// db.collection.name is on by default and survives the allow-keys view
 	// (ADR 0019 §7, 2026-07-29 amendment).
 	assertHasAttr(t, dp.Attributes, semconv.DBCollectionName("messages_by_room"))
-	// The metric is labelled with the contact point, not the coordinator the
-	// span reports, so series count does not scale with cluster size.
-	assertHasAttr(t, dp.Attributes, semconv.ServerAddress("127.0.0.1"))
-	assertHasAttr(t, dp.Attributes, semconv.ServerPort(9042))
+	// The metric carries no server.* by default — neither the coordinator the
+	// span reports nor the contact point — so series count does not scale with
+	// cluster size.
+	assertMissingKey(t, dp.Attributes, semconv.ServerAddressKey)
+	assertMissingKey(t, dp.Attributes, semconv.ServerPortKey)
 	assertMissingKey(t, dp.Attributes, semconv.NetworkPeerAddressKey)
 	assertMissingKey(t, dp.Attributes, semconv.CassandraCoordinatorIDKey)
 }
@@ -353,7 +354,7 @@ func TestBatchAttrsMirrorQueryPath(t *testing.T) {
 
 	attrs := obs.batchAttrs(batch, batchTarget(ns, tbl))
 	start := time.Now()
-	obs.record(context.Background(), spanName("BATCH", tbl), batchTarget(ns, tbl), obs.server, start, start.Add(time.Millisecond), nil, attrs)
+	obs.record(context.Background(), spanName("BATCH", tbl), batchTarget(ns, tbl), obs.metricServer(nil), start, start.Add(time.Millisecond), nil, attrs)
 
 	spans := sr.Ended()
 	require.Len(t, spans, 1)
@@ -426,7 +427,7 @@ func TestBatchTargetsFromQualifiedCQL(t *testing.T) {
 	assert.Equal(t, "events", tbl)
 
 	obs, sr, _ := newTestObserver(t, config{})
-	obs.record(context.Background(), spanName("BATCH", tbl), batchTarget(ns, tbl), obs.server, time.Now(), time.Now(), nil, obs.batchAttrs(batch, batchTarget(ns, tbl)))
+	obs.record(context.Background(), spanName("BATCH", tbl), batchTarget(ns, tbl), obs.metricServer(nil), time.Now(), time.Now(), nil, obs.batchAttrs(batch, batchTarget(ns, tbl)))
 
 	spans := sr.Ended()
 	require.Len(t, spans, 1)
@@ -447,7 +448,7 @@ func TestBatchTargetsMixedOmitted(t *testing.T) {
 	assert.Equal(t, "", tbl)
 
 	obs, sr, _ := newTestObserver(t, config{})
-	obs.record(context.Background(), spanName("BATCH", tbl), batchTarget(ns, tbl), obs.server, time.Now(), time.Now(), nil, obs.batchAttrs(batch, batchTarget(ns, tbl)))
+	obs.record(context.Background(), spanName("BATCH", tbl), batchTarget(ns, tbl), obs.metricServer(nil), time.Now(), time.Now(), nil, obs.batchAttrs(batch, batchTarget(ns, tbl)))
 
 	spans := sr.Ended()
 	require.Len(t, spans, 1)
@@ -544,35 +545,49 @@ func TestWithAttributesDropsReservedKeys(t *testing.T) {
 
 // TestObserveQueryServerAttribution: server.* on the span is always the node
 // that actually ran the query (token-aware routing). The query-path metrics
-// carry the configured contact point by default, so their series count does not
-// grow with the cluster, and the coordinator only with
-// WithCoordinatorMetricLabel(true).
+// carry no server.* by default, so their series count does not grow with the
+// cluster, and the coordinator only with WithCoordinatorMetricLabel(true).
 func TestObserveQueryServerAttribution(t *testing.T) {
-	// testHost reports no port (gocql has no setter), so the coordinator carries
-	// server.address only. Asserting the port alongside the address proves the
-	// pair comes from one source: a coordinator address must not pick up the
-	// contact point's 9042, nor a contact-point address lose it.
-	contactPoint := []attribute.KeyValue{semconv.ServerAddress("127.0.0.1"), semconv.ServerPort(9042)}
+	serverKeys := []attribute.Key{semconv.ServerAddressKey, semconv.ServerPortKey}
 	tests := []struct {
 		name        string
 		opts        []Option
+		host        *gocql.HostInfo
+		wantSpan    attribute.KeyValue
 		wantMetric  []attribute.KeyValue
 		wantMissing []attribute.Key
 	}{
 		{
-			name:       "default labels metrics with the contact point",
-			wantMetric: contactPoint,
+			name:        "default omits server labels from metrics",
+			host:        testHost(t),
+			wantSpan:    semconv.ServerAddress("10.0.0.5"),
+			wantMissing: serverKeys,
 		},
 		{
+			name:        "explicit false omits server labels from metrics",
+			opts:        []Option{WithCoordinatorMetricLabel(false)},
+			host:        testHost(t),
+			wantSpan:    semconv.ServerAddress("10.0.0.5"),
+			wantMissing: serverKeys,
+		},
+		{
+			// testHost reports no port (gocql has no setter), so the coordinator
+			// carries server.address only; the missing port proves it is not
+			// borrowed from the contact point's 9042.
 			name:        "opt-in labels metrics with the coordinator",
 			opts:        []Option{WithCoordinatorMetricLabel(true)},
+			host:        testHost(t),
+			wantSpan:    semconv.ServerAddress("10.0.0.5"),
 			wantMetric:  []attribute.KeyValue{semconv.ServerAddress("10.0.0.5")},
 			wantMissing: []attribute.Key{semconv.ServerPortKey},
 		},
 		{
-			name:       "explicit false keeps the contact point",
-			opts:       []Option{WithCoordinatorMetricLabel(false)},
-			wantMetric: contactPoint,
+			// The span falls back to the contact point; the metric label means
+			// "the node that served this" and is omitted rather than guessed.
+			name:        "opt-in with no reported host omits server labels",
+			opts:        []Option{WithCoordinatorMetricLabel(true)},
+			wantSpan:    semconv.ServerAddress("127.0.0.1"),
+			wantMissing: serverKeys,
 		},
 	}
 	for _, tt := range tests {
@@ -585,13 +600,12 @@ func TestObserveQueryServerAttribution(t *testing.T) {
 				Statement: "SELECT id FROM rooms WHERE id = ?",
 				Start:     start,
 				End:       start.Add(time.Millisecond),
-				Host:      testHost(t), // coordinator 10.0.0.5, not contact point 127.0.0.1
+				Host:      tt.host,
 			})
 
 			spans := sr.Ended()
 			require.Len(t, spans, 1)
-			assert.Contains(t, spans[0].Attributes(), semconv.ServerAddress("10.0.0.5"))
-			assert.NotContains(t, spans[0].Attributes(), semconv.ServerAddress("127.0.0.1"))
+			assert.Contains(t, spans[0].Attributes(), tt.wantSpan)
 
 			rm := collectMetrics(t, reader)
 			dur := metricByName(rm, "db.client.operation.duration").Data.(metricdata.Histogram[float64]).DataPoints
@@ -611,39 +625,60 @@ func TestObserveQueryServerAttribution(t *testing.T) {
 }
 
 // TestQueryAndBatchShareServerLabels: a query served by a coordinator and a
-// batch run through the SDK seam report the same server.* on
-// db.client.operation.duration, so the two paths cannot drift into separate
-// per-server series for the same keyspace and table.
+// batch run through the SDK seam agree on server.* for
+// db.client.operation.duration — absent by default, and still absent on the
+// batch when the coordinator label is on, because the batch seam knows no
+// coordinator. The batch span keeps the contact point throughout.
 func TestQueryAndBatchShareServerLabels(t *testing.T) {
-	obs, _, reader := newTestObserver(t, config{})
-	session := &gocql.Session{}
-	registerSession(session, obs)
-
-	start := time.Now()
-	obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
-		Statement: "INSERT INTO chat.rooms (id) VALUES (?)",
-		Start:     start,
-		End:       start.Add(time.Millisecond),
-		Host:      testHost(t),
-	})
-
-	batch := gocql.NewBatch(gocql.LoggedBatch) //nolint:staticcheck // see TestBatchAttrsMirrorQueryPath
-	batch.Query("INSERT INTO chat.rooms (id) VALUES (?)", "r1")
-	require.NoError(t, instrumentBatch(context.Background(), session, batch, func(*gocql.Batch) error { return nil }))
-
-	rm := collectMetrics(t, reader)
-	points := metricByName(rm, "db.client.operation.duration").Data.(metricdata.Histogram[float64]).DataPoints
-	require.Len(t, points, 2, "one series per operation (INSERT, BATCH)")
-	ops := map[string]bool{}
-	for _, dp := range points {
-		op, _ := dp.Attributes.Value(semconv.DBOperationNameKey)
-		ops[op.AsString()] = true
-		assertHasAttr(t, dp.Attributes, semconv.DBNamespace("chat"))
-		assertHasAttr(t, dp.Attributes, semconv.DBCollectionName("rooms"))
-		assertHasAttr(t, dp.Attributes, semconv.ServerAddress("127.0.0.1"))
-		assertHasAttr(t, dp.Attributes, semconv.ServerPort(9042))
+	tests := []struct {
+		name      string
+		opts      []Option
+		wantQuery bool // query metric carries the coordinator
+	}{
+		{name: "default"},
+		{name: "coordinator label on", opts: []Option{WithCoordinatorMetricLabel(true)}, wantQuery: true},
 	}
-	assert.Equal(t, map[string]bool{"INSERT": true, "BATCH": true}, ops)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obs, sr, reader := newTestObserver(t, newConfig(tt.opts))
+			session := &gocql.Session{}
+			registerSession(session, obs)
+
+			start := time.Now()
+			obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+				Statement: "INSERT INTO chat.rooms (id) VALUES (?)",
+				Start:     start,
+				End:       start.Add(time.Millisecond),
+				Host:      testHost(t),
+			})
+
+			batch := gocql.NewBatch(gocql.LoggedBatch) //nolint:staticcheck // see TestBatchAttrsMirrorQueryPath
+			batch.Query("INSERT INTO chat.rooms (id) VALUES (?)", "r1")
+			require.NoError(t, instrumentBatch(context.Background(), session, batch, func(*gocql.Batch) error { return nil }))
+
+			spans := sr.Ended()
+			require.Len(t, spans, 2)
+			assert.Contains(t, spans[1].Attributes(), semconv.ServerAddress("127.0.0.1"), "batch span keeps the contact point")
+
+			rm := collectMetrics(t, reader)
+			points := metricByName(rm, "db.client.operation.duration").Data.(metricdata.Histogram[float64]).DataPoints
+			require.Len(t, points, 2, "one series per operation (INSERT, BATCH)")
+			ops := map[string]bool{}
+			for _, dp := range points {
+				op, _ := dp.Attributes.Value(semconv.DBOperationNameKey)
+				ops[op.AsString()] = true
+				assertHasAttr(t, dp.Attributes, semconv.DBNamespace("chat"))
+				assertHasAttr(t, dp.Attributes, semconv.DBCollectionName("rooms"))
+				assertMissingKey(t, dp.Attributes, semconv.ServerPortKey)
+				if tt.wantQuery && op.AsString() == "INSERT" {
+					assertHasAttr(t, dp.Attributes, semconv.ServerAddress("10.0.0.5"))
+				} else {
+					assertMissingKey(t, dp.Attributes, semconv.ServerAddressKey)
+				}
+			}
+			assert.Equal(t, map[string]bool{"INSERT": true, "BATCH": true}, ops)
+		})
+	}
 }
 
 // TestObserveQueryMetricSeriesIndependentOfClusterSize: queries served by
@@ -828,7 +863,7 @@ func TestCollectionMetricLabelOmittedForMultiTableBatch(t *testing.T) {
 	require.Empty(t, tgt.table, "a two-table batch must not resolve a single table")
 
 	start := time.Now()
-	obs.record(context.Background(), spanName(tgt.operation, tgt.table), tgt, obs.server,
+	obs.record(context.Background(), spanName(tgt.operation, tgt.table), tgt, obs.metricServer(nil),
 		start, start.Add(time.Millisecond), nil, obs.batchAttrs(batch, tgt))
 
 	dur := metricByName(collectMetrics(t, reader), "db.client.operation.duration")
