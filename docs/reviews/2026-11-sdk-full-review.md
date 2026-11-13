@@ -42,8 +42,11 @@ Session 1 — core and infrastructure:
 - [x] `internal/baggageattrs` (diff only), `internal/exportstats` and
       `internal/repeat` (unchanged; `repeat` read because the logr finding
       depends on it)
-- [ ] CI and tooling: `.github/workflows/`, `Makefile`, `scripts/`
-- [ ] Tool results recorded
+- [x] CI and tooling: `.github/workflows/`, `Makefile`, `scripts/`
+- [x] Tool results recorded
+
+Session 1 is complete: nine findings (two P2, seven P3, no P1), all confirmed
+by a reproduction or, for the CI items, by a tool run against the files named. Sections 2, 6 and 7 are left for the last session.
 
 Session 2 — not started.
 
@@ -59,11 +62,13 @@ _To be written once all three sessions have reported._
 |---|---|---|---|---|
 | S1-01 | P3 | Confirmed | root / endpoints | `WithOTLPEndpoint` and `WithMetricsOTLPEndpoint` accept a URL with a trailing slash or a path prefix and then send traces and metrics to a path no collector serves, while logs still arrive |
 | S1-02 | P3 | Confirmed | root / diagnostics | A spec-valid `OTEL_TRACES_SAMPLER` value the Go SDK does not implement (`jaeger_remote`, `xray`) fails `Init`, even when the option that makes the variable irrelevant is set |
-
 | S1-03 | P2 | Confirmed | `internal/redact` | SigV4 presigned-URL credentials (`X-Amz-Signature`, `X-Amz-Credential`, `X-Amz-Security-Token`) pass through `redact.URL` / `URLAttribute` unredacted; only the SigV2, GCS and Azure keys are covered |
 | S1-04 | P3 | Confirmed | `internal/redact` | Redaction rewrites ordinary diagnostic text: a short header value such as tenant `1` blanks digits in addresses and counts, a header name such as `Authorization` is blanked wherever it appears, and any `@` outside a URL replaces the whole message |
 | S1-05 | P3 | Confirmed | `internal/redact` | The error `Shutdown` and `ForceFlush` return is redacted only in its own `Error()`; `errors.Unwrap` hands back the original, unredacted error |
 | S1-06 | P3 | Confirmed | `internal/log` | `Logr()` suppresses repeats by message text alone, so a second, different one-shot OTel warning that shares its message with the first (duplicate metric stream definitions for another instrument) is never logged |
+| S1-07 | P2 | Confirmed | `scripts/` (ADR gate) | The "no OTel global setters" gate catches `otel.SetTracerProvider` but not `log/global.SetLoggerProvider`, `otel.SetErrorHandler` or `otel.SetLogger`; its `SetLoggerProvider` entry can never match |
+| S1-08 | P3 | Confirmed | `scripts/` (semconv gate) | `make semconv-check` only recognises keys that exist in the pinned package, so a legacy or misspelt key literal (`db.statement`, `db.cassandra.table`) passes — the mistake Core Principle 5 warns about |
+| S1-09 | P3 | Confirmed | CI / Makefile | No gate for `go mod tidy`; CI comments defer upgrades to Dependabot / Renovate but the repository configures neither; `make tools` does not pin golangci-lint or govulncheck; two of the three gate scripts have no tests; one stale step label |
 
 ## 4. Findings
 
@@ -272,9 +277,126 @@ conflicts at start-up sees one. Including the redacted key-values in the
 suppression key for WARN and above, or exempting the first N distinct
 key-value sets per message, would keep the anti-flood property.
 
+#### S1-07 · P2 · Confirmed · The global-setter gate misses three of the OTel globals
+
+`scripts/check_integrations.go:21` (`otelModulePath`), `:23-28`
+(`setterNames`), `:210` (`isOTelPackageRoot`); run by `make adr-check` and
+`.github/workflows/adr-check.yml`.
+
+`checkNoGlobalSetters` is the mechanical enforcement of ADR 0003 and of the
+AGENTS.md rule that SDK code must not mutate OTel globals. It flags a call or
+selector named `SetTracerProvider`, `SetTextMapPropagator`, `SetMeterProvider`
+or `SetLoggerProvider` when the package it resolves to is exactly
+`go.opentelemetry.io/otel`.
+
+- `SetLoggerProvider` does not live in that package. The logs global is
+  `go.opentelemetry.io/otel/log/global.SetLoggerProvider`, so the entry in
+  `setterNames` never matches anything.
+- `otel.SetErrorHandler` and `otel.SetLogger` are in the root package and
+  mutate process-global state, but are not in `setterNames`.
+
+Reproduced on a `git archive` copy of the tree (baseline run exits 0) by
+adding one non-test file under `internal/` that calls all four:
+
+```go
+logglobal.SetLoggerProvider(sdklog.NewLoggerProvider())
+otel.SetErrorHandler(…)
+otel.SetLogger(…)
+otel.SetTracerProvider(nil)
+```
+
+The gate reported only the last line (`forbidden otel.SetTracerProvider
+call`). With that line removed the file would pass.
+
+No SDK code calls any of these today (see section 8.1), so nothing is broken;
+the gap is that a future change installing the SDK's own `ErrorHandler()` or
+`Logr()` globally "for convenience", or setting the global LoggerProvider,
+would merge with the ADR gate green. Fix: match on the pair (package path,
+name) with `go.opentelemetry.io/otel/log/global.SetLoggerProvider`,
+`otel.SetErrorHandler` and `otel.SetLogger` added. The gate also does not look
+at reads (`otel.GetTracerProvider()`, `global.GetLoggerProvider()`), which the
+MongoDB section of AGENTS.md rules out for that package; whether to gate those
+is a separate decision.
+
+#### S1-08 · P3 · Confirmed · The semconv literal gate cannot see a wrong key
+
+`scripts/check_semconv_literals.go:21-22` (stated limit), `:131` (`scan`).
+
+The gate builds its key set from the `attribute.Key("…")` declarations of the
+pinned package and reports a string literal in SDK code that equals one. A
+literal that is *not* in that set is ignored. Its header says so.
+
+Reproduced on the tree copy with one file holding four keys: the literal
+`"service.name"` was reported; `"service."+"namespace"`, the constant
+`"db.statement"` and the literal `"db.cassandra.table"` were not.
+
+So the gate enforces "use the constant for a key that exists" and is silent
+on "this key does not exist in v1.39.0", which is the failure AGENTS.md Core
+Principle 5 describes (`db.cassandra.*` → `cassandra.*`). That case still
+rests on the `verify-semconv-attributes` skill and review. A cheap extension:
+for the first argument of `attribute.Key(...)` / `attribute.String(...)` and
+friends, require the literal to be either in the pinned set (already an
+error) or in a short allow-list of SDK-owned keys. The tree has ten such
+literals today (`object_store.*`, `minio.error.kind`, `redis.error.kind`,
+`resty.*`, `cassandra.query.attempt`), all SDK-owned.
+
+#### S1-09 · P3 · Confirmed · CI and Makefile hygiene
+
+Each item was checked against the files named.
+
+- **No `go mod tidy` gate.** AGENTS.md requires `go mod tidy` before every
+  commit; neither workflow nor `make lint` checks it. `go mod tidy -diff` is
+  clean at `03537c3`, so this is a missing guard, not a present defect.
+  `go mod tidy -diff` in the `lint` job would close it.
+- **Dependabot / Renovate are cited but not configured.**
+  `.github/workflows/ci.yml:85` and `:113` say upgrades of the pinned
+  golangci-lint and govulncheck are managed "via Dependabot / Renovate", and
+  every action is pinned by commit SHA. `.github/` holds only `workflows/`,
+  and there is no `renovate.json`. The pins — including
+  `GOVULNCHECK_GOTOOLCHAIN`, whose comment asks for a review at every Go
+  patch release — move only when someone remembers.
+- **`make tools` covers half of the toolchain.** It pins gosec and semgrep so
+  "CI and local `make sast` stay in lockstep" (`ci.yml:141`), but
+  golangci-lint (CI: v2.11.4) and govulncheck (CI: v1.3.0) are whatever is on
+  `PATH`. In this environment that was golangci-lint 2.5.0 built with
+  go1.25, which refuses the go 1.26 module outright (see section 5).
+- **Two gate scripts have no tests.** `check_semconv_literals.go` has
+  `check_semconv_literals_test.go`; `check_credential_directives.go`
+  (994 lines, with its own YAML rule reader) and `check_integrations.go`
+  (302 lines) have none. S1-07 is the kind of defect a table of
+  must-fail fixtures would have caught.
+- **Stale step label.** `ci.yml:150` is named "…fail on medium+", while
+  `GOSEC_FLAGS` is `-severity low -confidence low` and the Makefile comment
+  says every rule blocks.
+
 ## 5. Tool results
 
-_Filled in at the end of session 1._
+### 5.1 Session 1
+
+All runs were against `03537c3` with a clean working tree.
+
+| Command | Result |
+|---|---|
+| `go vet ./...` | exit 0, no output |
+| `go test -race ./...` (run once) | exit 0; all 22 packages with tests report `ok` (root, `cassandra`, `elasticsearch`, `gin`, `http`, the ten `internal/*` packages, `minio`, `mongo`, `nats`, `o11ytest`, `obsctx`, `redis`, `resty`) |
+| `make semconv-check` | exit 0; the script's own test passes and the scan reports nothing |
+| `make lint` with the golangci-lint found on `PATH` (2.5.0, built with go1.25) | `adr-check` and `semconv-check` pass; golangci-lint exits 3: "the Go language version (go1.25) used to build golangci-lint is lower than the targeted Go version (1.26.0)" |
+| `make lint` with golangci-lint v2.11.4 (the CI pin), built with go1.26.11 into a scratch `GOBIN` | exit 0; `0 issues.` |
+| `make sast` (gosec v2.26.1 built with go1.26.11, semgrep 1.163.0) | exit 0; `semgrep=PASS directives=PASS gosec=PASS rule-tests=PASS`. gosec: 235 files, 61,779 lines, 142 `#nosec`, 0 issues. semgrep: 1 rule over 172 files, 0 findings; rule fixture test 1/1 |
+| `go mod tidy -diff`, `gofmt -l .` (extra) | both clean |
+| `govulncheck ./...` | not run: the proxy blocks vuln.go.dev. CI runs it |
+
+Notes:
+
+- The two `SA5011` reports in `minio/client_test.go` that are known from other
+  local runs did not appear with v2.11.4 built from source; the run reported
+  zero issues.
+- Tools were installed from a directory outside the module (`go install` with
+  `GOTOOLCHAIN=go1.26.11`, `pip install --user semgrep==1.163.0` because pipx
+  is not present here); `go.mod` and `go.sum` are unchanged.
+- semgrep reports "Scan was limited to files tracked by git", so an untracked
+  file is not scanned locally. CI checks out tracked files only, so the gate
+  is unaffected.
 
 ## 6. Status of earlier findings
 
@@ -384,3 +506,24 @@ Root package:
 - **Init failure paths** close the listener and shut the provider down; on the
   OTLP path the provider, not just the exporter, is shut down so the periodic
   reader's goroutine stops.
+
+CI and tooling:
+
+- **Each gate fails on the violation it names.** On a copy of the tree:
+  `check_semconv_literals.go` rejected a planted `"service.name"` literal;
+  `check_credential_directives.go` rejected a `#nosec G101` line with no
+  `nosemgrep: gosec.G101-1` beside it; `check_integrations.go` rejected a
+  planted `otel.SetTracerProvider` call (its blind spots are S1-07). All three
+  exit 0 on the unmodified tree.
+- **Workflow coverage matches `make lint` + `make sast`.** `ci.yml` runs
+  build, `go test -race`, example builds, golangci-lint, govulncheck and
+  `make sast`; `adr-check.yml` runs the ADR gate, the semconv literal gate
+  with its test, and regenerates
+  `internal/baggageattrs/semconv_reserved_gen.go` to check for drift.
+- **Workflow hardening.** Both workflows set `permissions: contents: read`,
+  pin every action by commit SHA, cancel superseded runs, and the SAST job
+  checks out with `persist-credentials: false`.
+- **gosec scope.** `-tags integration` brings `cassandra/integration_test.go`
+  into the scan, and `check_credential_directives.go` fails on a
+  `//go:build ignore` file that is not in its `gosecExempt` list, so a build
+  tag is not a way out of the scan.
