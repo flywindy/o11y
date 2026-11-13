@@ -145,7 +145,7 @@ func main() {
 			if err != nil {
 				obs.Logger.ErrorContext(reqCtx, "request failed", slog.Any("error", err))
 			} else {
-				resp.Body.Close()
+				_ = resp.Body.Close()
 				obs.Logger.InfoContext(reqCtx, "request sent",
 					slog.String("path", path),
 					slog.Int("status", resp.StatusCode),
