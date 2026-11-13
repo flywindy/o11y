@@ -548,24 +548,31 @@ func TestWithAttributesDropsReservedKeys(t *testing.T) {
 // grow with the cluster, and the coordinator only with
 // WithCoordinatorMetricLabel(true).
 func TestObserveQueryServerAttribution(t *testing.T) {
+	// testHost reports no port (gocql has no setter), so the coordinator carries
+	// server.address only. Asserting the port alongside the address proves the
+	// pair comes from one source: a coordinator address must not pick up the
+	// contact point's 9042, nor a contact-point address lose it.
+	contactPoint := []attribute.KeyValue{semconv.ServerAddress("127.0.0.1"), semconv.ServerPort(9042)}
 	tests := []struct {
-		name       string
-		opts       []Option
-		wantMetric attribute.KeyValue
+		name        string
+		opts        []Option
+		wantMetric  []attribute.KeyValue
+		wantMissing []attribute.Key
 	}{
 		{
 			name:       "default labels metrics with the contact point",
-			wantMetric: semconv.ServerAddress("127.0.0.1"),
+			wantMetric: contactPoint,
 		},
 		{
-			name:       "opt-in labels metrics with the coordinator",
-			opts:       []Option{WithCoordinatorMetricLabel(true)},
-			wantMetric: semconv.ServerAddress("10.0.0.5"),
+			name:        "opt-in labels metrics with the coordinator",
+			opts:        []Option{WithCoordinatorMetricLabel(true)},
+			wantMetric:  []attribute.KeyValue{semconv.ServerAddress("10.0.0.5")},
+			wantMissing: []attribute.Key{semconv.ServerPortKey},
 		},
 		{
 			name:       "explicit false keeps the contact point",
 			opts:       []Option{WithCoordinatorMetricLabel(false)},
-			wantMetric: semconv.ServerAddress("127.0.0.1"),
+			wantMetric: contactPoint,
 		},
 	}
 	for _, tt := range tests {
@@ -589,12 +596,54 @@ func TestObserveQueryServerAttribution(t *testing.T) {
 			rm := collectMetrics(t, reader)
 			dur := metricByName(rm, "db.client.operation.duration").Data.(metricdata.Histogram[float64]).DataPoints
 			require.Len(t, dur, 1)
-			assertHasAttr(t, dur[0].Attributes, tt.wantMetric)
 			attempts := metricByName(rm, "cassandra.query.attempts").Data.(metricdata.Sum[int64]).DataPoints
 			require.Len(t, attempts, 1)
-			assertHasAttr(t, attempts[0].Attributes, tt.wantMetric)
+			for _, set := range []attribute.Set{dur[0].Attributes, attempts[0].Attributes} {
+				for _, want := range tt.wantMetric {
+					assertHasAttr(t, set, want)
+				}
+				for _, key := range tt.wantMissing {
+					assertMissingKey(t, set, key)
+				}
+			}
 		})
 	}
+}
+
+// TestQueryAndBatchShareServerLabels: a query served by a coordinator and a
+// batch run through the SDK seam report the same server.* on
+// db.client.operation.duration, so the two paths cannot drift into separate
+// per-server series for the same keyspace and table.
+func TestQueryAndBatchShareServerLabels(t *testing.T) {
+	obs, _, reader := newTestObserver(t, config{})
+	session := &gocql.Session{}
+	registerSession(session, obs)
+
+	start := time.Now()
+	obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+		Statement: "INSERT INTO chat.rooms (id) VALUES (?)",
+		Start:     start,
+		End:       start.Add(time.Millisecond),
+		Host:      testHost(t),
+	})
+
+	batch := gocql.NewBatch(gocql.LoggedBatch) //nolint:staticcheck // see TestBatchAttrsMirrorQueryPath
+	batch.Query("INSERT INTO chat.rooms (id) VALUES (?)", "r1")
+	require.NoError(t, instrumentBatch(context.Background(), session, batch, func(*gocql.Batch) error { return nil }))
+
+	rm := collectMetrics(t, reader)
+	points := metricByName(rm, "db.client.operation.duration").Data.(metricdata.Histogram[float64]).DataPoints
+	require.Len(t, points, 2, "one series per operation (INSERT, BATCH)")
+	ops := map[string]bool{}
+	for _, dp := range points {
+		op, _ := dp.Attributes.Value(semconv.DBOperationNameKey)
+		ops[op.AsString()] = true
+		assertHasAttr(t, dp.Attributes, semconv.DBNamespace("chat"))
+		assertHasAttr(t, dp.Attributes, semconv.DBCollectionName("rooms"))
+		assertHasAttr(t, dp.Attributes, semconv.ServerAddress("127.0.0.1"))
+		assertHasAttr(t, dp.Attributes, semconv.ServerPort(9042))
+	}
+	assert.Equal(t, map[string]bool{"INSERT": true, "BATCH": true}, ops)
 }
 
 // TestObserveQueryMetricSeriesIndependentOfClusterSize: queries served by

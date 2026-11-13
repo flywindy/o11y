@@ -663,6 +663,14 @@ a list of bare IPs as contact points it is the first of them, which is stable
 but arbitrary. A DNS name or service name as the first contact point makes the
 label meaningful.
 
+It is one value per *session*, not guaranteed to be one value per cluster.
+Replicas of the same service that see `ClusterConfig.Hosts` in different orders —
+DNS resolution order, a shuffled seed list, a config change rolled out to only
+some pods — report different first entries for the same cluster. Grouping by
+`server_address` then splits that cluster across several series, and an alert
+pinned to one value misses the other replicas. A single stable name as the first
+contact point avoids this too.
+
 ### Migration
 
 Dashboards and alerts that group or filter the two query metrics by

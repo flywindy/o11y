@@ -115,7 +115,7 @@ func (o *observer) ObserveQuery(ctx context.Context, q gocql.ObservedQuery) {
 
 	// server.* is the node that actually ran this attempt (token-aware routing),
 	// falling back to the contact point when the driver supplies no host.
-	srv := o.queryServer(q.Host)
+	srv := o.observedServer(q.Host)
 
 	attrs := o.baseAttrs(tgt, srv, q.Host)
 	attrs = append(attrs, semconv.DBResponseReturnedRows(q.Rows))
@@ -173,7 +173,7 @@ func (o *observer) ObserveConnect(c gocql.ObservedConnect) {
 // preferring the actual ObservedConnect.Host and falling back to the configured
 // contact point when the driver does not supply a usable address.
 func (o *observer) connectPeer(host *gocql.HostInfo) (string, int) {
-	srv := o.queryServer(host)
+	srv := o.observedServer(host)
 	return srv.host, srv.port
 }
 
@@ -309,12 +309,14 @@ func (o *observer) metricAttrs(tgt target, srv serverAddr, obsErr error) []attri
 	return attrs
 }
 
-// queryServer resolves the server.* attributed to a query span and to a connect
-// observation: the actual
-// coordinator from ObservedQuery.Host (token-aware routing sends a query to the
-// replica node, not necessarily the configured contact point), falling back to
-// the contact point when the driver supplies no usable host (ADR 0019 §7).
-func (o *observer) queryServer(host *gocql.HostInfo) serverAddr {
+// observedServer resolves the node the driver reported for an observation: the
+// coordinator from ObservedQuery.Host (token-aware routing sends a query to a
+// replica node, not necessarily the configured contact point) or the node being
+// dialed from ObservedConnect.Host. It falls back to the contact point when the
+// driver supplies no usable host (ADR 0019 §7). This is the server.* recorded on
+// query spans and on the connection metrics; the query-path metrics go through
+// metricServer instead.
+func (o *observer) observedServer(host *gocql.HostInfo) serverAddr {
 	if host != nil {
 		if ip := host.ConnectAddress(); len(ip) > 0 {
 			return serverAddr{host: ip.String(), port: host.Port()}

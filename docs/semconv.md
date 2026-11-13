@@ -568,7 +568,7 @@ driver attempt and per page (ADR 0019 §4).
 | `network.peer.address` | string | Opt-In, only when `cassandra.WithHostAttributes(true)`. Actual contacted coordinator from `HostInfo` (useful under token-aware routing). |
 | `network.peer.port` | int | Opt-In, only when `cassandra.WithHostAttributes(true)`. Actual contacted coordinator port. |
 | `server.address` | string | On spans and the connection metrics: the node that served the operation (`ObservedQuery.Host` / `ObservedConnect.Host`), falling back to the configured contact point (batch spans use the contact point). On the query metrics: the configured contact point, unless `cassandra.WithCoordinatorMetricLabel(true)` — see § below. |
-| `server.port` | int | Port of that node, falling back to the configured contact point port (defaulted from `ClusterConfig.Port`). |
+| `server.port` | int | On spans and the connection metrics: port of that node, falling back to the configured contact point port (defaulted from `ClusterConfig.Port`). On the query metrics: the contact point's port, unless `cassandra.WithCoordinatorMetricLabel(true)` — see § below. |
 | `error.type` | string | Set on `ObservedQuery.Err` / batch error; Go type name or context sentinel. |
 
 ### Instruments

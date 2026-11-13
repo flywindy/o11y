@@ -94,8 +94,8 @@ func WithCollectionMetricLabel(enabled bool) Option {
 // Spans are unaffected: server.* on a query span is always the coordinator. The
 // connection metrics (db.client.connection.create_time,
 // cassandra.connection.attempts) are unaffected too and stay per-node — their
-// label set is otherwise only the pool name, so they grow linearly with the
-// cluster rather than multiplying the query-path dimensions.
+// only other labels are the pool name and, on failures, error.type, so they grow
+// linearly with the cluster rather than multiplying the query-path dimensions.
 func WithCoordinatorMetricLabel(enabled bool) Option {
 	return func(cfg *config) {
 		cfg.coordinatorMetricLabelEnabled = enabled
