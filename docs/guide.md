@@ -1337,14 +1337,15 @@ and datacenter (`cassandra.coordinator.id` / `.dc`, plus `network.peer.*`) are
 additional and off by default; enable them with
 `o11ycassandra.WithHostAttributes(true)`.
 
-On the query metrics (`db.client.operation.duration`,
-`cassandra.query.attempts`) the same two labels carry the **configured contact
-point** instead, so the series count does not grow with the number of nodes in
-the cluster. Make the first entry of `ClusterConfig.Hosts` a DNS or service name
-and the label reads as the cluster's identity. For per-node latency, follow the
-exemplar to the span or use the server-side exporter; to put the coordinator
-back on these metrics — multiplying their series by the node count — pass
-`o11ycassandra.WithCoordinatorMetricLabel(true)`. The connection metrics
+The query metrics (`db.client.operation.duration`,
+`cassandra.query.attempts`) carry **no `server.address` / `server.port` by
+default**, so the series count does not grow with the number of nodes in the
+cluster. For per-node latency, follow the exemplar to the span or use the
+server-side exporter; to put the coordinator on these metrics — multiplying
+their series by the node count — pass
+`o11ycassandra.WithCoordinatorMetricLabel(true)`. Without it nothing on these
+two metrics identifies the cluster: a process with sessions to two clusters that
+share a keyspace name reports both into the same series. The connection metrics
 (`db.client.connection.create_time`, `cassandra.connection.attempts`) always
 report the node that was dialed.
 

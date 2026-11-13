@@ -567,8 +567,8 @@ driver attempt and per page (ADR 0019 §4).
 | `cassandra.query.attempt` | int | SDK-owned. Driver-side attempt index (`ObservedQuery.Attempt`); span-only, never a metric label. |
 | `network.peer.address` | string | Opt-In, only when `cassandra.WithHostAttributes(true)`. Actual contacted coordinator from `HostInfo` (useful under token-aware routing). |
 | `network.peer.port` | int | Opt-In, only when `cassandra.WithHostAttributes(true)`. Actual contacted coordinator port. |
-| `server.address` | string | On spans and the connection metrics: the node that served the operation (`ObservedQuery.Host` / `ObservedConnect.Host`), falling back to the configured contact point (batch spans use the contact point). On the query metrics: the configured contact point, unless `cassandra.WithCoordinatorMetricLabel(true)` — see § below. |
-| `server.port` | int | On spans and the connection metrics: port of that node, falling back to the configured contact point port (defaulted from `ClusterConfig.Port`). On the query metrics: the contact point's port, unless `cassandra.WithCoordinatorMetricLabel(true)` — see § below. |
+| `server.address` | string | On spans and the connection metrics: the node that served the operation (`ObservedQuery.Host` / `ObservedConnect.Host`), falling back to the configured contact point (batch spans use the contact point). On the query metrics: absent by default; the coordinator with `cassandra.WithCoordinatorMetricLabel(true)` — see § below. |
+| `server.port` | int | On spans and the connection metrics: port of that node, falling back to the configured contact point port (defaulted from `ClusterConfig.Port`). On the query metrics: absent by default; the coordinator's port with `cassandra.WithCoordinatorMetricLabel(true)` — see § below. |
 | `error.type` | string | Set on `ObservedQuery.Err` / batch error; Go type name or context sentinel. |
 
 ### Instruments
@@ -593,13 +593,18 @@ contact point but target different keyspaces distinct; sessions sharing both
 should pass `cassandra.WithPoolName` to disambiguate.
 
 **§ `server.address` / `server.port` on the query metrics.** These two labels
-carry the configured contact point — one value per session — not the coordinator
-that served the attempt (ADR 0019 §7, 2026-11-12 amendment). Token-aware routing
-spreads queries over every node, so a per-coordinator label multiplies the
-operation × keyspace × table × error series by the node count. The span for the
-same attempt still reports the coordinator, and the metric's exemplar links to
-it. `cassandra.WithCoordinatorMetricLabel(true)` puts the coordinator back on
-these two metrics. The connection metrics are per-node regardless.
+are **absent by default** (ADR 0019 §7, 2026-11-13 amendment). Token-aware
+routing spreads queries over every node, so a per-coordinator label multiplies
+the operation × keyspace × table × error series by the node count; the
+configured contact point would avoid that but names a node that usually did not
+serve the sample, and can differ between replicas of one service. semconv rates
+`server.*` *Recommended* on `db.client.operation.duration`, so omitting it is
+conformant. The span for the same attempt still reports the coordinator, and the
+metric's exemplar links to it. `cassandra.WithCoordinatorMetricLabel(true)` puts
+the coordinator on these two metrics; batch samples, which have no known
+coordinator, stay unlabelled. With the label off nothing on these metrics
+identifies the cluster, so sessions to two clusters sharing a keyspace name
+report into the same series. The connection metrics are per-node regardless.
 
 **‡ `db.collection.name` on the query metrics.** The addressed table is a metric
 label on both query-path instruments, **on by default** (ADR 0019 §7,
