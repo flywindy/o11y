@@ -13,6 +13,32 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+---
+
+## [0.15.0] - 2026-11-13
+
+### Upgrade notes
+
+The sections below have the details; the items that change what a service
+sees on rollout are:
+
+- **`cassandra` query metrics change their `server_address` /
+  `server_port` value.** `db.client.operation.duration` and
+  `cassandra.query.attempts` carry the configured contact point instead of
+  the coordinator, so the per-node series end and one series per contact
+  point begins. Dashboards and alerts that group or filter these two metrics
+  by `server_address` need updating; totals across nodes are unchanged.
+  `cassandra.WithCoordinatorMetricLabel(true)` keeps the per-node labels.
+- **go1.26.11 or later is recommended** (it carries the fixes for
+  GO-2026-6809 and GO-2026-6859). Go 1.26.0 is still the minimum, and any
+  1.26.x builds against this release.
+- **`klauspost/compress` moves to v1.20.2** (GO-2026-6865), an indirect
+  dependency through `nats.go`.
+- **`nats` calls that used to panic now return an error or do nothing:**
+  `MessagesContext.Next` returns a non-nil ctx on error, `Fetch` /
+  `FetchNoWait` reject a negative batch, and `Inject` / `Extract` ignore a
+  nil message or propagator.
+
 ### Added
 
 - CI gate for `docs/semconv.md` Enforcement Rule 1: `make semconv-check`
