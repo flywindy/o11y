@@ -204,7 +204,9 @@ type Consumer interface {
 	// detected: the native API has no double-set guard for that option (only
 	// for FetchMaxWait), so it silently overrides this ctx parameter's
 	// cancellation wiring with no error — pass the ctx you want to govern
-	// cancellation as this method's ctx argument, not as an opt.
+	// cancellation as this method's ctx argument, not as an opt. A negative
+	// batch returns an error instead of reaching the native call, which
+	// panics on one.
 	Fetch(ctx context.Context, batch int, opts ...jetstream.FetchOpt) (MessageBatch, error)
 	// FetchBytes is the byte-budgeted variant of Fetch: the server stops
 	// delivering once maxBytes is reached rather than once batch messages
@@ -212,7 +214,8 @@ type Consumer interface {
 	FetchBytes(ctx context.Context, maxBytes int, opts ...jetstream.FetchOpt) (MessageBatch, error)
 	// FetchNoWait requests up to batch currently-available messages and
 	// returns without waiting for more to arrive (no jetstream.FetchOpt —
-	// matches the native jetstream.Consumer.FetchNoWait signature).
+	// matches the native jetstream.Consumer.FetchNoWait signature). A
+	// negative batch returns an error, as for Fetch.
 	FetchNoWait(ctx context.Context, batch int) (MessageBatch, error)
 	// Next fetches a single message. The returned ctx carries the consumer
 	// receive span (linked to the producer's trace when the message headers
@@ -253,8 +256,10 @@ type ConsumeContext interface {
 
 // MessagesContext is the pull iterator returned by Consumer.Messages. Next
 // yields a per-message ctx (carrying the consumer span) and the native
-// jetstream.Msg. Stop halts immediately; Drain stops new pulls but lets
-// already-buffered messages be returned by Next before it reports completion.
+// jetstream.Msg; on error the ctx is never nil (it falls back to the ctx
+// Messages was called with), so it is safe to log the error with it. Stop
+// halts immediately; Drain stops new pulls but lets already-buffered messages
+// be returned by Next before it reports completion.
 type MessagesContext interface {
 	Next(opts ...jetstream.NextOpt) (context.Context, jetstream.Msg, error)
 	Stop()
@@ -390,12 +395,15 @@ func (c *consumer) Messages(ctx context.Context, opts ...jetstream.PullMessagesO
 	if err != nil {
 		return nil, err
 	}
-	return &messagesContext{mc: mc, policy: c.policy}, nil
+	return &messagesContext{mc: mc, ctx: ctx, policy: c.policy}, nil
 }
 
 func (c *consumer) Fetch(ctx context.Context, batch int, opts ...jetstream.FetchOpt) (MessageBatch, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("nats jetstream fetch: %w", err)
+	}
+	if err := checkBatch("fetch", batch); err != nil {
+		return nil, err
 	}
 	// Derive a cancelable fetch ctx so Stop can abort the in-flight native
 	// pull, not just the facade's own forwarding goroutine — see
@@ -491,6 +499,9 @@ func (c *consumer) FetchNoWait(ctx context.Context, batch int) (MessageBatch, er
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("nats jetstream fetch-no-wait: %w", err)
 	}
+	if err := checkBatch("fetch-no-wait", batch); err != nil {
+		return nil, err
+	}
 	mb, err := c.c.FetchNoWait(batch)
 	if err != nil {
 		return nil, err
@@ -502,6 +513,19 @@ func (c *consumer) FetchNoWait(ctx context.Context, batch int) (MessageBatch, er
 	// wrapMessageBatch contract uniform.
 	// Same reasoning as Fetch: batch is a hard cap here too.
 	return wrapMessageBatch(mb, batch, func() {}, c.policy), nil
+}
+
+// errNegativeBatch is returned by Fetch and FetchNoWait for a negative batch,
+// which the native call would otherwise panic on (it sizes a channel by it).
+var errNegativeBatch = errors.New("batch must not be negative")
+
+// checkBatch rejects a negative batch for the named fetch call. Zero is left
+// to the native call, as before.
+func checkBatch(call string, batch int) error {
+	if batch < 0 {
+		return fmt.Errorf("nats jetstream %s: %w (got %d)", call, errNegativeBatch, batch)
+	}
+	return nil
 }
 
 // fetchBytesBatchBuf is the best-effort forwarding buffer size for
@@ -620,13 +644,23 @@ func (c *consumer) Info(ctx context.Context) (*jetstream.ConsumerInfo, error) { 
 func (c *consumer) CachedInfo() *jetstream.ConsumerInfo { return c.c.CachedInfo() }
 
 type messagesContext struct {
-	mc     oteljetstream.MessagesContext
+	mc oteljetstream.MessagesContext
+	// ctx is the ctx Messages was called with, returned by Next on its
+	// error path in place of the nil the upstream iterator returns there.
+	ctx    context.Context
 	policy propagationPolicy
 }
 
 func (m *messagesContext) Next(opts ...jetstream.NextOpt) (context.Context, jetstream.Msg, error) {
 	ctx, msg, err := m.mc.Next(opts...)
 	if err != nil {
+		// Never return a nil context, as consumer.Next does: the upstream
+		// iterator returns one on failure (including the
+		// jetstream.ErrMsgIteratorClosed every Stop ends a loop with), and a
+		// caller that logs the error with that ctx would dereference it.
+		if ctx == nil {
+			ctx = m.ctx
+		}
 		return ctx, msg, err
 	}
 	return m.policy.restoreBaggage(ctx, msg.Headers()), msg, nil

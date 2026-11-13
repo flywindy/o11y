@@ -72,7 +72,11 @@ func (c headerCarrier) Keys() []string {
 
 // Inject injects the tracing context from ctx into the NATS message headers
 // using the provided propagator. Pass sdk.Propagator obtained from o11y.Init.
+// A nil msg or prop is a no-op.
 func Inject(ctx context.Context, prop propagation.TextMapPropagator, msg *nats.Msg) {
+	if msg == nil || prop == nil {
+		return
+	}
 	if msg.Header == nil {
 		msg.Header = make(nats.Header)
 	}
@@ -81,9 +85,10 @@ func Inject(ctx context.Context, prop propagation.TextMapPropagator, msg *nats.M
 
 // Extract extracts the tracing context from the NATS message headers
 // using the provided propagator and returns an enriched context.
-// If the message has no headers the original ctx is returned unchanged.
+// If the message has no headers, or msg or prop is nil, the original ctx is
+// returned unchanged.
 func Extract(ctx context.Context, prop propagation.TextMapPropagator, msg *nats.Msg) context.Context {
-	if msg.Header == nil {
+	if msg == nil || prop == nil || msg.Header == nil {
 		return ctx
 	}
 	return prop.Extract(ctx, headerCarrier{h: msg.Header})
