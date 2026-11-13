@@ -14,6 +14,10 @@ type config struct {
 	// default: the zero-value config then means "shipped defaults", so a config
 	// literal built in a test cannot silently disagree with what NewSession does.
 	collectionMetricLabelDisabled bool
+	// coordinatorMetricLabelEnabled opts the query-path metrics back into
+	// labelling server.* with the per-attempt coordinator node instead of the
+	// contact point. See WithCoordinatorMetricLabel.
+	coordinatorMetricLabelEnabled bool
 }
 
 // collectionMetricLabel reports whether db.collection.name is recorded as a
@@ -66,6 +70,35 @@ func WithQueryText(enabled bool) Option {
 func WithCollectionMetricLabel(enabled bool) Option {
 	return func(cfg *config) {
 		cfg.collectionMetricLabelDisabled = !enabled
+	}
+}
+
+// WithCoordinatorMetricLabel controls which server the query-path metrics
+// (db.client.operation.duration and cassandra.query.attempts) report as
+// server.address / server.port.
+//
+// The default is false: the labels carry the configured contact point, one
+// stable value per session, so the series count does not depend on how many
+// nodes the cluster has (ADR 0019 §7, 2026-11-12 amendment). Token-aware routing
+// spreads queries over every replica, so labelling by coordinator multiplies
+// each operation × keyspace × table × error series — and every histogram bucket
+// of it — by the node count, and keeps growing as nodes are replaced and their
+// addresses change.
+//
+// Pass true to label those two metrics with the coordinator that served each
+// attempt, as they were before that amendment. That gives unsampled per-node
+// latency and error rates at the cost of that multiplier; it suits small,
+// address-stable clusters. Batch observations always use the contact point,
+// since the batch seam has no per-statement host.
+//
+// Spans are unaffected: server.* on a query span is always the coordinator. The
+// connection metrics (db.client.connection.create_time,
+// cassandra.connection.attempts) are unaffected too and stay per-node — their
+// only other labels are the pool name and, on failures, error.type, so they grow
+// linearly with the cluster rather than multiplying the query-path dimensions.
+func WithCoordinatorMetricLabel(enabled bool) Option {
+	return func(cfg *config) {
+		cfg.coordinatorMetricLabelEnabled = enabled
 	}
 }
 

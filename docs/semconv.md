@@ -567,16 +567,16 @@ driver attempt and per page (ADR 0019 §4).
 | `cassandra.query.attempt` | int | SDK-owned. Driver-side attempt index (`ObservedQuery.Attempt`); span-only, never a metric label. |
 | `network.peer.address` | string | Opt-In, only when `cassandra.WithHostAttributes(true)`. Actual contacted coordinator from `HostInfo` (useful under token-aware routing). |
 | `network.peer.port` | int | Opt-In, only when `cassandra.WithHostAttributes(true)`. Actual contacted coordinator port. |
-| `server.address` | string | Node that served the operation (`ObservedQuery.Host` / `ObservedConnect.Host`), falling back to the configured contact point (batch spans use the contact point). |
-| `server.port` | int | Port of that node, falling back to the configured contact point port (defaulted from `ClusterConfig.Port`). |
+| `server.address` | string | On spans and the connection metrics: the node that served the operation (`ObservedQuery.Host` / `ObservedConnect.Host`), falling back to the configured contact point (batch spans use the contact point). On the query metrics: the configured contact point, unless `cassandra.WithCoordinatorMetricLabel(true)` — see § below. |
+| `server.port` | int | On spans and the connection metrics: port of that node, falling back to the configured contact point port (defaulted from `ClusterConfig.Port`). On the query metrics: the contact point's port, unless `cassandra.WithCoordinatorMetricLabel(true)` — see § below. |
 | `error.type` | string | Set on `ObservedQuery.Err` / batch error; Go type name or context sentinel. |
 
 ### Instruments
 
 | Name | Kind | Unit | Attributes |
 |---|---|---|---|
-| `db.client.operation.duration` | Float64Histogram | `s` | `db.system.name`, `db.operation.name`, `db.namespace`, `db.collection.name` ‡, `server.address`, `server.port`, `error.type` |
-| `cassandra.query.attempts` | Int64Counter | `{attempt}` | SDK-owned name. `db.system.name`, `db.operation.name`, `db.namespace`, `db.collection.name` ‡, `server.address`, `server.port`, `error.type`. Incremented by 1 per `ObserveQuery` callback (one per attempt and per page) — a client-side **round-trip** count covering retries, speculative executions, and paging, **not** a retries-only counter. See the note below the table. |
+| `db.client.operation.duration` | Float64Histogram | `s` | `db.system.name`, `db.operation.name`, `db.namespace`, `db.collection.name` ‡, `server.address` §, `server.port` §, `error.type` |
+| `cassandra.query.attempts` | Int64Counter | `{attempt}` | SDK-owned name. `db.system.name`, `db.operation.name`, `db.namespace`, `db.collection.name` ‡, `server.address` §, `server.port` §, `error.type`. Incremented by 1 per `ObserveQuery` callback (one per attempt and per page) — a client-side **round-trip** count covering retries, speculative executions, and paging, **not** a retries-only counter. See the note below the table. |
 | `db.client.connection.create_time` | Float64Histogram | `s` | `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port`. `server.*` is the node actually dialed (`ObservedConnect.Host`), not the contact point. |
 | `cassandra.connection.attempts` | Int64Counter | `{attempt}` | SDK-owned name. `db.system.name`, `db.client.connection.pool.name`, `server.address`, `server.port`, `error.type`. |
 
@@ -591,6 +591,15 @@ prefix plus semconv's suggested `server.address:server.port/db.namespace` shape
 (e.g. `cassandra/10.0.0.1:9042/chat`). The keyspace suffix keeps sessions that share a
 contact point but target different keyspaces distinct; sessions sharing both
 should pass `cassandra.WithPoolName` to disambiguate.
+
+**§ `server.address` / `server.port` on the query metrics.** These two labels
+carry the configured contact point — one value per session — not the coordinator
+that served the attempt (ADR 0019 §7, 2026-11-12 amendment). Token-aware routing
+spreads queries over every node, so a per-coordinator label multiplies the
+operation × keyspace × table × error series by the node count. The span for the
+same attempt still reports the coordinator, and the metric's exemplar links to
+it. `cassandra.WithCoordinatorMetricLabel(true)` puts the coordinator back on
+these two metrics. The connection metrics are per-node regardless.
 
 **‡ `db.collection.name` on the query metrics.** The addressed table is a metric
 label on both query-path instruments, **on by default** (ADR 0019 §7,

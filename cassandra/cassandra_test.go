@@ -223,7 +223,10 @@ func TestObserveQueryEmitsSemconvSpanAndDuration(t *testing.T) {
 	// db.collection.name is on by default and survives the allow-keys view
 	// (ADR 0019 §7, 2026-07-29 amendment).
 	assertHasAttr(t, dp.Attributes, semconv.DBCollectionName("messages_by_room"))
-	assertHasAttr(t, dp.Attributes, semconv.ServerAddress("10.0.0.5"))
+	// The metric is labelled with the contact point, not the coordinator the
+	// span reports, so series count does not scale with cluster size.
+	assertHasAttr(t, dp.Attributes, semconv.ServerAddress("127.0.0.1"))
+	assertHasAttr(t, dp.Attributes, semconv.ServerPort(9042))
 	assertMissingKey(t, dp.Attributes, semconv.NetworkPeerAddressKey)
 	assertMissingKey(t, dp.Attributes, semconv.CassandraCoordinatorIDKey)
 }
@@ -539,29 +542,133 @@ func TestWithAttributesDropsReservedKeys(t *testing.T) {
 	assert.NotContains(t, span.Attributes(), semconv.ServerAddress("evil.example.com"))
 }
 
-// TestObserveQueryAttributesToObservedHost: server.* on the span and the
-// operation metric is the node that actually ran the query (token-aware
-// routing), not the configured contact point.
-func TestObserveQueryAttributesToObservedHost(t *testing.T) {
-	obs, sr, reader := newTestObserver(t, config{})
+// TestObserveQueryServerAttribution: server.* on the span is always the node
+// that actually ran the query (token-aware routing). The query-path metrics
+// carry the configured contact point by default, so their series count does not
+// grow with the cluster, and the coordinator only with
+// WithCoordinatorMetricLabel(true).
+func TestObserveQueryServerAttribution(t *testing.T) {
+	// testHost reports no port (gocql has no setter), so the coordinator carries
+	// server.address only. Asserting the port alongside the address proves the
+	// pair comes from one source: a coordinator address must not pick up the
+	// contact point's 9042, nor a contact-point address lose it.
+	contactPoint := []attribute.KeyValue{semconv.ServerAddress("127.0.0.1"), semconv.ServerPort(9042)}
+	tests := []struct {
+		name        string
+		opts        []Option
+		wantMetric  []attribute.KeyValue
+		wantMissing []attribute.Key
+	}{
+		{
+			name:       "default labels metrics with the contact point",
+			wantMetric: contactPoint,
+		},
+		{
+			name:        "opt-in labels metrics with the coordinator",
+			opts:        []Option{WithCoordinatorMetricLabel(true)},
+			wantMetric:  []attribute.KeyValue{semconv.ServerAddress("10.0.0.5")},
+			wantMissing: []attribute.Key{semconv.ServerPortKey},
+		},
+		{
+			name:       "explicit false keeps the contact point",
+			opts:       []Option{WithCoordinatorMetricLabel(false)},
+			wantMetric: contactPoint,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obs, sr, reader := newTestObserver(t, newConfig(tt.opts))
+
+			start := time.Now()
+			obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+				Keyspace:  "chat",
+				Statement: "SELECT id FROM rooms WHERE id = ?",
+				Start:     start,
+				End:       start.Add(time.Millisecond),
+				Host:      testHost(t), // coordinator 10.0.0.5, not contact point 127.0.0.1
+			})
+
+			spans := sr.Ended()
+			require.Len(t, spans, 1)
+			assert.Contains(t, spans[0].Attributes(), semconv.ServerAddress("10.0.0.5"))
+			assert.NotContains(t, spans[0].Attributes(), semconv.ServerAddress("127.0.0.1"))
+
+			rm := collectMetrics(t, reader)
+			dur := metricByName(rm, "db.client.operation.duration").Data.(metricdata.Histogram[float64]).DataPoints
+			require.Len(t, dur, 1)
+			attempts := metricByName(rm, "cassandra.query.attempts").Data.(metricdata.Sum[int64]).DataPoints
+			require.Len(t, attempts, 1)
+			for _, set := range []attribute.Set{dur[0].Attributes, attempts[0].Attributes} {
+				for _, want := range tt.wantMetric {
+					assertHasAttr(t, set, want)
+				}
+				for _, key := range tt.wantMissing {
+					assertMissingKey(t, set, key)
+				}
+			}
+		})
+	}
+}
+
+// TestQueryAndBatchShareServerLabels: a query served by a coordinator and a
+// batch run through the SDK seam report the same server.* on
+// db.client.operation.duration, so the two paths cannot drift into separate
+// per-server series for the same keyspace and table.
+func TestQueryAndBatchShareServerLabels(t *testing.T) {
+	obs, _, reader := newTestObserver(t, config{})
+	session := &gocql.Session{}
+	registerSession(session, obs)
 
 	start := time.Now()
 	obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
-		Keyspace:  "chat",
-		Statement: "SELECT id FROM rooms WHERE id = ?",
+		Statement: "INSERT INTO chat.rooms (id) VALUES (?)",
 		Start:     start,
 		End:       start.Add(time.Millisecond),
-		Host:      testHost(t), // coordinator 10.0.0.5, not contact point 127.0.0.1
+		Host:      testHost(t),
 	})
 
-	spans := sr.Ended()
-	require.Len(t, spans, 1)
-	assert.Contains(t, spans[0].Attributes(), semconv.ServerAddress("10.0.0.5"))
-	assert.NotContains(t, spans[0].Attributes(), semconv.ServerAddress("127.0.0.1"))
+	batch := gocql.NewBatch(gocql.LoggedBatch) //nolint:staticcheck // see TestBatchAttrsMirrorQueryPath
+	batch.Query("INSERT INTO chat.rooms (id) VALUES (?)", "r1")
+	require.NoError(t, instrumentBatch(context.Background(), session, batch, func(*gocql.Batch) error { return nil }))
 
 	rm := collectMetrics(t, reader)
-	dp := metricByName(rm, "db.client.operation.duration").Data.(metricdata.Histogram[float64]).DataPoints[0]
-	assertHasAttr(t, dp.Attributes, semconv.ServerAddress("10.0.0.5"))
+	points := metricByName(rm, "db.client.operation.duration").Data.(metricdata.Histogram[float64]).DataPoints
+	require.Len(t, points, 2, "one series per operation (INSERT, BATCH)")
+	ops := map[string]bool{}
+	for _, dp := range points {
+		op, _ := dp.Attributes.Value(semconv.DBOperationNameKey)
+		ops[op.AsString()] = true
+		assertHasAttr(t, dp.Attributes, semconv.DBNamespace("chat"))
+		assertHasAttr(t, dp.Attributes, semconv.DBCollectionName("rooms"))
+		assertHasAttr(t, dp.Attributes, semconv.ServerAddress("127.0.0.1"))
+		assertHasAttr(t, dp.Attributes, semconv.ServerPort(9042))
+	}
+	assert.Equal(t, map[string]bool{"INSERT": true, "BATCH": true}, ops)
+}
+
+// TestObserveQueryMetricSeriesIndependentOfClusterSize: queries served by
+// different coordinators land in one series per metric by default.
+func TestObserveQueryMetricSeriesIndependentOfClusterSize(t *testing.T) {
+	obs, _, reader := newTestObserver(t, config{})
+
+	start := time.Now()
+	for _, ip := range []string{"10.0.0.5", "10.0.0.6", "10.0.0.7"} {
+		obs.ObserveQuery(context.Background(), gocql.ObservedQuery{
+			Keyspace:  "chat",
+			Statement: "SELECT id FROM rooms WHERE id = ?",
+			Start:     start,
+			End:       start.Add(time.Millisecond),
+			Host:      (&gocql.HostInfo{}).SetConnectAddress(net.ParseIP(ip)),
+		})
+	}
+
+	rm := collectMetrics(t, reader)
+	dur := metricByName(rm, "db.client.operation.duration").Data.(metricdata.Histogram[float64]).DataPoints
+	require.Len(t, dur, 1)
+	assert.Equal(t, uint64(3), dur[0].Count)
+	attempts := metricByName(rm, "cassandra.query.attempts").Data.(metricdata.Sum[int64]).DataPoints
+	require.Len(t, attempts, 1)
+	assert.Equal(t, int64(3), attempts[0].Value)
 }
 
 func TestObserveConnectMetrics(t *testing.T) {
