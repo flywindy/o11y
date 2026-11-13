@@ -124,9 +124,9 @@ func (o *observer) ObserveQuery(ctx context.Context, q gocql.ObservedQuery) {
 		attrs = append(attrs, semconv.DBQueryText(q.Statement))
 	}
 
-	// The metric labels use the contact point unless the caller opted into the
+	// The metrics carry no server.* unless the caller opted into the
 	// per-coordinator breakdown, so series count does not scale with cluster size.
-	metricSrv := o.metricServer(srv)
+	metricSrv := o.metricServer(q.Host)
 
 	spanCtx := o.record(ctx, spanName(operation, table), tgt, metricSrv, q.Start, q.End, q.Err, attrs)
 
@@ -177,17 +177,27 @@ func (o *observer) connectPeer(host *gocql.HostInfo) (string, int) {
 	return srv.host, srv.port
 }
 
-// metricServer resolves the server.* label for the query-path metrics from the
-// coordinator resolved for the span. By default it is the configured contact
-// point — one value per session — because token-aware routing spreads queries
-// over every node and a per-coordinator label would multiply the operation ×
-// keyspace × table × error series by the cluster's node count (ADR 0019 §7,
-// 2026-11-12 amendment). WithCoordinatorMetricLabel(true) keeps the coordinator.
-func (o *observer) metricServer(coordinator serverAddr) serverAddr {
-	if o.cfg.coordinatorMetricLabelEnabled {
-		return coordinator
+// metricServer resolves the server.* label for the query-path metrics. By
+// default it is the zero serverAddr, which appendServerAttrs omits: token-aware
+// routing spreads queries over every node, so a per-coordinator label would
+// multiply the operation × keyspace × table × error series by the cluster's node
+// count, and the contact point would name a node that usually did not serve the
+// sample (ADR 0019 §7, 2026-11-13 amendment).
+//
+// WithCoordinatorMetricLabel(true) returns the coordinator the driver reported.
+// It does not fall back to the contact point when there is none (a nil host, or
+// the batch seam, which has no per-statement host): the label then means "the
+// node that served this", and a sample whose node is unknown carries no label
+// rather than a guess.
+func (o *observer) metricServer(host *gocql.HostInfo) serverAddr {
+	if !o.cfg.coordinatorMetricLabelEnabled || host == nil {
+		return serverAddr{}
 	}
-	return o.server
+	ip := host.ConnectAddress()
+	if len(ip) == 0 {
+		return serverAddr{}
+	}
+	return serverAddr{host: ip.String(), port: host.Port()}
 }
 
 // record creates a completed CLIENT span from a finished observation snapshot
@@ -276,8 +286,8 @@ func (o *observer) baseAttrs(tgt target, srv serverAddr, host *gocql.HostInfo) [
 }
 
 // metricAttrs builds the bounded label set for db.client.operation.duration and
-// the attempts counter. srv is the server label for the observation: the
-// configured contact point by default, or the actual coordinator when
+// the attempts counter. srv is the server label for the observation: empty (no
+// server.* label) by default, or the actual coordinator when
 // WithCoordinatorMetricLabel(true) is set (see metricServer). The MetricViews
 // allow-keys filter is the backstop.
 //

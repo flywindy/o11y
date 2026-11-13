@@ -135,8 +135,10 @@ func instrumentBatch(
 
 	tgt := batchTarget(batchTargets(batch))
 	// The batch seam has no per-statement host (gocql's ExecuteBatch* take no
-	// observer host here), so server.* is the configured contact point.
-	obs.record(ctx, spanName(tgt.operation, tgt.table), tgt, obs.server, start, end, err, obs.batchAttrs(batch, tgt))
+	// observer host here), so the span's server.* is the configured contact
+	// point (batchAttrs) and the metric carries no server.* at all, matching the
+	// query path's default (metricServer).
+	obs.record(ctx, spanName(tgt.operation, tgt.table), tgt, obs.metricServer(nil), start, end, err, obs.batchAttrs(batch, tgt))
 	return err
 }
 

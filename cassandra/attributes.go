@@ -6,11 +6,11 @@ import (
 	"strings"
 )
 
-// serverAddr is a server.address / server.port pair. The observer holds one for
-// the logical server (the configured contact point): a single value per client
-// instance, which is what the query-path metrics are labelled with by default
-// so their series count does not grow with the cluster (ADR 0019 §7). Query
-// spans and the connection metrics carry the per-node address instead.
+// serverAddr is a server.address / server.port pair; the zero value means "no
+// server" and produces no attributes. The observer holds one for the configured
+// contact point, used as the fallback for spans and connection metrics when the
+// driver reports no host, for batch spans, and to synthesize the pool name. The
+// query-path metrics carry no server.* by default (ADR 0019 §7).
 type serverAddr struct {
 	host string
 	port int
