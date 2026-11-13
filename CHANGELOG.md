@@ -22,13 +22,15 @@ adopters can plan their upgrades.
 The sections below have the details; the items that change what a service
 sees on rollout are:
 
-- **`cassandra` query metrics change their `server_address` /
-  `server_port` value.** `db.client.operation.duration` and
-  `cassandra.query.attempts` carry the configured contact point instead of
-  the coordinator, so the per-node series end and one series per contact
-  point begins. Dashboards and alerts that group or filter these two metrics
-  by `server_address` need updating; totals across nodes are unchanged.
-  `cassandra.WithCoordinatorMetricLabel(true)` keeps the per-node labels.
+- **`cassandra` query metrics drop `server_address` / `server_port`.**
+  `db.client.operation.duration` and `cassandra.query.attempts` no longer
+  carry the coordinator, so the per-node series end and one series without
+  the two labels begins. Dashboards and alerts that group or filter these two
+  metrics by `server_address` need updating; totals across nodes are
+  unchanged. Nothing on these metrics identifies the cluster any more, so a
+  process with sessions to two clusters that share a keyspace name reports
+  both in the same series. `cassandra.WithCoordinatorMetricLabel(true)` keeps
+  per-coordinator labels.
 - **go1.26.11 or later is recommended** (it carries the fixes for
   GO-2026-6809 and GO-2026-6859). Go 1.26.0 is still the minimum, and any
   1.26.x builds against this release.
