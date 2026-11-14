@@ -65,7 +65,15 @@ Session 2 — integration packages:
 Session 2 is complete: eight findings (two P2, six P3, no P1), all confirmed
 by a scratch test, a benchmark or a mutation run described in the finding.
 
-Session 3 — not started.
+Session 3 — documentation and comparison with the earlier reviews:
+
+- [x] Documentation drift: `README.md`, `docs/guide.md`, `docs/semconv.md`,
+      `docs/adr/` (status lines and the sections changed since `afbd622`;
+      the ADR bodies were not re-read in full), `AGENTS.md`, `examples/` and
+      `examples/README.md`, package comments; `k8s/infrastructure/` for
+      obvious errors (section 4.3)
+- [ ] Status of the earlier findings (section 6)
+- [ ] Executive summary and suggested sequencing (sections 2 and 7)
 
 ## 2. Executive summary
 
@@ -92,6 +100,15 @@ _To be written once all three sessions have reported._
 | S2-06 | P3 | Confirmed | `cassandra/` | `WithQueryText`, `WithHostAttributes` and `WithPoolName` are never called by a test; with all three turned into no-ops the package's tests still pass |
 | S2-07 | P3 | Confirmed | `nats/` | A server URL that fails to parse yields `nats connect [endpoint redacted]: [endpoint redacted]`, which no longer says what is wrong with the URL |
 | S2-08 | P3 | Confirmed | cross-integration | The integrations disagree on four contracts: what a nil provider does (three behaviours), whether a second instrumentation call is safe (`mongo.Instrument` emits every span twice), whether errors carry the package prefix, and how default pool names are built (three schemes) |
+| S3-01 | P3 | Confirmed | `docs/guide.md` | The JetStream section says in one place that single-message `Consumer.Next` is "deferred, not wrapped" and in another that it is wrapped; the code wraps it |
+| S3-02 | P3 | Confirmed | docs | Two documented paths do not exist: the guide's link to `k8s/infrastructure/base/prometheus.yaml`, and the `kubectl apply -k k8s/infrastructure/base` entry point in `AGENTS.md` (no kustomization there) |
+| S3-03 | P3 | Confirmed | `k8s/` | `base/cassandra.yaml` and `base/elasticsearch.yaml` are unreferenced copies of the component manifests; the Elasticsearch copy has drifted (`runAsGroup: 0` against `1000`) |
+| S3-04 | P3 | Confirmed (text) | docs / `kind-config.yaml` | Local profiling instructions say to reach Alloy on `localhost:4040`; the kind port mapping sends that port to Pyroscope directly, and `examples/README.md` refers to an Alloy port-forward its setup block does not contain |
+| S3-05 | P3 | Confirmed | `examples/` | `examples/README.md` says no example passes `WithOTLPEndpoint`; the profiling example does, so the standard endpoint variables do not redirect it |
+| S3-06 | P3 | Speculative | `examples/` | Forty `os.Exit(1)` sites skip the deferred `Shutdown`, so the error record that explains the exit never reaches the OTLP log pipeline — in the code services copy for their `main` |
+| S3-07 | P3 | Confirmed | `.agents/skills/` | The lookup command in the semconv verification skill never matches the module-cache path (`otel@v1.46.0/semconv/...`), so the step Core Principle 5 mandates returns nothing |
+| S3-08 | P3 | Confirmed | `AGENTS.md`, `README.md` | The package layout, tech stack, ADR summary and "Do NOT" list in `AGENTS.md` omit `resty/`, `minio/`, `cassandra/`, `obsctx/` and `o11ytest/`; the README's infrastructure, sub-package and example lists each omit some of Cassandra, Elasticsearch, MinIO and the background example |
+| S3-09 | P3 | Confirmed | docs / comments | Nine stale statements: `deployment.environment` for `deployment.environment.name`, "Fluentd", a 0.1.0 migration note, a recommendation of a deprecated option, the `nats.Conn` type comment, duplicate package comments, and three ADR status or version lines |
 
 ## 4. Findings
 
@@ -691,6 +708,201 @@ one integration to the next. A short "integration contract" section in
 `docs/guide.md` — nil is an error, constructors are idempotent or say they
 are not, errors are prefixed and redacted — would give new integrations
 something to conform to.
+
+### 4.3 Session 3 — documentation and examples
+
+Scope: `README.md`, `docs/guide.md`, `docs/semconv.md`, `docs/adr/`,
+`AGENTS.md`, `examples/` with `examples/README.md`, package documentation,
+and `k8s/infrastructure/` for obvious errors only.
+
+Method: every `o11y*.Name` and `With*` identifier the documents mention was
+checked against the exported symbols of the tree; every backticked dotted key
+in the four user-facing documents was checked against the key and metric-name
+literals of the pinned `semconv/v1.39.0` package source in the module cache;
+every `go run` path was checked to exist; the guide's integration sections
+were read against the constructors and option defaults they describe. An
+item is **Confirmed** when the two texts (or the text and the file listing)
+were put side by side by a command, or when a scratch run reproduced the
+behaviour; where a consequence was only reasoned, the item says so.
+
+Most of what these documents say holds. The option tables, defaults,
+constructor signatures, the NATS request/reply error contract, the Redis
+dropped-command list and the gin skip paths all match the code. Section 8.3
+lists what was checked.
+
+#### S3-01 · P3 · Confirmed · The guide says both that `Consumer.Next` is not wrapped and that it is
+
+- `docs/guide.md:1624-1625`: "Single-message `Consumer.Next` is a different
+  case — deferred, not wrapped; see below."
+- `docs/guide.md:1731-1732`: "Single-message `Consumer.Next` is wrapped since
+  the otel-nats v0.6.0 upgrade".
+- `nats/jetstream.go:628`: `func (c *consumer) Next(ctx, opts...)
+  (context.Context, jetstream.Msg, error)` exists and restores baggage.
+
+A reader who stops at the first statement drops to the upstream package for
+single-message pulls, which is what the "Do NOT" list forbids. The earlier
+review reported the same contradiction (R-45); the first sentence was not
+removed. `AGENTS.md` has it right.
+
+#### S3-02 · P3 · Confirmed · Two documented paths do not exist
+
+- `docs/guide.md:371` links `k8s/infrastructure/base/prometheus.yaml`. The
+  file is `k8s/infrastructure/base/monitor/prometheus.yaml`; the link is dead.
+- `AGENTS.md:200` gives `kubectl apply -k k8s/infrastructure/base` as the
+  usual Kustomize entry point. `k8s/infrastructure/base/` holds no
+  `kustomization.yaml` (only `monitor/`, `components/` and two loose files),
+  so that command fails. The same file's command list, lines 105-116, uses
+  the correct `base/monitor` and `base/components/<name>` paths.
+
+Both were confirmed with a directory listing. The `kubectl` failure itself
+was not run (no cluster tooling here); `kubectl apply -k` requires a
+kustomization file in the target directory.
+
+#### S3-03 · P3 · Confirmed · Two orphaned manifests sit next to the live ones, and one has drifted
+
+`k8s/infrastructure/base/cassandra.yaml` and
+`k8s/infrastructure/base/elasticsearch.yaml` are referenced by no
+kustomization (`grep -rn 'cassandra.yaml\|elasticsearch.yaml' k8s` finds only
+the two `components/*/kustomization.yaml` entries, which point at their own
+directory). The Cassandra copy is byte-identical to
+`components/cassandra/cassandra.yaml` (`cmp`). The Elasticsearch copy differs
+from `components/elasticsearch/elasticsearch.yaml` at line 32: `runAsGroup: 0`
+in the orphan, `runAsGroup: 1000` in the live file.
+
+Trigger: someone fixes or applies the file at the top of `base/` because it
+is the first one a search finds, and either the fix never reaches the
+cluster or the stale security context does. Delete the two files.
+
+#### S3-04 · P3 · Confirmed (text) / Speculative (port conflict) · Local profiling instructions disagree about what listens on `localhost:4040`
+
+- `README.md:47` and `docs/guide.md:480` describe the path as application →
+  Alloy → Pyroscope, and `docs/guide.md:494-495` says "For local development,
+  port-forward Alloy and use `WithProfilingEndpoint("http://localhost:4040")`".
+- `kind-config.yaml:10-11` maps host port 4040 to node port 30002, and
+  `k8s/infrastructure/base/monitor/pyroscope.yaml:74-81` gives node port 30002
+  to the **Pyroscope** Service. `AGENTS.md` records the mapping the same way.
+- `examples/README.md:36-37` says "4318 (otel-collector) and 4040
+  (alloy/pyroscope) are already bound to host ports via kind-config.yaml — no
+  port-forward needed", and `examples/README.md:81-82` then says "Keep the
+  Alloy and Grafana port-forwards from the setup block running"; the setup
+  block has no Alloy port-forward.
+
+So on the documented kind cluster `localhost:4040` is Pyroscope itself, and a
+local run pushes profiles past Alloy — the opposite of the flow the README
+draws. Reasoned, not run: following the guide literally
+(`kubectl port-forward svc/alloy 4040:4040`) should fail to bind, because
+kind already holds host port 4040. Profiles still arrive either way, which is
+why nobody has noticed; the cost is a reader debugging an Alloy pipeline that
+their profiles never touch. Say in all three places that the kind mapping
+goes to Pyroscope directly, or move the mapping to Alloy's Service.
+
+#### S3-05 · P3 · Confirmed · `examples/README.md` says no example sets the OTLP endpoint; the profiling example does
+
+`examples/README.md:17-22`: "the examples do not pass `WithOTLPEndpoint`, so
+an `OTEL_EXPORTER_OTLP_ENDPOINT` … variable exported in your shell redirects
+traces and logs". `examples/profiling/main.go:34-43` reads `OTLP_ENDPOINT`
+(default `http://localhost:4318`) and passes it to both `WithOTLPEndpoint` and
+`WithMetricsOTLPEndpoint`. For that one example the standard variable is
+overridden and has no effect; the variable that does work, `OTLP_ENDPOINT`,
+is named only in the profiling section (`examples/README.md:80-81`). Either
+drop the option from the example or name the exception in the paragraph.
+
+#### S3-06 · P3 · Speculative · The examples exit through `os.Exit(1)` past the deferred `Shutdown`
+
+Forty call sites in `examples/` log a failure and call `os.Exit(1)`; the
+ones after `Init` (for instance `examples/jetstream/publisher/main.go:57`,
+`:66`, `:78`) sit below `defer func() { … obs.Shutdown(…) }()`. `os.Exit`
+does not run deferred functions, so the batchers are never flushed: the
+`ERROR` record that explains the exit reaches stdout but not the OTLP log
+pipeline, and the spans leading to it are dropped. Not run; it follows from
+`os.Exit`'s contract and the batch processors' export delay.
+
+The examples are what a service copies for its `main`. The README's own
+snippet (`README.md:140-143`) returns from `main` instead, which is the
+pattern to copy: a `run() error` function with the defer inside it, and one
+`os.Exit` in `main`.
+
+#### S3-07 · P3 · Confirmed · The semconv verification skill's lookup command finds nothing
+
+`.agents/skills/verify-semconv-attributes/SKILL.md`, step 2:
+
+```bash
+SRC=$(find "$(go env GOMODCACHE)" -path "*otel/semconv/$SEMV/attribute_group.go" | head -1)
+```
+
+The package lives at
+`…/pkg/mod/go.opentelemetry.io/otel@v1.46.0/semconv/v1.39.0/attribute_group.go`.
+The pattern requires the literal `otel/semconv`, and the module directory is
+`otel@v1.46.0`, so it never matches. Run here with the modules downloaded,
+the command printed an empty string; the `grep … "$SRC"` that follows then
+fails on an empty file name.
+
+Core Principle 5 makes this skill mandatory before any attribute key is
+written or defended, and its "one rule" is to read the literal from this
+file. With the first command returning nothing, the path of least
+resistance is the one the skill exists to prevent — answering from memory.
+Fix: `-path "*otel@*/semconv/$SEMV/attribute_group.go"`, or resolve the
+directory with `go list -m -f '{{.Dir}}' go.opentelemetry.io/otel`.
+
+#### S3-08 · P3 · Confirmed · `AGENTS.md` and the README overview stop short of the current package set
+
+`AGENTS.md` is the canonical context file for assistants and the README is
+the first contact for users. Compared with the tree:
+
+| Place | Says | Tree |
+|---|---|---|
+| `AGENTS.md` Package Layout (lines 40-51) | root, `http/`, `gin/`, `nats/`, `mongo/`, `elasticsearch/`, `redis/`, `internal/`, `examples/` | also `resty/`, `minio/`, `cassandra/`, `obsctx/`, `o11ytest/` |
+| `AGENTS.md` Tech Stack and ADR summary | no row for Cassandra, MinIO or Resty | ADR 0011, 0018, 0019 are accepted and implemented |
+| `AGENTS.md` "Do NOT" | rules for NATS, MongoDB, gin, Redis | no rule for the Cassandra batch seam (`session.ExecuteBatch` emits no span, `docs/guide.md:1301-1304`) or for bypassing `o11yresty` / `o11yminio` |
+| `README.md:24-35` Infrastructure | NATS, MongoDB, Redis, Cassandra | also Elasticsearch and MinIO |
+| `README.md:376-379` sub-package list | NATS, MongoDB, Redis, Elasticsearch, HTTP, Resty, MinIO, gin | also Cassandra |
+| `README.md:407-410` examples list | gin, Resty, MongoDB, Redis, NATS, MinIO | also Cassandra, Elasticsearch, background |
+| `README.md:73` | "an extra port mapping for the OTel Collector (port `4318`)" | `kind-config.yaml` maps three ports (4318, 4223, 4040) |
+
+The practical gap is the first three rows: an assistant working from
+`AGENTS.md` alone does not learn that three integrations exist or that
+Cassandra batches must go through `cassandra.ExecuteBatch`. The earlier
+review listed the Package Layout and examples-list rows (R-45); they are
+unchanged.
+
+#### S3-09 · P3 · Confirmed · Stale statements in documents and comments
+
+Each was checked with a grep against the file named.
+
+- `docs/guide.md:238` and `internal/log/provider.go:19` name the Resource
+  attribute `deployment.environment`. The pinned package has no such key; it
+  is `deployment.environment.name` (`README.md:170` and `AGENTS.md` have it
+  right).
+- `o11y.go:70`, the `SDK.Logger` field comment, says stdout is collected "via
+  Fluentd". The stack and every other document use Alloy.
+- `README.md:245-252` is a "Migration note (pre-1.0 API change)" about
+  `DefaultLatencyBuckets` becoming a function and the provider accessors'
+  return types. `CHANGELOG.md` records those changes under 0.1.0
+  (2026-05-22); the note still sits under the options table as if current.
+- `README.md:220` tells callers to pair `WithExtraHTTPServerAttributeKeys`
+  with `o11ygin.WithMetricAttributesFn` "/ `otelhttp` equivalent";
+  `http/options.go:29-31` marks `o11yhttp.WithMetricAttributesFn`
+  `Deprecated:` in favour of otelhttp's Labeler.
+- `nats/conn.go:36-39`, the `Conn` type comment, lists `Request` among the
+  methods "available directly" from the embedded connection. `Request` and
+  `RequestMsg` are overridden by ctx-first methods (`nats/conn.go:336`,
+  `:356`), and `Respond` and `JetStream` are not mentioned.
+- `nats` and `mongo` each carry two package comments (`nats/conn.go:1` and
+  `nats/doc.go`; `mongo/client.go:1` and `mongo/doc.go`), which godoc joins
+  into one text.
+- `docs/adr/0015-trace-sampling-strategy.md:83` heads its verification
+  "OTel Go SDK v1.43.0"; `go.mod` pins v1.46.0.
+- `docs/adr/0023-span-naming-convention.md:39` argues from "pre-1.0 with no
+  tagged release"; `CHANGELOG.md` lists releases from 0.1.0 to 0.15.0.
+- `docs/adr/0017-echo-integration.md` has status "Accepted" and its scope
+  note defers the `echo/` package to a follow-up. No such package exists and
+  the status does not say so, where its neighbours write "Accepted
+  (implemented)".
+
+The earlier review listed the Fluentd, ADR 0015, ADR 0017, ADR 0023,
+migration-note and `WithMetricAttributesFn` items (R-45); none was changed.
+ADRs are historical records, so the three ADR items want a one-line status
+amendment, not a rewrite.
 
 ## 5. Tool results
 
