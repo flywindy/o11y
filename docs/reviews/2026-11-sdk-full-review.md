@@ -48,18 +48,22 @@ Session 1 — core and infrastructure:
 Session 1 is complete: nine findings (two P2, seven P3, no P1), all confirmed
 by a reproduction or, for the CI items, by a tool run against the files named. Sections 2, 6 and 7 are left for the last session.
 
-Session 2 — integration packages (in progress):
+Session 2 — integration packages:
 
-- [x] `resty/`
-- [ ] `redis/`
-- [ ] `mongo/`
-- [ ] `nats/`
-- [ ] `cassandra/`
-- [ ] `gin/`
-- [ ] `http/`, `elasticsearch/`, `minio/`, `obsctx/`, `o11ytest/` (unchanged
-      since `afbd622`; quick scan only)
-- [ ] Cross-integration contract comparison
-- [ ] Session 2 tool results recorded
+- [x] `resty/` (changed; diff read in full)
+- [x] `redis/` (changed; diff read in full)
+- [x] `mongo/` (changed; diff read in full)
+- [x] `nats/` (changed; diff read in full)
+- [x] `cassandra/` (changed; diff read in full)
+- [x] `gin/` (changed; diff read in full)
+- [x] `http/`, `elasticsearch/`, `minio/`, `obsctx/`, `o11ytest/` (no non-test
+      change since `afbd622`; constructors and error paths scanned, the rest
+      not re-read)
+- [x] Cross-integration contract comparison (section 4.2, S2-08)
+- [x] Session 2 tool results recorded
+
+Session 2 is complete: eight findings (two P2, six P3, no P1), all confirmed
+by a scratch test, a benchmark or a mutation run described in the finding.
 
 Session 3 — not started.
 
@@ -82,6 +86,12 @@ _To be written once all three sessions have reported._
 | S1-09 | P3 | Confirmed | CI / Makefile | No gate for `go mod tidy`; CI comments defer upgrades to Dependabot / Renovate but the repository configures neither; `make tools` does not pin golangci-lint or govulncheck; two of the three gate scripts have no tests; one stale step label |
 | S2-01 | P3 | Confirmed | `resty/` | Every cookie the client or its jar holds is treated as a credential, so an ordinary cookie value (`consent=1`, `lang=en`) blanks matching text in the span's error description — the last octet of the failing address, for one |
 | S2-02 | P3 | Confirmed | `resty/` | The client's credential forms are rebuilt on every request, although they are read only when a request fails: about 99 extra allocations and 25 µs per successful request for a client with a bearer token and one API-key header |
+| S2-03 | P2 | Confirmed | `gin/`, `http/` | `o11ygin.Middleware`, `o11yhttp.NewServerHandler` and `o11yhttp.NewTransport` pass a nil tracer provider, meter provider or propagator straight to otelgin / otelhttp, which then use the process-global ones; their godoc says that never happens, and every other integration rejects nil or substitutes a no-op |
+| S2-04 | P2 | Confirmed | `elasticsearch/` | `NewClient` / `NewTypedClient` return an error that quotes the whole address, username and password included, when an address fails to parse — the usual cause being an unescaped character in the password; the NATS facade redacts the same upstream behaviour |
+| S2-05 | P3 | Confirmed | `mongo/` | The default pool name takes a number from one process-wide counter that is never reused: the name each host gets depends on the order unrelated clients are instrumented in, and every re-instrumentation starts a new set of pool series; the `WithPoolName` godoc describes a different scheme |
+| S2-06 | P3 | Confirmed | `cassandra/` | `WithQueryText`, `WithHostAttributes` and `WithPoolName` are never called by a test; with all three turned into no-ops the package's tests still pass |
+| S2-07 | P3 | Confirmed | `nats/` | A server URL that fails to parse yields `nats connect [endpoint redacted]: [endpoint redacted]`, which no longer says what is wrong with the URL |
+| S2-08 | P3 | Confirmed | cross-integration | The integrations disagree on four contracts: what a nil provider does (three behaviours), whether a second instrumentation call is safe (`mongo.Instrument` emits every span twice), whether errors carry the package prefix, and how default pool names are built (three schemes) |
 
 ## 4. Findings
 
@@ -450,6 +460,238 @@ strings (`Token`, `AuthScheme`, `UserInfo`, the credential-named header
 values, the cookie values) could be copied cheaply and expanded into forms
 only inside `finishError`.
 
+#### S2-03 · P2 · Confirmed · gin and http: a nil provider silently selects the OTel globals
+
+`gin/middleware.go:27-32`, `http/server.go:21-29`, `http/transport.go:16-22`;
+upstream `otelgin@v0.71.0/gin.go:39-51`, `otelhttp@v0.71.0/config.go:55-56`,
+`:79`, `:89`, `:109`.
+
+The three facades hand `tp`, `mp` and `prop` to `otelgin.WithTracerProvider`
+/ `otelhttp.WithTracerProvider` (and the meter and propagator equivalents)
+without a nil check. Both upstreams treat a nil argument as "not set" and fall
+back to `otel.GetTracerProvider()`, `otel.GetMeterProvider()` and
+`otel.GetTextMapPropagator()`.
+
+Reproduced with a scratch test that installed a recording tracer provider and
+a W3C propagator as the process globals and then passed nil for all three
+arguments:
+
+- `o11ygin.Middleware("svc", nil, nil, nil)` — the request's `GET /x` server
+  span was exported by the global provider.
+- `o11yhttp.NewServerHandler(h, nil, nil, nil)` — same, span `GET`.
+- `o11yhttp.NewTransport(nil, nil, nil, nil)` — the `HTTP GET` client span was
+  exported by the global provider, and the outgoing request carried a
+  `traceparent` header written by the global propagator.
+
+The meter-provider fallback sits on the same lines of the upstream config and
+was read, not separately observed.
+
+Nothing here *writes* a global, so the letter of ADR 0003 ("must not mutate")
+holds. What fails is the stated contract: `gin/middleware.go:23-24` says the
+providers are passed "so otelgin never falls back to process-wide
+OpenTelemetry globals", `http/server.go:17-18` says the same of otelhttp, and
+`http/transport.go:14-15` says they are wired "to avoid reading OpenTelemetry
+globals". A service that passes a nil provider — an unset struct field, a
+disabled-signal code path — gets telemetry on whatever a third-party library
+installed globally, or none, with no error. No test covers a nil argument for
+these three functions.
+
+Every other integration in scope has a nil check (table in S2-08). The fix
+that matches the stricter majority is to substitute a no-op provider and an
+empty composite propagator, since `Middleware`, `NewServerHandler` and
+`NewTransport` have no error return.
+
+#### S2-04 · P2 · Confirmed · elasticsearch: a malformed address is echoed with its credentials
+
+`elasticsearch/client.go:141-155` (`NewClient`), `:177-190`
+(`NewTypedClient`).
+
+go-elasticsearch accepts credentials in the address
+(`https://user:pass@host:9200`). When an address does not parse, the upstream
+constructor returns net/url's parse error, which quotes the input verbatim,
+and the facade wraps it unchanged. Reproduced:
+
+```
+NewClient(elastic.Config{Addresses: []string{"https://elastic:s3cr%ZZetpw@es.internal:9200"}}, tp, mp)
+→ elasticsearch new client: cannot create client: cannot parse url:
+  parse "https://elastic:s3cr%ZZetpw@es.internal:9200": invalid URL escape "%ZZ"
+```
+
+A second address, `https://elastic:pa ss@[bad`, was echoed the same way. The
+trigger is not exotic: the address fails to parse precisely when the password
+holds a character that needed percent-encoding (`%`, a space, `[`), so the
+error appears on the deployments where the secret is in the URL. The SDK's
+documented logging pattern is `slog.Any("error", err)`, which sends the text
+to stdout and the OTLP log pipeline.
+
+`nats/conn.go:169-177` handles the identical upstream behaviour by passing the
+error through `redact.Error`, with a comment explaining why; that change
+landed in this review window and was not carried over. The other constructors
+were probed for the same leak and are clean: the MongoDB driver's URI errors
+name the fault without quoting the URI (seven malformed URIs tried), and
+`redis`, `cassandra` and `minio` take no credential-bearing URL.
+
+The working path is fine: with `http://elastic:s3cretpw@127.0.0.1:port` the
+span's `url.full` and `server.address` carried no userinfo, on both a
+successful search and a connection-refused one.
+
+Rated P2 rather than P1 because it needs a malformed address and surfaces
+once, at start-up, in a returned error rather than in emitted telemetry.
+
+#### S2-05 · P3 · Confirmed · mongo: default pool names depend on global call order and are never reused
+
+`mongo/pool_metrics.go:154` (`defaultPoolNameSeq`), `:159-171`
+(`defaultPoolName`), `mongo/client.go:34-37` (the `WithPoolName` godoc).
+
+Without `WithPoolName`, the `db.client.connection.pool.name` label is
+`mongo-<first host>-<seq>`, where `<seq>` comes from one package-level
+counter shared by every `Instrument` call in the process and only ever
+increments. Reproduced with a scratch test:
+
+- Instrumenting `orders-db` then `users-db` gives `mongo-orders-db-1` and
+  `mongo-users-db-2`; the opposite order gives `mongo-users-db-1` and
+  `mongo-orders-db-2`. A service that builds its clients concurrently
+  therefore reports the same pool under different names from one restart to
+  the next.
+- Three `Instrument` + cleanup cycles for the same host moved the next name
+  to `mongo-orders-db-6`. A service that rebuilds its client (credential
+  rotation, a reconnect path) adds a new set of pool series each time; the
+  old ones stay in the SDK at their last value. Growth stops only at the
+  SDK's per-stream cardinality limit.
+- The port is not part of the name: `localhost:27017` and `localhost:27018`
+  differ only in the sequence number.
+
+`redis/client.go:24-86` replaced exactly this pattern in this review window —
+per-base numbering, lowest free number, names returned on `Unwrap` or
+collection — and its comments name the two problems above as the reason. The
+MongoDB package kept the older scheme.
+
+The godoc at `mongo/client.go:34-35` says the SDK "derives a bounded name
+from the first configured MongoDB host and the ClientOptions instance
+identity". Neither half matches: the name does not use the options' identity,
+and it is not bounded across repeated `Instrument` calls.
+
+#### S2-06 · P3 · Confirmed · cassandra: three public options have no test
+
+`cassandra/options.go:34` (`WithQueryText`), `:136` (`WithHostAttributes`),
+`:154` (`WithPoolName`).
+
+The package's tests build a `config{…}` literal directly
+(`cassandra_test.go:236`, `:293`, `:490`) and call the unexported
+`poolName(…)` helper, so the behaviour behind each option is covered but the
+exported functions are not called anywhere under `cassandra/`, including the
+`integration`-tagged file. Confirmed by mutation: with the assignment in each
+of the three functions replaced by a no-op (through `go test -overlay`, no
+change to the tree), `go test ./cassandra/` and
+`go test -tags integration ./cassandra/` both still pass.
+
+AGENTS.md requires a unit test for every public function. The same scan —
+every exported function and method in the eleven packages, looked up by name
+in that package's test files — found no other gap. `WithCoordinatorMetricLabel`,
+added in this window, is called by its tests.
+
+#### S2-07 · P3 · Confirmed · nats: an unparseable server URL leaves an error with no cause
+
+`nats/conn.go:169-177`, `:422-445` (`redactedURLs`, `redactServerURL`).
+
+When any entry of the server list fails to parse, both halves of the message
+are replaced. Reproduced through `Connect` with seven malformed inputs — an
+invalid escape in the password, a space in the password, an unescaped `/` or
+`?` in the password, an unclosed IPv6 bracket, and two lists separated by a
+space or `;` instead of a comma. Each returned exactly:
+
+```
+nats connect [endpoint redacted]: [endpoint redacted]
+```
+
+No credential survives, which is the point, and `errors.Is` / `errors.As`
+still reach the upstream error. What is lost is the reason: `invalid URL
+escape`, `invalid port`, `missing ']' in host` all read the same, and for a
+list the operator cannot tell which entry is at fault. This is the
+fail-closed rule of S1-04 seen from the caller's side. A message that keeps
+net/url's reason and drops only the quoted URL — the reason text does not
+repeat the input — would stay safe and remain actionable.
+
+The well-formed cases behave as documented: `nats://alice:…@host`,
+`alice:…@host` with no scheme, a bare token, and a comma-separated list each
+come back with `redacted@` in place of the userinfo and the host intact.
+
+#### S2-08 · P3 · Confirmed · The integrations disagree on four contracts
+
+Compared across the eleven packages. Each row was either reproduced in this
+session or read at the line cited.
+
+**1. A nil tracer provider, meter provider or propagator — three behaviours.**
+
+| Package | Entry point | nil `tp` / `mp` | nil `prop` |
+|---|---|---|---|
+| `redis` | `Wrap` | error (`client.go:372-377`) | no parameter |
+| `cassandra` | `NewSession` | error (`session.go:61-66`) | no parameter |
+| `elasticsearch` | `NewClient`, `NewTypedClient` | error (`client.go:204-209`) | no parameter |
+| `nats` | `Connect`, `ConnectWithOptions` | error for `tp` (`conn.go:158-163`); no `mp` | error |
+| `mongo` | `Instrument`, `Connect` | error (`client.go:134-139`) | error (`:140`), although the propagator is never used |
+| `mongo` | `NewMonitor` | no-op provider (`client.go:166-171`) | no parameter |
+| `resty` | `Wrap`, `NewClient` | no-op provider (`client.go:54-59`) | W3C TraceContext (`:60-62`) |
+| `minio` | `New` | no-op provider (`client.go:87-92`) | accepted and ignored (`:93-97`) |
+| `gin` | `Middleware` | OTel global (S2-03) | OTel global |
+| `http` | `NewServerHandler`, `NewTransport` | OTel global (S2-03) | OTel global |
+
+Two details inside the table: `mongo` rejects a nil propagator it has no use
+for, while `minio` accepts and discards one for the same "API consistency"
+reason; and `minio/client.go:71` documents `tp`, `mp` and `prop` as
+"required" although nil is tolerated for all three. `resty` defaulting a nil
+propagator to TraceContext means baggage is dropped on outgoing requests
+without a signal, where the SDK's own propagator carries both.
+
+**2. A second instrumentation call.** `resty.Wrap` and `redis.Wrap` are
+idempotent by design and say so. `cassandra.NewSession` restores the caller's
+observers on the `ClusterConfig` so a repeated call does not stack
+(`session.go:79-86`). `mongo.Instrument` composes onto whatever monitor is
+already on the options (`client.go:150-151`), so a second call on the same
+`ClientOptions` — a retry loop around a failed connect is the likely way to
+get there — installs a second otelmongo monitor and a second pool tracker.
+Reproduced: after two `Instrument` calls one `find` command produced two
+`mongodb.find users` spans. The godoc warns against sharing one instrumented
+`ClientOptions` between clients but not against calling `Instrument` twice.
+
+**3. Error wrapping.** `nats` (`nats connect …`), `mongo.Connect`
+(`mongo connect: …`), `elasticsearch` (`elasticsearch new client: …`),
+`minio` (`minio new: …`) and `redis` (`redis wrap: …`) prefix what they
+return. `cassandra.NewSession` returns gocql's `CreateSession` error and its
+own instrument-creation error bare (`session.go:70`, `:88`), and
+`mongo.Instrument` called directly returns `tracer provider must not be nil`
+with no package name (`client.go:131-141`) — the prefix is added only by
+`Connect`. Only `nats` redacts the upstream error (S2-04).
+
+**4. Metric labels.**
+
+- *Default pool name.* Three schemes: `redis-<host>:<port>-<n>` with the
+  lowest free `<n>` per address, reused; `mongo-<host>-<seq>` from a global
+  counter, never reused, no port (S2-05); `cassandra/<host>:<port>/<keyspace>`
+  with no number, so two sessions on the same contact point and keyspace
+  share a name (documented at `session.go:121-128`).
+- *`server.address` on `db.client.operation.duration`.* Present for `redis`,
+  `mongo` (through otelmongo), `elasticsearch` and `minio`; absent by default
+  for `cassandra` since this window (`WithCoordinatorMetricLabel`). The
+  cassandra choice is argued in ADR 0019 §7 and documented in
+  `docs/semconv.md:570-605`; it is listed here because a dashboard that
+  groups the shared histogram by `server.address` now has an empty group for
+  one system.
+- *Process-level state.* `resty`, `redis` and `cassandra` each keep a
+  package-level registry keyed by the client pointer with a
+  `runtime.AddCleanup` eviction; `redis` adds the `poolNames` allocator and
+  `mongo` the `defaultPoolNameSeq` counter. None is an OTel global and none
+  runs at package initialisation, so ADR 0003 is not engaged; the effect is
+  that default pool names are numbered across every SDK instance and every
+  test in one process.
+
+None of these is a defect on its own beyond what S2-03, S2-04 and S2-05
+already record. Together they mean a caller cannot carry an expectation from
+one integration to the next. A short "integration contract" section in
+`docs/guide.md` — nil is an error, constructors are idempotent or say they
+are not, errors are prefixed and redacted — would give new integrations
+something to conform to.
+
 ## 5. Tool results
 
 ### 5.1 Session 1
@@ -478,6 +720,26 @@ Notes:
 - semgrep reports "Scan was limited to files tracked by git", so an untracked
   file is not scanned locally. CI checks out tracked files only, so the gate
   is unaffected.
+
+### 5.2 Session 2
+
+- `go test -race` on the eleven packages in scope (`./http/... ./gin/...
+  ./nats/... ./mongo/... ./elasticsearch/... ./redis/... ./cassandra/...
+  ./resty/... ./minio/... ./obsctx/... ./o11ytest/...`): all pass, run once.
+- Scratch tests were injected with `go test -overlay` as an extra
+  `_test.go` file in the package under test, so unexported helpers could be
+  called without writing to the tree. One mutation run replaced
+  `cassandra/options.go` the same way (S2-06).
+- One scratch benchmark in `resty/` (S2-02).
+- Not run in this session: golangci-lint, govulncheck, `make sast`,
+  `make semconv-check` (session 1 covered the whole tree).
+- Attribute keys: every key added or changed in the six diffs is written
+  through a constant of the pinned `semconv/v1.39.0` package
+  (`DBClientConnectionPoolName`, `DBClientConnectionStateUsed` / `Idle`,
+  `ExceptionType`, `ExceptionMessage`, `ExceptionEventName`), so there was no
+  string literal to resolve against the package source. The two SDK-owned
+  literals touched, `gin.error.type` and `resty.error.kind`, are outside
+  semconv by design.
 
 ## 6. Status of earlier findings
 
@@ -608,3 +870,103 @@ CI and tooling:
   into the scan, and `check_credential_directives.go` fails on a
   `//go:build ignore` file that is not in its `gosecExempt` list, so a build
   tag is not a way out of the scan.
+
+### 8.2 Session 2
+
+`resty/`:
+
+- **URL and error redaction.** `url.full` goes through `redact.URLAttribute`
+  on every path, including the fallbacks for an unresolved or unparseable URL
+  (`hook.go:386-430`). The span status description and the exception event
+  are built from `redact.Error` with the request's own credentials: userinfo
+  and the Basic header derived from it, the bearer token, basic-auth pair and
+  cookies set on the request or the client, the caller's own
+  `HeaderAuthorizationKey`, and cookies the jar adds on a redirect. A
+  cancelled request to `http://user:pw@host/x?sig=abc` recorded
+  `http://redacted@host/x?sig=%5Bredacted%5D` in all three places. The
+  remaining gap is S1-03 (SigV4 query keys), which reaches `url.full` here
+  too: `X-Amz-Signature=…` set with `SetQueryParam` was recorded verbatim.
+  Generic keys such as `access_token` and `api_key` are also recorded; the
+  pinned semconv text for `url.full` lists only `AWSAccessKeyId`,
+  `Signature`, `sig` and `X-Goog-Signature`.
+- **`exception.type`** matches what `span.RecordError` would have produced
+  (`exceptionType` mirrors the pinned SDK's `typeStr`).
+- **No new data race against resty.** The hook reads `Token`, `UserInfo`,
+  `Header` and `BaseURL` from the client without a lock; resty v2.17.2's
+  setters and its own middleware do the same, so the hook adds no race resty
+  does not already have.
+
+`redis/`:
+
+- **Pool-name allocator** (`client.go:24-86`). Every path that takes a name
+  gives it back exactly once: the three pre-commit failures, `Unwrap`, the
+  GC cleanup and the address-reuse eviction all go through `detach`, which
+  clears `poolName` after releasing it. A caller-chosen name is held, so a
+  generated name is not placed on top of it or under its per-shard prefix.
+  An unwrapped wrapper's hooks stay attached but are gated by `disabled`, so
+  a reused name is not written by two wrappers.
+- **`connectionCounts`** caps idle at total, so the used count cannot wrap
+  when go-redis reads the two under separate locks.
+- `go-redis@v9.9.0/sentinel.go:104` does set `Addr` to `FailoverClient`, as
+  `sentinelAddr` assumes.
+
+`mongo/`:
+
+- **Connection-ID normalisation** (`connid.go`). The three facts it rests on
+  hold at the pinned versions: the driver formats the ID as `%s[-%d]`
+  (`topology/connection.go:128`); otelmongo derives the peer address with
+  `net.SplitHostPort` and falls back to the whole string and port 27017
+  (`otelmongo/mongo.go:214-217`); and otelmongo's span map is keyed by
+  `{ConnectionID, RequestID}`, where `RequestID` comes from one
+  process-global counter (`wiremessage.go:27-30`), so collapsing connections
+  onto one address cannot make two in-flight commands collide. Events are
+  copied, not mutated, so an application monitor composed alongside still
+  sees the driver's own ID.
+- **Pool gauges** (`pool_metrics.go`). Walked against the driver's event
+  order in `topology/pool.go`: a failed handshake emits `ConnectionCreated`
+  then `ConnectionClosed` with no `ConnectionReady` and is now ignored; a
+  checked-out connection closed after `ConnectionPoolClosed` finds a fresh
+  empty state and is ignored; with two pools behind one state the first
+  `ConnectionPoolClosed` no longer unwinds the survivor's connections. One
+  comment is imprecise without affecting behaviour: `pool.close` emits
+  `ConnectionClosed` for *idle* connections before `ConnectionPoolClosed`
+  and for the rest after it, whereas `poolClosed`'s comment says the pool
+  event precedes them all.
+- **Connect errors carry no credential**: seven malformed URIs produced
+  driver errors that name the fault without quoting the URI.
+
+`nats/`:
+
+- **Connect error redaction** for well-formed URLs, scheme-less entries, bare
+  tokens and comma-separated lists (see S2-07 for the malformed case).
+- **`Request` / `RequestMsg` timeout contract.** A sent request that runs
+  out of time satisfies both `nats.ErrTimeout` and
+  `context.DeadlineExceeded`; a call with no time left and a cancelled
+  context are left unwrapped; a nil context returns `nats.ErrInvalidContext`.
+  Read against `withRequestTimeout` and its three dedicated tests.
+- **JetStream**: a negative batch is rejected before the native call that
+  would panic; `MessagesContext.Next` no longer returns a nil context on
+  error.
+
+`cassandra/`:
+
+- The query-path metrics drop `server.*` by default and the span keeps the
+  coordinator; batches carry no server label either way. Code,
+  `docs/semconv.md` and the option godoc agree.
+
+`gin/`:
+
+- **Filtered requests.** With `WithSkipPaths` on a chain nested inside
+  `o11yhttp.NewServerHandler`, a skipped `/healthz` that called `c.Error`
+  put no exception event on the outer span; a traced `/x` put exactly one,
+  carrying `gin.error.type`, on the chain's own span. The per-chain
+  `chainKey` is removed from `c.Keys` after it is read.
+- A 4xx response with `c.Errors` set ends with span status Error. That is
+  otelgin's behaviour and is recorded as scenario 3 in ADR 0010; not a
+  finding.
+
+`http/`, `elasticsearch/`, `minio/`, `obsctx/`, `o11ytest/`:
+
+- No non-test change since `afbd622`. Constructors and error paths were
+  read for the cross-integration comparison (S2-03, S2-04, S2-08); the rest
+  was not re-read.
