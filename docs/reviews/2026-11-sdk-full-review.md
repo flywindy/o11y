@@ -48,7 +48,18 @@ Session 1 — core and infrastructure:
 Session 1 is complete: nine findings (two P2, seven P3, no P1), all confirmed
 by a reproduction or, for the CI items, by a tool run against the files named. Sections 2, 6 and 7 are left for the last session.
 
-Session 2 — not started.
+Session 2 — integration packages (in progress):
+
+- [x] `resty/`
+- [ ] `redis/`
+- [ ] `mongo/`
+- [ ] `nats/`
+- [ ] `cassandra/`
+- [ ] `gin/`
+- [ ] `http/`, `elasticsearch/`, `minio/`, `obsctx/`, `o11ytest/` (unchanged
+      since `afbd622`; quick scan only)
+- [ ] Cross-integration contract comparison
+- [ ] Session 2 tool results recorded
 
 Session 3 — not started.
 
@@ -69,6 +80,8 @@ _To be written once all three sessions have reported._
 | S1-07 | P2 | Confirmed | `scripts/` (ADR gate) | The "no OTel global setters" gate catches `otel.SetTracerProvider` but not `log/global.SetLoggerProvider`, `otel.SetErrorHandler` or `otel.SetLogger`; its `SetLoggerProvider` entry can never match |
 | S1-08 | P3 | Confirmed | `scripts/` (semconv gate) | `make semconv-check` only recognises keys that exist in the pinned package, so a legacy or misspelt key literal (`db.statement`, `db.cassandra.table`) passes — the mistake Core Principle 5 warns about |
 | S1-09 | P3 | Confirmed | CI / Makefile | No gate for `go mod tidy`; CI comments defer upgrades to Dependabot / Renovate but the repository configures neither; `make tools` does not pin golangci-lint or govulncheck; two of the three gate scripts have no tests; one stale step label |
+| S2-01 | P3 | Confirmed | `resty/` | Every cookie the client or its jar holds is treated as a credential, so an ordinary cookie value (`consent=1`, `lang=en`) blanks matching text in the span's error description — the last octet of the failing address, for one |
+| S2-02 | P3 | Confirmed | `resty/` | The client's credential forms are rebuilt on every request, although they are read only when a request fails: about 99 extra allocations and 25 µs per successful request for a client with a bearer token and one API-key header |
 
 ## 4. Findings
 
@@ -368,6 +381,74 @@ Each item was checked against the files named.
 - **Stale step label.** `ci.yml:150` is named "…fail on medium+", while
   `GOSEC_FLAGS` is `-severity low -confidence low` and the Makefile comment
   says every rule blocks.
+
+### 4.2 Session 2 — integration packages
+
+Non-test code changed since `afbd622` in six of the eleven packages in scope:
+`resty/`, `redis/`, `mongo/`, `nats/`, `cassandra/` and `gin/`. Those diffs
+were read in full. `http/`, `elasticsearch/`, `minio/`, `obsctx/` and
+`o11ytest/` have no non-test change and got a quick scan.
+
+#### S2-01 · P3 · Confirmed · resty: an ordinary cookie blanks parts of the error text
+
+`resty/hook.go:582-604` (`jarSecrets`), `:648-658` (`configuredSecrets`, the
+cookie loop), `internal/redact/redact.go:392` (`shortSecretLen`).
+
+When a request fails, the span's status description and `exception.message`
+are passed through `redact.Error` with a secret list that includes the value
+of **every** cookie configured on the request or client, and every cookie the
+client's jar would send to the URL. Nothing distinguishes a session cookie
+from a preference cookie.
+
+Reproduced with a wrapped client, a `cookiejar.Jar` holding `lang=en`,
+`consent=1` and `theme=refused` for `http://10.0.0.1:8080/`, and a transport
+that fails with `dial tcp 10.0.0.1:8080: connect: connection refused (1
+attempt, tenant en)`. The span carried:
+
+```
+Get "http://10.0.0.[redacted]:8080/orders": dial tcp 10.0.0.[redacted]:8080:
+connect: connection [redacted] ([redacted] attempt, tenant [redacted])
+```
+
+`url.full` and `server.address` on the same span still read `10.0.0.1`, so
+nothing is hidden; the description is only harder to read. A second run with
+`client.SetCookie(&http.Cookie{Name: "region", Value: "timeout"})` turned
+`i/o timeout` into `i/o [redacted]`.
+
+This is the same fail-closed trade-off as S1-04, reached from a new source.
+It is worth a separate entry because the input is not configuration the
+service owner wrote: the jar is filled by whatever `Set-Cookie` the remote
+server sends, so a one-digit tracking or consent cookie from a third-party
+API is enough. Options: keep the rule and document it next to the resty
+section in `docs/guide.md`, or skip cookie values shorter than
+`shortSecretLen`, which are too short to be a bearer credential.
+
+#### S2-02 · P3 · Confirmed · resty: credential forms are rebuilt on every request
+
+`resty/hook.go:126` (`clientSecrets(c)` in `beforeRequest`), `:610-616`.
+
+`beforeRequest` calls `clientSecrets` for every request so that a later
+failure can redact with the invoking client's credentials. The result is read
+only by `finishError`; a request that succeeds never uses it. Building it
+walks the client's headers, lower-cases names, and renders each credential in
+every form `redact.HeaderValueForms` lists.
+
+Measured with a scratch benchmark against a loopback `httptest` server, a
+never-sampling tracer provider, 20,000 requests, two runs each:
+
+| Client | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| no credentials | 72,637 – 76,260 | 10,281 | 98 |
+| `SetAuthToken` + one `X-Api-Key` header | 98,159 – 101,144 | 13,935 | 197 |
+
+So about 25 µs, 3.6 KB and 99 allocations are added to each successful
+request — the allocation count doubles. The comment at `hook.go:49-53`
+explains why the client must be read in `beforeRequest` (resty passes it to
+no other hook). That constraint only requires capturing the *inputs* there:
+the header map reference would not be safe to keep, but the handful of
+strings (`Token`, `AuthScheme`, `UserInfo`, the credential-named header
+values, the cookie values) could be copied cheaply and expanded into forms
+only inside `finishError`.
 
 ## 5. Tool results
 
