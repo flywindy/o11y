@@ -75,11 +75,76 @@ Session 3 — documentation and comparison with the earlier reviews:
 - [x] Status of the earlier findings: R-1 to R-45 and SDK-1 to SDK-30
       (section 6)
 - [x] Session 3 tool results and clean list (sections 5.3 and 8.3)
-- [ ] Executive summary and suggested sequencing (sections 2 and 7)
+- [x] Executive summary and suggested sequencing (sections 2 and 7)
+
+Session 3 is complete: nine findings, all P3 (eight confirmed, one reasoned
+only), and the status of 75 earlier items. The review as a whole is
+complete.
 
 ## 2. Executive summary
 
-_To be written once all three sessions have reported._
+The review found no P1: nothing that corrupts data, panics, or loses
+telemetry at scale. The two credential findings each need a specific input
+(a presigned URL, a malformed address) and are rated P2. The tooling
+gates are clean on `03537c3` (`go vet`, `go test -race`, golangci-lint at the
+CI pin, `make sast`, `make semconv-check`; section 5.1), no SDK package
+mutates an OTel global or has an `init()` with side effects, and 23 of the
+45 findings of the 2026-09-14 review are fixed, including its three P1s.
+
+Counts:
+
+| | P1 | P2 | P3 | Total |
+|---|---|---|---|---|
+| New in this review (sections 4.1 to 4.3) | 0 | 4 | 22 | 26 |
+| Earlier findings still present and not restated above (section 6.3) | 0 | 6 | 12 rows | 18 rows |
+
+Of the 26 new findings, 25 are confirmed by a reproduction, a tool run or a
+side-by-side comparison of text and code; one (S3-06) is reasoned only, and
+one consequence of S3-04 is marked as reasoned inside the finding.
+
+What remains falls into five groups.
+
+1. **Two credential paths, both conditional** (P2). An Elasticsearch address
+   that fails to parse — typically because the password holds an unescaped
+   character — comes back in the constructor's error with the username and
+   password in it (S2-04). SigV4 presigned-URL parameters
+   (`X-Amz-Signature`, `X-Amz-Credential`, `X-Amz-Security-Token`) pass
+   through the SDK's URL redaction, and a request made through the Resty
+   facade records them on `url.full` (S1-03, confirmed end to end). Related, P3: the redacted `Shutdown` error unwraps
+   to the unredacted one (S1-05).
+2. **The Zero Global State promise has two holes at the edges** (P2). The
+   gin and net/http facades hand a nil provider or propagator to the
+   upstream, which then uses the process-global one, although their godoc
+   says that cannot happen (S2-03). The gate that is meant to stop SDK code
+   calling an OTel global setter misses three of the setters (S1-07). The
+   older, related item is that `http.Option` is an alias through which a
+   caller can replace the SDK's providers (R-32, reproduced).
+3. **Redis Cluster and Ring observation is unchanged since September** (P2,
+   R-7, R-8, SDK-13). Every metrics collection on a Cluster client reloads
+   `CLUSTER SLOTS`, and a Ring shard that is down at `Wrap` time is never
+   instrumented. This is the oldest open defect and the only one that needs
+   design work.
+4. **The semconv safeguards do not catch the mistake they exist for** (P3).
+   `make semconv-check` passes a legacy or misspelt key literal (S1-08), and
+   the lookup command in the mandatory verification skill returns nothing
+   on a normal module cache (S3-07).
+5. **Contract and documentation debt** (P3). The integrations differ on
+   what nil means, whether a second instrumentation call is safe, error
+   prefixes and pool naming (S2-08); three Cassandra options have no test
+   (S2-06); `AGENTS.md` does not mention five packages (S3-08); the guide
+   contradicts itself on `Consumer.Next` (S3-01); and a list of smaller
+   stale statements that the earlier review already named was not acted on
+   (S3-09, R-45).
+
+Also still open from the earlier reviews at P2, and worth a decision rather
+than a fix: NATS handlers have no panic recovery (SDK-12), a routine 404
+from the low-level Elasticsearch client counts as an error with no override
+(SDK-30), and the guide has no section on application-defined metrics
+(R-20).
+
+None of this argues for holding back v0.15.0 or for an urgent patch
+release. Groups 1 and 2 are small, self-contained changes and are the ones
+to schedule first.
 
 ## 3. Priority table
 
@@ -234,6 +299,20 @@ leaked URL grants access to one object for a bounded time, and the SDK matches
 the semconv minimum; but this repository ships a MinIO integration whose
 presigned URLs are exactly the uncovered shape. The session that owns `resty/`
 should confirm the end-to-end span attribute.
+
+Session 3 addendum — the end-to-end path is confirmed. A scratch test in
+`resty/` sent one GET through `o11yresty.NewClient` to a local server with a
+SigV4-style query plus one SigV2 key, and read the recorded span:
+
+```
+url.full = http://HOST/bucket/obj?X-Amz-Algorithm=AWS4-HMAC-SHA256
+  &X-Amz-Credential=AKIAEXAMPLE%2F20261114%2Fus-east-1%2Fs3%2Faws4_request
+  &X-Amz-Security-Token=SESSIONTOKEN&X-Amz-Signature=deadbeef
+  &Signature=%5Bredacted%5D
+```
+
+(one line in the original; wrapped here). The SigV2 `Signature` is redacted;
+the three SigV4 values are on the span as sent.
 
 #### S1-04 · P3 · Confirmed · Redaction rewrites ordinary diagnostic text
 
@@ -993,6 +1072,9 @@ Notes:
   metrics address (R-36), the repeated scope-guard warning (R-37) and the
   provider replacement through `http.Option` (R-32). Results are in
   section 6.1.
+- One scratch test in `resty/`, injected the same way: a request with
+  SigV4 query parameters, to read `url.full` off the recorded span (the
+  addendum to S1-03).
 - `go list -m -versions` for `otelmongo` (run outside the module): no tagged
   version (SDK-26).
 - Not run in this session: `go test -race ./...`, golangci-lint,
@@ -1158,7 +1240,65 @@ S3-07.
 
 ## 7. Suggested sequencing
 
-_To be written once all three sessions have reported._
+Each line is one pull request: one package or one concern, with its tests.
+Titles are in the repository's Conventional Commits form. Nothing here has
+been started; the split is a proposal.
+
+**Wave 1 — small, independent, closes the P2s that need no design**
+
+| # | Pull request | Closes | Notes |
+|---|---|---|---|
+| 1 | `fix(redact): cover SigV4 presigned-URL parameters` | S1-03 | One list in `internal/redact`; add the three keys and a table test. Update the `url.full` row in `docs/semconv.md` |
+| 2 | `fix(elasticsearch): redact the address in constructor errors` | S2-04 | Same treatment as `nats.redactedURLs`. Keep the parse cause (see S2-07) |
+| 3 | `fix(gin,http): reject or neutralise nil providers` | S2-03, part of S2-08 | Decide the rule once — the review suggests "nil is an error where the constructor returns one, a no-op provider where it cannot" — and apply it to `minio` too (R-34). `Middleware` returns no error, so it needs the no-op form |
+| 4 | `ci(adr): gate the remaining OTel global setters` | S1-07 | Add `log/global.SetLoggerProvider`, `otel.SetErrorHandler`, `otel.SetLogger`; add a test for the script |
+| 5 | `ci(semconv): reject key literals in a semconv namespace that the pinned package lacks` and `docs(skill): fix the semconv lookup command` | S1-08, S3-07 | Two commits or two PRs; both protect Core Principle 5 |
+
+**Wave 2 — documentation and examples, no behaviour change**
+
+| # | Pull request | Closes | Notes |
+|---|---|---|---|
+| 6 | `docs: bring AGENTS.md and the README overview up to the current package set` | S3-08 | Include a "Do NOT" entry for the Cassandra batch seam |
+| 7 | `docs(guide): fix the Consumer.Next contradiction, dead paths and stale statements` | S3-01, S3-02, S3-09, the `mongo.WithPoolName` godoc from S2-05 | The three ADR items are one-line status amendments |
+| 8 | `docs(profiling): state where localhost:4040 goes on the kind cluster` | S3-04, S3-05 | Or move the kind mapping to Alloy; that is a `k8s/` change and needs the `verify-kubernetes-manifests` skill |
+| 9 | `chore(k8s): remove the two unreferenced manifests` | S3-03 | Separate because it touches `k8s/infrastructure/` |
+| 10 | `fix(examples): return from run() instead of os.Exit past Shutdown; use valid messaging.operation.type` | S3-06, R-43 | Reproduce S3-06 first; it is the one finding not run |
+| 11 | `docs(guide): add an integration contract and a custom-metrics section` | S2-08 (the written rule), R-20 | Records the decision from PR 3 |
+
+**Wave 3 — P3 fixes, grouped by package**
+
+| # | Pull request | Closes |
+|---|---|---|
+| 12 | `fix(core): endpoint and environment-variable edge cases` | S1-01, S1-02, R-25, R-36 |
+| 13 | `fix(redact): stop rewriting ordinary diagnostic text; redact through Unwrap` | S1-04 (with R-27), S1-05 |
+| 14 | `fix(log,metrics): repeat suppression keyed correctly` | S1-06, R-37 |
+| 15 | `fix(resty): narrow cookie redaction, build credential forms lazily, surface the histogram error` | S2-01, S2-02, R-33 |
+| 16 | `fix(mongo): stable default pool names, idempotent Instrument, cleanup on Connect` | S2-05, the `mongo` row of S2-08, R-35 |
+| 17 | `test(cassandra): cover WithQueryText, WithHostAttributes, WithPoolName` | S2-06 |
+| 18 | `fix(nats): keep the cause in an unparseable-URL error` | S2-07 |
+| 19 | `chore(ci): tidy gate, pinned tools, script tests` | S1-09 |
+| 20 | `fix(obsctx): define Go with a non-positive timeout` | R-26 |
+
+**Needs a decision or a design before code**
+
+- **Redis Cluster / Ring observation** (R-7, R-8, SDK-13): amend ADR 0013
+  first. The earlier review's direction — enumerate the node clients the SDK
+  already hooked through `OnNewNode` instead of calling `ForEachShard`, and
+  hook the Ring itself — still applies at go-redis v9.9.0.
+- **`http.Option` as an alias** (R-32): sealing the type is a breaking API
+  change; decide whether it rides with PR 3 or waits for the next minor.
+- **NATS handler panics** (SDK-12) and **the consumer-span lifetime note**
+  (SDK-11): the note is a documentation line; recovery is a behaviour
+  decision (recover, record on the span and re-panic, or leave it to the
+  application).
+- **Elasticsearch accepted statuses** (SDK-30): a new option.
+- **Scrape-server hardening** (R-39, R-41, SDK-27) and
+  **`metricscap` non-string values** (R-40): unchanged code, low urgency.
+- Feature requests carried from the 2026-09-06 review: SDK-2, SDK-18,
+  SDK-19, SDK-20, SDK-24, SDK-25. SDK-26 waits for an upstream tag.
+
+Order within wave 1 does not matter; PR 3 should land before PR 11, which
+documents its rule.
 
 ## 8. Checked and found clean
 
