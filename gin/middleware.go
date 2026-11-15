@@ -6,6 +6,8 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/flywindy/o11y/internal/providers"
 )
 
 // Middleware returns the canonical gin middleware chain for o11y tracing:
@@ -24,7 +26,16 @@ import (
 // explicitly so otelgin never falls back to process-wide OpenTelemetry globals.
 // User options are appended last for behavior customizations; provider and
 // propagator overrides are intentionally not exposed by this facade.
+//
+// A nil tp, mp or prop is replaced by one that does nothing: a no-op tracer
+// provider (no server span), a no-op meter provider (no metrics), an empty
+// propagator (the caller's trace context is not read from the request).
+// Middleware has no error to return, and otelgin reads a nil as "not set" and
+// uses the OpenTelemetry global instead, so passing one through would select
+// whatever another library installed globally. Pass obs.TracerProvider(),
+// obs.MeterProvider() and obs.Propagator, which are never nil.
 func Middleware(service string, tp trace.TracerProvider, mp metric.MeterProvider, prop propagation.TextMapPropagator, opts ...Option) []ginframework.HandlerFunc {
+	tp, mp, prop = providers.OrNoop(tp, mp, prop)
 	base := []otelgin.Option{
 		otelgin.WithTracerProvider(tp),
 		otelgin.WithMeterProvider(mp),

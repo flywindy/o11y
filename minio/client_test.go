@@ -16,30 +16,61 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdkmetricdata "go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 )
 
+// TestNew_Validation pins what New rejects. A nil tracer or meter provider is
+// an error, as it is for every other constructor that can return one (redis,
+// cassandra, elasticsearch): New used to replace either with a no-op, so a
+// client that recorded nothing was indistinguishable from one that worked.
 func TestNew_Validation(t *testing.T) {
+	tp := sdktrace.NewTracerProvider()
+	mp := sdkmetric.NewMeterProvider()
+	prop := propagation.NewCompositeTextMapPropagator()
 	cases := []struct {
 		name     string
 		endpoint string
 		opts     *miniogo.Options
+		tp       trace.TracerProvider
+		mp       metric.MeterProvider
 		wantErr  string
 	}{
-		{name: "empty endpoint", endpoint: "", opts: &miniogo.Options{}, wantErr: "endpoint must not be empty"},
-		{name: "nil options", endpoint: "minio.internal:9000", opts: nil, wantErr: "options must not be nil"},
+		{name: "empty endpoint", endpoint: "", opts: &miniogo.Options{}, tp: tp, mp: mp, wantErr: "minio new: endpoint must not be empty"},
+		{name: "nil options", endpoint: "minio.internal:9000", opts: nil, tp: tp, mp: mp, wantErr: "minio new: options must not be nil"},
+		{name: "nil tracer provider", endpoint: "minio.internal:9000", opts: &miniogo.Options{}, tp: nil, mp: mp, wantErr: "minio new: tracer provider must not be nil"},
+		{name: "nil meter provider", endpoint: "minio.internal:9000", opts: &miniogo.Options{}, tp: tp, mp: nil, wantErr: "minio new: meter provider must not be nil"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := New(tc.endpoint, tc.opts, nil, nil, nil)
-			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-				t.Fatalf("got %v, want error containing %q", err, tc.wantErr)
+			client, err := New(tc.endpoint, tc.opts, tc.tp, tc.mp, prop)
+			if err == nil || err.Error() != tc.wantErr {
+				t.Fatalf("got %v, want error %q", err, tc.wantErr)
+			}
+			if client != nil {
+				t.Fatalf("got a client alongside the error")
 			}
 		})
+	}
+}
+
+// TestNew_NilPropagatorIsAccepted pins the one nil New does take. The wrapper
+// never injects trace context toward the storage backend (ADR 0018 §7), so
+// there is nothing a propagator would have been used for and no reason to
+// reject its absence.
+func TestNew_NilPropagatorIsAccepted(t *testing.T) {
+	client, err := New("minio.internal:9000", &miniogo.Options{},
+		sdktrace.NewTracerProvider(), sdkmetric.NewMeterProvider(), nil)
+	if err != nil {
+		t.Fatalf("New with a nil propagator: %v", err)
+	}
+	if client == nil {
+		t.Fatal("New returned no client and no error")
 	}
 }
 

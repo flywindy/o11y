@@ -791,6 +791,13 @@ handler := o11yhttp.NewServerHandler(
 )
 ```
 
+`NewServerHandler` and `NewTransport` have no error to return, so a nil
+tracer provider, meter provider or propagator is replaced by one that does
+nothing — no span, no metrics, no trace context read or written. They never
+fall back to the OpenTelemetry globals, whatever another library installed
+there. `obs.TracerProvider()`, `obs.MeterProvider()` and `obs.Propagator` are
+never nil.
+
 For Go 1.22+ `http.ServeMux`, route patterns become bounded span names such
 as `GET /api/orders/{id}` and bounded `http.route` metric labels. For routers
 such as chi or echo, use their route pattern as an otelhttp label or span-name
@@ -860,6 +867,9 @@ router.Use(o11ygin.Middleware(
     obs.MeterProvider(),
     obs.Propagator,
 )...)
+
+// Middleware has no error to return: a nil provider or propagator is replaced
+// by one that does nothing, never by the OpenTelemetry global.
 router.Use(gin.Recovery())
 
 router.GET("/orders/:id", func(c *gin.Context) {
@@ -951,6 +961,11 @@ resp, err := client.R().SetContext(ctx).Get("http://orders:8080/api/orders/123")
 Route metrics are opt-in. Use bounded route templates such as
 `/api/orders/{id}`; never put raw URL paths, user IDs, or trace IDs into
 `http.route`.
+
+`Wrap` and `NewClient` have no error to return, so a nil tracer provider, meter
+provider or propagator is replaced by one that does nothing. A nil propagator
+therefore means no `traceparent` (and no `baggage`) on the outgoing request —
+pass `obs.Propagator` to propagate.
 
 ## Databases
 
@@ -1780,6 +1795,11 @@ client, err := o11yminio.New(
     o11yminio.WithHTTPChildSpans(true),
 )
 ```
+
+`New` returns an error when the tracer provider or the meter provider is nil.
+The propagator may be nil: it is accepted so every o11y constructor takes the
+same three values, and is not used, because the wrapper never injects trace
+context toward the store.
 
 Options:
 
