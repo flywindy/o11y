@@ -72,7 +72,9 @@ Session 3 — documentation and comparison with the earlier reviews:
       the ADR bodies were not re-read in full), `AGENTS.md`, `examples/` and
       `examples/README.md`, package comments; `k8s/infrastructure/` for
       obvious errors (section 4.3)
-- [ ] Status of the earlier findings (section 6)
+- [x] Status of the earlier findings: R-1 to R-45 and SDK-1 to SDK-30
+      (section 6)
+- [x] Session 3 tool results and clean list (sections 5.3 and 8.3)
 - [ ] Executive summary and suggested sequencing (sections 2 and 7)
 
 ## 2. Executive summary
@@ -953,9 +955,206 @@ Notes:
   literals touched, `gin.error.type` and `resty.error.kind`, are outside
   semconv by design.
 
+### 5.3 Session 3
+
+- `go build ./...` (examples included): exit 0.
+- Identifier check: every `o11y*.Name`, `obsctx.Name`, `sdk.Name` /
+  `obs.Name` and `With*` token in `README.md`, `docs/guide.md`,
+  `docs/semconv.md`, `examples/README.md`, `AGENTS.md` and the 27 ADRs was
+  compared with the exported symbols of the non-test, non-example tree. In
+  the four user-facing documents and `AGENTS.md` every miss is an upstream
+  option (`resource.WithProcess`, `jetstream.WithMsgID`, `context.WithTimeout`
+  and the like) or `WithTeam`, which `AGENTS.md` names as removed. The misses
+  in the ADRs are mostly upstream options; the SDK-shaped ones that were
+  read in context (ADR 0005, 0007, 0012, 0021, 0026) are each marked by the
+  ADR as proposed, deferred, hypothetical or removed.
+- Attribute-key check, per the `verify-semconv-attributes` skill: the key
+  literals of `attribute_group.go` and the metric names of the `*conv`
+  packages under
+  `go.opentelemetry.io/otel@v1.46.0/semconv/v1.39.0` (1,020 distinct strings)
+  were extracted from the module cache, and every backticked dotted token in
+  `docs/semconv.md`, `docs/guide.md`, `README.md` and `AGENTS.md` was
+  compared with that list. Each token not in the list was read in context:
+  all are SDK-owned names with a Deviations row, legacy keys the catalog
+  attributes to an upstream, keys listed as deliberately not emitted, or
+  example values — except `deployment.environment` (S3-09). The skill's own
+  lookup command returned nothing (S3-07); the package directory was located
+  by hand.
+- Instrument names: the 21 instrument creations in non-test code were
+  listed and each name found in `docs/semconv.md`.
+- `go run` paths in `AGENTS.md` and `examples/README.md`: all exist.
+- `AGENTS.md`'s image-coverage command: the 13 images under
+  `k8s/infrastructure/base/monitor` and `base/components` each have a
+  `newName` entry in the private-registry overlay. The three `NodePort`
+  services match the three `extraPortMappings` in `kind-config.yaml`.
+- One scratch test file, injected into the root package with
+  `go test -overlay` (five tests, all run once): the toggle variable with a
+  trailing space (R-25), `obsctx.Go` with a zero timeout (R-26), an empty
+  metrics address (R-36), the repeated scope-guard warning (R-37) and the
+  provider replacement through `http.Option` (R-32). Results are in
+  section 6.1.
+- `go list -m -versions` for `otelmongo` (run outside the module): no tagged
+  version (SDK-26).
+- Not run in this session: `go test -race ./...`, golangci-lint,
+  govulncheck, `make sast`. No kind cluster or `kubectl` was available, so
+  nothing under `k8s/` was applied.
+
 ## 6. Status of earlier findings
 
-_To be written once all three sessions have reported._
+Two earlier reports were read from
+`origin/claude/o11y-newchat-integration-priority-sbwb9s`:
+`docs/reviews/2026-09-14-sdk-full-review.md` (findings R-1 to R-45, written
+against `afbd622`) and `docs/reviews/2026-09-06-newchat-launch-readiness-review.md`
+(SDK-1 to SDK-30; its APP-n items concern the newchat repository and are
+skipped). Each SDK item was compared with the code at `03537c3`.
+
+How to read the status column:
+
+- **Fixed** — the code or text the finding named has changed so that the
+  trigger no longer applies; the location of the change is given. Unless a
+  row says "reproduced", this was established by reading the current code,
+  not by re-running the earlier scratch test.
+- **Still present** — the code the finding named is unchanged in the
+  relevant respect. "Reproduced" means a scratch test was run in this
+  session (section 5.3); otherwise it was established by reading.
+- **Partly fixed / changed** — some of it was addressed, or the finding now
+  takes a different form; the row says which.
+
+### 6.1 The 2026-09-14 review (R-1 to R-45)
+
+| ID | Was | Finding | Status at `03537c3` |
+|---|---|---|---|
+| R-1 | P1 | Mongo operation histogram never carries exemplars and reports an exemplar-overflow error on every scrape | **Fixed.** `internal/metrics/reserved.go:278` composes `dropFilteredAttrs` onto every view stream that has a filter, not only the HTTP views |
+| R-2 | P1 | Mongo pool idle gauge drifts after a handshake that fails before `ConnectionReady` | **Fixed.** `mongo/pool_metrics.go:382-416` tracks ready connections; the close of a connection that never became ready is not counted |
+| R-3 | P1 | Profiler log adapter echoes the endpoint's userinfo at DEBUG | **Fixed.** `internal/profiling/profiling.go:205-298` redacts the endpoint, its Basic-auth form and the auth header forms in every adapter line |
+| R-4 | P2 | Standard OTLP endpoint variables validated, then ignored | **Fixed.** `endpoint.go:69-93` resolves option > signal variable > generic variable > default; documented in `docs/guide.md` "OTLP endpoint" |
+| R-5 | P2 | `nats.Connect` errors carry the URL with credentials | **Fixed.** `nats/conn.go:422-428` (`redactedURLs`). One residue, new in this review: an unparseable URL now yields an error with no cause (S2-07) |
+| R-6 | P2 | resty `url.full` keeps userinfo and the query string | **Fixed** for userinfo and the four keys semconv names: `resty/hook.go:446-473` through `redact.URLAttribute`. Residue: SigV4 presigned-URL keys are not on the list (S1-03) |
+| R-7 | P2 | Redis Cluster pool observation issues `CLUSTER SLOTS` on every metrics collection | **Still present.** `redis/metrics.go:138` still calls `ClusterClient.ForEachShard`; go-redis is still v9.9.0, where `ForEachShard` calls `ReloadOrGet`, which reloads first (`osscluster.go:914-920`, `:1160-1167`, read in the module cache). Not re-run: no cluster here |
+| R-8 | P2 | Ring shards that are down at `Wrap` time are never instrumented | **Still present.** `redis/client.go:280` and `redis/metrics.go:154` still enumerate through `Ring.ForEachShard`, which skips a shard whose `IsDown()` is true (`ring.go:651-662`). `docs/adr/0013-redis-valkey-integration.md:739-742` and `:1533-1541` now describe the gap. Not re-run |
+| R-9 | P2 | An attribute with an empty key removes its family from `/metrics` | **Fixed.** `internal/metrics/reserved.go:86-92` treats `""` as reserved |
+| R-10 | P2 | `ErrorRecorder` records every gin error twice | **Fixed.** otelgin is now v0.71.0, which records no exception event itself; the chain's handler records one typed event per error (`gin/errors.go`, `chainErrors`), and `ErrorRecorder` is documented as for chains without `Middleware` only (`gin/errors.go:21-33`) |
+| R-11 | P2 | `Conn.Request` timeout is `context.DeadlineExceeded`, never `nats.ErrTimeout` | **Fixed.** `nats/conn.go:391-407` wraps both sentinels; contract in the `Request` godoc and `docs/guide.md:1552-1568` |
+| R-12 | P2 | No `ForceFlush` | **Fixed.** `o11y.go:239` (`SDK.ForceFlush`); `docs/guide.md:327-369` |
+| R-13 | P2 | 16 public functions with no test | **Fixed** for the 16 named: each is now referenced from a test file of its package, and `internal/trace` has `trace_test.go`. A new gap of the same kind: three `cassandra` options (S2-06) |
+| R-14 | P2 | Literal semconv keys in `redis` | **Fixed.** No `"db.client.connection.*"` or `"used"` / `"idle"` literal remains in `redis/`; `make semconv-check` now gates this (with the blind spot in S1-08) |
+| R-15 | P2 | `gin.error.type` and `pyroscope.profile.id` missing from the catalog | **Fixed.** Both have rows in `docs/semconv.md` |
+| R-16 | P2 | v0.13.0 needs a `### Migration` section | **Fixed.** `CHANGELOG.md:935`, under 0.13.0 |
+| R-17 | P2 | `WithHistogramBuckets` documented as HTTP-only | **Fixed** in the documents: `README.md:214` and `docs/guide.md:386-407` list every histogram the option reaches, and `WithInstrumentHistogramBuckets` reshapes one alone |
+| R-18 | P2 | Redis default pool name is a heap address | **Fixed.** Names are `redis-<host>:<port>-<n>` (`docs/guide.md:1071-1099`). The three integrations now use three different schemes (S2-08), and Mongo's has a restart-order problem (S2-05) |
+| R-19 | P2 | Redis `used` gauge can wrap to 4.29e9 | **Fixed.** `redis/metrics.go:167-168` widens before subtracting and caps idle at total |
+| R-20 | P2 | Custom-metric ergonomics undocumented (private registry, unit suffixes, default buckets) | **Still present.** A search of `README.md` and `docs/guide.md` for `promauto`, "custom metric", "private registry" and `DefaultRegisterer` finds nothing. What was added nearby: the cardinality limit is documented as covering the application's own instruments, and the RPC histograms have views |
+| R-21 | P3 | Scheme-less endpoints pass validation | **Fixed.** `endpoint.go:143-181` requires an `http://` or `https://` URL with a host and names the option or variable in the error |
+| R-22 | P3 | `WithOTLPEndpoint` with a path prefix sends both signals to the wrong path | **Changed.** The generic variable is now a base URL and behaves correctly. The option keeps its own per-signal rules, which the guide now documents (`docs/guide.md:534-539`) and which still split the signals for a trailing slash or a path (S1-01) |
+| R-23 | P3 | `Shutdown` logs and returns exporter errors unredacted | **Fixed** for the rendered text (`o11y.go:328`). Residue: `errors.Unwrap` returns the unredacted error (S1-05) |
+| R-24 | P3 | otelslog instrumentation scope version is set to the service version | **Still present.** `o11y.go:637-639` |
+| R-25 | P3 | `O11Y_*_ENABLED` values are not trimmed | **Still present, reproduced.** `options.go:871-885`. `O11Y_TRACE_ENABLED="false "` logs a WARN and leaves `Toggles.Trace` true |
+| R-26 | P3 | `obsctx.Go(ctx, 0, fn)` runs `fn` with an expired context | **Still present, reproduced.** `obsctx/obsctx.go:47-49`, `:64`. Inside `fn`, `ctx.Err()` is already `context deadline exceeded` |
+| R-27 | P3 | A configured header name is redacted wherever it appears in diagnostic text | **Still present**; S1-04 reproduces it together with two related cases |
+| R-28 | P3 | `MessagesContext.Next` returns a nil ctx on error | **Fixed.** `nats/jetstream.go:654-667` |
+| R-29 | P3 | `Fetch(ctx, -1)` panics | **Fixed.** `nats/jetstream.go:405` (`checkBatch`) |
+| R-30 | P3 | `Inject` / `Extract` panic on nil | **Fixed.** `nats/middleware.go:76-95` |
+| R-31 | P3 | `restoreBaggage` re-parses `traceparent` per message | **Not re-measured.** `nats/conn.go:72-85` still runs the full propagator's `Extract`; it returns early for empty headers and for disabled tracing |
+| R-32 | P3 | `http.Option` is an alias of `otelhttp.Option`, so a caller option can replace the SDK provider | **Still present, reproduced.** `http/options.go:11`. With `otelhttp.WithTracerProvider(other)` passed to `NewServerHandler`, the span was recorded on `other` and none on the SDK provider |
+| R-33 | P3 | resty `Wrap` swallows the histogram-creation error | **Still present.** `resty/client.go:91-102` |
+| R-34 | P3 | minio `New` substitutes no-op providers for nil and discards the histogram error | **Still present.** `minio/client.go:87-92`, `:136-142`; now one of the three nil behaviours in S2-08 |
+| R-35 | P3 | mongo `Connect` drops the pool-metrics cleanup on success | **Still present.** `mongo/client.go:86-97` |
+| R-36 | P3 | `WithMetricsAddr("")` binds a random port silently | **Still present, reproduced.** `options.go:490-494`. `Init` succeeds and logs nothing about the address |
+| R-37 | P3 | The scope guard logs on every `Meter()` call | **Still present, reproduced.** `internal/metrics/scopeguard.go:56-63`. Three `Meter()` calls with a colliding scope attribute produced three WARN records |
+| R-38 | P3 | Exemplar comments overstate the failure as a failed scrape | **Fixed.** `internal/metrics/exemplar.go:25-29` |
+| R-39 | P3 | Scrape-error log line is unredacted and at WARN | **Still present.** `internal/metrics/scrapelog.go:79-83` |
+| R-40 | P3 | `metricscap` clones every capped datapoint on every export; non-string values are never capped | **Still present.** `internal/metricscap/reader.go:405-406`; the package is unchanged since `afbd622` |
+| R-41 | P3 | Scrape server has only `ReadHeaderTimeout`; `Serve` error discarded | **Still present.** `internal/metrics/metrics.go:534-536` |
+| R-42 | P3 | Per-command attribute sets rebuilt on every call (redis, cassandra) | **Not re-checked** (performance only) |
+| R-43 | P3 | `examples/nats-ws-browser` sets `messaging.operation.type` to `publish` | **Still present.** `examples/nats-ws-browser/backend/main.go:122`. The pinned package defines `create`, `send`, `receive`, `process` and `settle` only (`attribute_group.go:11070-11090`). The hand-rolled carrier (`:100`, `:133`) is also unchanged |
+| R-44 | P3 | Deprecated calls and G115 conversions | **Partly fixed.** `attribute.Value.Emit` is gone from `internal/metrics/targetinfo.go`; the G115 conversions are bounds-checked (CHANGELOG 0.15.0). The deprecated `gocql.NewBatch` calls in tests were not re-checked |
+| R-45 | P3 | Documentation drift list | **Partly fixed.** Fixed: the `url.full` row in `docs/semconv.md`; ADR 0010 carries an amendment correcting its `RecordError` row (`docs/adr/0010-gin-integration.md:33`, `:366-368`); ADR 0013 now describes the Ring gap. Unchanged, and restated in this review: the `Consumer.Next` contradiction (S3-01), the `prometheus.yaml` link (S3-02), the `AGENTS.md` package layout and README examples list (S3-08), "Fluentd", the 0.1.0 migration note, the deprecated-option recommendation, the `nats.Conn` type comment, ADR 0015 / 0017 / 0023 (S3-09), the `mongo.WithPoolName` godoc (S2-05), and the ADR gate's coverage (S1-07). Not re-checked: `//nolint` without a reason, and the hand-rolled env restore in `o11y_test.go` |
+
+Count: of the 45, 23 are fixed (five of them — R-5, R-6, R-13, R-18 and
+R-23 — with a residue or a neighbouring gap recorded as a new finding), 17
+are still present, 3 are partly fixed or changed (R-22, R-44, R-45), and 2
+were not re-checked (R-31, R-42).
+
+### 6.2 The 2026-09-06 review (SDK-1 to SDK-30)
+
+The 2026-09-14 review already recorded SDK-1, 4, 5, 6, 7, 9, 14 and 15 as
+fixed. Three were spot-checked by reading and still hold:
+`resource.WithProcess()` appears only in the comment that explains its
+absence (`o11y.go:817`), `WithTraceSampler(nil)` returns without touching the
+configuration (`options.go:227-236`), and the environment name is trimmed
+and lower-cased before matching (`o11y.go:1073`). The others were not
+re-tested.
+
+| ID | Was | Finding | Status at `03537c3` |
+|---|---|---|---|
+| SDK-2 | P1 | Link-consistent sampling across NATS hops | **Still open** (deferred by decision). No such option exists; `docs/guide.md:228-232` describes `ParentBased` thinning only |
+| SDK-3 | P1 | Prometheus default-registry bridge | **Dropped** by decision in the earlier review. The written decision and the accompanying documentation it asked for are still missing (R-20) |
+| SDK-8 | P1 | Soften the v0.12.0 `elasticsearch.NewClient` break | **Fixed** as a migration note: `CHANGELOG.md:1144-1146` |
+| SDK-10 | P2 | gin: a panic leaves no metric and no status when `gin.Recovery` runs first | **Changed.** The required order is documented (`gin/doc.go`, `docs/guide.md:842-845`); the facade still does not recover or detect the wrong order |
+| SDK-11 | P2 | Document that the NATS consumer span ends when the callback returns | **Still present.** No such statement in `docs/guide.md` or the `Subscribe` / `Consume` godoc. (The guide does say it for `Fetch`: `docs/guide.md:1717-1729`) |
+| SDK-12 | P2 | No panic recovery in `Subscribe` / `Consume` | **Still present.** No `recover()` in `nats/` |
+| SDK-13 | P2 | redis Cluster: `CLUSTER SLOTS` per scrape; `Wrap` has no deadline | **Still present**; see R-7 and R-8 |
+| SDK-16 | P2 | Public-ingress propagator and inbound-baggage stripping helpers | **Partly fixed.** `ContextWithoutBaggageValues` (`attributes.go:85`) and the guidance in `docs/guide.md:138-153`; no ready-made TraceContext-only propagator |
+| SDK-17 | P2 | Collector-outage runbook, compression and queue-size options | **Partly fixed.** `docs/guide.md` "Export failures & OTel diagnostics" covers the outage signals and the `OTEL_BSP_*` variables; there is no compression option |
+| SDK-18 | P2 | SDK-owned NATS client metrics | **Still open.** `nats/` creates no instrument |
+| SDK-19 | P3 | Bucket views by unit | **Still open.** Only named instruments have views; `WithInstrumentHistogramBuckets` is the per-name workaround |
+| SDK-20 | P3 | Views for the HTTP body-size histograms | **Still open.** No view names `body.size` |
+| SDK-21 | P3 | Cassandra: un-bypassable batch seam, tokenisation cache, `db.namespace` cap | **Not re-checked** beyond the seam, which is unchanged by design (`docs/guide.md:1301-1308`) |
+| SDK-22 | P3 | Mongo: tie instrumentation cleanup to the client lifecycle | **Still present**; see R-35 |
+| SDK-23 | P3 | `telemetry.sdk.*` missing; otelslog scope version | **Partly fixed.** `telemetry.sdk.*` is on the Resource (`README.md:177`); the scope version is R-24 |
+| SDK-24 | P3 | Dynamic log level | **Still open.** `WithLogLevel` takes a fixed level |
+| SDK-25 | P3 | `o11ytest.New(t)` | **Still open.** `o11ytest` has `CanceledRequestContext` and `RequireNotCanceled` only |
+| SDK-26 | P3 | Pin a released `otelmongo` tag | **Still present.** `go.mod:25` is the pseudo-version `v0.0.0-20260622212340-49857026d46e`; `go list -m -versions` on 2026-11-14 shows the module has no tagged version to move to |
+| SDK-27 | P3 | `/metrics` server timeouts and bind-failure handling | **Still present**; see R-41 and R-36 |
+| SDK-28 | P3 | Hot-path allocations | **Not re-measured** |
+| SDK-29 | P3 | Documentation items | **Partly fixed.** `docs/guide.md:200-212` states that `OTEL_TRACES_SAMPLER` is honoured. A search of the guide finds no JetStream `FilterSubject` span-name rule and no `sampled` log field; the remaining items were not checked |
+| SDK-30 | P2 | Low-level Elasticsearch client counts routine 404s as failures; no override | **Changed.** `docs/guide.md:1208-1212` documents the rule; `elasticsearch` still exposes only `WithSearchBody` and `WithCollectionMetricLabel` |
+
+### 6.3 Earlier findings still present that sessions 1 and 2 did not report
+
+Sessions 1 and 2 reviewed the code changed since `afbd622` in depth and
+scanned the rest, so a finding that sits in unchanged code could be missed
+by design. These are the ones that are still present and appear nowhere in
+sections 4.1 and 4.2. The severity is the earlier review's.
+
+| ID | Sev | Where | Problem |
+|---|---|---|---|
+| R-7 / SDK-13 | P2 | `redis/metrics.go:138` | On a Redis Cluster client every metrics collection — each Prometheus scrape, or each export tick on the push path — makes a `CLUSTER SLOTS` round trip, so scrape latency and scrape failure depend on Redis. (The earlier review also thought a span and a histogram sample per scrape plausible; that part was never exercised, then or now) |
+| R-8 | P2 | `redis/client.go:280`, `redis/metrics.go:154` | A Ring shard that is down when `Wrap` runs is never hooked, so its commands and pool stay invisible after it recovers |
+| R-20 | P2 | `README.md`, `docs/guide.md` | Nothing tells a service that metrics registered on the Prometheus default registry never appear on the SDK's `/metrics`, that names gain unit suffixes, or that a seconds histogram needs explicit boundaries |
+| SDK-12 | P2 | `nats/conn.go`, `nats/jetstream.go` | A panic in a `Subscribe` or `Consume` handler is not recovered by the facade |
+| SDK-11 | P2 | `docs/guide.md`, `nats/` godoc | Not documented that the consumer span ends when the handler returns, so work handed to a goroutine is not covered by it |
+| SDK-30 | P2 | `elasticsearch/client.go` | A routine 404 from the low-level client is recorded as an error on the metric and the span; documented, but there is no way to exempt an operation |
+| R-25 | P3 | `options.go:871-885` | `O11Y_TRACE_ENABLED="false "` (trailing space) leaves tracing on with a warning, while `WithEnvironment` trims |
+| R-26 | P3 | `obsctx/obsctx.go:64` | `obsctx.Go(ctx, 0, fn)` hands `fn` a context that is already expired |
+| R-32 | P3 | `http/options.go:11` | A caller can pass `otelhttp.WithTracerProvider` / `WithMeterProvider` through the facade and replace the SDK's providers |
+| R-33 | P3 | `resty/client.go:91-102` | A failed histogram creation falls back to a no-op with no log, so the client silently has no metric |
+| R-35 / SDK-22 | P3 | `mongo/client.go:86-97` | `Connect` discards the cleanup function that `Instrument` callers are told to defer |
+| R-36, R-41 / SDK-27 | P3 | `options.go:490-494`, `internal/metrics/metrics.go:534-536` | An empty metrics address binds a random port without a log line; the scrape server sets only `ReadHeaderTimeout` and discards the `Serve` error |
+| R-37 | P3 | `internal/metrics/scopeguard.go:56-63` | The dropped-scope-attribute warning repeats on every `Meter()` call |
+| R-39 | P3 | `internal/metrics/scrapelog.go:79-83` | The scrape-error record is at WARN and carries the gather error text unredacted |
+| R-40 | P3 | `internal/metricscap/reader.go:405-406` | A capped label with a non-string value takes a cap slot and is never rewritten |
+| R-24 | P3 | `o11y.go:637-639` | The log bridge's instrumentation scope version is the service's version |
+| R-43 | P3 | `examples/nats-ws-browser/backend/main.go:122` | The example sets `messaging.operation.type` to `publish`, which is not a value the pinned semconv defines |
+| SDK-26 | P3 | `go.mod:25` | `otelmongo` is pinned to a pseudo-version; no tag exists upstream yet |
+
+Still open as feature requests, not defects: SDK-2, SDK-18, SDK-19, SDK-20,
+SDK-24, SDK-25.
+
+### 6.4 New in this review
+
+Everything in sections 4.1 to 4.3 is new relative to the two earlier
+reports, with these overlaps:
+
+- S1-01 continues R-22, S1-04 includes R-27, S1-05 is the residue of R-23,
+  S1-03 the residue of R-6, S2-07 the residue of R-5.
+- S2-08's nil-provider row includes R-34.
+- S3-01, S3-02 (the link), S3-08 (two rows) and S3-09 (six items) restate
+  entries of R-45 that were not acted on.
+
+The findings with no predecessor are S1-02, S1-06, S1-07, S1-08, S1-09,
+S2-01, S2-02, S2-03, S2-04, S2-05, S2-06, S3-03, S3-04, S3-05, S3-06 and
+S3-07.
 
 ## 7. Suggested sequencing
 
@@ -1182,3 +1381,54 @@ CI and tooling:
 - No non-test change since `afbd622`. Constructors and error paths were
   read for the cross-integration comparison (S2-03, S2-04, S2-08); the rest
   was not re-read.
+
+### 8.3 Session 3
+
+Documentation that was compared with the code and matches:
+
+- **README options table.** Every option exists with the documented name
+  and signature. Defaults checked: `:2112`, `WithMaxUniqueRoutes` 1000,
+  `WithMaxUniqueCollections` 200, eight baggage keys
+  (`MaxBaggageAttributeKeys`), 256-byte baggage values, `WithExemplars`
+  true, the profiling double gate. The toggle variables go through
+  `strconv.ParseBool`, which accepts the values the README lists (and
+  `T`, `True`, `F`, `False`, which it does not list).
+- **README telemetry flow and `AGENTS.md` port table** against
+  `kind-config.yaml` and the three `NodePort` services, apart from S3-04.
+- **Guide, HTTP and gin.** `NewServerHandler`, `NewTransport` and
+  `Middleware` signatures; the eight `DefaultSkipPaths()` entries; the
+  ordering statement (chain before `gin.Recovery()`) agrees with
+  `gin/doc.go`.
+- **Guide, Resty, MongoDB, Redis.** `NewClient`, `Connect`, `Instrument`
+  (including the `func(context.Context) error` cleanup) and `Wrap`
+  signatures; the Redis always-dropped command list against
+  `redis/hook.go:354-393`.
+- **Guide, Elasticsearch and Cassandra.** Constructor signatures, the
+  option names, the span-name shapes (`elasticsearch.search my-index`,
+  `cassandra.SELECT rooms`), and the keys `cassandra.coordinator.id` /
+  `.dc`, `network.peer.*` and `db.response.status_code` against the pinned
+  package.
+- **Guide and `AGENTS.md`, NATS.** Every facade method the two documents
+  call exists (`Publish`, `Subscribe`, `Respond`, `Request`, `RequestMsg`,
+  `JetStream`, `CreateOrUpdateStream`, `Stream`, both
+  `CreateOrUpdateConsumer` forms, `Consume`, `Messages`, `Fetch`,
+  `FetchBytes`, `FetchNoWait`, `Next`, `MessageBatch.Stop`). The
+  request/reply error contract in `docs/guide.md:1552-1568` matches
+  `withRequestTimeout` (`nats/conn.go:391-407`) and the `Request` godoc line
+  for line.
+- **Guide, MinIO.** `New` signature, the four options and their defaults,
+  and `aws.s3.bucket` / `aws.s3.key` against the pinned package.
+- **`docs/semconv.md`.** No key in the catalog contradicts the pinned
+  package; the Mongo and Redis pool-metric tables match the instruments in
+  `mongo/pool_metrics.go` and `redis/metrics.go` in name and kind.
+- **CHANGELOG 0.15.0.** The three `nats` fixes and the
+  `cassandra.WithCoordinatorMetricLabel` change it describes are in the
+  code; 0.12.0 and 0.13.0 have their `### Migration` sections.
+- **Examples against the "Do NOT" list.** No example calls `msg.Respond`,
+  an upstream instrumentation package, an OTel global setter or
+  `slog.SetDefault`; all nineteen `WithEnvironment` calls use the canonical
+  `"development"`. The one `panic` (`examples/gin/main.go:80`) is the
+  simulated panic the example exists to show.
+- **ADRs.** Status lines of all 27 read; apart from the three in S3-09 none
+  contradicts the tree. ADR bodies were not re-read in full.
+
