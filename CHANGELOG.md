@@ -13,6 +13,23 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+### Fixed
+
+- CI gate for ADR 0003 (`make adr-check`, `scripts/check_integrations.go`):
+  the check that SDK code sets no OpenTelemetry global missed three of the six
+  functions that do. It held one list of names and matched it against
+  `go.opentelemetry.io/otel` alone, so its `SetLoggerProvider` entry could
+  never fire (the logs global is `go.opentelemetry.io/otel/log/global`), and
+  `otel.SetErrorHandler` and `otel.SetLogger` were not listed. It now matches
+  on the package path and the function name together, and reports
+  `otel.SetTracerProvider`, `otel.SetTextMapPropagator`,
+  `otel.SetMeterProvider`, `otel.SetErrorHandler`, `otel.SetLogger` and
+  `log/global.SetLoggerProvider` — through an import alias or a dot import,
+  and as a bare reference as well as a call. No SDK code called any of them,
+  so nothing changes at run time. The script gains tests, run by the same
+  target and workflow step; ADR 0003's Decision section lists the six, and a
+  test keeps that list and the gate's identical.
+
 ---
 
 ## [0.15.0] - 2026-11-13

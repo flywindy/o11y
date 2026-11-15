@@ -13,25 +13,47 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 )
 
 var integrationDirs = []string{"http", "nats", "mongo", "gin", "resty", "redis", "minio", "elasticsearch", "cassandra"}
 
-const otelModulePath = "go.opentelemetry.io/otel"
+// globalSetters lists the functions that replace a process-wide OpenTelemetry
+// value, by the import path of the package that declares them. SDK code may
+// call none of them (ADR 0003).
+//
+// The key is the package, not only the name. An earlier form of this gate held
+// one set of names and matched them against go.opentelemetry.io/otel alone, so
+// its SetLoggerProvider entry could never fire: the logs global lives in
+// go.opentelemetry.io/otel/log/global. SetErrorHandler and SetLogger, which
+// are in the root package and are process-wide like the rest, were not listed
+// at all. TestGlobalSettersExist reads each function out of the pinned module
+// so an entry that names nothing fails instead of sitting here unnoticed.
+var globalSetters = map[string][]string{
+	"go.opentelemetry.io/otel": {
+		"SetTracerProvider",
+		"SetTextMapPropagator",
+		"SetMeterProvider",
+		"SetErrorHandler",
+		"SetLogger",
+	},
+	"go.opentelemetry.io/otel/log/global": {
+		"SetLoggerProvider",
+	},
+}
 
-var setterNames = map[string]struct{}{
-	"SetTracerProvider":    {},
-	"SetTextMapPropagator": {},
-	"SetMeterProvider":     {},
-	"SetLoggerProvider":    {},
+// isGlobalSetter reports whether name, declared in the package at pkgPath, is
+// one of globalSetters.
+func isGlobalSetter(pkgPath, name string) bool {
+	return slices.Contains(globalSetters[pkgPath], name)
 }
 
 func main() {
 	var errs []error
 	errs = append(errs, checkGoModIntegrations()...)
 	errs = append(errs, checkTierAnnotations()...)
-	errs = append(errs, checkNoGlobalSetters()...)
+	errs = append(errs, checkNoGlobalSetters(".")...)
 	errs = append(errs, checkRootDoesNotLinkDrivers()...)
 	if len(errs) > 0 {
 		for _, err := range errs {
@@ -139,10 +161,22 @@ func adrMentionsPackage(dir string) bool {
 	return false
 }
 
-func checkNoGlobalSetters() []error {
+// checkNoGlobalSetters reports every use of a globalSetters function in a
+// non-test Go file under root.
+//
+// A use is any identifier that resolves to one of those functions, however it
+// is written: otel.SetTracerProvider(tp), the same through an import alias or
+// a dot import, and a reference that is not a call (f := otel.SetLogger). The
+// identifier is resolved through go/types rather than matched as text, so a
+// function of the same name in another package, a method, and a comment or
+// string that mentions one are not reported.
+//
+// Test files are exempt: a test may install a global to prove the SDK does not
+// read it.
+func checkNoGlobalSetters(root string) []error {
 	var errs []error
 	fset := token.NewFileSet()
-	err := filepath.WalkDir(".", func(path string, d os.DirEntry, err error) error {
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			errs = append(errs, fmt.Errorf("walk %s: %w", path, err))
 			return nil
@@ -158,35 +192,29 @@ func checkNoGlobalSetters() []error {
 			errs = append(errs, fmt.Errorf("parse %s: %w", path, err))
 			return nil
 		}
+		// Uses maps every identifier to what it denotes. For a selector such
+		// as otel.SetTracerProvider that is the Sel identifier, and for a dot
+		// import it is the bare name, so one pass over the map covers both.
+		var uses []*ast.Ident
 		info := typeInfoForFile(fset, file)
-		ast.Inspect(file, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if ok {
-				if ident, ok := call.Fun.(*ast.Ident); ok {
-					if _, forbidden := setterNames[ident.Name]; forbidden {
-						if isOTelObject(info.Uses[ident]) {
-							errs = append(errs, fmt.Errorf("%s: forbidden otel.%s call", fset.Position(ident.Pos()), ident.Name))
-						}
-					}
-				}
+		for ident, obj := range info.Uses {
+			fn, ok := obj.(*types.Func)
+			if !ok || fn.Pkg() == nil {
+				continue
 			}
-
-			sel, ok := n.(*ast.SelectorExpr)
-			if !ok {
-				return true
+			if isGlobalSetter(fn.Pkg().Path(), fn.Name()) {
+				uses = append(uses, ident)
 			}
-			ident, ok := sel.X.(*ast.Ident)
-			if !ok {
-				return true
-			}
-			if !isOTelPackageRoot(info.Uses[ident]) {
-				return true
-			}
-			if _, forbidden := setterNames[sel.Sel.Name]; forbidden {
-				errs = append(errs, fmt.Errorf("%s: forbidden otel.%s call", fset.Position(sel.Pos()), sel.Sel.Name))
-			}
-			return true
-		})
+		}
+		// Map order is random; report in source order.
+		slices.SortFunc(uses, func(a, b *ast.Ident) int { return int(a.Pos() - b.Pos()) })
+		for _, ident := range uses {
+			fn := info.Uses[ident]
+			errs = append(errs, fmt.Errorf(
+				"%s: forbidden %s.%s: SDK code must not set an OpenTelemetry global (ADR 0003)",
+				fset.Position(ident.Pos()), fn.Pkg().Path(), fn.Name(),
+			))
+		}
 		return nil
 	})
 	if err != nil {
@@ -195,6 +223,10 @@ func checkNoGlobalSetters() []error {
 	return errs
 }
 
+// typeInfoForFile type-checks one file on its own, far enough to say what each
+// identifier denotes. Errors are discarded: the file is checked without the
+// rest of its package and against policyImporter's empty packages, so most of
+// it does not type-check, and nothing here needs it to.
 func typeInfoForFile(fset *token.FileSet, file *ast.File) *types.Info {
 	info := &types.Info{
 		Uses: make(map[*ast.Ident]types.Object),
@@ -207,35 +239,19 @@ func typeInfoForFile(fset *token.FileSet, file *ast.File) *types.Info {
 	return info
 }
 
-func isOTelPackageRoot(obj types.Object) bool {
-	pkgName, ok := obj.(*types.PkgName)
-	if !ok || pkgName.Imported() == nil {
-		return false
-	}
-	return pkgName.Imported().Path() == otelModulePath
-}
-
-func isOTelObject(obj types.Object) bool {
-	if obj == nil {
-		return false
-	}
-	if isOTelPackageRoot(obj) {
-		return true
-	}
-	pkg := obj.Pkg()
-	return pkg != nil && pkg.Path() == otelModulePath
-}
-
+// policyImporter resolves every import to an empty package, except that the
+// packages in globalSetters declare those functions. That is all the gate needs
+// in order to tell go.opentelemetry.io/otel.SetLogger from a SetLogger declared
+// anywhere else, and it means the scan needs neither a module cache nor a
+// build.
 type policyImporter struct{}
 
 func (policyImporter) Import(path string) (*types.Package, error) {
 	pkg := types.NewPackage(path, packageName(path))
-	if path == otelModulePath {
-		empty := types.NewTuple()
-		sig := types.NewSignatureType(nil, nil, nil, empty, empty, false)
-		for name := range setterNames {
-			pkg.Scope().Insert(types.NewFunc(token.NoPos, pkg, name, sig))
-		}
+	empty := types.NewTuple()
+	sig := types.NewSignatureType(nil, nil, nil, empty, empty, false)
+	for _, name := range globalSetters[path] {
+		pkg.Scope().Insert(types.NewFunc(token.NoPos, pkg, name, sig))
 	}
 	pkg.MarkComplete()
 	return pkg, nil

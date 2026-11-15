@@ -229,17 +229,24 @@ the "Implementation note (as shipped)" under responsibility 3 below:
 
 3. **No direct `otel.SetX` calls in non-test code.**
    No `otel.SetTracerProvider` / `otel.SetTextMapPropagator` /
-   `otel.SetMeterProvider` / `otel.SetLoggerProvider` call may appear
-   in any non-test `.go` file under the module root. This enforces ADR
-   0003 at the source level for our own code.
+   `otel.SetMeterProvider` / `otel.SetErrorHandler` / `otel.SetLogger` call,
+   and no `go.opentelemetry.io/otel/log/global` `SetLoggerProvider` call, may
+   appear in any non-test `.go` file under the module root. This enforces ADR
+   0003 at the source level for our own code; the list is the table in ADR
+   0003's Decision section. *(2026-11-15: this item first listed
+   `otel.SetLoggerProvider`, a function the root package does not have, and
+   omitted `otel.SetErrorHandler` and `otel.SetLogger`; see the amendment in
+   ADR 0003.)*
 
    **Implementation note (as shipped).** The "open future work" the
    original draft flagged was done in the first cut of the gate: the
    check is **AST/`go/types`-based**, not `grep`-based. `checkNoGlobalSetters`
    in `scripts/check_integrations.go` parses each non-test file with
-   `go/parser` and resolves the `otel` package identity through a
-   `go/types` importer, so a forbidden call is matched only when the
-   selector's receiver actually resolves to `go.opentelemetry.io/otel`.
+   `go/parser` and resolves each identifier through a `go/types` importer,
+   so a forbidden use is matched only when it actually resolves to a listed
+   function in `go.opentelemetry.io/otel` or
+   `go.opentelemetry.io/otel/log/global` — through the default import name,
+   an alias or a dot import, as a call or as a bare reference.
    That removes the grep-era false-positive surface (matches inside
    comments and string literals), so the `// nolint:o11y-globals`
    suppression the draft proposed has not been needed. `make adr-check`

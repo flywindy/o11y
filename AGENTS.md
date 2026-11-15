@@ -406,7 +406,7 @@ further noise such as health-check PINGs, use `o11yredis.WithIgnoredCommands("pi
 - ❌ Use `panic` for error handling — use `slog.ErrorContext` instead
 - ❌ Use a global `*slog.Logger` variable — pass logger via context or struct
 - ❌ Thread a request-scoped context (`c.Request.Context()`, `r.Context()`, or `*gin.Context`) into a goroutine, `defer`, or post-response write that outlives the request — it is canceled when the handler returns and aborts the work (`context canceled` / DB `connection reset by peer`). Use `obsctx.Detach` / `obsctx.DetachWithTimeout` / `obsctx.Go` (keeps the trace, drops cancelation) and `c.Copy()` for the gin side. See [ADR 0024](docs/adr/0024-context-lifecycle-for-background-work.md)
-- ❌ Call `otel.SetTracerProvider` or `otel.SetTextMapPropagator` anywhere in SDK code — the SDK must not mutate OTel globals. Application `main()` may still choose to do so. See [ADR 0003](docs/adr/0003-global-state-policy.md)
+- ❌ Call `otel.SetTracerProvider`, `otel.SetTextMapPropagator`, `otel.SetMeterProvider`, `otel.SetErrorHandler`, `otel.SetLogger` or `log/global.SetLoggerProvider` anywhere in SDK code — the SDK must not mutate OTel globals; `make adr-check` rejects all six. Application `main()` may still choose to do so. See [ADR 0003](docs/adr/0003-global-state-policy.md)
 - ❌ Use OTLP/gRPC unless explicitly asked
 - ❌ Import `github.com/sirupsen/logrus` or `go.uber.org/zap` — we use stdlib `slog`
 - ❌ Commit without running `go fmt` and `go mod tidy`
