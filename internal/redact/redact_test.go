@@ -222,6 +222,22 @@ func TestURLAttribute(t *testing.T) {
 			want: "https://storage.example.com/o?sig=%5Bredacted%5D&X-GOOG-SIGNATURE=%5Bredacted%5D&name=report",
 		},
 		{
+			name: "a Signature Version 4 presigned URL loses its three credential parameters and keeps the rest",
+			raw: "https://minio.example.com/bucket/report.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256" +
+				"&X-Amz-Credential=AKIAEXAMPLE%2F20261114%2Fus-east-1%2Fs3%2Faws4_request" +
+				"&X-Amz-Date=20261114T000000Z&X-Amz-Expires=900" +
+				"&X-Amz-Security-Token=SESSIONTOKEN&X-Amz-SignedHeaders=host&X-Amz-Signature=deadbeef",
+			want: "https://minio.example.com/bucket/report.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256" +
+				"&X-Amz-Credential=%5Bredacted%5D" +
+				"&X-Amz-Date=20261114T000000Z&X-Amz-Expires=900" +
+				"&X-Amz-Security-Token=%5Bredacted%5D&X-Amz-SignedHeaders=host&X-Amz-Signature=%5Bredacted%5D",
+		},
+		{
+			name: "the Signature Version 4 keys are matched whatever their case",
+			raw:  "https://s3.example.com/b/k?x-amz-signature=deadbeef&X-AMZ-CREDENTIAL=AKIAEXAMPLE&x-Amz-Security-token=SESSIONTOKEN",
+			want: "https://s3.example.com/b/k?x-amz-signature=%5Bredacted%5D&X-AMZ-CREDENTIAL=%5Bredacted%5D&x-Amz-Security-token=%5Bredacted%5D",
+		},
+		{
 			name: "parameter order and escaping are preserved",
 			raw:  "https://api.example.com/x?z=1&a=hello%20world&Signature=s",
 			want: "https://api.example.com/x?z=1&a=hello%20world&Signature=%5Bredacted%5D",
@@ -752,6 +768,64 @@ func TestCredentialQueryKeysAreDecodedBeforeComparison(t *testing.T) {
 	})
 }
 
+// TestSigV4PresignedParametersAreCredentials pins that each of the three
+// Signature Version 4 query parameters is treated as a credential by every
+// entry point that decides on a query key.
+//
+// semconv v1.39.0 names four keys for url.full, and its two AWS ones
+// (AWSAccessKeyId, Signature) are the Signature Version 2 spellings. minio-go
+// and the current AWS SDKs sign with Version 4, whose parameters are named
+// differently, so a presigned URL from either went through URL, URLAttribute,
+// InText and Error exactly as it was written — onto the url.full span
+// attribute, among other places.
+//
+// Each key gets its own case so that dropping any one of them from
+// credentialQueryKeys fails here by name.
+func TestSigV4PresignedParametersAreCredentials(t *testing.T) {
+	tests := []struct {
+		key   string
+		value string
+	}{
+		{key: "X-Amz-Signature", value: "deadbeefcafe"},
+		{key: "X-Amz-Credential", value: "AKIAEXAMPLE%2F20261114%2Fus-east-1%2Fs3%2Faws4_request"},
+		{key: "X-Amz-Security-Token", value: "SESSIONTOKENVALUE"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.key, func(t *testing.T) {
+			raw := "https://minio.example.com/bucket/obj?X-Amz-Expires=900&" + tt.key + "=" + tt.value + "&name=report"
+			redacted := "https://minio.example.com/bucket/obj?X-Amz-Expires=900&" + tt.key + "=%5Bredacted%5D&name=report"
+
+			assert.Equal(t, redacted, redact.URL(raw),
+				"URL replaces the value and keeps the key, as semconv asks for a redacted query value")
+
+			u, err := url.Parse(raw)
+			require.NoError(t, err)
+			assert.Equal(t, redacted, redact.URLAttribute(u), "URLAttribute applies the same rule")
+
+			assert.Equal(t, "fetching "+redacted, redact.InText("fetching "+raw, raw),
+				"InText substitutes a URL it was told about")
+			assert.Equal(t, "[endpoint redacted]", redact.InText("fetching "+raw),
+				"and refuses a message holding one it was not told about")
+
+			failure := &url.Error{Op: "Get", URL: raw, Err: errors.New("connection refused")}
+			got := redact.Error(failure, nil, nil).Error()
+			assert.NotContains(t, got, tt.value, "the URL a client error quotes is redacted too")
+			assert.Contains(t, got, "connection refused", "and the cause is still readable")
+		})
+	}
+}
+
+// TestSigV4PresignedParametersThatAreNotCredentials pins that the rest of a
+// Signature Version 4 query stays readable: the algorithm, timestamp, lifetime
+// and signed-header list identify nothing and authorise nothing on their own.
+func TestSigV4PresignedParametersThatAreNotCredentials(t *testing.T) {
+	const raw = "https://minio.example.com/bucket/obj?X-Amz-Algorithm=AWS4-HMAC-SHA256" +
+		"&X-Amz-Date=20261114T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host"
+
+	assert.Equal(t, raw, redact.URL(raw))
+	assert.Equal(t, "fetching "+raw, redact.InText("fetching "+raw))
+}
+
 // TestQueryKeysThatOnlyLookLikeCredentials pins the other side: the wider
 // pattern must not start failing closed on ordinary parameters.
 func TestQueryKeysThatOnlyLookLikeCredentials(t *testing.T) {
@@ -759,6 +833,7 @@ func TestQueryKeysThatOnlyLookLikeCredentials(t *testing.T) {
 		"https://host/p?signature_version=4&name=svc",
 		"https://host/p?design=flat",
 		"https://host/p?a=1&b=2",
+		"https://host/p?X-Amz-Signature-Version=4&X-Amz-Credential-Scope=s3",
 	} {
 		t.Run(raw, func(t *testing.T) {
 			assert.Equal(t, raw, redact.URL(raw), "nothing here is a credential key")
