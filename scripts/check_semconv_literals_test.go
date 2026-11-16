@@ -284,7 +284,8 @@ var (
 // key through the forms that hide it from a literal comparison: a constant, a
 // constant declared in another file of the package, a concatenation, and an
 // import alias for the attribute package. It also pins the assembled form of a
-// pinned key, which Rule 1 cannot see because no literal equals it.
+// pinned key, which Rule 1 cannot see because no literal equals it — whether it
+// is put together at the call or in a constant the call names.
 func TestScan_ResolvesAKeyThatIsNotWrittenAsALiteral(t *testing.T) {
 	const unknown = ` is not an attribute key of go.opentelemetry.io/otel/semconv/v1.39.0, whose "db" namespace it is in`
 	got := scanTree(t, testCatalog(t), map[string]string{
@@ -293,6 +294,9 @@ func TestScan_ResolvesAKeyThatIsNotWrittenAsALiteral(t *testing.T) {
 const (
 	statementKey = "db.statement"
 	prefix       = "db."
+	// A pinned key that no literal equals: Rule 1 sees neither half.
+	assembledKey = "service." + "namespace"
+	viaAssembled = assembledKey
 )
 `,
 		"pkg/uses.go": `package pkg
@@ -305,6 +309,8 @@ var (
 	viaPrefix  = attr.Key(prefix + "instance")
 	viaConvert = attr.Key(string(statementKey))
 	assembled  = attr.String("service."+"namespace", "platform")
+	inConst    = attr.String(assembledKey, "platform")
+	twoSteps   = attr.Key(viaAssembled)
 )
 `,
 	})
@@ -314,7 +320,9 @@ var (
 		`pkg/uses.go:7: "db.statement"` + unknown,
 		`pkg/uses.go:8: "db.instance"` + unknown,
 		`pkg/uses.go:9: "db.statement"` + unknown,
-		`pkg/uses.go:10: "service.namespace" is a semconv attribute key, assembled here from parts`,
+		`pkg/uses.go:10: "service.namespace" is a semconv attribute key, assembled from parts`,
+		`pkg/uses.go:11: "service.namespace" is a semconv attribute key, assembled from parts`,
+		`pkg/uses.go:12: "service.namespace" is a semconv attribute key, assembled from parts`,
 	})
 }
 
@@ -327,8 +335,10 @@ var (
 //   - strings that read like keys but are not in a key position: a metric
 //     name, a span name, a log message, an attribute value;
 //   - a pinned key named through its constant;
-//   - a key the scan cannot resolve: a function result, a name declared twice
-//     or shadowed by a parameter or a := variable, a lookup method named Key;
+//   - a key the scan cannot resolve: a function result, a variable (it may be
+//     assigned again), a name declared twice or shadowed by a parameter or a :=
+//     variable, a lookup method named Key;
+//   - a call on a local that has the attribute package's name;
 //   - a function of the same name in a package that is not the attribute one;
 //   - a test file.
 func TestScan_AcceptsWhatRule2IsNotAbout(t *testing.T) {
@@ -394,12 +404,35 @@ func (lookup) Key(string) string { return "app.resolved" }
 
 // Not a conversion: cfg.Key looks a key up, it does not hold one.
 func viaLookup(cfg lookup) attribute.KeyValue { return attribute.String(cfg.Key("db.statement"), "x") }
+
+// A variable is not resolved: by the time it is used it holds something else.
+var reassigned = "db.statement"
+
+func viaReassigned() attribute.KeyValue {
+	reassigned = "app.query"
+	return attribute.String(reassigned, "x")
+}
 `,
 		"pkg/ok_test.go": `package pkg
 
 import "go.opentelemetry.io/otel/attribute"
 
 var legacy = attribute.Key("db.statement")
+`,
+		// The file imports the attribute package and also has a parameter of
+		// that name. Inside the function the name is the parameter, so the
+		// call builds no attribute.
+		"pkg/shadowed.go": `package pkg
+
+import "go.opentelemetry.io/otel/attribute"
+
+var _ = attribute.Bool("app.flag", true)
+
+type recorder struct{}
+
+func (recorder) String(string, string) {}
+
+func record(attribute recorder) { attribute.String("db.statement", "ok") }
 `,
 		"pkg/noimport.go": `package pkg
 

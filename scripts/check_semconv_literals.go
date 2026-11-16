@@ -30,8 +30,9 @@
 //	[]attribute.Key{k}, map[attribute.Key]T{k: v}
 //
 // In such a position the key may be a literal, a concatenation of literals, or
-// the name of a string constant or variable declared in the same directory;
-// all three are resolved. The functions are read from the pinned attribute
+// the name of a string constant declared in the same directory; all three are
+// resolved. A variable is not: it can be assigned again before it is used, and
+// what it was declared with then says nothing about the key. The functions are read from the pinned attribute
 // package, as the keys are from the pinned semconv package.
 //
 // The SDK-owned keys are read from docs/semconv.md, not listed here: a table
@@ -49,12 +50,13 @@
 //	                  catalog is the key set itself, as data)
 //	hidden dirs, testdata, vendor
 //
-// What is still left to review: a key assembled at run time, one that comes
-// from a constant declared in another package or from a name that is also a
-// parameter or local variable somewhere in the directory, a method argument
-// such as set.Value("k") whose receiver type only a type-checker could name, a
-// file that dot-imports the attribute package, and a key in a namespace the
-// pinned package does not use at all.
+// What is still left to review: a key assembled at run time or held in a
+// variable, one that comes from a constant declared in another package or from
+// a name that is also a parameter or local variable somewhere in the directory,
+// a method argument such as set.Value("k") whose receiver type only a
+// type-checker could name, a file that dot-imports the attribute package or
+// declares something else under the package's name, and a key in a namespace
+// the pinned package does not use at all.
 package main
 
 import (
@@ -471,16 +473,17 @@ func scanDir(paths []string, cat catalog) ([]string, error) {
 		})
 		// Rule 2: a key in a key position.
 		for _, expr := range keyPositions(file, cat.keyFuncs) {
-			value, ok := stringValue(expr, consts, map[string]bool{})
+			value, assembled, ok := stringValue(expr, consts, map[string]bool{})
 			if !ok {
 				continue
 			}
 			if cat.keys[value] {
 				// A literal, and a constant declared with one, are already
 				// reported above where the literal stands. A key put together
-				// from parts is not a literal anywhere, so say it here.
-				if _, assembled := ast.Unparen(expr).(*ast.BinaryExpr); assembled {
-					report(expr.Pos(), "%q is a semconv attribute key, assembled here from parts", value)
+				// from parts — here, or in the constant this names — is not a
+				// literal anywhere, so it is reported where it is used.
+				if assembled {
+					report(expr.Pos(), "%q is a semconv attribute key, assembled from parts", value)
 				}
 				continue
 			}
@@ -492,22 +495,67 @@ func scanDir(paths []string, cat catalog) ([]string, error) {
 	return findings, nil
 }
 
-// stringDecls returns the string constants and variables the files declare, by
-// name, as the expression each is declared with.
+// stringDecls returns the constants the files declare, by name, as the
+// expression each is declared with.
 //
-// A name bound more than once anywhere in the directory is left out: declared
-// twice, or also used as a parameter, a := variable or a range variable. Which
-// binding a use refers to is a scoping question this scan does not answer, and
-// guessing could report a key the code never uses — a package constant "name"
-// holding a log message, say, against a function whose parameter is called
-// name.
+// Only constants. A variable declared with a literal can be assigned again
+// before it is used as a key, and reporting what it was declared with would
+// reject correct code.
+//
+// A name bound more than once anywhere in the directory is left out as well:
+// declared twice, or also a variable, a parameter, a := variable or a range
+// variable. Which binding a use refers to is a scoping question this scan does
+// not answer, and guessing could report a key the code never uses — a package
+// constant "name" holding a log message, say, against a function whose
+// parameter is called name.
 func stringDecls(files []*ast.File) map[string]ast.Expr {
 	decls := map[string]ast.Expr{}
-	ambiguous := map[string]bool{}
-	rebound := func(names ...ast.Expr) {
-		for _, name := range names {
-			if ident, ok := name.(*ast.Ident); ok {
-				ambiguous[ident.Name] = true
+	bound := map[string]int{}
+	for _, file := range files {
+		for name, count := range bindings(file) {
+			bound[name] += count
+		}
+		ast.Inspect(file, func(node ast.Node) bool {
+			decl, ok := node.(*ast.GenDecl)
+			if !ok || decl.Tok != token.CONST {
+				return true
+			}
+			for _, spec := range decl.Specs {
+				value, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for i, name := range value.Names {
+					// A spec with no value of its own repeats the one above
+					// it (the iota form), which is not a string to resolve.
+					if i < len(value.Values) {
+						decls[name.Name] = value.Values[i]
+					}
+				}
+			}
+			return true
+		})
+	}
+	for name := range decls {
+		if bound[name] != 1 {
+			delete(decls, name)
+		}
+	}
+	return decls
+}
+
+// bindings counts how many times each name is bound in file: by a constant or
+// variable declaration, as a receiver, parameter or result, or by := in an
+// assignment or a range clause.
+//
+// It is how the scan knows what it cannot tell without scopes. A name bound
+// once is that binding wherever it is used. A name bound twice may be either.
+func bindings(file *ast.File) map[string]int {
+	bound := map[string]int{}
+	idents := func(exprs ...ast.Expr) {
+		for _, expr := range exprs {
+			if ident, ok := expr.(*ast.Ident); ok && ident.Name != "_" {
+				bound[ident.Name]++
 			}
 		}
 	}
@@ -517,73 +565,63 @@ func stringDecls(files []*ast.File) map[string]ast.Expr {
 		}
 		for _, field := range list.List {
 			for _, name := range field.Names {
-				ambiguous[name.Name] = true
+				idents(name)
 			}
 		}
 	}
-	for _, file := range files {
-		ast.Inspect(file, func(node ast.Node) bool {
-			switch n := node.(type) {
-			case *ast.ValueSpec:
-				for i, name := range n.Names {
-					if name.Name == "_" {
-						continue
-					}
-					if _, dup := decls[name.Name]; dup || i >= len(n.Values) {
-						ambiguous[name.Name] = true
-						continue
-					}
-					decls[name.Name] = n.Values[i]
-				}
-			case *ast.FuncDecl:
-				fields(n.Recv)
-			case *ast.FuncType:
-				fields(n.Params)
-				fields(n.Results)
-			case *ast.AssignStmt:
-				if n.Tok == token.DEFINE {
-					rebound(n.Lhs...)
-				}
-			case *ast.RangeStmt:
-				if n.Tok == token.DEFINE {
-					rebound(n.Key, n.Value)
-				}
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch n := node.(type) {
+		case *ast.ValueSpec:
+			for _, name := range n.Names {
+				idents(name)
 			}
-			return true
-		})
-	}
-	for name := range ambiguous {
-		delete(decls, name)
-	}
-	return decls
+		case *ast.FuncDecl:
+			fields(n.Recv)
+		case *ast.FuncType:
+			fields(n.Params)
+			fields(n.Results)
+		case *ast.AssignStmt:
+			if n.Tok == token.DEFINE {
+				idents(n.Lhs...)
+			}
+		case *ast.RangeStmt:
+			if n.Tok == token.DEFINE {
+				idents(n.Key, n.Value)
+			}
+		}
+		return true
+	})
+	return bound
 }
 
 // stringValue returns the string an expression in a key position denotes, when
 // that can be told without running the program: a literal, a concatenation, a
-// string(...) conversion of either, or the name of a declaration in decls that
-// is one of those.
+// string(...) conversion of either, or the name of a constant in decls that is
+// one of those. assembled reports that a concatenation was involved anywhere
+// along the way, so the value is not written out as one literal.
 //
 // An attribute.Key(...) conversion is not followed. It is a key position of its
 // own and is checked where it stands, and following every call named Key would
 // also follow ones that are not conversions at all.
-func stringValue(expr ast.Expr, decls map[string]ast.Expr, visiting map[string]bool) (string, bool) {
+func stringValue(expr ast.Expr, decls map[string]ast.Expr, visiting map[string]bool) (value string, assembled, ok bool) {
 	switch e := ast.Unparen(expr).(type) {
 	case *ast.BasicLit:
-		return stringLiteral(e)
+		value, ok = stringLiteral(e)
+		return value, false, ok
 	case *ast.BinaryExpr:
 		if e.Op != token.ADD {
-			return "", false
+			return "", false, false
 		}
-		left, ok := stringValue(e.X, decls, visiting)
+		left, _, ok := stringValue(e.X, decls, visiting)
 		if !ok {
-			return "", false
+			return "", false, false
 		}
-		right, ok := stringValue(e.Y, decls, visiting)
-		return left + right, ok
+		right, _, ok := stringValue(e.Y, decls, visiting)
+		return left + right, true, ok
 	case *ast.Ident:
 		decl, ok := decls[e.Name]
 		if !ok || visiting[e.Name] {
-			return "", false
+			return "", false, false
 		}
 		visiting[e.Name] = true
 		defer delete(visiting, e.Name)
@@ -593,11 +631,11 @@ func stringValue(expr ast.Expr, decls map[string]ast.Expr, visiting map[string]b
 		// resolved either: a directory that declares its own "string" is not
 		// one this scan needs to understand.
 		if fun, ok := e.Fun.(*ast.Ident); !ok || fun.Name != "string" || len(e.Args) != 1 {
-			return "", false
+			return "", false, false
 		}
 		return stringValue(e.Args[0], decls, visiting)
 	}
-	return "", false
+	return "", false, false
 }
 
 // keyPositions returns the expressions in file that stand where an attribute
@@ -605,6 +643,14 @@ func stringValue(expr ast.Expr, decls map[string]ast.Expr, visiting map[string]b
 func keyPositions(file *ast.File, keyFuncs map[string]keyArgs) []ast.Expr {
 	pkg := importName(file, attributePackage)
 	if pkg == "" {
+		return nil
+	}
+	// A variable or parameter with the package's name hides the import for as
+	// far as its scope reaches, and what follows it — attribute.String(k, v)
+	// on a local of that name — is not the package's function. Telling the two
+	// apart needs scopes, so a file that binds the name at all is left to
+	// review rather than risk reporting a call that builds no attribute.
+	if bindings(file)[pkg] > 0 {
 		return nil
 	}
 	// isAttr reports whether expr is the attribute package's name, e.g. Key.
