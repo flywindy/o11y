@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/elastic/elastic-transport-go/v8/elastictransport"
 	elastic "github.com/elastic/go-elasticsearch/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -221,10 +222,10 @@ func TestPinAddresses(t *testing.T) {
 			wantSource: "ELASTICSEARCH_URL",
 		},
 		{
-			name:       "an unset variable leaves nothing to pin",
+			name:       "an unset variable pins the upstream default, so the upstream has no reason to read it later",
 			env:        "",
-			wantAddrs:  nil,
-			wantSource: "ELASTICSEARCH_URL",
+			wantAddrs:  []string{"http://localhost:9200"},
+			wantSource: "the default address",
 		},
 	}
 	for _, tt := range tests {
@@ -272,6 +273,82 @@ func TestConstructors_ReadTheEnvironmentOnce(t *testing.T) {
 		assert.NotContains(t, text, "hunter2")
 		assert.NotContains(t, text, "esadmin")
 	}
+}
+
+// TestConstructors_DoNotReadTheEnvironmentAfterPinning pins the other window:
+// the variable is unset when the facade settles the address list and is set, to
+// an address with credentials that does not parse, before the upstream
+// constructor runs.
+//
+// Had the facade left an unset variable for the upstream to deal with, the
+// upstream would read the new value, fail on it, and return an error quoting
+// the password — "hunter2" here, in a parse error net/url truncates at the "#",
+// so there is no "@" left for the generic redaction to hold on to — while the
+// facade, having pinned nothing, had no address to recognise it by. With the
+// default pinned the upstream does not read the variable at all, so there is no
+// such error to redact. Both upstream constructors are checked, since they
+// share the address handling but are separate entry points.
+func TestConstructors_DoNotReadTheEnvironmentAfterPinning(t *testing.T) {
+	upstreams := map[string]func(elastic.Config) (interface{ URLs() []*url.URL }, error){
+		"NewClient": func(cfg elastic.Config) (interface{ URLs() []*url.URL }, error) {
+			client, err := elastic.NewClient(cfg)
+			if err != nil {
+				return nil, err
+			}
+			return client.Transport.(*elastictransport.Client), nil
+		},
+		"NewTypedClient": func(cfg elastic.Config) (interface{ URLs() []*url.URL }, error) {
+			client, err := elastic.NewTypedClient(cfg)
+			if err != nil {
+				return nil, err
+			}
+			return client.Transport.(*elastictransport.Client), nil
+		},
+	}
+	for name, construct := range upstreams {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("ELASTICSEARCH_URL", "")
+			pinned, source := pinAddresses(elastic.Config{})
+
+			// From here on the variable holds a credential that does not parse.
+			// #nosec G101 -- fabricated fixture URL, not a live credential
+			// nosemgrep: gosec.G101-1
+			t.Setenv("ELASTICSEARCH_URL", "https://esadmin:hunter2#tail@es.internal:9200")
+
+			// The premise: an upstream left to read the variable fails on it
+			// and quotes the credential.
+			_, unpinned := construct(elastic.Config{})
+			require.Error(t, unpinned)
+			require.Contains(t, unpinned.Error(), "hunter2")
+
+			transport, err := construct(pinned)
+			require.NoError(t, err, "the pinned Config gives the upstream nothing to read the variable for")
+			require.Len(t, transport.URLs(), 1)
+			assert.Equal(t, "http://localhost:9200", transport.URLs()[0].String())
+
+			// And were the upstream to fail for another reason, the list the
+			// error is checked against is the one it was given.
+			assert.Equal(t, []string{"http://localhost:9200"}, pinned.Addresses)
+			assert.Equal(t, "the default address", source)
+		})
+	}
+}
+
+// TestPinAddresses_DefaultIsTheUpstreamDefault pins that the address written in
+// for an unconfigured client is the one go-elasticsearch would have chosen
+// itself. The upstream constant is unexported, so the facade carries a copy;
+// this is what keeps the copy honest across an upgrade.
+func TestPinAddresses_DefaultIsTheUpstreamDefault(t *testing.T) {
+	t.Setenv("ELASTICSEARCH_URL", "")
+
+	client, err := elastic.NewClient(elastic.Config{})
+	require.NoError(t, err)
+	urls := client.Transport.(*elastictransport.Client).URLs()
+	require.Len(t, urls, 1, "the premise: an unconfigured upstream client has exactly one address")
+
+	pinned, _ := pinAddresses(elastic.Config{})
+
+	assert.Equal(t, []string{urls[0].String()}, pinned.Addresses)
 }
 
 // TestPinAddresses_DoesNotWriteThroughTheCallersConfig pins that the caller's

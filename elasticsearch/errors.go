@@ -16,6 +16,13 @@ import (
 // the Config names none.
 const envAddresses = "ELASTICSEARCH_URL"
 
+// defaultAddress is the address go-elasticsearch uses when the Config names
+// none and the variable is unset or empty: its unexported defaultURL, v8.19.3.
+// TestPinAddresses_DefaultIsTheUpstreamDefault compares it with the address an
+// unconfigured upstream client actually ends up with, so an upgrade that moves
+// the default fails there rather than changing where clients connect.
+const defaultAddress = "http://localhost:9200"
+
 // constructorError returns the error an upstream constructor produced, in a
 // form that is safe to log.
 //
@@ -68,29 +75,32 @@ func constructorError(err error, addrs []string, source string) error {
 }
 
 // pinAddresses fixes the address list before the upstream constructor runs, and
-// returns where the list came from: "cfg.Addresses" or "ELASTICSEARCH_URL".
+// returns where the list came from.
 //
 // go-elasticsearch reads its addresses from ELASTICSEARCH_URL, split on commas,
-// when the Config names neither an address nor a CloudID (v8.19.3
-// newTransport). Reading the variable a second time to redact the error would
-// leave a window: were it changed between the upstream's read and that one, the
-// redaction would be working from a list the upstream never parsed, find no
-// address at fault, and pass the upstream error through with the address in
-// it. So the variable is read once, here, and the result is written into the
-// returned Config. The upstream then parses that list instead of reading the
-// variable — its only use of cfg.Addresses is to take the list as given — and
-// constructorError is handed the same one.
+// when the Config names neither an address nor a CloudID, and falls back to
+// defaultAddress when the variable gives it none (v8.19.3 newTransport).
+// Leaving that read to the upstream makes the redaction depend on a second
+// reading of the same variable, and the two can differ: changed in between, or
+// unset at one and set by the other. Either way the redaction would be working
+// from a list the upstream never parsed, find no address at fault, and pass
+// the upstream error through with the address in it.
 //
-// One window is left, and it cannot be closed from here: a variable that is
-// unset at this read and set before the upstream's own, which still happens
-// when there is nothing to pin.
+// So the decision is taken once, here, and written into the returned Config:
+// the Config's own addresses, or the variable's, or the default. The Config
+// then always carries an address or a CloudID, which is the condition under
+// which the upstream does not consult the variable at all, and
+// constructorError is handed the very list the upstream parsed. The upstream's
+// only use of cfg.Addresses is to take the list as given, so which client is
+// built does not change.
 func pinAddresses(cfg elastic.Config) (elastic.Config, string) {
 	if len(cfg.Addresses) > 0 || cfg.CloudID != "" {
 		return cfg, "cfg.Addresses"
 	}
 	env := os.Getenv(envAddresses)
 	if env == "" {
-		return cfg, envAddresses
+		cfg.Addresses = []string{defaultAddress}
+		return cfg, "the default address"
 	}
 	// A new slice, so the caller's Config is not written through.
 	var addrs []string
