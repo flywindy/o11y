@@ -75,6 +75,32 @@ Nothing changes for a service that passes `obs.TracerProvider()`,
   - `o11yhttp.NewTransport` is unchanged: otelhttp strips userinfo from
     `url.full` and records the query string as sent, for these keys as for
     the four above (see the `url.full` row in `docs/semconv.md`).
+- `elasticsearch`: `NewClient` and `NewTypedClient` no longer return an error
+  that quotes a malformed address. go-elasticsearch accepts credentials in an
+  address (`https://user:pass@host:9200`) and returns net/url's parse error for
+  one it cannot parse, which quotes the address verbatim; the facade wrapped
+  it unchanged. An address fails to parse when its password holds a character
+  that needed percent-encoding (a space, `/`, `#`, `?`, or a `%` that does not
+  start an escape, among others), so the error appeared
+  on the deployments that keep the secret in the URL, and
+  `slog.Any("error", err)` sent it to stdout and the OTLP log pipeline.
+  - The error now names the address by position and keeps the reason:
+    `elasticsearch new client: cannot parse address 2 of 3 in cfg.Addresses:
+    invalid URL escape (the address is not shown because it may carry
+    credentials)`. It reads `in ELASTICSEARCH_URL` when the addresses came
+    from that variable.
+  - The reason is not repeated verbatim either: net/url quotes a piece of the
+    input in some of its errors, and for a URL with credentials that piece can
+    come from the password (`invalid URL escape "%ZZ"`, `invalid port ":pa"
+    after host`). The quoted piece is dropped and the rest kept; a reason the
+    facade does not recognise is reported as `not a valid URL`.
+  - The error does not unwrap to the upstream one, so `errors.Unwrap` does
+    not bring the address back. The upstream constructors return plain text
+    errors, so there was nothing in the chain for `errors.Is` / `errors.As`
+    to match. Code that matched on the old message text (`cannot create
+    client: cannot parse url: …`) needs updating.
+  - Other constructor errors (both `Addresses` and `CloudID` set, a malformed
+    `CloudID`, the nil-provider errors) are unchanged.
 
 ### Fixed
 

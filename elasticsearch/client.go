@@ -138,6 +138,19 @@ func newConfig(opts []Option) config {
 // Any cfg.Instrumentation set by the caller is replaced by the o11y-wired
 // instrumentation. cfg is taken by value, so the caller's own Config struct is
 // not mutated.
+//
+// The returned error is safe to log. go-elasticsearch accepts credentials in
+// an address (https://user:pass@host:9200) and quotes the whole address in its
+// error when one fails to parse — which it does when the password holds a
+// character that needed percent-encoding. Such an error is replaced by one
+// that names the address by its position in cfg.Addresses (or in
+// ELASTICSEARCH_URL) and keeps the reason, without the address or the part of
+// it net/url quotes: "cannot parse address 2 of 3 in cfg.Addresses: invalid
+// URL escape". Unlike the error Shutdown returns, it does not unwrap to the
+// upstream error, so no link of the chain carries the address either; the
+// upstream constructors return plain text errors, so there is nothing in
+// them for errors.Is or errors.As to match. Any other constructor error is
+// returned with its chain when it needed no redaction.
 func NewClient(
 	cfg elastic.Config,
 	tp trace.TracerProvider,
@@ -147,9 +160,12 @@ func NewClient(
 	if err := instrument(&cfg, tp, mp, false, opts...); err != nil {
 		return nil, fmt.Errorf("elasticsearch new client: %w", err)
 	}
+	cfg, source := pinAddresses(cfg)
 	client, err := elastic.NewClient(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("elasticsearch new client: %w", err)
+		// Not the upstream error as it stands: an address that fails to parse
+		// is quoted in it, credentials included. See constructorError.
+		return nil, fmt.Errorf("elasticsearch new client: %w", constructorError(err, cfg.Addresses, source))
 	}
 	return client, nil
 }
@@ -160,7 +176,7 @@ func NewClient(
 // is not reachable from *elasticsearch.Client, so this parallel constructor
 // lets typed-API call sites stay on the typed API while sharing the same
 // instrumentation wiring as NewClient. tp and mp are required and rejected when
-// nil.
+// nil. The returned error is redacted on the same terms as NewClient's.
 //
 // Call typed requests with their .Do(ctx) terminator (e.g.
 // client.Search().Index("idx").Do(ctx)) to get a fully populated span and
@@ -183,9 +199,12 @@ func NewTypedClient(
 	if err := instrument(&cfg, tp, mp, true, opts...); err != nil {
 		return nil, fmt.Errorf("elasticsearch new typed client: %w", err)
 	}
+	cfg, source := pinAddresses(cfg)
 	client, err := elastic.NewTypedClient(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("elasticsearch new typed client: %w", err)
+		// Not the upstream error as it stands: an address that fails to parse
+		// is quoted in it, credentials included. See constructorError.
+		return nil, fmt.Errorf("elasticsearch new typed client: %w", constructorError(err, cfg.Addresses, source))
 	}
 	return client, nil
 }
