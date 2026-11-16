@@ -223,6 +223,112 @@ func TestWrapRedactsCredentialsFromURLFull(t *testing.T) {
 	assert.NotEmpty(t, gotAuth, "userinfo must still reach the server as Basic auth")
 }
 
+// TestWrapRedactsSigV4PresignedURLFromURLFull pins, end to end, that a
+// Signature Version 4 presigned URL fetched through the hook does not reach
+// the url.full span attribute with its credentials.
+//
+// The four query keys semconv v1.39.0 names cover Signature Version 2. minio-go
+// and the current AWS SDKs sign with Version 4, so before the three X-Amz-*
+// keys were added the span recorded the signature, the access key ID and the
+// session token exactly as sent — a URL anyone with trace access could replay
+// until it expired.
+func TestWrapRedactsSigV4PresignedURLFromURLFull(t *testing.T) {
+	tp, mp, sr := testProviders()
+	var gotQuery url.Values
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	const (
+		signature = "deadbeefcafe"
+		// #nosec G101 -- fabricated fixture access key ID, not a live credential
+		// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+		accessKey = "AKIAEXAMPLE"
+		session   = "SESSIONTOKENVALUE"
+		scope     = accessKey + "%2F20261114%2Fus-east-1%2Fs3%2Faws4_request"
+	)
+	// The query is written out rather than built with SetQueryParam so the
+	// request carries exactly the shape a presigner hands back.
+	presigned := ts.URL + "/bucket/report.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256" +
+		"&X-Amz-Credential=" + scope +
+		"&X-Amz-Date=20261114T000000Z&X-Amz-Expires=900" +
+		"&X-Amz-Security-Token=" + session +
+		"&X-Amz-SignedHeaders=host&X-Amz-Signature=" + signature
+
+	client := NewClient(tp, mp, propagation.TraceContext{})
+	resp, err := client.R().Get(presigned)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode())
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	full := attrValue(t, spans[0], semconv.URLFullKey).AsString()
+
+	assert.NotContains(t, full, signature, "the signature must not reach url.full")
+	assert.NotContains(t, full, accessKey, "nor the access key ID in the credential scope")
+	assert.NotContains(t, full, session, "nor the session token")
+	for _, key := range []string{"X-Amz-Signature", "X-Amz-Credential", "X-Amz-Security-Token"} {
+		assert.Contains(t, full, key+"=%5Bredacted%5D", "the key stays so the query shape is still readable")
+	}
+	assert.Contains(t, full, "/bucket/report.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256", "the object is still identifiable")
+	assert.Contains(t, full, "X-Amz-Expires=900", "and the parameters that are not credentials are left alone")
+
+	// The redaction is for the attribute only: the server has to receive the
+	// signed query intact or the request stops authenticating.
+	assert.Equal(t, signature, gotQuery.Get("X-Amz-Signature"))
+	assert.Equal(t, accessKey+"/20261114/us-east-1/s3/aws4_request", gotQuery.Get("X-Amz-Credential"))
+	assert.Equal(t, session, gotQuery.Get("X-Amz-Security-Token"))
+}
+
+// TestWrapRedactsSigV4PresignedURLFromTheErrorSpan pins the same for a request
+// that fails: the *url.Error net/http returns quotes the whole query, and that
+// text becomes the span's status description and its exception.message.
+func TestWrapRedactsSigV4PresignedURLFromTheErrorSpan(t *testing.T) {
+	tp, mp, sr := testProviders()
+	client := NewClient(tp, mp, propagation.TraceContext{})
+
+	const (
+		signature = "deadbeefcafe"
+		// #nosec G101 -- fabricated fixture access key ID, not a live credential
+		// nosemgrep: hardcoded-credential-literal,gosec.G101-1
+		accessKey = "AKIAEXAMPLE"
+		session   = "SESSIONTOKENVALUE"
+	)
+	// Port 1 refuses immediately, so the failure is a transport error whose
+	// *url.Error carries the request URL.
+	_, err := client.R().Get("http://127.0.0.1:1/bucket/report.pdf" +
+		"?X-Amz-Credential=" + accessKey + "%2F20261114%2Fus-east-1%2Fs3%2Faws4_request" +
+		"&X-Amz-Security-Token=" + session +
+		"&X-Amz-Signature=" + signature)
+	require.Error(t, err)
+
+	spans := endedClientSpans(sr)
+	require.Len(t, spans, 1)
+	span := spans[0]
+
+	texts := map[string]string{"status description": span.Status().Description}
+	for _, event := range span.Events() {
+		if event.Name != semconv.ExceptionEventName {
+			continue
+		}
+		for _, attr := range event.Attributes {
+			if attr.Key == semconv.ExceptionMessageKey {
+				texts["exception.message"] = attr.Value.AsString()
+			}
+		}
+	}
+	require.Contains(t, texts, "exception.message", "the error is still recorded as an exception")
+
+	for where, text := range texts {
+		assert.NotContains(t, text, signature, "%s must not carry the signature", where)
+		assert.NotContains(t, text, accessKey, "%s must not carry the access key ID", where)
+		assert.NotContains(t, text, session, "%s must not carry the session token", where)
+		assert.Contains(t, text, "127.0.0.1:1", "%s still has to identify the server", where)
+	}
+}
+
 // TestRequestTarget_FailsClosedOnUnresolvableURLs pins that the fallbacks
 // taken before resty has built a RawRequest never put a raw URL on the span.
 //

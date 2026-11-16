@@ -49,6 +49,33 @@ Nothing changes for a service that passes `obs.TracerProvider()`,
   for a caller who had passed no propagator, and without the baggage the SDK's
   own propagator carries.
 
+### Security
+
+- Signature Version 4 presigned URLs are now redacted. The SDK replaced the
+  values of the four query parameters semconv v1.39.0 names for `url.full`
+  (`AWSAccessKeyId`, `Signature`, `sig`, `X-Goog-Signature`); its two AWS keys
+  are the Signature Version 2 spellings, and `minio-go` and the current AWS
+  SDKs presign with Version 4, whose parameters none of the four matches. The
+  values of `X-Amz-Signature`, `X-Amz-Credential` (the access key ID and its
+  scope) and `X-Amz-Security-Token` (the session token of a temporary
+  credential) are now replaced by `[redacted]` as well, matched
+  case-insensitively and after percent-decoding like the other four.
+  - `resty`: a presigned URL fetched through `o11yresty.Wrap` / `NewClient`
+    was recorded on the span's `url.full` attribute as sent, and in the status
+    description and `exception.message` of a failed request, so anyone with
+    trace access could replay it until it expired. All three now carry the
+    key with `[redacted]` for its value; the request itself is unchanged.
+  - Endpoint redaction (`WithOTLPEndpoint`, `WithProfilingEndpoint` and the
+    other configured endpoints, in the SDK's own log records and in the errors
+    `Shutdown` / `ForceFlush` return) applies the same list. As with the
+    existing four keys, a log line holding one of these parameters that the
+    SDK did not redact itself is replaced wholesale by `[endpoint redacted]`.
+  - The other Version 4 parameters (`X-Amz-Algorithm`, `X-Amz-Date`,
+    `X-Amz-Expires`, `X-Amz-SignedHeaders`) are left readable.
+  - `o11yhttp.NewTransport` is unchanged: otelhttp strips userinfo from
+    `url.full` and records the query string as sent, for these keys as for
+    the four above (see the `url.full` row in `docs/semconv.md`).
+
 ### Fixed
 
 - `gin`, `http`: `o11ygin.Middleware`, `o11yhttp.NewServerHandler` and
@@ -63,6 +90,7 @@ Nothing changes for a service that passes `obs.TracerProvider()`,
 - One rule now covers a nil provider in every integration: a constructor that
   can return an error rejects it, and one that cannot substitutes a no-op. A
   nil no longer selects an OpenTelemetry global in any of them.
+
 
 ---
 
