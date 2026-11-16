@@ -189,6 +189,103 @@ func TestConstructors_DoNotEchoAMalformedEnvironmentAddress(t *testing.T) {
 	}
 }
 
+// TestPinAddresses pins which list the upstream constructor is given and where
+// it is said to come from, mirroring go-elasticsearch's own precedence: the
+// Config's addresses, then nothing when a CloudID is set, then the variable.
+func TestPinAddresses(t *testing.T) {
+	tests := []struct {
+		name       string
+		env        string
+		cfg        elastic.Config
+		wantAddrs  []string
+		wantSource string
+	}{
+		{
+			name:       "the Config's addresses win and the variable is not read",
+			env:        "https://from-env:9200",
+			cfg:        elastic.Config{Addresses: []string{"https://from-cfg:9200"}},
+			wantAddrs:  []string{"https://from-cfg:9200"},
+			wantSource: "cfg.Addresses",
+		},
+		{
+			name:       "a CloudID means the variable is not read either",
+			env:        "https://from-env:9200",
+			cfg:        elastic.Config{CloudID: "name:Zm9v"},
+			wantAddrs:  nil,
+			wantSource: "cfg.Addresses",
+		},
+		{
+			name:       "the variable is split on commas and trimmed, empty entries kept, as upstream does",
+			env:        " https://es-1:9200 ,,https://es-2:9200/",
+			wantAddrs:  []string{"https://es-1:9200", "", "https://es-2:9200/"},
+			wantSource: "ELASTICSEARCH_URL",
+		},
+		{
+			name:       "an unset variable leaves nothing to pin",
+			env:        "",
+			wantAddrs:  nil,
+			wantSource: "ELASTICSEARCH_URL",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("ELASTICSEARCH_URL", tt.env)
+
+			got, source := pinAddresses(tt.cfg)
+
+			assert.Equal(t, tt.wantAddrs, got.Addresses)
+			assert.Equal(t, tt.wantSource, source)
+		})
+	}
+}
+
+// TestConstructors_ReadTheEnvironmentOnce pins that the address list is settled
+// before the upstream constructor runs, so the list that is parsed and the list
+// the error is redacted against cannot be two different readings of
+// ELASTICSEARCH_URL.
+//
+// The window this closes: the upstream reads the variable, fails on an address
+// with credentials in it, and by the time the facade reads the variable to
+// redact the error it holds something else — so no address is found at fault
+// and the upstream error goes out as it is. The test stands in for the other
+// goroutine by changing the variable between the two steps.
+func TestConstructors_ReadTheEnvironmentOnce(t *testing.T) {
+	// #nosec G101 -- fabricated fixture URL, not a live credential
+	// nosemgrep: gosec.G101-1
+	t.Setenv("ELASTICSEARCH_URL", "https://esadmin:hunter2#tail@es.internal:9200")
+	pinned, source := pinAddresses(elastic.Config{})
+
+	// From here on the variable says something else.
+	t.Setenv("ELASTICSEARCH_URL", "https://replaced.internal:9200")
+
+	_, upstream := elastic.NewClient(pinned)
+	require.Error(t, upstream, "the upstream parses the pinned list, not the variable's new value")
+	require.Contains(t, upstream.Error(), "hunter2", "the premise: its error quotes the credential")
+
+	got := constructorError(upstream, pinned.Addresses, source)
+
+	assert.Equal(t,
+		"cannot parse address 1 of 1 in ELASTICSEARCH_URL: invalid port after host "+
+			"(the address is not shown because it may carry credentials)",
+		got.Error())
+	for _, text := range chainTexts(got) {
+		assert.NotContains(t, text, "hunter2")
+		assert.NotContains(t, text, "esadmin")
+	}
+}
+
+// TestPinAddresses_DoesNotWriteThroughTheCallersConfig pins that the caller's
+// Config is left as it was: the constructors take it by value and say so.
+func TestPinAddresses_DoesNotWriteThroughTheCallersConfig(t *testing.T) {
+	t.Setenv("ELASTICSEARCH_URL", "https://es-1:9200")
+	original := elastic.Config{}
+
+	pinned, _ := pinAddresses(original)
+
+	assert.Empty(t, original.Addresses)
+	assert.Equal(t, []string{"https://es-1:9200"}, pinned.Addresses)
+}
+
 // TestConstructors_KeepOtherUpstreamErrors pins that only the address parse
 // failure is rewritten. A Config with both Addresses and CloudID fails before
 // any address is parsed, so that is what the error has to keep saying even
@@ -243,7 +340,7 @@ func TestConstructorError_DoesNotUnwrapToACredential(t *testing.T) {
 	upstream := fmt.Errorf("error creating transport: %w",
 		&url.Error{Op: "Get", URL: address, Err: errors.New("connection refused")})
 
-	got := constructorError(upstream, elastic.Config{Addresses: []string{address}})
+	got := constructorError(upstream, []string{address}, "cfg.Addresses")
 
 	for _, text := range chainTexts(got) {
 		assert.NotContains(t, text, "esadmin")
@@ -268,7 +365,7 @@ func TestConstructorError_ReportsTheParseFailureInAWordingItDoesNotRecognise(t *
 	const address = "https://esadmin:hunter2/tail@es.internal:9200"
 	upstream := errors.New(`cannot create client: bad address ` + address + `: invalid port ":hunter2" after host`)
 
-	got := constructorError(upstream, elastic.Config{Addresses: []string{address}})
+	got := constructorError(upstream, []string{address}, "cfg.Addresses")
 
 	assert.Equal(t,
 		"cannot parse address 1 of 1 in cfg.Addresses: invalid port after host "+
@@ -284,7 +381,7 @@ func TestConstructorError_KeepsAnErrorThatNeededNoRedaction(t *testing.T) {
 	sentinel := errors.New("unsupported option")
 	upstream := fmt.Errorf("error creating transport: %w", sentinel)
 
-	got := constructorError(upstream, elastic.Config{Addresses: []string{"https://es.internal:9200"}})
+	got := constructorError(upstream, []string{"https://es.internal:9200"}, "cfg.Addresses")
 
 	assert.Equal(t, upstream, got)
 	assert.ErrorIs(t, got, sentinel)

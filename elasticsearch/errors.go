@@ -49,8 +49,10 @@ const envAddresses = "ELASTICSEARCH_URL"
 // errors.Unwrap away from anything that renders each link of a chain. The
 // upstream constructors build these errors with %s and %v, so they carry no
 // chain for a caller to match on, and flattening them loses nothing.
-func constructorError(err error, cfg elastic.Config) error {
-	addrs, source := configuredAddresses(cfg)
+//
+// addrs and source are what pinAddresses returned for the Config the upstream
+// constructor was given, so the list checked here is the list it parsed.
+func constructorError(err error, addrs []string, source string) error {
 	index, parseErr := firstUnparseable(addrs)
 	if parseErr != nil && strings.Contains(err.Error(), parseErr.Error()) {
 		return addressParseError(index, len(addrs), source, parseErr)
@@ -65,22 +67,38 @@ func constructorError(err error, cfg elastic.Config) error {
 	return errors.New(redacted.Error())
 }
 
-// configuredAddresses returns the addresses the upstream constructor will
-// parse and where they came from, mirroring go-elasticsearch v8.19.3
-// newTransport: the Config's own list, or the comma-separated ELASTICSEARCH_URL
-// when the Config names neither an address nor a CloudID.
-func configuredAddresses(cfg elastic.Config) (addrs []string, source string) {
+// pinAddresses fixes the address list before the upstream constructor runs, and
+// returns where the list came from: "cfg.Addresses" or "ELASTICSEARCH_URL".
+//
+// go-elasticsearch reads its addresses from ELASTICSEARCH_URL, split on commas,
+// when the Config names neither an address nor a CloudID (v8.19.3
+// newTransport). Reading the variable a second time to redact the error would
+// leave a window: were it changed between the upstream's read and that one, the
+// redaction would be working from a list the upstream never parsed, find no
+// address at fault, and pass the upstream error through with the address in
+// it. So the variable is read once, here, and the result is written into the
+// returned Config. The upstream then parses that list instead of reading the
+// variable — its only use of cfg.Addresses is to take the list as given — and
+// constructorError is handed the same one.
+//
+// One window is left, and it cannot be closed from here: a variable that is
+// unset at this read and set before the upstream's own, which still happens
+// when there is nothing to pin.
+func pinAddresses(cfg elastic.Config) (elastic.Config, string) {
 	if len(cfg.Addresses) > 0 || cfg.CloudID != "" {
-		return cfg.Addresses, "cfg.Addresses"
+		return cfg, "cfg.Addresses"
 	}
 	env := os.Getenv(envAddresses)
 	if env == "" {
-		return nil, envAddresses
+		return cfg, envAddresses
 	}
+	// A new slice, so the caller's Config is not written through.
+	var addrs []string
 	for entry := range strings.SplitSeq(env, ",") {
 		addrs = append(addrs, strings.TrimSpace(entry))
 	}
-	return addrs, envAddresses
+	cfg.Addresses = addrs
+	return cfg, envAddresses
 }
 
 // firstUnparseable returns the position and the parse error of the first

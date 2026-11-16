@@ -160,11 +160,12 @@ func NewClient(
 	if err := instrument(&cfg, tp, mp, false, opts...); err != nil {
 		return nil, fmt.Errorf("elasticsearch new client: %w", err)
 	}
+	cfg, source := pinAddresses(cfg)
 	client, err := elastic.NewClient(cfg)
 	if err != nil {
 		// Not the upstream error as it stands: an address that fails to parse
 		// is quoted in it, credentials included. See constructorError.
-		return nil, fmt.Errorf("elasticsearch new client: %w", constructorError(err, cfg))
+		return nil, fmt.Errorf("elasticsearch new client: %w", constructorError(err, cfg.Addresses, source))
 	}
 	return client, nil
 }
@@ -198,11 +199,12 @@ func NewTypedClient(
 	if err := instrument(&cfg, tp, mp, true, opts...); err != nil {
 		return nil, fmt.Errorf("elasticsearch new typed client: %w", err)
 	}
+	cfg, source := pinAddresses(cfg)
 	client, err := elastic.NewTypedClient(cfg)
 	if err != nil {
 		// Not the upstream error as it stands: an address that fails to parse
 		// is quoted in it, credentials included. See constructorError.
-		return nil, fmt.Errorf("elasticsearch new typed client: %w", constructorError(err, cfg))
+		return nil, fmt.Errorf("elasticsearch new typed client: %w", constructorError(err, cfg.Addresses, source))
 	}
 	return client, nil
 }
