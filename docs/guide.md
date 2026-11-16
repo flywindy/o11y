@@ -1196,6 +1196,24 @@ convention, e.g. `elasticsearch.search my-index`, and an ES HTTP error response
 (4xx/5xx, or a 3xx redirect) is reflected as span status Error with
 `http.response.status_code`.
 
+The error `NewClient` / `NewTypedClient` return is safe to log.
+go-elasticsearch accepts credentials in an address
+(`https://user:pass@host:9200`) and, when an address fails to parse, returns
+net/url's error, which quotes the whole address — and an address fails to
+parse when its password holds a character that needed percent-encoding (a
+space, `/`, `#`, `?`, or a `%` that does not start an escape, among others).
+The facade replaces that error with one that names the
+address by position and keeps the reason:
+
+```text
+elasticsearch new client: cannot parse address 2 of 3 in cfg.Addresses: invalid URL escape (the address is not shown because it may carry credentials)
+```
+
+The position counts from 1, and reads `in ELASTICSEARCH_URL` when the
+addresses came from that variable. The reason is net/url's without the piece
+of the address it quotes, and the error does not unwrap to the upstream one,
+so `errors.Unwrap` does not bring the address back.
+
 The upstream is trace-only, so the **metric is SDK-owned** ([ADR
 0027](adr/0027-elasticsearch-metrics.md)): every request records one
 `db.client.operation.duration` sample on `mp`, measured from the start of the
