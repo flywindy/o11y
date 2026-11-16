@@ -46,8 +46,11 @@ inspection. Any exception must be recorded in the integration ADR.
    resolving a literal, a concatenation, or a string constant declared in the
    same directory. A key found there whose first segment is a namespace the
    pinned package uses (`db`, `http`, `messaging`, `cassandra`, …) must be
-   either a key the pinned package declares or one this catalog marks as
-   SDK-owned. Anything else is rejected: resolve the key with the
+   a key the pinned package declares, a key it builds from a prefix and a
+   caller-supplied name (`db.operation.parameter.<key>`,
+   `http.request.header.<key>` and the other helpers of that shape, which have
+   no constant per key), or one this catalog marks as SDK-owned. Anything else
+   is rejected: resolve the key with the
    [`verify-semconv-attributes`](../.agents/skills/verify-semconv-attributes/SKILL.md)
    skill. A metric name, a span name or any other string outside a key
    position is not checked, and neither is a key in a namespace the pinned

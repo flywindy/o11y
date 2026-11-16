@@ -38,6 +38,11 @@ adopters can plan their upgrades.
     follow that convention.
   - A pinned key assembled from parts (`"service." + "namespace"`) is
     reported as well; no literal equals it, so the existing rule missed it.
+  - A key the pinned package builds from a prefix and a caller-supplied name
+    (`db.operation.parameter.<key>` through `DBOperationParameter`,
+    `http.request.header.<key>`, and the other helpers of that shape) is
+    accepted: the package has no constant per key, so there is nothing to
+    name it through. The prefixes are read from the pinned package too.
   - Nothing in the tree is newly reported. `docs/semconv.md` records the
     check as Enforcement Rule 2; the former rules 2 and 3 are now 3 and 4.
 

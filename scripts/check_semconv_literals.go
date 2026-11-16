@@ -17,6 +17,12 @@
 // and a literal holding one equals nothing. This rule sees them, because "db"
 // is a namespace of the pinned package and neither key is in it.
 //
+// A third kind of key is neither. The pinned package builds some keys from a
+// prefix and a name the caller supplies — DBOperationParameter("limit", v) is
+// "db.operation.parameter.limit" — and declares no constant for any one of
+// them. Such a key is the pinned package's own, so Rule 2 accepts it: the
+// prefixes are read from those helper functions, like everything else here.
+//
 // Rule 2 looks only at attribute-key positions, not at every string. A metric
 // name ("db.client.operation.duration"), a span name and a log message all
 // read like dotted keys and are none of its business. The positions are:
@@ -105,6 +111,10 @@ var skipDirs = map[string]bool{"testdata": true, "vendor": true}
 type catalog struct {
 	// keys are the attribute keys the pinned semconv package declares.
 	keys map[string]bool
+	// templates are the prefixes, each ending in a dot, under which the pinned
+	// package builds a key from a caller-supplied name: "db.operation.parameter."
+	// for DBOperationParameter.
+	templates []string
 	// owned are the keys docs/semconv.md marks as SDK-owned. An entry ending
 	// in ".*" covers every key under that prefix.
 	owned map[string]bool
@@ -149,7 +159,7 @@ func main() {
 // loadCatalog reads the three sets the scan needs: the pinned keys, the
 // attribute-package functions that take one, and the SDK-owned keys.
 func loadCatalog(semconvDoc string) (catalog, error) {
-	keys, err := semconvKeys()
+	keys, templates, err := semconvKeys()
 	if err != nil {
 		return catalog{}, err
 	}
@@ -161,7 +171,7 @@ func loadCatalog(semconvDoc string) (catalog, error) {
 	if err != nil {
 		return catalog{}, err
 	}
-	return catalog{keys: keys, owned: owned, keyFuncs: keyFuncs}, nil
+	return catalog{keys: keys, templates: templates, owned: owned, keyFuncs: keyFuncs}, nil
 }
 
 // packageFiles parses the non-test Go files of the package at importPath, as
@@ -198,13 +208,14 @@ func packageFiles(importPath string) ([]*ast.File, string, error) {
 	return files, dir, nil
 }
 
-// semconvKeys returns every attribute key the pinned semconv package declares.
-func semconvKeys() (map[string]bool, error) {
+// semconvKeys returns every attribute key the pinned semconv package declares,
+// and the prefixes of the keys it builds from a caller-supplied name.
+func semconvKeys() (keys map[string]bool, templates []string, err error) {
 	files, dir, err := packageFiles(semconvPackage)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	keys := map[string]bool{}
+	keys = map[string]bool{}
 	for _, file := range files {
 		ast.Inspect(file, func(node ast.Node) bool {
 			if key, ok := attributeKeyCall(node); ok {
@@ -212,11 +223,69 @@ func semconvKeys() (map[string]bool, error) {
 			}
 			return true
 		})
+		for _, decl := range file.Decls {
+			if prefix, ok := templatePrefix(decl); ok {
+				templates = append(templates, prefix)
+			}
+		}
 	}
 	if len(keys) == 0 {
-		return nil, fmt.Errorf("found no attribute.Key declarations in %s", dir)
+		return nil, nil, fmt.Errorf("found no attribute.Key declarations in %s", dir)
 	}
-	return keys, nil
+	// The pinned package has had these helpers since before v1.39.0; finding
+	// none means their shape changed and every such key would be rejected.
+	if len(templates) == 0 {
+		return nil, nil, fmt.Errorf("found no parameterized key helpers in %s", dir)
+	}
+	slices.Sort(templates)
+	return keys, templates, nil
+}
+
+// templatePrefix reports the key prefix of a helper that builds a key from a
+// name its caller supplies, such as
+//
+//	func DBOperationParameter(key string, val string) attribute.KeyValue {
+//		return attribute.String("db.operation.parameter."+key, val)
+//	}
+//
+// The shape is matched as written in the generated source: one return
+// statement, calling into the attribute package with a string literal ending in
+// a dot concatenated with the function's first parameter.
+func templatePrefix(decl ast.Decl) (string, bool) {
+	fn, ok := decl.(*ast.FuncDecl)
+	if !ok || fn.Recv != nil || fn.Body == nil || len(fn.Body.List) != 1 {
+		return "", false
+	}
+	params := fn.Type.Params
+	if params == nil || len(params.List) == 0 || len(params.List[0].Names) == 0 {
+		return "", false
+	}
+	ret, ok := fn.Body.List[0].(*ast.ReturnStmt)
+	if !ok || len(ret.Results) != 1 {
+		return "", false
+	}
+	call, ok := ret.Results[0].(*ast.CallExpr)
+	if !ok || len(call.Args) == 0 {
+		return "", false
+	}
+	if sel, ok := call.Fun.(*ast.SelectorExpr); !ok {
+		return "", false
+	} else if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "attribute" {
+		return "", false
+	}
+	concat, ok := call.Args[0].(*ast.BinaryExpr)
+	if !ok || concat.Op != token.ADD {
+		return "", false
+	}
+	name, ok := concat.Y.(*ast.Ident)
+	if !ok || name.Name != params.List[0].Names[0].Name {
+		return "", false
+	}
+	prefix, ok := stringLiteral(concat.X)
+	if !ok || !strings.HasSuffix(prefix, ".") {
+		return "", false
+	}
+	return prefix, true
 }
 
 // attributeKeyCall reports the key of an attribute.Key("...") call.
@@ -368,6 +437,18 @@ func (c catalog) isOwned(key string) bool {
 	}
 }
 
+// isTemplated reports whether key is one the pinned package builds from a
+// prefix and a caller-supplied name: the prefix followed by at least one more
+// character.
+func (c catalog) isTemplated(key string) bool {
+	for _, prefix := range c.templates {
+		if len(key) > len(prefix) && strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // unknownNamespace returns the semconv namespace key sits in when the pinned
 // package uses that namespace and declares no such key, and "" otherwise.
 //
@@ -375,7 +456,7 @@ func (c catalog) isOwned(key string) bool {
 // themselves: "db" from "db.system.name". A key with no dot has no namespace.
 func (c catalog) unknownNamespace(key string) string {
 	namespace, _, ok := strings.Cut(key, ".")
-	if !ok || c.keys[key] || c.isOwned(key) {
+	if !ok || c.keys[key] || c.isTemplated(key) || c.isOwned(key) {
 		return ""
 	}
 	for pinned := range c.keys {
@@ -520,16 +601,26 @@ func stringDecls(files []*ast.File) map[string]ast.Expr {
 			if !ok || decl.Tok != token.CONST {
 				return true
 			}
+			// Within one const declaration a spec with no expression list
+			// repeats the previous one, textually (the Go specification,
+			// "Constant declarations"). That is the iota idiom, and it is
+			// just as true of strings: in const ( a = "db.statement"; b ),
+			// b is "db.statement" too.
+			var inherited []ast.Expr
 			for _, spec := range decl.Specs {
 				value, ok := spec.(*ast.ValueSpec)
 				if !ok {
 					continue
 				}
+				values := value.Values
+				if len(values) == 0 {
+					values = inherited
+				} else {
+					inherited = values
+				}
 				for i, name := range value.Names {
-					// A spec with no value of its own repeats the one above
-					// it (the iota form), which is not a string to resolve.
-					if i < len(value.Values) {
-						decls[name.Name] = value.Values[i]
+					if i < len(values) {
+						decls[name.Name] = values[i]
 					}
 				}
 			}

@@ -3,6 +3,8 @@
 package main
 
 import (
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"slices"
@@ -11,7 +13,7 @@ import (
 )
 
 func TestSemconvKeys(t *testing.T) {
-	keys, err := semconvKeys()
+	keys, _, err := semconvKeys()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,6 +33,93 @@ func TestSemconvKeys(t *testing.T) {
 		if keys[key] {
 			t.Errorf("semconvKeys holds %q, which the pinned package does not declare", key)
 		}
+	}
+}
+
+// TestSemconvKeys_Templates pins that the prefixes of the parameterized keys
+// are read from the pinned package's helper functions, and only from those: a
+// helper that returns a fixed key is not a template.
+func TestSemconvKeys_Templates(t *testing.T) {
+	_, templates, err := semconvKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The pinned package has a couple of dozen; a partial read must fail.
+	if len(templates) < 20 {
+		t.Errorf("semconvKeys found %d templates, want a couple of dozen: %q", len(templates), templates)
+	}
+	for _, prefix := range []string{
+		"db.operation.parameter.", "db.query.parameter.",
+		"http.request.header.", "http.response.header.",
+		"k8s.pod.label.", "container.label.", "rpc.request.metadata.",
+	} {
+		if !slices.Contains(templates, prefix) {
+			t.Errorf("semconvKeys is missing the template %q", prefix)
+		}
+	}
+	for _, prefix := range templates {
+		if !strings.HasSuffix(prefix, ".") {
+			t.Errorf("template %q does not end in a dot", prefix)
+		}
+		// DBSystemName(val) returns a fixed key; it must not be read as the
+		// prefix "db.system.name" or anything like it.
+		if strings.HasPrefix("db.system.name", strings.TrimSuffix(prefix, ".")) {
+			t.Errorf("template %q is a fixed key's prefix, not a parameterized one", prefix)
+		}
+	}
+}
+
+// TestTemplatePrefix pins which helper shapes count as a parameterized key, on
+// source written out here so the cases the pinned package does not happen to
+// contain are covered too.
+func TestTemplatePrefix(t *testing.T) {
+	tests := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{
+			name: "a prefix ending in a dot joined to the first parameter",
+			src:  `func DBOperationParameter(key string, val string) attribute.KeyValue { return attribute.String("db.operation.parameter."+key, val) }`,
+			want: "db.operation.parameter.",
+		},
+		{
+			name: "the variadic form",
+			src:  `func HTTPRequestHeader(key string, val ...string) attribute.KeyValue { return attribute.StringSlice("http.request.header."+key, val) }`,
+			want: "http.request.header.",
+		},
+		{
+			name: "a fixed key is not a template",
+			src:  `func DBSystemName(val string) attribute.KeyValue { return attribute.String("db.system.name", val) }`,
+		},
+		{
+			name: "a prefix that does not end in a dot would swallow sibling keys",
+			src:  `func F(key string, val string) attribute.KeyValue { return attribute.String("db.operation"+key, val) }`,
+		},
+		{
+			name: "the name joined on is not the first parameter",
+			src:  `func F(key string, val string) attribute.KeyValue { return attribute.String("db.operation.parameter."+val, key) }`,
+		},
+		{
+			name: "the call is not into the attribute package",
+			src:  `func F(key string, val string) attribute.KeyValue { return other.String("db.operation.parameter."+key, val) }`,
+		},
+		{
+			name: "a method is not a helper",
+			src:  `func (r recv) F(key string, val string) attribute.KeyValue { return attribute.String("db.operation.parameter."+key, val) }`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			file, err := parser.ParseFile(token.NewFileSet(), "x.go", "package x\n\n"+tt.src+"\n", 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, ok := templatePrefix(file.Decls[0])
+			if got != tt.want || ok != (tt.want != "") {
+				t.Errorf("templatePrefix = %q, %v; want %q", got, ok, tt.want)
+			}
+		})
 	}
 }
 
@@ -162,8 +251,9 @@ func testCatalog(t *testing.T) catalog {
 			"cassandra.page.size":        true,
 			"messaging.destination.name": true,
 		},
-		owned:    map[string]bool{"cassandra.query.attempt": true, "db.owned.*": true},
-		keyFuncs: keyFuncs,
+		templates: []string{"db.operation.parameter.", "http.request.header."},
+		owned:     map[string]bool{"cassandra.query.attempt": true, "db.owned.*": true},
+		keyFuncs:  keyFuncs,
 	}
 }
 
@@ -257,6 +347,9 @@ var (
 	list       = []attribute.Key{"service.instance", "db.name"}
 	set        = map[attribute.Key]struct{}{"db.connection_string": {}}
 	byName     = map[string]attribute.Key{"x": "db.redis.database_index"}
+	// Near a template, not under one: the prefix alone, and a misspelt prefix.
+	bare     = attribute.Key("db.operation.parameter")
+	misspelt = attribute.String("db.operation.parameters.limit", "10")
 )
 `,
 	})
@@ -277,13 +370,16 @@ var (
 		`pkg/positions.go:16: "db.name"` + unknown + `"db" namespace it is in`,
 		`pkg/positions.go:17: "db.connection_string"` + unknown + `"db" namespace it is in`,
 		`pkg/positions.go:18: "db.redis.database_index"` + unknown + `"db" namespace it is in`,
+		`pkg/positions.go:20: "db.operation.parameter"` + unknown + `"db" namespace it is in`,
+		`pkg/positions.go:21: "db.operation.parameters.limit"` + unknown + `"db" namespace it is in`,
 	})
 }
 
 // TestScan_ResolvesAKeyThatIsNotWrittenAsALiteral pins that Rule 2 follows a
 // key through the forms that hide it from a literal comparison: a constant, a
 // constant declared in another file of the package, a concatenation, and an
-// import alias for the attribute package. It also pins the assembled form of a
+// import alias for the attribute package, and a constant that inherits the
+// expression of the one declared above it. It also pins the assembled form of a
 // pinned key, which Rule 1 cannot see because no literal equals it — whether it
 // is put together at the call or in a constant the call names.
 func TestScan_ResolvesAKeyThatIsNotWrittenAsALiteral(t *testing.T) {
@@ -298,6 +394,13 @@ const (
 	assembledKey = "service." + "namespace"
 	viaAssembled = assembledKey
 )
+
+// A spec with no expression list repeats the one above it, so both of these
+// are "db.cassandra.table" and "db.cassandra.keyspace".
+const (
+	tableKey, keyspaceKey = "db.cassandra.table", "db.cassandra.keyspace"
+	sameTable, sameKeyspace
+)
 `,
 		"pkg/uses.go": `package pkg
 
@@ -311,6 +414,8 @@ var (
 	assembled  = attr.String("service."+"namespace", "platform")
 	inConst    = attr.String(assembledKey, "platform")
 	twoSteps   = attr.Key(viaAssembled)
+	inherited  = attr.String(sameTable, "users")
+	inherited2 = attr.Key(sameKeyspace)
 )
 `,
 	})
@@ -323,6 +428,8 @@ var (
 		`pkg/uses.go:10: "service.namespace" is a semconv attribute key, assembled from parts`,
 		`pkg/uses.go:11: "service.namespace" is a semconv attribute key, assembled from parts`,
 		`pkg/uses.go:12: "service.namespace" is a semconv attribute key, assembled from parts`,
+		`pkg/uses.go:13: "db.cassandra.table"` + unknown,
+		`pkg/uses.go:14: "db.cassandra.keyspace"` + unknown,
 	})
 }
 
@@ -332,6 +439,8 @@ var (
 //   - an SDK-owned key, by name and under an owned prefix;
 //   - a key in a namespace the pinned package does not use, and one with no
 //     namespace at all;
+//   - a key the pinned package builds from a prefix and a caller-supplied name
+//     (DBOperationParameter, HTTPRequestHeader), for which it has no constant;
 //   - strings that read like keys but are not in a key position: a metric
 //     name, a span name, a log message, an attribute value;
 //   - a pinned key named through its constant;
@@ -362,6 +471,9 @@ func f(meter interface{ Float64Histogram(string) }, tracer interface{ Start(stri
 	_ = attribute.String("object_store.bucket.name", "b")
 	_ = attribute.String("redis.error.kind", "pool_timeout")
 	_ = attribute.String("tenant", "acme")
+	_ = attribute.String("db.operation.parameter.limit", "10")
+	_ = attribute.StringSlice("http.request.header.x-request-id", nil)
+	_ = attribute.NewAllowKeysFilter("db.operation.parameter.offset")
 	_ = attribute.String("app.db.statement", "x")
 	meter.Float64Histogram("db.client.operation.duration")
 	meter.Float64Histogram(metricName)
