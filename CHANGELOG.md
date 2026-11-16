@@ -13,6 +13,34 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+### Changed
+
+- CI gate for `docs/semconv.md` (`make semconv-check`,
+  `scripts/check_semconv_literals.go`): it now also rejects an attribute key
+  that sits in a semconv namespace without being a key of the pinned
+  `semconv/v1.39.0` package. The gate compared string literals against the
+  pinned key set, so a key the pinned package does not declare — a spelling
+  from an earlier semconv version such as `db.statement` or
+  `db.cassandra.table`, or a typo — equalled nothing and passed; that is the
+  mistake Core Principle 5 describes.
+  - Only attribute-key positions are checked (`attribute.Key(k)`, the
+    `attribute.String(k, v)` family, the key filters, declarations typed
+    `attribute.Key`, `attribute.KeyValue{Key: k}`, and `attribute.Key` slices
+    and maps), so metric names, span names and other dotted strings are left
+    alone. A literal, a concatenation and a string constant declared in the
+    same directory are all resolved. The positions are read from the pinned
+    `attribute` package, as the keys are from the pinned semconv package.
+  - A key the SDK defines itself inside a semconv namespace
+    (`cassandra.query.attempt`) is allowed when `docs/semconv.md` marks it:
+    a table row whose last cell begins with `SDK-owned`. The catalog is the
+    allow-list, so there is no second list in the script to keep in step.
+    The `resty.error.kind` and `resty.retry.exhausted` rows were reworded to
+    follow that convention.
+  - A pinned key assembled from parts (`"service." + "namespace"`) is
+    reported as well; no literal equals it, so the existing rule missed it.
+  - Nothing in the tree is newly reported. `docs/semconv.md` records the
+    check as Enforcement Rule 2; the former rules 2 and 3 are now 3 and 4.
+
 ---
 
 ## [0.15.0] - 2026-11-13

@@ -94,7 +94,7 @@ go mod tidy
 
 # Lint
 go vet ./...
-make semconv-check           # semconv attribute keys must use the pinned constants
+make semconv-check           # pinned semconv keys must use the constants; a key in a semconv namespace must be pinned or SDK-owned
 
 # Test
 go test ./...

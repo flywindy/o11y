@@ -129,7 +129,7 @@ lint: adr-check semconv-check ## Run ADR integration gate, semconv literal check
 adr-check: ## Run ADR 0008 integration policy gate
 	$(GO) run ./scripts/check_integrations.go
 
-semconv-check: ## Reject semconv attribute keys written as string literals in SDK code
+semconv-check: ## Reject semconv keys written as literals, and unknown keys in a semconv namespace
 	$(GO) test ./scripts/check_semconv_literals.go ./scripts/check_semconv_literals_test.go
 	$(GO) run ./scripts/check_semconv_literals.go
 

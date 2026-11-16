@@ -35,9 +35,35 @@ inspection. Any exception must be recorded in the integration ADR.
    the pinned package declares. `_test.go` files, the root `examples/`
    directory and generated files are exempt: a test pins the wire string on
    purpose.
-2. **New attribute? Update this catalog.** The PR reviewer checks that this
+2. **A key in a semconv namespace is a pinned key or an SDK-owned one.**
+   Rule 1 cannot see a key the pinned package does not declare — a spelling
+   from an earlier semconv version (`db.statement`, `db.cassandra.table`) or
+   a typo equals no pinned key, so the literal passes. `make semconv-check`
+   therefore also looks at every place an attribute key is written
+   (`attribute.Key(k)`, `attribute.String(k, v)` and the other constructors,
+   the key filters, a declaration typed `attribute.Key`, an
+   `attribute.KeyValue{Key: k}` literal, and `attribute.Key` slices and maps),
+   resolving a literal, a concatenation, or a string constant declared in the
+   same directory. A key found there whose first segment is a namespace the
+   pinned package uses (`db`, `http`, `messaging`, `cassandra`, …) must be
+   either a key the pinned package declares or one this catalog marks as
+   SDK-owned. Anything else is rejected: resolve the key with the
+   [`verify-semconv-attributes`](../.agents/skills/verify-semconv-attributes/SKILL.md)
+   skill. A metric name, a span name or any other string outside a key
+   position is not checked, and neither is a key in a namespace the pinned
+   package does not use (`object_store.*`, `redis.error.kind`). The same
+   exemptions as Rule 1 apply.
+
+   **Marking a key SDK-owned.** The gate reads the allow-list from this file:
+   a table row whose last cell *begins with* `SDK-owned` marks every key in
+   its first cell (`cassandra.query.attempt` in the Cassandra span table, for
+   one). A key the SDK defines inside a semconv namespace therefore needs
+   exactly the row Rule 3 asks for, worded that way, and nothing in the
+   script. "SDK-owned" later in a cell does not count; it also describes
+   wrappers and instruments in rows about semconv keys.
+3. **New attribute? Update this catalog.** The PR reviewer checks that this
    file lists any new key introduced in the diff.
-3. **Deviations require explicit justification** in the "Deviations"
+4. **Deviations require explicit justification** in the "Deviations"
    section below. The default answer is "no deviation".
 
 ---
@@ -141,8 +167,8 @@ Histogram boundaries use the SDK's configured latency buckets.
 | `http.request.resend_count` | int | Resty spans only; emitted on retry attempts after the first attempt. |
 | `url.full` | string | Emitted by both facades, redacted differently. **`http`**: otelhttp strips the URL's userinfo and records everything else, query string included. **`resty`**: userinfo is replaced by `redacted` and the values of `AWSAccessKeyId`, `Signature`, `sig` and `X-Goog-Signature` by `[redacted]`, per semconv v1.39.0; parameter order and escaping are otherwise preserved, so the attribute still matches the upstream's access log, and a URL whose credentials cannot be accounted for (an opaque one such as `http:user:pass@host`) is replaced wholesale. Any other secret a caller puts in a URL is still recorded by either facade. |
 | `error.type` | string | Error-path metric label and span attribute. |
-| `resty.error.kind` | string | Resty spans only; SDK-owned closed enum: `client_canceled`, `client_timeout`, `server_timeout`, `tls`, `transport`, `protocol`, `unknown`. |
-| `resty.retry.exhausted` | bool | Resty spans only; set on the last failed attempt when resty's retry budget is exhausted. |
+| `resty.error.kind` | string | SDK-owned closed enum, Resty spans only: `client_canceled`, `client_timeout`, `server_timeout`, `tls`, `transport`, `protocol`, `unknown`. |
+| `resty.retry.exhausted` | bool | SDK-owned, Resty spans only: set on the last failed attempt when resty's retry budget is exhausted. |
 | `server.address` | string | Upstream host. |
 | `server.port` | int | Upstream port. |
 
