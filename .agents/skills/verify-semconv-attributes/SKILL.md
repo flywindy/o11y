@@ -35,16 +35,27 @@ disagree, that is its own bug (see ADR 0006).
 
 ### 2. Resolve the EXACT key from the pinned package source (offline, deterministic)
 
-The package is in the Go module cache. Grep the literal — do not paraphrase it:
+The package is in the Go module cache. Ask the go tool where — run this from
+inside the repository, so the answer follows the `go.mod` pin — and grep the
+literal; do not paraphrase it:
 
 ```bash
 SEMV=v1.39.0
-SRC=$(find "$(go env GOMODCACHE)" -path "*otel/semconv/$SEMV/attribute_group.go" | head -1)
+SRC="$(go list -f '{{.Dir}}' "go.opentelemetry.io/otel/semconv/$SEMV")/attribute_group.go"
+test -f "$SRC" || echo "not found: $SRC"   # must print nothing before you go on
 # Find every key in a namespace you care about:
 grep -nE 'attribute\.Key\("(cassandra|db\.cassandra|elasticsearch|db\.elasticsearch|db\.)' "$SRC"
 # Or resolve a specific constant by name:
 grep -n 'CassandraConsistencyLevelKey' "$SRC"
 ```
+
+Do not search the module cache by path pattern instead. The package sits under
+the module's versioned directory (`…/go.opentelemetry.io/otel@v1.46.0/semconv/v1.39.0/`),
+so a pattern such as `*otel/semconv/v1.39.0/*` matches nothing, `SRC` comes
+back empty, and the grep that follows fails on an empty file name — which
+reads like "no such key" when it means "no such file". An earlier version of
+this skill did exactly that. If `SRC` does not exist, stop and fix the lookup;
+an empty result is never evidence about a key.
 
 `go doc` also works for browsing the constant names:
 
@@ -95,6 +106,14 @@ Assume any `db.<vendor>.*` key you remember has moved — verify it.
 string. The compiler then guarantees the string; a version bump re-maps it for
 free. String literals are only for the deviations table.
 
+`make semconv-check` enforces this, and Enforcement Rule #2 with it: a key
+written where an attribute key goes, in a namespace the pinned package uses,
+must be a pinned key or one `docs/semconv.md` marks as SDK-owned (a table row
+whose last cell begins with `SDK-owned`). So a legacy or misspelt key such as
+`db.statement` now fails the gate. The gate does not replace this skill: it
+tells you a key is not in the pinned package, not what the right key is, and
+it does not read ADRs, documentation or test files.
+
 ### 5. For T2 facades, separate two different keys
 
 A third-party instrumentation library often **lags** semconv. Track both:
@@ -103,7 +122,13 @@ A third-party instrumentation library often **lags** semconv. Track both:
 - **what the upstream actually emits** (resolve from the upstream source, the
   same way: grep its `attribute.Key("...")`). It is commonly an older spelling
   (e.g. Elastic's transport emits `db.system`, `db.statement`,
-  `db.elasticsearch.path_parts`).
+  `db.elasticsearch.path_parts`). Locate the upstream module the same way,
+  through the go tool rather than a path pattern:
+
+  ```bash
+  UP="$(go list -m -f '{{.Dir}}' github.com/elastic/elastic-transport-go/v8)"
+  grep -rnE 'attribute\.Key\("|"db\.[a-z_.]+"' "$UP" --include='*.go' | grep -v _test.go
+  ```
 
 Pin the **actually emitted** keys with a compatibility test and record the drift
 in the integration ADR + `docs/semconv.md` Deviations. Do not assume the lib
