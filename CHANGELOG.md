@@ -13,8 +13,41 @@ adopters can plan their upgrades.
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **`o11yminio.New` returns an error for a nil tracer provider or meter
+  provider.** It used to replace either with a no-op and return a client that
+  recorded nothing. A service that passes nil now fails at construction with
+  `minio new: tracer provider must not be nil` or `minio new: meter provider
+  must not be nil`. Pass `obs.TracerProvider()` and `obs.MeterProvider()`,
+  which are never nil (they are no-op providers when the signal is disabled).
+  A nil propagator is still accepted; the wrapper does not use it.
+- **`o11yresty.Wrap` / `NewClient` with a nil propagator no longer send
+  `traceparent`.** A nil propagator used to be replaced by W3C Trace Context;
+  it is now replaced by one that writes nothing. A service that relied on
+  that default loses trace propagation on its Resty calls until it passes
+  `obs.Propagator`.
+- **`o11ygin.Middleware`, `o11yhttp.NewServerHandler` and
+  `o11yhttp.NewTransport` with a nil argument no longer use the OpenTelemetry
+  globals.** A service that passed nil and had a global tracer provider, meter
+  provider or propagator installed (by its own `main` or by another library)
+  got spans, metrics and propagation through those globals; it now gets none
+  for the nil argument. Pass the SDK's values explicitly.
+
+Nothing changes for a service that passes `obs.TracerProvider()`,
+`obs.MeterProvider()` and `obs.Propagator`.
+
 ### Changed
 
+- **Breaking** — `minio`: `New` rejects a nil tracer provider or meter
+  provider instead of substituting a no-op, matching `redis.Wrap`,
+  `cassandra.NewSession` and `elasticsearch.NewClient`. A nil propagator stays
+  accepted, and the godoc no longer calls it required: the wrapper never
+  injects trace context toward the storage backend (ADR 0018 §7).
+- `resty`: `Wrap` / `NewClient` replace a nil propagator with an empty one
+  rather than `propagation.TraceContext{}`. The old default sent `traceparent`
+  for a caller who had passed no propagator, and without the baggage the SDK's
+  own propagator carries.
 - CI gate for `docs/semconv.md` (`make semconv-check`,
   `scripts/check_semconv_literals.go`): it now also rejects an attribute key
   that sits in a semconv namespace without being a key of the pinned
@@ -101,6 +134,29 @@ adopters can plan their upgrades.
     client: cannot parse url: …`) needs updating.
   - Other constructor errors (both `Addresses` and `CloudID` set, a malformed
     `CloudID`, the nil-provider errors) are unchanged.
+
+### Fixed
+
+- `gin`, `http`: `o11ygin.Middleware`, `o11yhttp.NewServerHandler` and
+  `o11yhttp.NewTransport` passed a nil tracer provider, meter provider or
+  propagator straight to otelgin / otelhttp, which read a nil as "not set" and
+  fall back to `otel.GetTracerProvider()`, `otel.GetMeterProvider()` and
+  `otel.GetTextMapPropagator()`. A nil argument — an unset struct field, a
+  disabled-signal code path — therefore recorded on whatever was installed
+  process-wide, while the godoc of all three said that never happens. Each nil
+  is now replaced by an implementation that does nothing (a no-op provider, an
+  empty propagator); none of the three has an error to return.
+- One rule now covers a nil tracer provider or meter provider in every
+  integration: a constructor that can return an error rejects it, and one that
+  cannot substitutes a no-op. A nil no longer selects an OpenTelemetry global
+  in any of them.
+- The propagator is not under that rule, and is not uniform. Where it is used
+  and the constructor has no error to return, a nil one becomes an empty
+  propagator (`gin`, `http`, `resty`). `nats` uses it and rejects nil. Two
+  constructors take a propagator they do not use and disagree: `minio.New`
+  accepts nil, and `mongo.Instrument` / `Connect` still reject it (unchanged
+  here; `mongo` keeps the parameter for outbox / envelope helpers it does not
+  have yet). `redis`, `cassandra` and `elasticsearch` take no propagator.
 
 
 ---
