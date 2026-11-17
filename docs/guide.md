@@ -1815,9 +1815,12 @@ client, err := o11yminio.New(
 ```
 
 `New` returns an error when the tracer provider or the meter provider is nil.
-The propagator may be nil: it is accepted so every o11y constructor takes the
-same three values, and is not used, because the wrapper never injects trace
-context toward the store.
+The propagator may be nil. `New` takes one for consistency with the
+integrations that propagate (`http`, `gin`, `resty`, `nats`), so the same
+`obs.Propagator` can be passed along, and does not use it: the wrapper never
+injects trace context toward the store. (`redis`, `cassandra` and
+`elasticsearch` take no propagator at all; `mongo` takes one it does not use
+either, and rejects nil.)
 
 Options:
 

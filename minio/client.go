@@ -70,9 +70,10 @@ type Client struct {
 // tp and mp are required: New returns an error when either is nil, as the
 // other constructors that can return one do (redis, cassandra, elasticsearch),
 // and the wrapper never reads or writes OTel globals (ADR 0003). prop may be
-// nil. It is accepted so application code can pass obs.Propagator to every
-// o11y constructor alike, and is not used: the wrapper never injects trace
-// context toward the storage backend (ADR 0018 §7).
+// nil. It is accepted for consistency with the integrations that propagate
+// (http, gin, resty, nats), so application code can pass obs.Propagator along,
+// and is not used: the wrapper never injects trace context toward the storage
+// backend (ADR 0018 §7).
 func New(
 	endpoint string,
 	minioOpts *miniogo.Options,

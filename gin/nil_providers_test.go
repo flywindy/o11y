@@ -21,12 +21,23 @@ import (
 )
 
 // installRecordingGlobals sets a recording tracer provider, a recording meter
-// provider and the W3C propagator as the OpenTelemetry globals, and restores
-// the previous ones when the test ends.
+// provider and the W3C propagator as the OpenTelemetry globals, and sets the
+// previous values back when the test ends.
+//
+// Setting them back is not a full restore. Before anything is set, each global
+// is OpenTelemetry's default delegating implementation, and the first Set call
+// in a process points that default at the value given, for good. So once this
+// has run, the default — which is what the cleanup puts back — keeps forwarding
+// to the first recorder installed in this test binary. A later test that needs
+// globals nothing has touched cannot get them here; each test that calls this
+// gets fresh recorders, which is all these tests rely on.
 //
 // It stands in for a third-party library that installs globals in the same
-// process. Only test code may do this; SDK code never sets a global (ADR 0003).
-// A test that calls it must not run in parallel.
+// process. Only test code may do this; SDK code never sets a global (ADR 0003),
+// and the gate that enforces it reads every non-test file, internal/testutil
+// included, which is why this helper is repeated in the three test packages
+// that need it instead of living there. A test that calls it must not run in
+// parallel.
 func installRecordingGlobals(t *testing.T) (*tracetest.SpanRecorder, *sdkmetric.ManualReader) {
 	t.Helper()
 	spans := tracetest.NewSpanRecorder()

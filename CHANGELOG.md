@@ -113,9 +113,17 @@ Nothing changes for a service that passes `obs.TracerProvider()`,
   process-wide, while the godoc of all three said that never happens. Each nil
   is now replaced by an implementation that does nothing (a no-op provider, an
   empty propagator); none of the three has an error to return.
-- One rule now covers a nil provider in every integration: a constructor that
-  can return an error rejects it, and one that cannot substitutes a no-op. A
-  nil no longer selects an OpenTelemetry global in any of them.
+- One rule now covers a nil tracer provider or meter provider in every
+  integration: a constructor that can return an error rejects it, and one that
+  cannot substitutes a no-op. A nil no longer selects an OpenTelemetry global
+  in any of them.
+- The propagator is not under that rule, and is not uniform. Where it is used
+  and the constructor has no error to return, a nil one becomes an empty
+  propagator (`gin`, `http`, `resty`). `nats` uses it and rejects nil. Two
+  constructors take a propagator they do not use and disagree: `minio.New`
+  accepts nil, and `mongo.Instrument` / `Connect` still reject it (unchanged
+  here; `mongo` keeps the parameter for outbox / envelope helpers it does not
+  have yet). `redis`, `cassandra` and `elasticsearch` take no propagator.
 
 
 ---
