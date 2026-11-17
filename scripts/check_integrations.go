@@ -372,13 +372,15 @@ func (s scopes) binds(name string, pos token.Pos) bool {
 // fileScopes collects the bindings of file with the scope Go gives each.
 //
 // A package-level declaration covers the file. A receiver, type parameter,
-// parameter or result covers its function. A local var, const, type or :=
-// starts after its own declaration — in "otel := otel.X", the right-hand side
-// still means the import — and runs to the end of the enclosing block or case
-// clause, with or without a label in front of it. A variable declared in the
-// header of an if, for, switch, type switch or range statement, or in a select
-// case, covers that statement or case. Labels and struct fields do not
-// bind ordinary names and are left out.
+// parameter or result covers its function. A local var, const or := starts
+// after its own spec or statement — in "otel := otel.X", the right-hand side
+// still means the import, while in a grouped var a later spec already sees an
+// earlier one — and a local type starts at its name, so it can refer to
+// itself. Each runs to the end of the enclosing block or case clause, with or
+// without a label in front of it. A variable declared in the header of an if,
+// for, switch, type switch or range statement, or in a select case, covers
+// that statement or case. Labels and struct fields do not bind ordinary names
+// and are left out.
 func fileScopes(file *ast.File) scopes {
 	var out scopes
 	add := func(from, to token.Pos, idents ...*ast.Ident) {
@@ -435,8 +437,17 @@ func fileScopes(file *ast.File) scopes {
 			}
 			switch st := stmt.(type) {
 			case *ast.DeclStmt:
-				if gen, ok := st.Decl.(*ast.GenDecl); ok {
-					add(st.End(), end, specNames(gen)...)
+				gen, ok := st.Decl.(*ast.GenDecl)
+				if !ok {
+					break
+				}
+				for _, spec := range gen.Specs {
+					switch sp := spec.(type) {
+					case *ast.ValueSpec:
+						add(sp.End(), end, sp.Names...)
+					case *ast.TypeSpec:
+						add(sp.Name.Pos(), end, sp.Name)
+					}
 				}
 			case *ast.AssignStmt:
 				add(st.End(), end, defined(st)...)

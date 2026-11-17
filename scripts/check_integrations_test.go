@@ -206,6 +206,11 @@ func later() {
 
 var hooks = map[string]any{strings.ToLower("H"): otel.SetErrorHandler}
 
+func sameSpec() {
+	var otel, hooks = 1, map[string]any{strings.ToLower("c"): otel.SetTextMapPropagator}
+	_, _ = otel, hooks
+}
+
 func afterBranch(n int) {
 	switch n {
 	case 1:
@@ -223,7 +228,8 @@ func afterBranch(n int) {
 		"dot.go:9: go.opentelemetry.io/otel.SetLogger",
 		"elsewhere.go:12: go.opentelemetry.io/otel.SetLogger",
 		"elsewhere.go:17: go.opentelemetry.io/otel.SetErrorHandler",
-		"elsewhere.go:25: go.opentelemetry.io/otel.SetMeterProvider",
+		"elsewhere.go:20: go.opentelemetry.io/otel.SetTextMapPropagator",
+		"elsewhere.go:30: go.opentelemetry.io/otel.SetMeterProvider",
 		"otherfile.go:5: go.opentelemetry.io/otel/log/global.SetLoggerProvider",
 		"otherimport.go:9: go.opentelemetry.io/otel.SetErrorHandler",
 	}
@@ -380,6 +386,15 @@ again:
 	_ = map[string]any{strings.ToLower("c"): otel.SetTracerProvider}
 	goto again
 }
+
+// In a grouped declaration, a later spec already sees an earlier one.
+func grouped() {
+	var (
+		otel  = struct{ SetLogger bool }{true}
+		hooks = map[string]any{strings.ToLower("d"): otel.SetLogger}
+	)
+	_ = hooks
+}
 `,
 		"fieldname.go": `package x
 
@@ -406,7 +421,8 @@ import (
 // Under a key the type checker cannot evaluate, each name spelled like a
 // dot-imported setter is declared here, never a reference to the setter: a
 // struct field, an interface method, a parameter of a function type, and
-// locals of a function literal (var, :=, type, range and a label).
+// locals of a function literal (var, :=, type, range and a label), and a
+// local type that refers to itself.
 var _ = map[string]any{
 	strings.ToLower("f"): struct{ SetLogger bool }{SetLogger: true},
 	strings.ToLower("g"): (*interface{ SetErrorHandler(any) })(nil),
@@ -423,6 +439,10 @@ var _ = map[string]any{
 			break SetTracerProvider
 		}
 		_, _, _ = SetMeterProvider, SetTextMapPropagator, SetErrorHandler(0)
+	},
+	strings.ToLower("j"): func() {
+		type SetLogger struct{ next *SetLogger }
+		_ = SetLogger{}
 	},
 }
 
