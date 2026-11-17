@@ -150,7 +150,8 @@ func TestAttributeKeyFuncs(t *testing.T) {
 }
 
 // TestSDKOwnedKeys pins the convention the allow-list is read by: the keys in
-// the first cell of a table row whose last cell begins with "SDK-owned".
+// the first cell of a row whose last cell begins with "SDK-owned", in a table
+// whose first column is headed "Key" — and in no other table.
 func TestSDKOwnedKeys(t *testing.T) {
 	doc := filepath.Join(t.TempDir(), "semconv.md")
 	body := strings.Join([]string{
@@ -166,6 +167,24 @@ func TestSDKOwnedKeys(t *testing.T) {
 		"| `db.operation.name` | string | Low-cardinality operation name. |",
 		"| `messaging.with.pipe` | string | SDK-owned \\| escaped pipe in the last cell. |",
 		"A line that says `db.prose.key` is SDK-owned but is not a table row.",
+		"",
+		"An instrument table. Its names are not attribute keys, however they are marked.",
+		"",
+		"| Name | Kind | Unit | Attributes |",
+		"|---|---|---|---|",
+		"| `cassandra.query.attempts` | Int64Counter | `{attempt}` | SDK-owned name. `db.system.name`. |",
+		"",
+		"A table that lists instruments and attributes together.",
+		"",
+		"| Key family | Source | Reason |",
+		"|---|---|---|",
+		"| `db.family.metric`, `db.family.attribute` | `x` wrapper | SDK-owned names for a signal. |",
+		"",
+		"A second attribute table, after the others, is read again.",
+		"",
+		"| Key | Type | Notes |",
+		"|---|---|---|",
+		"| `db.second.table` | string | SDK-owned. |",
 		"",
 	}, "\n")
 	if err := os.WriteFile(doc, []byte(body), 0o644); err != nil {
@@ -184,6 +203,7 @@ func TestSDKOwnedKeys(t *testing.T) {
 	slices.Sort(got)
 	want := []string{
 		"cassandra.query.attempt",
+		"db.second.table",
 		"db.thing.one",
 		"db.thing.two",
 		"http.owned.bold",
@@ -231,6 +251,48 @@ func TestSDKOwnedKeys_ReadsTheRealCatalog(t *testing.T) {
 			t.Errorf("the catalog marks %q as SDK-owned, which it is not", key)
 		}
 	}
+	// SDK-owned instrument names. The catalog marks them in its instrument
+	// tables with the same words, and they are not attribute keys.
+	for _, name := range []string{"cassandra.query.attempts", "cassandra.connection.attempts", "o11y.export.failures"} {
+		if owned[name] {
+			t.Errorf("the instrument name %q is in the attribute-key allow-list", name)
+		}
+	}
+}
+
+// TestScan_RejectsAnSDKOwnedInstrumentNameAsAnAttributeKey pins, against the
+// real catalog, that an SDK-owned instrument name is not an accepted attribute
+// key.
+//
+// The counter cassandra.query.attempts and the span attribute
+// cassandra.query.attempt are both SDK-owned, both in a pinned namespace, and
+// one letter apart. With instrument rows read into the allow-list, writing the
+// counter's name where the attribute was meant passed the gate, while a less
+// likely slip ("attemps") was caught.
+func TestScan_RejectsAnSDKOwnedInstrumentNameAsAnAttributeKey(t *testing.T) {
+	cat, err := loadCatalog(filepath.Join("..", catalogPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const unknown = ` is not an attribute key of go.opentelemetry.io/otel/semconv/v1.39.0, whose "cassandra" namespace it is in`
+
+	got := scanTree(t, cat, map[string]string{
+		"pkg/attrs.go": `package pkg
+
+import "go.opentelemetry.io/otel/attribute"
+
+var (
+	attribute1 = attribute.Int("cassandra.query.attempt", 1)
+	counter    = attribute.Int("cassandra.query.attempts", 1)
+	counter2   = attribute.Key("cassandra.connection.attempts")
+)
+`,
+	})
+
+	assertFindings(t, got, []string{
+		`pkg/attrs.go:7: "cassandra.query.attempts"` + unknown,
+		`pkg/attrs.go:8: "cassandra.connection.attempts"` + unknown,
+	})
 }
 
 // testCatalog is a small catalog with the pinned attribute package's real key
@@ -241,8 +303,8 @@ func testCatalog(t *testing.T) catalog {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return catalog{
-		keys: map[string]bool{
+	return newCatalog(
+		map[string]bool{
 			"server.address":             true,
 			"service.name":               true,
 			"service.namespace":          true,
@@ -251,10 +313,10 @@ func testCatalog(t *testing.T) catalog {
 			"cassandra.page.size":        true,
 			"messaging.destination.name": true,
 		},
-		templates: []string{"db.operation.parameter.", "http.request.header."},
-		owned:     map[string]bool{"cassandra.query.attempt": true, "db.owned.*": true},
-		keyFuncs:  keyFuncs,
-	}
+		[]string{"db.operation.parameter.", "http.request.header."},
+		map[string]bool{"cassandra.query.attempt": true, "db.owned.*": true},
+		keyFuncs,
+	)
 }
 
 // scanTree writes files under a temporary root and returns the scan's findings

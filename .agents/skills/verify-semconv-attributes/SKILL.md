@@ -108,8 +108,9 @@ free. String literals are only for the deviations table.
 
 `make semconv-check` enforces this, and Enforcement Rule #2 with it: a key
 written where an attribute key goes, in a namespace the pinned package uses,
-must be a pinned key or one `docs/semconv.md` marks as SDK-owned (a table row
-whose last cell begins with `SDK-owned`). So a legacy or misspelt key such as
+must be a pinned key or one `docs/semconv.md` marks as SDK-owned (a row whose
+last cell begins with `SDK-owned`, in a table whose first column is headed
+`Key`). So a legacy or misspelt key such as
 `db.statement` now fails the gate. The gate does not replace this skill: it
 tells you a key is not in the pinned package, not what the right key is, and
 it does not read ADRs, documentation or test files.

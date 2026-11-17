@@ -58,12 +58,20 @@ inspection. Any exception must be recorded in the integration ADR.
    exemptions as Rule 1 apply.
 
    **Marking a key SDK-owned.** The gate reads the allow-list from this file:
-   a table row whose last cell *begins with* `SDK-owned` marks every key in
-   its first cell (`cassandra.query.attempt` in the Cassandra span table, for
-   one). A key the SDK defines inside a semconv namespace therefore needs
-   exactly the row Rule 3 asks for, worded that way, and nothing in the
-   script. "SDK-owned" later in a cell does not count; it also describes
-   wrappers and instruments in rows about semconv keys.
+   in an attribute table — one whose first column is headed `Key` — a row
+   whose last cell *begins with* `SDK-owned` marks every key in its first cell
+   (`cassandra.query.attempt` in the Cassandra span table, for one). A key the
+   SDK defines inside a semconv namespace therefore needs exactly the row
+   Rule 3 asks for, worded that way, and nothing in the script. "SDK-owned"
+   later in a cell does not count; it also describes wrappers and instruments
+   in rows about semconv keys.
+
+   Instrument tables (first column `Name`) and the Deviations table are not
+   read, although they use the same wording for SDK-owned instrument names. An
+   instrument name is not an attribute key, and the two can be one letter
+   apart: `cassandra.query.attempts` is the counter, `cassandra.query.attempt`
+   the span attribute. Keep that column heading when adding a table, or the
+   keys in it will not be recognised.
 3. **New attribute? Update this catalog.** The PR reviewer checks that this
    file lists any new key introduced in the diff.
 4. **Deviations require explicit justification** in the "Deviations"

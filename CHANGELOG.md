@@ -32,7 +32,10 @@ adopters can plan their upgrades.
     `attribute` package, as the keys are from the pinned semconv package.
   - A key the SDK defines itself inside a semconv namespace
     (`cassandra.query.attempt`) is allowed when `docs/semconv.md` marks it:
-    a table row whose last cell begins with `SDK-owned`. The catalog is the
+    a row whose last cell begins with `SDK-owned`, in a table whose first
+    column is headed `Key`. Instrument tables are not read, so an SDK-owned
+    instrument name (`cassandra.query.attempts`) is not accepted where the
+    attribute (`cassandra.query.attempt`) was meant. The catalog is the
     allow-list, so there is no second list in the script to keep in step.
     The `resty.error.kind` and `resty.retry.exhausted` rows were reworded to
     follow that convention.

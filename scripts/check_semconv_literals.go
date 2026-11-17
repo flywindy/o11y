@@ -41,8 +41,13 @@
 // what it was declared with then says nothing about the key. The functions are read from the pinned attribute
 // package, as the keys are from the pinned semconv package.
 //
-// The SDK-owned keys are read from docs/semconv.md, not listed here: a table
-// row whose last cell begins with "SDK-owned" marks the keys in its first cell.
+// The SDK-owned keys are read from docs/semconv.md, not listed here: in a table
+// whose first column is headed "Key", a row whose last cell begins with
+// "SDK-owned" marks the keys in its first cell. Instrument tables (first column
+// "Name") use the same wording for SDK-owned instrument names and are not
+// read: a counter's name is not an attribute key, and the two can differ by
+// one letter (cassandra.query.attempts, the counter, against
+// cassandra.query.attempt, the span attribute).
 // A key the SDK defines in a semconv namespace (cassandra.query.attempt) is
 // documented there already, so the catalog is the allow-list and the two cannot
 // drift apart.
@@ -97,6 +102,10 @@ const catalogPath = "docs/semconv.md"
 // sdkOwnedMarker is how a catalog row says the SDK defines the key itself.
 const sdkOwnedMarker = "SDK-owned"
 
+// keyColumn is the heading of the first column of the catalog's attribute
+// tables. Its instrument tables are headed "Name".
+const keyColumn = "Key"
+
 // lookupTimeout bounds the `go list` subprocess so a stalled module lookup
 // fails with a clear message instead of consuming the whole CI job budget.
 const lookupTimeout = 2 * time.Minute
@@ -111,6 +120,9 @@ var skipDirs = map[string]bool{"testdata": true, "vendor": true}
 type catalog struct {
 	// keys are the attribute keys the pinned semconv package declares.
 	keys map[string]bool
+	// namespaces are the first dot-separated segments of keys: "db" from
+	// "db.system.name". Derived once by newCatalog.
+	namespaces map[string]bool
 	// templates are the prefixes, each ending in a dot, under which the pinned
 	// package builds a key from a caller-supplied name: "db.operation.parameter."
 	// for DBOperationParameter.
@@ -150,8 +162,8 @@ func main() {
 		fmt.Fprintf(os.Stderr,
 			"%d finding(s). A key the pinned package declares is named through the %s constant (docs/semconv.md, Enforcement Rule 1). "+
 				"A key in a semconv namespace that the pinned package does not declare is renamed, removed or misspelt — "+
-				"resolve it with the verify-semconv-attributes skill — or is SDK-owned and needs a row in %s whose description begins with %q (Enforcement Rule 2).\n",
-			len(findings), semconvPackage, catalogPath, sdkOwnedMarker)
+				"resolve it with the verify-semconv-attributes skill — or is SDK-owned and needs a row in an attribute table of %s (first column %q) whose description begins with %q (Enforcement Rule 2).\n",
+			len(findings), semconvPackage, catalogPath, keyColumn, sdkOwnedMarker)
 		os.Exit(1)
 	}
 }
@@ -171,7 +183,18 @@ func loadCatalog(semconvDoc string) (catalog, error) {
 	if err != nil {
 		return catalog{}, err
 	}
-	return catalog{keys: keys, templates: templates, owned: owned, keyFuncs: keyFuncs}, nil
+	return newCatalog(keys, templates, owned, keyFuncs), nil
+}
+
+// newCatalog assembles a catalog and derives the namespace set from its keys.
+func newCatalog(keys map[string]bool, templates []string, owned map[string]bool, keyFuncs map[string]keyArgs) catalog {
+	namespaces := map[string]bool{}
+	for key := range keys {
+		if namespace, _, ok := strings.Cut(key, "."); ok {
+			namespaces[namespace] = true
+		}
+	}
+	return catalog{keys: keys, namespaces: namespaces, templates: templates, owned: owned, keyFuncs: keyFuncs}
 }
 
 // packageFiles parses the non-test Go files of the package at importPath, as
@@ -366,23 +389,42 @@ func keyParams(params []*ast.Field) (keyArgs, bool) {
 // backticked matches one `code span` of a Markdown table cell.
 var backticked = regexp.MustCompile("`([^`]+)`")
 
-// sdkOwnedKeys returns the keys docs/semconv.md marks as SDK-owned: every code
-// span in the first cell of a table row whose last cell begins with
-// "SDK-owned".
+// sdkOwnedKeys returns the attribute keys docs/semconv.md marks as SDK-owned:
+// every code span in the first cell of a row whose last cell begins with
+// "SDK-owned", in a table whose first column is headed "Key".
 //
 // Beginning with it is the convention, not containing it. "SDK-owned" also
 // turns up mid-sentence in rows that are about something else — "emitted by
 // the SDK-owned resty wrapper" describes the wrapper, and the key in that row
 // is a semconv metric name.
+//
+// Only attribute tables are read. The catalog's instrument tables mark an
+// SDK-owned instrument name with the same words, and an instrument name is not
+// an attribute key: taking it for one accepted
+// attribute.Int("cassandra.query.attempts", n), the counter's name where the
+// span attribute cassandra.query.attempt was meant — a one-letter slip, and
+// the kind this gate is for. The Deviations table, headed "Key family", lists
+// instruments and attributes together in one cell and is not read either;
+// every attribute in it has a row of its own in an attribute table.
 func sdkOwnedKeys(path string) (map[string]bool, error) {
 	body, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read the attribute catalog: %w", err)
 	}
 	owned := map[string]bool{}
+	inTable, keyTable := false, false
 	for line := range strings.SplitSeq(string(body), "\n") {
 		cells := tableCells(line)
 		if len(cells) < 2 {
+			inTable = false
+			continue
+		}
+		if !inTable {
+			// The first row of a table is its header.
+			inTable, keyTable = true, cells[0] == keyColumn
+			continue
+		}
+		if !keyTable {
 			continue
 		}
 		// Emphasis around the marker does not change what the row says.
@@ -395,10 +437,11 @@ func sdkOwnedKeys(path string) (map[string]bool, error) {
 		}
 	}
 	// The tree holds SDK-owned keys, so an empty set means the convention was
-	// not found — a reworded table, a moved file — and every such key would be
-	// reported as unknown, or none would if the scan trusted an empty list.
+	// not found — a reworded table, a renamed column, a moved file — and every
+	// such key would be reported as unknown, or none would if the scan trusted
+	// an empty list.
 	if len(owned) == 0 {
-		return nil, fmt.Errorf("%s marks no key as %s: expected table rows whose last cell begins with it", path, sdkOwnedMarker)
+		return nil, fmt.Errorf("%s marks no key as %s: expected rows whose last cell begins with it, in tables whose first column is headed %q", path, sdkOwnedMarker, keyColumn)
 	}
 	return owned, nil
 }
@@ -452,19 +495,15 @@ func (c catalog) isTemplated(key string) bool {
 // unknownNamespace returns the semconv namespace key sits in when the pinned
 // package uses that namespace and declares no such key, and "" otherwise.
 //
-// The namespace is the first dot-separated segment, taken from the pinned keys
-// themselves: "db" from "db.system.name". A key with no dot has no namespace.
+// The namespace is the first dot-separated segment, and the namespaces in use
+// are those of the pinned keys themselves: "db" from "db.system.name". A key
+// with no dot has no namespace.
 func (c catalog) unknownNamespace(key string) string {
 	namespace, _, ok := strings.Cut(key, ".")
-	if !ok || c.keys[key] || c.isTemplated(key) || c.isOwned(key) {
+	if !ok || !c.namespaces[namespace] || c.keys[key] || c.isTemplated(key) || c.isOwned(key) {
 		return ""
 	}
-	for pinned := range c.keys {
-		if strings.HasPrefix(pinned, namespace+".") {
-			return namespace
-		}
-	}
-	return ""
+	return namespace
 }
 
 // scan returns a finding for each string literal under root, in SDK code, that
