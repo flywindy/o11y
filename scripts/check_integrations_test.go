@@ -159,7 +159,9 @@ func f() { defer otel.SetTextMapPropagator(nil) }
 //   - a method, a local function and a local variable with a setter's name;
 //   - the getters, which the gate does not cover;
 //   - a comment and a string that mention one;
-//   - a test file, and directories the gate skips.
+//   - a test file, and directories the gate skips;
+//   - a program under the root examples directory, which is an application and
+//     may set globals as the README shows.
 func TestCheckNoGlobalSetters_IgnoresWhatIsNotASetter(t *testing.T) {
 	root := writeTree(t, map[string]string{
 		"otherpkg.go": `package x
@@ -230,6 +232,16 @@ import "go.opentelemetry.io/otel"
 
 func g() { otel.SetTracerProvider(nil) }
 `,
+		"examples/app/main.go": `package main
+
+import "go.opentelemetry.io/otel"
+
+func main() {
+	otel.SetErrorHandler(nil)
+	otel.SetLogger(nil)
+	otel.SetTracerProvider(nil)
+}
+`,
 		"vendor/v/v.go": `package v
 
 import "go.opentelemetry.io/otel"
@@ -246,6 +258,35 @@ func f() { otel.SetTracerProvider(nil) }
 
 	if got := findings(t, root); len(got) != 0 {
 		t.Errorf("nothing here sets an OpenTelemetry global, got:\n  %s", strings.Join(got, "\n  "))
+	}
+}
+
+// TestCheckNoGlobalSetters_ExemptsOnlyTheRootExamples pins where the examples
+// exemption stops. The directory at the root holds applications. A directory
+// of the same name deeper in the tree is a package of the SDK, and a setter
+// there is reported like any other.
+func TestCheckNoGlobalSetters_ExemptsOnlyTheRootExamples(t *testing.T) {
+	const program = `package main
+
+import "go.opentelemetry.io/otel"
+
+func main() { otel.SetErrorHandler(nil) }
+`
+	root := writeTree(t, map[string]string{
+		"examples/basic/main.go":      program,
+		"examples/main.go":            program,
+		"internal/examples/main.go":   program,
+		"redis/examples/demo/main.go": program,
+	})
+
+	got := findings(t, root)
+
+	want := []string{
+		"internal/examples/main.go:5: go.opentelemetry.io/otel.SetErrorHandler",
+		"redis/examples/demo/main.go:5: go.opentelemetry.io/otel.SetErrorHandler",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }
 

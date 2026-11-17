@@ -79,7 +79,11 @@ adopters can plan their upgrades.
   `otel.SetMeterProvider`, `otel.SetErrorHandler`, `otel.SetLogger` and
   `log/global.SetLoggerProvider` — through an import alias or a dot import,
   and as a bare reference as well as a call. No SDK code called any of them,
-  so nothing changes at run time. The script gains tests, run by the same
+  so nothing changes at run time. The root `examples/` directory is no longer
+  scanned: its programs are applications, which ADR 0003 leaves free to set
+  globals, and the README's recommended wiring
+  (`otel.SetErrorHandler(obs.ErrorHandler())`, `otel.SetLogger(obs.Logr())`)
+  would otherwise fail the gate in an example. The script gains tests, run by the same
   target and workflow step; ADR 0003's Decision section lists the six, and a
   test keeps that list and the gate's identical.
 

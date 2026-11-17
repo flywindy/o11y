@@ -71,8 +71,9 @@ Concretely:
 1. **Direct invocation is forbidden** in any package under
    `github.com/flywindy/o11y/...`. `make adr-check`
    (`scripts/check_integrations.go`, `checkNoGlobalSetters`) rejects a use of
-   any function in the table in a non-test Go file. The table and the gate's
-   list are kept identical by `TestADR0003NamesEveryGatedSetter`.
+   any function in the table in a non-test Go file, outside the root
+   `examples/` directory (see point 3). The table and the gate's list are
+   kept identical by `TestADR0003NamesEveryGatedSetter`.
 2. **Transitive invocation** (calling a third-party constructor that internally
    calls the setters) is equally forbidden. Every third-party instrumentation
    library introduced into this repository must be verified before adoption.
@@ -80,7 +81,10 @@ Concretely:
    if they want. That is an application-level decision outside this SDK's
    scope and is not affected by this ADR. The README shows an application
    installing `sdk.ErrorHandler()` and `sdk.Logr()` this way; the SDK hands
-   those values out and leaves the installing to the application.
+   those values out and leaves the installing to the application. The
+   programs under the root `examples/` directory are applications in this
+   sense, so the gate does not read them: an example that follows the
+   README's wiring has to be able to pass it.
 
 **Amendment (2026-11-15).** This section first named two functions,
 `otel.SetTracerProvider` and `otel.SetTextMapPropagator`. The gate went
@@ -97,6 +101,10 @@ libraries behind the SDK-owned wrappers (`go-redis/v9` v9.9.0, `gocql` v1.7.0,
 versions for a call to any of the six in non-test, non-example code; none has
 one. The gate does not cover reads (`otel.GetTracerProvider()`,
 `global.GetLoggerProvider()`); whether to gate those is a separate decision.
+The root `examples/` directory was in the gate's scope until this amendment.
+No example set a global, so nothing changes for the existing ones; it is
+exempt now because gating `otel.SetErrorHandler` and `otel.SetLogger` would
+otherwise reject the wiring the README recommends to applications.
 
 ---
 

@@ -43,6 +43,10 @@ var globalSetters = map[string][]string{
 	},
 }
 
+// examplesDir holds the runnable examples at the repository root. They are
+// application code, not SDK code.
+const examplesDir = "examples"
+
 // isGlobalSetter reports whether name, declared in the package at pkgPath, is
 // one of globalSetters.
 func isGlobalSetter(pkgPath, name string) bool {
@@ -171,8 +175,15 @@ func adrMentionsPackage(dir string) bool {
 // function of the same name in another package, a method, and a comment or
 // string that mentions one are not reported.
 //
-// Test files are exempt: a test may install a global to prove the SDK does not
-// read it.
+// Two things are exempt. Test files: a test may install a global to prove the
+// SDK does not read it. And the examples directory at the root: its programs
+// are applications, and ADR 0003 leaves an application's main free to set
+// globals — the README's recommended wiring is
+// otel.SetErrorHandler(obs.ErrorHandler()) and otel.SetLogger(obs.Logr()), so
+// an example that follows it must not fail the gate. Only the root directory
+// of that name is exempt; a package elsewhere that happens to be called
+// examples is SDK code like any other. The semconv literal gate draws the same
+// line.
 func checkNoGlobalSetters(root string) []error {
 	var errs []error
 	fset := token.NewFileSet()
@@ -181,7 +192,7 @@ func checkNoGlobalSetters(root string) []error {
 			errs = append(errs, fmt.Errorf("walk %s: %w", path, err))
 			return nil
 		}
-		if d.IsDir() && shouldSkipDir(d.Name()) {
+		if d.IsDir() && (shouldSkipDir(d.Name()) || path == filepath.Join(root, examplesDir)) {
 			return filepath.SkipDir
 		}
 		if d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {

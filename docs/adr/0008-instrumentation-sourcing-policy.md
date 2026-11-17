@@ -231,9 +231,10 @@ the "Implementation note (as shipped)" under responsibility 3 below:
    No `otel.SetTracerProvider` / `otel.SetTextMapPropagator` /
    `otel.SetMeterProvider` / `otel.SetErrorHandler` / `otel.SetLogger` call,
    and no `go.opentelemetry.io/otel/log/global` `SetLoggerProvider` call, may
-   appear in any non-test `.go` file under the module root. This enforces ADR
-   0003 at the source level for our own code; the list is the table in ADR
-   0003's Decision section. *(2026-11-15: this item first listed
+   appear in any non-test `.go` file under the module root, the root
+   `examples/` directory excepted (application code, which ADR 0003 leaves
+   free to set globals). This enforces ADR 0003 at the source level for our
+   own code; the list is the table in ADR 0003's Decision section. *(2026-11-15: this item first listed
    `otel.SetLoggerProvider`, a function the root package does not have, and
    omitted `otel.SetErrorHandler` and `otel.SetLogger`; see the amendment in
    ADR 0003.)*
