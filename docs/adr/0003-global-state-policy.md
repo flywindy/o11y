@@ -94,7 +94,11 @@ fire — the logs global is `go.opentelemetry.io/otel/log/global.SetLoggerProvid
 — and `otel.SetErrorHandler` and `otel.SetLogger`, which are process-wide like
 the rest, were not listed. No SDK code called any of them; the gap was in the
 check. The table above is the full set, and the gate now matches on the pair
-(package path, function name). The adopted third-party modules in the table
+(package path, function name). Each file is type-checked on its own, and
+`go/types` skips some expressions it cannot evaluate there (a map value under
+a key that calls another package, for one); references in those are matched
+from the syntax tree against the file's imports, with a local binding of the
+same name honoured within the scope Go gives it. The adopted third-party modules in the table
 under [Approved integrations](#approved-integrations), and the client
 libraries behind the SDK-owned wrappers (`go-redis/v9` v9.9.0, `gocql` v1.7.0,
 `nats.go` v1.50.0, `mongo-driver/v2` v2.8.1), were searched at their pinned

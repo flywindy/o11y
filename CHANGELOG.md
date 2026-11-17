@@ -134,7 +134,10 @@ Nothing changes for a service that passes `obs.TracerProvider()`,
   `otel.SetTracerProvider`, `otel.SetTextMapPropagator`,
   `otel.SetMeterProvider`, `otel.SetErrorHandler`, `otel.SetLogger` and
   `log/global.SetLoggerProvider` — through an import alias or a dot import,
-  and as a bare reference as well as a call. No SDK code called any of them,
+  and as a bare reference as well as a call, including in an expression the
+  gate's per-file type check skips (a map value under a key it cannot
+  evaluate), where a local binding of the same name is honoured within its Go
+  scope. No SDK code called any of them,
   so nothing changes at run time. The root `examples/` directory is no longer
   scanned: its programs are applications, which ADR 0003 leaves free to set
   globals, and the README's recommended wiring
