@@ -515,7 +515,8 @@ func fileScopes(file *ast.File) scopes {
 }
 
 // receiverTypeParams returns the type parameters a method's receiver declares,
-// T and U in func (p *pair[T, U]) M().
+// T and U in func (p *pair[T, U]) M(), through any parentheses around the
+// receiver type or inside its pointer.
 func receiverTypeParams(recv *ast.FieldList) []*ast.Ident {
 	if recv == nil {
 		return nil
@@ -523,8 +524,15 @@ func receiverTypeParams(recv *ast.FieldList) []*ast.Ident {
 	var ids []*ast.Ident
 	for _, field := range recv.List {
 		typ := field.Type
-		if star, ok := typ.(*ast.StarExpr); ok {
-			typ = star.X
+		for unwrapped := false; !unwrapped; {
+			switch t := typ.(type) {
+			case *ast.ParenExpr:
+				typ = t.X
+			case *ast.StarExpr:
+				typ = t.X
+			default:
+				unwrapped = true
+			}
 		}
 		switch t := typ.(type) {
 		case *ast.IndexExpr:

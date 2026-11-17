@@ -385,6 +385,15 @@ func (p *pair[SetErrorHandler, SetMeterProvider]) get() any {
 	return map[string]any{strings.ToLower("r"): []any{new(SetErrorHandler), new(SetMeterProvider)}}
 }
 
+// Parentheses around the receiver type, or inside a pointer, change nothing.
+func (o (one[SetTextMapPropagator])) id2() any {
+	return map[string]any{strings.ToLower("q"): new(SetTextMapPropagator)}
+}
+
+func (p (*(pair[SetLogger, SetTracerProvider]))) get2() any {
+	return map[string]any{strings.ToLower("s"): []any{new(SetLogger), new(SetTracerProvider)}}
+}
+
 var _ = GetTracerProvider
 `,
 		"branches.go": `package x
