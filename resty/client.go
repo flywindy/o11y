@@ -12,7 +12,8 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
-	tracenoop "go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/flywindy/o11y/internal/providers"
 )
 
 const instrumentationName = "github.com/flywindy/o11y/resty"
@@ -41,6 +42,13 @@ type cleanupArg struct {
 // the first call. Resty v2 keeps hook chains private, so the implementation
 // tracks wrapped client allocations in a weak-reference table and removes stale
 // entries when clients are collected.
+//
+// A nil tp, mp or prop is replaced by one that does nothing: a no-op tracer
+// provider (no client span), a no-op meter provider (no metrics), an empty
+// propagator (no traceparent or baggage header on the outgoing request). Wrap
+// has no error to return, and it never reads the OpenTelemetry globals. Pass
+// obs.TracerProvider(), obs.MeterProvider() and obs.Propagator, which are
+// never nil.
 func Wrap(
 	rc *restyclient.Client,
 	tp trace.TracerProvider,
@@ -51,15 +59,7 @@ func Wrap(
 	if rc == nil {
 		return nil
 	}
-	if tp == nil {
-		tp = tracenoop.NewTracerProvider()
-	}
-	if mp == nil {
-		mp = metricnoop.NewMeterProvider()
-	}
-	if prop == nil {
-		prop = propagation.TraceContext{}
-	}
+	tp, mp, prop = providers.OrNoop(tp, mp, prop)
 
 	key := clientKey(rc)
 	for {
@@ -119,6 +119,7 @@ func Wrap(
 }
 
 // NewClient returns a new Resty client with o11y tracing and metrics installed.
+// A nil tp, mp or prop is handled as Wrap handles it.
 func NewClient(
 	tp trace.TracerProvider,
 	mp metric.MeterProvider,

@@ -20,6 +20,7 @@ import (
 	restyclient "github.com/go-resty/resty/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/codes"
@@ -63,13 +64,56 @@ func TestWrapInjectsTraceContextAndCreatesClientSpan(t *testing.T) {
 	assertNoAttr(t, spans[0], restyErrorKindKey)
 }
 
-func TestWrapNilPropagatorDefaultsToTraceContext(t *testing.T) {
-	tp, mp, _ := testProviders()
-	var traceparent string
-	var baggageHeader string
+// installRecordingGlobals sets a recording tracer provider, a recording meter
+// provider and the W3C propagator as the OpenTelemetry globals, and sets the
+// previous values back when the test ends.
+//
+// Setting them back is not a full restore. Before anything is set, each global
+// is OpenTelemetry's default delegating implementation, and the first Set call
+// in a process points that default at the value given, for good. So once this
+// has run, the default — which is what the cleanup puts back — keeps forwarding
+// to the first recorder installed in this test binary. A later test that needs
+// globals nothing has touched cannot get them here; each test that calls this
+// gets fresh recorders, which is all these tests rely on.
+//
+// It stands in for a third-party library that installs globals in the same
+// process. Only test code may do this; SDK code never sets a global (ADR 0003),
+// and the gate that enforces it reads every non-test file, internal/testutil
+// included, which is why this helper is repeated in the three test packages
+// that need it instead of living there. A test that calls it must not run in
+// parallel.
+func installRecordingGlobals(t *testing.T) (*tracetest.SpanRecorder, *sdkmetric.ManualReader) {
+	t.Helper()
+	spans := tracetest.NewSpanRecorder()
+	reader := sdkmetric.NewManualReader()
+	prevTP, prevMP, prevProp := otel.GetTracerProvider(), otel.GetMeterProvider(), otel.GetTextMapPropagator()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithSpanProcessor(spans),
+	))
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() {
+		otel.SetTracerProvider(prevTP)
+		otel.SetMeterProvider(prevMP)
+		otel.SetTextMapPropagator(prevProp)
+	})
+	return spans, reader
+}
+
+// TestWrapNilPropagatorInjectsNothing pins that a nil propagator means no
+// propagation, not W3C Trace Context.
+//
+// Wrap used to substitute propagation.TraceContext{} for a nil propagator, so
+// a caller who passed none still sent traceparent to the server — and, unlike
+// the SDK's own propagator, without baggage. The client span is still recorded
+// on the provider that was passed.
+func TestWrapNilPropagatorInjectsNothing(t *testing.T) {
+	globalSpans, _ := installRecordingGlobals(t)
+	tp, mp, sr := testProviders()
+	var sent http.Header
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		traceparent = r.Header.Get("traceparent")
-		baggageHeader = r.Header.Get("baggage")
+		sent = r.Header.Clone()
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer ts.Close()
@@ -87,9 +131,42 @@ func TestWrapNilPropagatorDefaultsToTraceContext(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode())
 
-	parts := traceparentParts(t, traceparent)
-	assert.Equal(t, parent.SpanContext().TraceID().String(), parts.traceID)
-	assert.Empty(t, baggageHeader)
+	assert.Empty(t, sent.Get("traceparent"), "no propagator was given, so no trace header is written")
+	assert.Empty(t, sent.Get("baggage"))
+	require.Len(t, endedClientSpans(sr), 1, "the client span is still recorded on the provider that was passed")
+	assert.Empty(t, globalSpans.Started(), "and nothing is started on the global tracer provider")
+}
+
+// TestWrapNilProvidersNeverUseTheGlobals pins that a nil tracer provider,
+// meter provider or propagator is replaced by one that does nothing, with
+// another library's globals installed in the same process.
+func TestWrapNilProvidersNeverUseTheGlobals(t *testing.T) {
+	globalSpans, globalReader := installRecordingGlobals(t)
+	var sent http.Header
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sent = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	// The caller is inside a sampled span, so a propagator that was consulted
+	// would have something to write.
+	ctx := trace.ContextWithSpanContext(context.Background(), trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    trace.TraceID{1},
+		SpanID:     trace.SpanID{2},
+		TraceFlags: trace.FlagsSampled,
+	}))
+
+	client := NewClient(nil, nil, nil)
+	resp, err := client.R().SetContext(ctx).Get(ts.URL)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode())
+
+	assert.Empty(t, sent.Get("traceparent"), "the global propagator must not write a header")
+	assert.Empty(t, globalSpans.Started(), "no span may be started on the global tracer provider")
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, globalReader.Collect(context.Background(), &rm))
+	assert.Empty(t, rm.ScopeMetrics, "no instrument may be created on the global meter provider")
 }
 
 func TestWrapRecordsComposedRestyURL(t *testing.T) {
