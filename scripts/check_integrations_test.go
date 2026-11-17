@@ -188,6 +188,18 @@ var viaDot = map[string]any{strings.ToUpper("l"): SetLogger}
 `,
 		// A binding of the same name in a scope that does not enclose the
 		// reference says nothing about it: here the reference means the import.
+		"generic.go": `package x
+
+import (
+	"strings"
+
+	. "go.opentelemetry.io/otel"
+)
+
+type box[SetErrorHandler any] struct{ Value SetErrorHandler }
+
+var _ = map[string]any{strings.ToLower("g"): SetErrorHandler}
+`,
 		"elsewhere.go": `package x
 
 import (
@@ -230,6 +242,7 @@ func afterBranch(n int) {
 		"elsewhere.go:17: go.opentelemetry.io/otel.SetErrorHandler",
 		"elsewhere.go:20: go.opentelemetry.io/otel.SetTextMapPropagator",
 		"elsewhere.go:30: go.opentelemetry.io/otel.SetMeterProvider",
+		"generic.go:11: go.opentelemetry.io/otel.SetErrorHandler",
 		"otherfile.go:5: go.opentelemetry.io/otel/log/global.SetLoggerProvider",
 		"otherimport.go:9: go.opentelemetry.io/otel.SetErrorHandler",
 	}
@@ -356,6 +369,22 @@ func g[SetLogger any]() any {
 	return map[string]any{strings.ToLower("t"): new(SetLogger)}
 }
 
+type pair[A, B any] struct {
+	a A
+	b B
+}
+
+// So does a type parameter that a method's receiver declares.
+type one[A any] struct{ a A }
+
+func (o one[SetTracerProvider]) id() any {
+	return map[string]any{strings.ToLower("o"): new(SetTracerProvider)}
+}
+
+func (p *pair[SetErrorHandler, SetMeterProvider]) get() any {
+	return map[string]any{strings.ToLower("r"): []any{new(SetErrorHandler), new(SetMeterProvider)}}
+}
+
 var _ = GetTracerProvider
 `,
 		"branches.go": `package x
@@ -421,8 +450,8 @@ import (
 // Under a key the type checker cannot evaluate, each name spelled like a
 // dot-imported setter is declared here, never a reference to the setter: a
 // struct field, an interface method, a parameter of a function type, and
-// locals of a function literal (var, :=, type, range and a label), and a
-// local type that refers to itself.
+// locals of a function literal (var, :=, type, range and a label), a local
+// type that refers to itself, and a type parameter of a local generic type.
 var _ = map[string]any{
 	strings.ToLower("f"): struct{ SetLogger bool }{SetLogger: true},
 	strings.ToLower("g"): (*interface{ SetErrorHandler(any) })(nil),
@@ -443,6 +472,10 @@ var _ = map[string]any{
 	strings.ToLower("j"): func() {
 		type SetLogger struct{ next *SetLogger }
 		_ = SetLogger{}
+	},
+	strings.ToLower("k"): func() {
+		type box[SetLogger any] struct{ Value SetLogger }
+		_ = box[int]{}
 	},
 }
 

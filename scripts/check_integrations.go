@@ -371,8 +371,10 @@ func (s scopes) binds(name string, pos token.Pos) bool {
 
 // fileScopes collects the bindings of file with the scope Go gives each.
 //
-// A package-level declaration covers the file. A receiver, type parameter,
-// parameter or result covers its function. A local var, const or := starts
+// A package-level declaration covers the file. A receiver, type parameter
+// (including one the receiver declares), parameter or result covers its
+// function, and a type parameter of a generic
+// type covers that type's spec. A local var, const or := starts
 // after its own spec or statement — in "otel := otel.X", the right-hand side
 // still means the import, while in a grouped var a later spec already sees an
 // earlier one — and a local type starts at its name, so it can refer to
@@ -471,6 +473,9 @@ func fileScopes(file *ast.File) scopes {
 		switch n := node.(type) {
 		case *ast.FuncDecl:
 			add(n.Type.Pos(), n.End(), fieldNames(n.Recv, n.Type.TypeParams, n.Type.Params, n.Type.Results)...)
+			add(n.Pos(), n.End(), receiverTypeParams(n.Recv)...)
+		case *ast.TypeSpec:
+			add(n.Name.End(), n.End(), fieldNames(n.TypeParams)...)
 		case *ast.FuncLit:
 			add(n.Pos(), n.End(), fieldNames(n.Type.Params, n.Type.Results)...)
 		case *ast.BlockStmt:
@@ -507,6 +512,28 @@ func fileScopes(file *ast.File) scopes {
 		return true
 	})
 	return out
+}
+
+// receiverTypeParams returns the type parameters a method's receiver declares,
+// T and U in func (p *pair[T, U]) M().
+func receiverTypeParams(recv *ast.FieldList) []*ast.Ident {
+	if recv == nil {
+		return nil
+	}
+	var ids []*ast.Ident
+	for _, field := range recv.List {
+		typ := field.Type
+		if star, ok := typ.(*ast.StarExpr); ok {
+			typ = star.X
+		}
+		switch t := typ.(type) {
+		case *ast.IndexExpr:
+			ids = append(ids, identsOf(t.Index)...)
+		case *ast.IndexListExpr:
+			ids = append(ids, identsOf(t.Indices...)...)
+		}
+	}
+	return ids
 }
 
 // identsOf returns the expressions among exprs that are plain identifiers.
