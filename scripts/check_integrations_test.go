@@ -205,6 +205,15 @@ func later() {
 }
 
 var hooks = map[string]any{strings.ToLower("H"): otel.SetErrorHandler}
+
+func afterBranch(n int) {
+	switch n {
+	case 1:
+		otel := 1
+		_ = otel
+	}
+	_ = map[string]any{strings.ToLower("b"): otel.SetMeterProvider}
+}
 `,
 	})
 
@@ -214,6 +223,7 @@ var hooks = map[string]any{strings.ToLower("H"): otel.SetErrorHandler}
 		"dot.go:9: go.opentelemetry.io/otel.SetLogger",
 		"elsewhere.go:12: go.opentelemetry.io/otel.SetLogger",
 		"elsewhere.go:17: go.opentelemetry.io/otel.SetErrorHandler",
+		"elsewhere.go:25: go.opentelemetry.io/otel.SetMeterProvider",
 		"otherfile.go:5: go.opentelemetry.io/otel/log/global.SetLoggerProvider",
 		"otherimport.go:9: go.opentelemetry.io/otel.SetErrorHandler",
 	}
@@ -325,6 +335,51 @@ func f(otel struct{ SetLogger any }) {
 }
 
 var _ = map[string]any{strings.ToLower("d"): GetLoggerProvider}
+`,
+		"typeparam.go": `package x
+
+import (
+	"strings"
+
+	. "go.opentelemetry.io/otel"
+)
+
+// A type parameter named like a dot-imported setter shadows it in its
+// function.
+func g[SetLogger any]() any {
+	return map[string]any{strings.ToLower("t"): new(SetLogger)}
+}
+
+var _ = GetTracerProvider
+`,
+		"branches.go": `package x
+
+import (
+	"strings"
+
+	"go.opentelemetry.io/otel"
+)
+
+// A local named otel declared in a switch or select branch, or behind a
+// label, shadows the import for the rest of that branch or block.
+func f(n int, ch chan int) {
+	_ = otel.GetTracerProvider
+	switch n {
+	case 1:
+		otel := struct{ SetLogger bool }{true}
+		_ = map[string]any{strings.ToLower("a"): otel.SetLogger}
+	}
+	select {
+	case <-ch:
+		var otel struct{ SetErrorHandler bool }
+		_ = map[string]any{strings.ToLower("b"): otel.SetErrorHandler}
+	default:
+	}
+again:
+	otel := struct{ SetTracerProvider bool }{}
+	_ = map[string]any{strings.ToLower("c"): otel.SetTracerProvider}
+	goto again
+}
 `,
 		"fieldname.go": `package x
 

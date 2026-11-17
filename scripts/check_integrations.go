@@ -371,12 +371,13 @@ func (s scopes) binds(name string, pos token.Pos) bool {
 
 // fileScopes collects the bindings of file with the scope Go gives each.
 //
-// A package-level declaration covers the file. A receiver, parameter or result
-// covers its function. A local var, const, type or := starts after its own
-// declaration — in "otel := otel.X", the right-hand side still means the
-// import — and runs to the end of the enclosing block. A variable declared in
-// the header of an if, for, switch, type switch or range statement, or in a
-// select case, covers that statement or case. Labels and struct fields do not
+// A package-level declaration covers the file. A receiver, type parameter,
+// parameter or result covers its function. A local var, const, type or :=
+// starts after its own declaration — in "otel := otel.X", the right-hand side
+// still means the import — and runs to the end of the enclosing block or case
+// clause, with or without a label in front of it. A variable declared in the
+// header of an if, for, switch, type switch or range statement, or in a select
+// case, covers that statement or case. Labels and struct fields do not
 // bind ordinary names and are left out.
 func fileScopes(file *ast.File) scopes {
 	var out scopes
@@ -421,6 +422,27 @@ func fileScopes(file *ast.File) scopes {
 		}
 		return nil
 	}
+	// locals adds what each statement of a list declares, from the end of
+	// that statement to end: the end of the block or case clause holding it.
+	locals := func(list []ast.Stmt, end token.Pos) {
+		for _, stmt := range list {
+			for {
+				labeled, ok := stmt.(*ast.LabeledStmt)
+				if !ok {
+					break
+				}
+				stmt = labeled.Stmt
+			}
+			switch st := stmt.(type) {
+			case *ast.DeclStmt:
+				if gen, ok := st.Decl.(*ast.GenDecl); ok {
+					add(st.End(), end, specNames(gen)...)
+				}
+			case *ast.AssignStmt:
+				add(st.End(), end, defined(st)...)
+			}
+		}
+	}
 
 	for _, decl := range file.Decls {
 		switch d := decl.(type) {
@@ -437,20 +459,11 @@ func fileScopes(file *ast.File) scopes {
 	ast.Inspect(file, func(node ast.Node) bool {
 		switch n := node.(type) {
 		case *ast.FuncDecl:
-			add(n.Type.Pos(), n.End(), fieldNames(n.Recv, n.Type.Params, n.Type.Results)...)
+			add(n.Type.Pos(), n.End(), fieldNames(n.Recv, n.Type.TypeParams, n.Type.Params, n.Type.Results)...)
 		case *ast.FuncLit:
 			add(n.Pos(), n.End(), fieldNames(n.Type.Params, n.Type.Results)...)
 		case *ast.BlockStmt:
-			for _, stmt := range n.List {
-				switch st := stmt.(type) {
-				case *ast.DeclStmt:
-					if gen, ok := st.Decl.(*ast.GenDecl); ok {
-						add(st.End(), n.End(), specNames(gen)...)
-					}
-				case *ast.AssignStmt:
-					add(st.End(), n.End(), defined(st)...)
-				}
-			}
+			locals(n.List, n.End())
 		case *ast.IfStmt:
 			if n.Init != nil {
 				add(n.Init.End(), n.End(), defined(n.Init)...)
@@ -472,10 +485,13 @@ func fileScopes(file *ast.File) scopes {
 			if n.Tok == token.DEFINE {
 				add(n.X.End(), n.End(), identsOf(n.Key, n.Value)...)
 			}
+		case *ast.CaseClause:
+			locals(n.Body, n.End())
 		case *ast.CommClause:
 			if n.Comm != nil {
 				add(n.Comm.End(), n.End(), defined(n.Comm)...)
 			}
+			locals(n.Body, n.End())
 		}
 		return true
 	})
