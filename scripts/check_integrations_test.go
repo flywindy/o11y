@@ -148,6 +148,56 @@ func f() { defer otel.SetTextMapPropagator(nil) }
 	}
 }
 
+// TestCheckNoGlobalSetters_ReportsWhatTheTypeCheckerSkips pins the setter
+// references found from the syntax tree.
+//
+// Each file is type-checked on its own against empty packages, and go/types
+// does not look inside some expressions it cannot make sense of: a map literal
+// whose key it cannot evaluate has its value skipped. Before the syntax pass, a
+// setter written there was not reported. These are the shapes that do it, by
+// default name, alias and dot import.
+func TestCheckNoGlobalSetters_ReportsWhatTheTypeCheckerSkips(t *testing.T) {
+	root := writeTree(t, map[string]string{
+		"otherimport.go": `package x
+
+import (
+	"strings"
+
+	"go.opentelemetry.io/otel"
+)
+
+var hooks = map[string]any{strings.ToLower("H"): otel.SetErrorHandler}
+`,
+		"otherfile.go": `package x
+
+import g "go.opentelemetry.io/otel/log/global"
+
+var installers = map[string]any{keyDeclaredInAnotherFile: g.SetLoggerProvider}
+`,
+		"dot.go": `package x
+
+import (
+	"strings"
+
+	. "go.opentelemetry.io/otel"
+)
+
+var viaDot = map[string]any{strings.ToUpper("l"): SetLogger}
+`,
+	})
+
+	got := findings(t, root)
+
+	want := []string{
+		"dot.go:9: go.opentelemetry.io/otel.SetLogger",
+		"otherfile.go:5: go.opentelemetry.io/otel/log/global.SetLoggerProvider",
+		"otherimport.go:9: go.opentelemetry.io/otel.SetErrorHandler",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("got:\n  %s\nwant:\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
+	}
+}
+
 // TestCheckNoGlobalSetters_IgnoresWhatIsNotASetter pins the other side. Each
 // file holds something that reads like a forbidden call and is not one:
 //
@@ -159,6 +209,8 @@ func f() { defer otel.SetTextMapPropagator(nil) }
 //   - a method, a local function and a local variable with a setter's name;
 //   - the getters, which the gate does not cover;
 //   - a comment and a string that mention one;
+//   - the same, in an expression the type checker skips (a map value under a
+//     key it cannot evaluate), where only the syntax is there to go on;
 //   - a test file, and directories the gate skips;
 //   - a program under the root examples directory, which is an application and
 //     may set globals as the README shows.
@@ -225,6 +277,44 @@ func f() {
 
 // f does not call otel.SetTracerProvider(tp).
 func f() string { return "otel.SetLogger(l); global.SetLoggerProvider(p)" }
+`,
+		"skipped.go": `package x
+
+import (
+	"strings"
+
+	"go.opentelemetry.io/otel"
+	. "go.opentelemetry.io/otel/log/global"
+)
+
+type hooks struct{ SetLogger any }
+
+// Under a key the type checker cannot evaluate, none of these is a setter:
+// a getter, a local that shadows the package name, a struct field named like
+// a setter, and a local function named like a dot-imported one.
+func SetLoggerProvider(any) {}
+
+func f(otel struct{ SetLogger any }) {
+	_ = map[string]any{strings.ToLower("a"): otel.SetLogger}
+	_ = map[string]any{strings.ToLower("b"): hooks{SetLogger: nil}}
+	_ = map[string]any{strings.ToLower("c"): SetLoggerProvider}
+}
+
+var _ = map[string]any{strings.ToLower("d"): GetLoggerProvider}
+`,
+		"fieldname.go": `package x
+
+import (
+	"strings"
+
+	. "go.opentelemetry.io/otel"
+)
+
+type installers struct{ SetErrorHandler any }
+
+// A struct field that shares a dot-imported setter's name, under a key the
+// type checker cannot evaluate: a field name, not a reference to the setter.
+var _ = map[string]any{strings.ToLower("e"): installers{SetErrorHandler: nil}}
 `,
 		"x_test.go": `package x
 

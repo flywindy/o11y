@@ -9,11 +9,13 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -205,8 +207,9 @@ func checkNoGlobalSetters(root string) []error {
 		}
 		// Uses maps every identifier to what it denotes. For a selector such
 		// as otel.SetTracerProvider that is the Sel identifier, and for a dot
-		// import it is the bare name, so one pass over the map covers both.
-		var uses []*ast.Ident
+		// import it is the bare name, so one pass over the map covers both —
+		// for the expressions the type checker visits.
+		found := map[*ast.Ident]string{}
 		info := typeInfoForFile(fset, file)
 		for ident, obj := range info.Uses {
 			fn, ok := obj.(*types.Func)
@@ -214,16 +217,26 @@ func checkNoGlobalSetters(root string) []error {
 				continue
 			}
 			if isGlobalSetter(fn.Pkg().Path(), fn.Name()) {
-				uses = append(uses, ident)
+				found[ident] = fn.Pkg().Path()
 			}
 		}
+		// It does not visit them all. Checked one file at a time against
+		// empty packages, much of a file fails to type-check, and go/types
+		// gives up on some expressions without looking inside: a map literal
+		// whose key it cannot evaluate — strings.ToLower("k"), or a constant
+		// from another file of the package — has its value skipped, so
+		// otel.SetErrorHandler written there never reaches Uses.
+		// unvisitedSetters reports those from the syntax alone.
+		for ident, pkgPath := range unvisitedSetters(file, info) {
+			found[ident] = pkgPath
+		}
+		idents := slices.Collect(maps.Keys(found))
 		// Map order is random; report in source order.
-		slices.SortFunc(uses, func(a, b *ast.Ident) int { return int(a.Pos() - b.Pos()) })
-		for _, ident := range uses {
-			fn := info.Uses[ident]
+		slices.SortFunc(idents, func(a, b *ast.Ident) int { return int(a.Pos() - b.Pos()) })
+		for _, ident := range idents {
 			errs = append(errs, fmt.Errorf(
 				"%s: forbidden %s.%s: SDK code must not set an OpenTelemetry global (ADR 0003)",
-				fset.Position(ident.Pos()), fn.Pkg().Path(), fn.Name(),
+				fset.Position(ident.Pos()), found[ident], ident.Name,
 			))
 		}
 		return nil
@@ -234,6 +247,135 @@ func checkNoGlobalSetters(root string) []error {
 	return errs
 }
 
+// unvisitedSetters finds setter references in the parts of file the type
+// checker did not visit, from the syntax tree and the file's imports alone.
+//
+// An identifier the type checker reached is in info.Uses or info.Defs, and the
+// main pass has already judged it; only the rest is looked at here. Without
+// type information a name is matched to an import by its spelling, so a name
+// the file also binds itself — a variable called otel, a function called
+// SetLogger — is left alone rather than guessed at. A struct field name in a
+// composite literal (Hooks{SetLogger: …}) is not a reference either.
+func unvisitedSetters(file *ast.File, info *types.Info) map[*ast.Ident]string {
+	imported := map[string]string{} // local name -> import path
+	var dotImported []string
+	for _, spec := range file.Imports {
+		path, err := strconv.Unquote(spec.Path.Value)
+		if err != nil || len(globalSetters[path]) == 0 {
+			continue
+		}
+		switch {
+		case spec.Name == nil:
+			imported[packageName(path)] = path
+		case spec.Name.Name == ".":
+			dotImported = append(dotImported, path)
+		case spec.Name.Name != "_":
+			imported[spec.Name.Name] = path
+		}
+	}
+	if len(imported) == 0 && len(dotImported) == 0 {
+		return nil
+	}
+	bound := localNames(file)
+	visited := func(ident *ast.Ident) bool {
+		_, used := info.Uses[ident]
+		_, defined := info.Defs[ident]
+		return used || defined
+	}
+
+	found := map[*ast.Ident]string{}
+	skip := map[*ast.Ident]bool{} // selector halves and field names
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch n := node.(type) {
+		case *ast.ImportSpec:
+			return false
+		case *ast.SelectorExpr:
+			skip[n.Sel] = true
+			x, ok := n.X.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			skip[x] = true
+			if visited(x) || bound[x.Name] {
+				return true
+			}
+			if path, ok := imported[x.Name]; ok && isGlobalSetter(path, n.Sel.Name) {
+				found[n.Sel] = path
+			}
+		case *ast.CompositeLit:
+			for _, elt := range n.Elts {
+				if kv, ok := elt.(*ast.KeyValueExpr); ok {
+					if key, ok := kv.Key.(*ast.Ident); ok {
+						skip[key] = true
+					}
+				}
+			}
+		case *ast.Ident:
+			if skip[n] || visited(n) || bound[n.Name] {
+				return true
+			}
+			for _, path := range dotImported {
+				if isGlobalSetter(path, n.Name) {
+					found[n] = path
+				}
+			}
+		}
+		return true
+	})
+	return found
+}
+
+// localNames returns every name file declares or binds itself: package-level
+// declarations, receivers, parameters and results, and := and range variables.
+func localNames(file *ast.File) map[string]bool {
+	names := map[string]bool{}
+	add := func(idents ...*ast.Ident) {
+		for _, ident := range idents {
+			if ident != nil && ident.Name != "_" {
+				names[ident.Name] = true
+			}
+		}
+	}
+	addExprs := func(exprs ...ast.Expr) {
+		for _, expr := range exprs {
+			if ident, ok := expr.(*ast.Ident); ok {
+				add(ident)
+			}
+		}
+	}
+	fields := func(list *ast.FieldList) {
+		if list != nil {
+			for _, field := range list.List {
+				add(field.Names...)
+			}
+		}
+	}
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch n := node.(type) {
+		case *ast.ValueSpec:
+			add(n.Names...)
+		case *ast.TypeSpec:
+			add(n.Name)
+		case *ast.FuncDecl:
+			add(n.Name)
+			fields(n.Recv)
+		case *ast.FuncType:
+			fields(n.Params)
+			fields(n.Results)
+		case *ast.AssignStmt:
+			if n.Tok == token.DEFINE {
+				addExprs(n.Lhs...)
+			}
+		case *ast.RangeStmt:
+			if n.Tok == token.DEFINE {
+				addExprs(n.Key, n.Value)
+			}
+		}
+		return true
+	})
+	return names
+}
+
 // typeInfoForFile type-checks one file on its own, far enough to say what each
 // identifier denotes. Errors are discarded: the file is checked without the
 // rest of its package and against policyImporter's empty packages, so most of
@@ -241,6 +383,7 @@ func checkNoGlobalSetters(root string) []error {
 func typeInfoForFile(fset *token.FileSet, file *ast.File) *types.Info {
 	info := &types.Info{
 		Uses: make(map[*ast.Ident]types.Object),
+		Defs: make(map[*ast.Ident]types.Object),
 	}
 	conf := types.Config{
 		Importer: policyImporter{},
