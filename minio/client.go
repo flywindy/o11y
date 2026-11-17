@@ -18,7 +18,6 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 	"go.opentelemetry.io/otel/trace"
-	tracenoop "go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/flywindy/o11y/internal/views"
 )
@@ -68,8 +67,13 @@ type Client struct {
 // New time), so this is the only entry point that can enable the optional
 // HTTP child-span layer (WithHTTPChildSpans).
 //
-// tp, mp, and prop are required and are passed explicitly; the wrapper
-// never reads or writes OTel globals (ADR 0003).
+// tp and mp are required: New returns an error when either is nil, as the
+// other constructors that can return one do (redis, cassandra, elasticsearch),
+// and the wrapper never reads or writes OTel globals (ADR 0003). prop may be
+// nil. It is accepted for consistency with the integrations that propagate
+// (http, gin, resty, nats), so application code can pass obs.Propagator along,
+// and is not used: the wrapper never injects trace context toward the storage
+// backend (ADR 0018 §7).
 func New(
 	endpoint string,
 	minioOpts *miniogo.Options,
@@ -85,15 +89,16 @@ func New(
 		return nil, errors.New("minio new: options must not be nil")
 	}
 	if tp == nil {
-		tp = tracenoop.NewTracerProvider()
+		return nil, errors.New("minio new: tracer provider must not be nil")
 	}
 	if mp == nil {
-		mp = metricnoop.NewMeterProvider()
+		return nil, errors.New("minio new: meter provider must not be nil")
 	}
 	// prop is accepted for API consistency with the other o11y wrappers
 	// but intentionally unused: per ADR 0018 §7 the wrapper never injects
 	// trace context toward the storage backend (the optional HTTP layer
-	// uses its own empty propagator below).
+	// uses its own empty propagator below). A nil one is therefore not an
+	// error — there is nothing it would have been used for.
 	_ = prop
 
 	cfg := newConfig(opts)
