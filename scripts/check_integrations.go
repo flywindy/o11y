@@ -253,9 +253,11 @@ func checkNoGlobalSetters(root string) []error {
 // An identifier the type checker reached is in info.Uses or info.Defs, and the
 // main pass has already judged it; only the rest is looked at here. Without
 // type information a name is matched to an import by its spelling, so a name
-// the file also binds itself — a variable called otel, a function called
-// SetLogger — is left alone rather than guessed at. A struct field name in a
-// composite literal (Hooks{SetLogger: …}) is not a reference either.
+// bound in a scope that encloses the reference — a parameter called otel, a
+// local function value called SetLogger — is left alone, since there it means
+// the local and not the import. A binding in some other scope of the file does
+// not count. A struct field name in a composite literal (Hooks{SetLogger: …})
+// is not a reference either.
 func unvisitedSetters(file *ast.File, info *types.Info) map[*ast.Ident]string {
 	imported := map[string]string{} // local name -> import path
 	var dotImported []string
@@ -276,7 +278,7 @@ func unvisitedSetters(file *ast.File, info *types.Info) map[*ast.Ident]string {
 	if len(imported) == 0 && len(dotImported) == 0 {
 		return nil
 	}
-	bound := localNames(file)
+	scopes := fileScopes(file)
 	visited := func(ident *ast.Ident) bool {
 		_, used := info.Uses[ident]
 		_, defined := info.Defs[ident]
@@ -296,7 +298,7 @@ func unvisitedSetters(file *ast.File, info *types.Info) map[*ast.Ident]string {
 				return true
 			}
 			skip[x] = true
-			if visited(x) || bound[x.Name] {
+			if visited(x) || scopes.binds(x.Name, x.Pos()) {
 				return true
 			}
 			if path, ok := imported[x.Name]; ok && isGlobalSetter(path, n.Sel.Name) {
@@ -311,7 +313,7 @@ func unvisitedSetters(file *ast.File, info *types.Info) map[*ast.Ident]string {
 				}
 			}
 		case *ast.Ident:
-			if skip[n] || visited(n) || bound[n.Name] {
+			if skip[n] || visited(n) || scopes.binds(n.Name, n.Pos()) {
 				return true
 			}
 			for _, path := range dotImported {
@@ -325,55 +327,147 @@ func unvisitedSetters(file *ast.File, info *types.Info) map[*ast.Ident]string {
 	return found
 }
 
-// localNames returns every name file declares or binds itself: package-level
-// declarations, receivers, parameters and results, and := and range variables.
-func localNames(file *ast.File) map[string]bool {
-	names := map[string]bool{}
-	add := func(idents ...*ast.Ident) {
+// scope is a stretch of source in which a set of names is bound.
+type scope struct {
+	from, to token.Pos
+	names    map[string]bool
+}
+
+// scopes are the bindings of one file, each with the stretch of source it
+// covers.
+type scopes []scope
+
+// binds reports whether name is bound by some binding whose scope contains
+// pos.
+func (s scopes) binds(name string, pos token.Pos) bool {
+	for _, sc := range s {
+		if sc.names[name] && sc.from <= pos && pos < sc.to {
+			return true
+		}
+	}
+	return false
+}
+
+// fileScopes collects the bindings of file with the scope Go gives each.
+//
+// A package-level declaration covers the file. A receiver, parameter or result
+// covers its function. A local var, const, type or := starts after its own
+// declaration — in "otel := otel.X", the right-hand side still means the
+// import — and runs to the end of the enclosing block. A variable declared in
+// the header of an if, for, switch, type switch or range statement, or in a
+// select case, covers that statement or case. Labels and struct fields do not
+// bind ordinary names and are left out.
+func fileScopes(file *ast.File) scopes {
+	var out scopes
+	add := func(from, to token.Pos, idents ...*ast.Ident) {
+		names := map[string]bool{}
 		for _, ident := range idents {
 			if ident != nil && ident.Name != "_" {
 				names[ident.Name] = true
 			}
 		}
-	}
-	addExprs := func(exprs ...ast.Expr) {
-		for _, expr := range exprs {
-			if ident, ok := expr.(*ast.Ident); ok {
-				add(ident)
-			}
+		if len(names) > 0 {
+			out = append(out, scope{from: from, to: to, names: names})
 		}
 	}
-	fields := func(list *ast.FieldList) {
-		if list != nil {
-			for _, field := range list.List {
-				add(field.Names...)
+	idents := func(exprs ...ast.Expr) []*ast.Ident {
+		var ids []*ast.Ident
+		for _, expr := range exprs {
+			if ident, ok := expr.(*ast.Ident); ok {
+				ids = append(ids, ident)
+			}
+		}
+		return ids
+	}
+	fieldNames := func(lists ...*ast.FieldList) []*ast.Ident {
+		var ids []*ast.Ident
+		for _, list := range lists {
+			if list != nil {
+				for _, field := range list.List {
+					ids = append(ids, field.Names...)
+				}
+			}
+		}
+		return ids
+	}
+	specNames := func(decl *ast.GenDecl) []*ast.Ident {
+		var ids []*ast.Ident
+		for _, spec := range decl.Specs {
+			switch sp := spec.(type) {
+			case *ast.ValueSpec:
+				ids = append(ids, sp.Names...)
+			case *ast.TypeSpec:
+				ids = append(ids, sp.Name)
+			}
+		}
+		return ids
+	}
+	// defined returns the variables an init statement declares with :=.
+	defined := func(stmt ast.Stmt) []*ast.Ident {
+		if assign, ok := stmt.(*ast.AssignStmt); ok && assign.Tok == token.DEFINE {
+			return idents(assign.Lhs...)
+		}
+		return nil
+	}
+
+	for _, decl := range file.Decls {
+		switch d := decl.(type) {
+		case *ast.GenDecl:
+			if d.Tok != token.IMPORT {
+				add(file.Pos(), file.End(), specNames(d)...)
+			}
+		case *ast.FuncDecl:
+			if d.Recv == nil {
+				add(file.Pos(), file.End(), d.Name)
 			}
 		}
 	}
 	ast.Inspect(file, func(node ast.Node) bool {
 		switch n := node.(type) {
-		case *ast.ValueSpec:
-			add(n.Names...)
-		case *ast.TypeSpec:
-			add(n.Name)
 		case *ast.FuncDecl:
-			add(n.Name)
-			fields(n.Recv)
-		case *ast.FuncType:
-			fields(n.Params)
-			fields(n.Results)
-		case *ast.AssignStmt:
-			if n.Tok == token.DEFINE {
-				addExprs(n.Lhs...)
+			add(n.Type.Pos(), n.End(), fieldNames(n.Recv, n.Type.Params, n.Type.Results)...)
+		case *ast.FuncLit:
+			add(n.Pos(), n.End(), fieldNames(n.Type.Params, n.Type.Results)...)
+		case *ast.BlockStmt:
+			for _, stmt := range n.List {
+				switch st := stmt.(type) {
+				case *ast.DeclStmt:
+					if gen, ok := st.Decl.(*ast.GenDecl); ok {
+						add(st.End(), n.End(), specNames(gen)...)
+					}
+				case *ast.AssignStmt:
+					add(st.End(), n.End(), defined(st)...)
+				}
 			}
+		case *ast.IfStmt:
+			if n.Init != nil {
+				add(n.Init.End(), n.End(), defined(n.Init)...)
+			}
+		case *ast.ForStmt:
+			if n.Init != nil {
+				add(n.Init.End(), n.End(), defined(n.Init)...)
+			}
+		case *ast.SwitchStmt:
+			if n.Init != nil {
+				add(n.Init.End(), n.End(), defined(n.Init)...)
+			}
+		case *ast.TypeSwitchStmt:
+			if n.Init != nil {
+				add(n.Init.End(), n.End(), defined(n.Init)...)
+			}
+			add(n.Assign.End(), n.End(), defined(n.Assign)...)
 		case *ast.RangeStmt:
 			if n.Tok == token.DEFINE {
-				addExprs(n.Key, n.Value)
+				add(n.X.End(), n.End(), idents(n.Key, n.Value)...)
+			}
+		case *ast.CommClause:
+			if n.Comm != nil {
+				add(n.Comm.End(), n.End(), defined(n.Comm)...)
 			}
 		}
 		return true
 	})
-	return names
+	return out
 }
 
 // typeInfoForFile type-checks one file on its own, far enough to say what each

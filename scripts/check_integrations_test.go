@@ -155,7 +155,9 @@ func f() { defer otel.SetTextMapPropagator(nil) }
 // does not look inside some expressions it cannot make sense of: a map literal
 // whose key it cannot evaluate has its value skipped. Before the syntax pass, a
 // setter written there was not reported. These are the shapes that do it, by
-// default name, alias and dot import.
+// default name, alias and dot import — including next to a binding of the same
+// name in a scope that does not reach the reference, and before a local
+// declaration that only takes effect after it.
 func TestCheckNoGlobalSetters_ReportsWhatTheTypeCheckerSkips(t *testing.T) {
 	root := writeTree(t, map[string]string{
 		"otherimport.go": `package x
@@ -184,12 +186,34 @@ import (
 
 var viaDot = map[string]any{strings.ToUpper("l"): SetLogger}
 `,
+		// A binding of the same name in a scope that does not enclose the
+		// reference says nothing about it: here the reference means the import.
+		"elsewhere.go": `package x
+
+import (
+	"strings"
+
+	"go.opentelemetry.io/otel"
+)
+
+func unrelated(otel int) { _ = otel }
+
+func later() {
+	_ = map[string]any{strings.ToLower("a"): otel.SetLogger}
+	otel := 1
+	_ = otel
+}
+
+var hooks = map[string]any{strings.ToLower("H"): otel.SetErrorHandler}
+`,
 	})
 
 	got := findings(t, root)
 
 	want := []string{
 		"dot.go:9: go.opentelemetry.io/otel.SetLogger",
+		"elsewhere.go:12: go.opentelemetry.io/otel.SetLogger",
+		"elsewhere.go:17: go.opentelemetry.io/otel.SetErrorHandler",
 		"otherfile.go:5: go.opentelemetry.io/otel/log/global.SetLoggerProvider",
 		"otherimport.go:9: go.opentelemetry.io/otel.SetErrorHandler",
 	}
