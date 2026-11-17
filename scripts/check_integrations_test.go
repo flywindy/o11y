@@ -340,6 +340,39 @@ type installers struct{ SetErrorHandler any }
 // type checker cannot evaluate: a field name, not a reference to the setter.
 var _ = map[string]any{strings.ToLower("e"): installers{SetErrorHandler: nil}}
 `,
+		"declarations.go": `package x
+
+import (
+	"strings"
+
+	. "go.opentelemetry.io/otel"
+)
+
+// Under a key the type checker cannot evaluate, each name spelled like a
+// dot-imported setter is declared here, never a reference to the setter: a
+// struct field, an interface method, a parameter of a function type, and
+// locals of a function literal (var, :=, type, range and a label).
+var _ = map[string]any{
+	strings.ToLower("f"): struct{ SetLogger bool }{SetLogger: true},
+	strings.ToLower("g"): (*interface{ SetErrorHandler(any) })(nil),
+	strings.ToLower("h"): (func(SetTracerProvider int))(nil),
+	strings.ToLower("i"): func() {
+		var SetMeterProvider = 1
+		SetTextMapPropagator := 2
+		type SetErrorHandler int
+		for SetLogger := range 3 {
+			_ = SetLogger
+		}
+	SetTracerProvider:
+		for {
+			break SetTracerProvider
+		}
+		_, _, _ = SetMeterProvider, SetTextMapPropagator, SetErrorHandler(0)
+	},
+}
+
+var _ = GetTracerProvider
+`,
 		"x_test.go": `package x
 
 import "go.opentelemetry.io/otel"

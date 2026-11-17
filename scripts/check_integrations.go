@@ -256,8 +256,10 @@ func checkNoGlobalSetters(root string) []error {
 // bound in a scope that encloses the reference — a parameter called otel, a
 // local function value called SetLogger — is left alone, since there it means
 // the local and not the import. A binding in some other scope of the file does
-// not count. A struct field name in a composite literal (Hooks{SetLogger: …})
-// is not a reference either.
+// not count. Some names are not references at all and are never reported: a
+// field key in a composite literal (Hooks{SetLogger: …}), a name being
+// declared (a struct field, interface method, parameter, var, const, type, :=
+// or range variable), and a label, which lives in a namespace of its own.
 func unvisitedSetters(file *ast.File, info *types.Info) map[*ast.Ident]string {
 	imported := map[string]string{} // local name -> import path
 	var dotImported []string
@@ -286,7 +288,7 @@ func unvisitedSetters(file *ast.File, info *types.Info) map[*ast.Ident]string {
 	}
 
 	found := map[*ast.Ident]string{}
-	skip := map[*ast.Ident]bool{} // selector halves and field names
+	skip := map[*ast.Ident]bool{} // selector halves and declared names
 	ast.Inspect(file, func(node ast.Node) bool {
 		switch n := node.(type) {
 		case *ast.ImportSpec:
@@ -312,6 +314,25 @@ func unvisitedSetters(file *ast.File, info *types.Info) map[*ast.Ident]string {
 					}
 				}
 			}
+		case *ast.Field:
+			// Struct fields, interface methods, parameters and results.
+			skipAll(skip, n.Names...)
+		case *ast.ValueSpec:
+			skipAll(skip, n.Names...)
+		case *ast.TypeSpec:
+			skipAll(skip, n.Name)
+		case *ast.AssignStmt:
+			if n.Tok == token.DEFINE {
+				skipAll(skip, identsOf(n.Lhs...)...)
+			}
+		case *ast.RangeStmt:
+			if n.Tok == token.DEFINE {
+				skipAll(skip, identsOf(n.Key, n.Value)...)
+			}
+		case *ast.LabeledStmt:
+			skipAll(skip, n.Label)
+		case *ast.BranchStmt:
+			skipAll(skip, n.Label)
 		case *ast.Ident:
 			if skip[n] || visited(n) || scopes.binds(n.Name, n.Pos()) {
 				return true
@@ -370,15 +391,6 @@ func fileScopes(file *ast.File) scopes {
 			out = append(out, scope{from: from, to: to, names: names})
 		}
 	}
-	idents := func(exprs ...ast.Expr) []*ast.Ident {
-		var ids []*ast.Ident
-		for _, expr := range exprs {
-			if ident, ok := expr.(*ast.Ident); ok {
-				ids = append(ids, ident)
-			}
-		}
-		return ids
-	}
 	fieldNames := func(lists ...*ast.FieldList) []*ast.Ident {
 		var ids []*ast.Ident
 		for _, list := range lists {
@@ -405,7 +417,7 @@ func fileScopes(file *ast.File) scopes {
 	// defined returns the variables an init statement declares with :=.
 	defined := func(stmt ast.Stmt) []*ast.Ident {
 		if assign, ok := stmt.(*ast.AssignStmt); ok && assign.Tok == token.DEFINE {
-			return idents(assign.Lhs...)
+			return identsOf(assign.Lhs...)
 		}
 		return nil
 	}
@@ -458,7 +470,7 @@ func fileScopes(file *ast.File) scopes {
 			add(n.Assign.End(), n.End(), defined(n.Assign)...)
 		case *ast.RangeStmt:
 			if n.Tok == token.DEFINE {
-				add(n.X.End(), n.End(), idents(n.Key, n.Value)...)
+				add(n.X.End(), n.End(), identsOf(n.Key, n.Value)...)
 			}
 		case *ast.CommClause:
 			if n.Comm != nil {
@@ -468,6 +480,26 @@ func fileScopes(file *ast.File) scopes {
 		return true
 	})
 	return out
+}
+
+// identsOf returns the expressions among exprs that are plain identifiers.
+func identsOf(exprs ...ast.Expr) []*ast.Ident {
+	var ids []*ast.Ident
+	for _, expr := range exprs {
+		if ident, ok := expr.(*ast.Ident); ok {
+			ids = append(ids, ident)
+		}
+	}
+	return ids
+}
+
+// skipAll marks each non-nil ident in skip.
+func skipAll(skip map[*ast.Ident]bool, idents ...*ast.Ident) {
+	for _, ident := range idents {
+		if ident != nil {
+			skip[ident] = true
+		}
+	}
 }
 
 // typeInfoForFile type-checks one file on its own, far enough to say what each
