@@ -58,15 +58,18 @@ Nothing changes for a service that passes `obs.TracerProvider()`,
   mistake Core Principle 5 describes.
   - Only attribute-key positions are checked (`attribute.Key(k)`, the
     `attribute.String(k, v)` family, the key filters, declarations typed
-    `attribute.Key`, `attribute.KeyValue{Key: k}`, and `attribute.Key` slices
-    and maps), so metric names, span names and other dotted strings are left
-    alone. A literal, a concatenation and a string constant declared in the
-    same directory are all resolved. The positions are read from the pinned
+    `attribute.Key`, `attribute.KeyValue{Key: k}` — also with its type
+    elided in a slice or as a map value — and `attribute.Key` slices and
+    maps, with or without parentheses around the called function), so metric
+    names, span names and other dotted strings are left alone. A literal, a
+    concatenation and a string constant declared in the same directory are
+    all resolved; a variable is not followed. The positions are read from the pinned
     `attribute` package, as the keys are from the pinned semconv package.
   - A key the SDK defines itself inside a semconv namespace
     (`cassandra.query.attempt`) is allowed when `docs/semconv.md` marks it:
     a row whose last cell begins with `SDK-owned`, in a table whose first
-    column is headed `Key`. Instrument tables are not read, so an SDK-owned
+    column is headed `Key`, with the key in backticks. A table inside a
+    fenced code block is not read. Instrument tables are not read either, so an SDK-owned
     instrument name (`cassandra.query.attempts`) is not accepted where the
     attribute (`cassandra.query.attempt`) was meant. The catalog is the
     allow-list, so there is no second list in the script to keep in step.

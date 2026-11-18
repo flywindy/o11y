@@ -32,8 +32,13 @@
 //	                                      package whose first parameter is the key
 //	attribute.NewAllowKeysFilter(k...)    and NewDenyKeysFilter
 //	const k attribute.Key = ...           a declaration typed attribute.Key
-//	attribute.KeyValue{Key: k}            the composite literal
+//	attribute.KeyValue{Key: k}            the composite literal, also with its
+//	                                      type elided in a []attribute.KeyValue
+//	                                      or as a map[T]attribute.KeyValue value
 //	[]attribute.Key{k}, map[attribute.Key]T{k: v}
+//
+// A call is the same call with its function in parentheses,
+// (attribute.String)(k, v).
 //
 // In such a position the key may be a literal, a concatenation of literals, or
 // the name of a string constant declared in the same directory; all three are
@@ -66,8 +71,9 @@
 // a name that is also a parameter or local variable somewhere in the directory,
 // a method argument such as set.Value("k") whose receiver type only a
 // type-checker could name, a file that dot-imports the attribute package or
-// declares something else under the package's name, and a key in a namespace
-// the pinned package does not use at all.
+// declares something else under the package's name (a variable, a parameter,
+// a local type), a string(...) call in a directory that declares its own
+// string, and a key in a namespace the pinned package does not use at all.
 package main
 
 import (
@@ -145,7 +151,7 @@ type keyArgs struct {
 }
 
 func main() {
-	cat, err := loadCatalog(catalogPath)
+	cat, err := loadCatalog(context.Background(), catalogPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "check_semconv_literals:", err)
 		os.Exit(1)
@@ -170,12 +176,12 @@ func main() {
 
 // loadCatalog reads the three sets the scan needs: the pinned keys, the
 // attribute-package functions that take one, and the SDK-owned keys.
-func loadCatalog(semconvDoc string) (catalog, error) {
-	keys, templates, err := semconvKeys()
+func loadCatalog(ctx context.Context, semconvDoc string) (catalog, error) {
+	keys, templates, err := semconvKeys(ctx)
 	if err != nil {
 		return catalog{}, err
 	}
-	keyFuncs, err := attributeKeyFuncs()
+	keyFuncs, err := attributeKeyFuncs(ctx)
 	if err != nil {
 		return catalog{}, err
 	}
@@ -198,9 +204,10 @@ func newCatalog(keys map[string]bool, templates []string, owned map[string]bool,
 }
 
 // packageFiles parses the non-test Go files of the package at importPath, as
-// the build resolves it.
-func packageFiles(importPath string) ([]*ast.File, string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
+// the build resolves it. The go list lookup ends when ctx does, and after
+// lookupTimeout at the latest.
+func packageFiles(ctx context.Context, importPath string) ([]*ast.File, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, lookupTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "go", "list", "-f", "{{.Dir}}", importPath).Output()
 	if err != nil {
@@ -233,8 +240,8 @@ func packageFiles(importPath string) ([]*ast.File, string, error) {
 
 // semconvKeys returns every attribute key the pinned semconv package declares,
 // and the prefixes of the keys it builds from a caller-supplied name.
-func semconvKeys() (keys map[string]bool, templates []string, err error) {
-	files, dir, err := packageFiles(semconvPackage)
+func semconvKeys(ctx context.Context) (keys map[string]bool, templates []string, err error) {
+	files, dir, err := packageFiles(ctx, semconvPackage)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -335,8 +342,8 @@ func attributeKeyCall(node ast.Node) (string, bool) {
 // constructors take a variadic list of Key. Reading them from the source
 // rather than listing them means a constructor a later release adds is covered
 // when the pin moves.
-func attributeKeyFuncs() (map[string]keyArgs, error) {
-	files, dir, err := packageFiles(attributePackage)
+func attributeKeyFuncs(ctx context.Context) (map[string]keyArgs, error) {
+	files, dir, err := packageFiles(ctx, attributePackage)
 	if err != nil {
 		return nil, err
 	}
@@ -406,25 +413,44 @@ var backticked = regexp.MustCompile("`([^`]+)`")
 // the kind this gate is for. The Deviations table, headed "Key family", lists
 // instruments and attributes together in one cell and is not read either;
 // every attribute in it has a row of its own in an attribute table.
+//
+// A table is recognized as GitHub renders one: a header row followed by a
+// delimiter row, with or without outer pipes. A table inside a fenced code
+// block is an example and grants nothing. Only code spans in the first cell
+// are read, so a key is written in backticks.
 func sdkOwnedKeys(path string) (map[string]bool, error) {
 	body, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read the attribute catalog: %w", err)
 	}
 	owned := map[string]bool{}
+	lines := strings.Split(string(body), "\n")
 	inTable, keyTable := false, false
-	for line := range strings.SplitSeq(string(body), "\n") {
+	fence := "" // the fence a code block was opened with, while inside one
+	for i, line := range lines {
+		// A table inside a fenced code block is an example, not the catalog.
+		if marker := fenceMarker(line); fence != "" {
+			if marker != "" && marker[0] == fence[0] && len(marker) >= len(fence) && strings.TrimSpace(line) == marker {
+				fence = ""
+			}
+			continue
+		} else if marker != "" {
+			fence, inTable = marker, false
+			continue
+		}
 		cells := tableCells(line)
 		if len(cells) < 2 {
 			inTable = false
 			continue
 		}
 		if !inTable {
-			// The first row of a table is its header.
-			inTable, keyTable = true, cells[0] == keyColumn
+			// A table is a header row followed by a delimiter row.
+			if i+1 < len(lines) && isDelimiterRow(tableCells(lines[i+1])) {
+				inTable, keyTable = true, cells[0] == keyColumn
+			}
 			continue
 		}
-		if !keyTable {
+		if !keyTable || isDelimiterRow(cells) {
 			continue
 		}
 		// Emphasis around the marker does not change what the row says.
@@ -446,21 +472,54 @@ func sdkOwnedKeys(path string) (map[string]bool, error) {
 	return owned, nil
 }
 
-// tableCells returns the trimmed cells of a Markdown table row, or nil for a
-// line that is not one.
+// tableCells returns the trimmed cells of a line read as a Markdown table row,
+// with or without its outer pipes, or nil for a line with no cell separator.
+// Whether the line is in a table is the caller's question: a table starts with
+// a header row followed by a delimiter row.
 func tableCells(line string) []string {
-	line = strings.TrimSpace(line)
-	if len(line) < 2 || !strings.HasPrefix(line, "|") || !strings.HasSuffix(line, "|") {
-		return nil
-	}
 	// An escaped pipe is cell content, not a separator.
 	const escapedPipe = "\x00"
-	line = strings.ReplaceAll(line[1:len(line)-1], `\|`, escapedPipe)
+	line = strings.ReplaceAll(strings.TrimSpace(line), `\|`, escapedPipe)
+	if !strings.Contains(line, "|") {
+		return nil
+	}
+	line = strings.TrimPrefix(line, "|")
+	line = strings.TrimSuffix(line, "|")
 	cells := strings.Split(line, "|")
 	for i, cell := range cells {
 		cells[i] = strings.TrimSpace(strings.ReplaceAll(cell, escapedPipe, "|"))
 	}
 	return cells
+}
+
+// isDelimiterRow reports whether cells are a table's delimiter row: every cell
+// one or more dashes, optionally colon-aligned.
+func isDelimiterRow(cells []string) bool {
+	if len(cells) == 0 {
+		return false
+	}
+	for _, cell := range cells {
+		if !delimiterCell.MatchString(cell) {
+			return false
+		}
+	}
+	return true
+}
+
+// delimiterCell matches one cell of a table's delimiter row.
+var delimiterCell = regexp.MustCompile(`^:?-+:?$`)
+
+// fenceMarker returns the run of backticks or tildes that opens or closes a
+// fenced code block on line, or "" when line is not a fence.
+func fenceMarker(line string) string {
+	trimmed := strings.TrimSpace(line)
+	for _, char := range []string{"`", "~"} {
+		marker := trimmed[:len(trimmed)-len(strings.TrimLeft(trimmed, char))]
+		if len(marker) >= 3 {
+			return marker
+		}
+	}
+	return ""
 }
 
 // isOwned reports whether key is SDK-owned, by name or under an owned prefix.
@@ -565,7 +624,13 @@ func scanDir(paths []string, cat catalog) ([]string, error) {
 			files = append(files, file)
 		}
 	}
-	consts := stringDecls(files)
+	bound := map[string]int{}
+	for _, file := range files {
+		for name, count := range bindings(file) {
+			bound[name] += count
+		}
+	}
+	res := resolver{decls: stringDecls(files, bound), stringShadowed: bound["string"] > 0}
 
 	var findings []string
 	seen := map[string]bool{}
@@ -593,7 +658,7 @@ func scanDir(paths []string, cat catalog) ([]string, error) {
 		})
 		// Rule 2: a key in a key position.
 		for _, expr := range keyPositions(file, cat.keyFuncs) {
-			value, assembled, ok := stringValue(expr, consts, map[string]bool{})
+			value, assembled, ok := res.stringValue(expr, map[string]bool{})
 			if !ok {
 				continue
 			}
@@ -622,19 +687,16 @@ func scanDir(paths []string, cat catalog) ([]string, error) {
 // before it is used as a key, and reporting what it was declared with would
 // reject correct code.
 //
-// A name bound more than once anywhere in the directory is left out as well:
+// A name bound more than once anywhere in the directory, by bound's count (see
+// bindings), is left out as well:
 // declared twice, or also a variable, a parameter, a := variable or a range
 // variable. Which binding a use refers to is a scoping question this scan does
 // not answer, and guessing could report a key the code never uses — a package
 // constant "name" holding a log message, say, against a function whose
 // parameter is called name.
-func stringDecls(files []*ast.File) map[string]ast.Expr {
+func stringDecls(files []*ast.File, bound map[string]int) map[string]ast.Expr {
 	decls := map[string]ast.Expr{}
-	bound := map[string]int{}
 	for _, file := range files {
-		for name, count := range bindings(file) {
-			bound[name] += count
-		}
 		ast.Inspect(file, func(node ast.Node) bool {
 			decl, ok := node.(*ast.GenDecl)
 			if !ok || decl.Tok != token.CONST {
@@ -674,9 +736,9 @@ func stringDecls(files []*ast.File) map[string]ast.Expr {
 	return decls
 }
 
-// bindings counts how many times each name is bound in file: by a constant or
-// variable declaration, as a receiver, parameter or result, or by := in an
-// assignment or a range clause.
+// bindings counts how many times each name is bound in file: by a constant,
+// variable or type declaration, as a function (not a method), as a receiver,
+// parameter or result, or by := in an assignment or a range clause.
 //
 // It is how the scan knows what it cannot tell without scopes. A name bound
 // once is that binding wherever it is used. A name bound twice may be either.
@@ -705,7 +767,12 @@ func bindings(file *ast.File) map[string]int {
 			for _, name := range n.Names {
 				idents(name)
 			}
+		case *ast.TypeSpec:
+			idents(n.Name)
 		case *ast.FuncDecl:
+			if n.Recv == nil {
+				idents(n.Name)
+			}
 			fields(n.Recv)
 		case *ast.FuncType:
 			fields(n.Params)
@@ -724,6 +791,15 @@ func bindings(file *ast.File) map[string]int {
 	return bound
 }
 
+// resolver tells what string an expression in a key position denotes.
+type resolver struct {
+	// decls are the directory's string constants, by name (see stringDecls).
+	decls map[string]ast.Expr
+	// stringShadowed reports that the directory binds the name string itself,
+	// so string(...) may not be the conversion.
+	stringShadowed bool
+}
+
 // stringValue returns the string an expression in a key position denotes, when
 // that can be told without running the program: a literal, a concatenation, a
 // string(...) conversion of either, or the name of a constant in decls that is
@@ -733,7 +809,7 @@ func bindings(file *ast.File) map[string]int {
 // An attribute.Key(...) conversion is not followed. It is a key position of its
 // own and is checked where it stands, and following every call named Key would
 // also follow ones that are not conversions at all.
-func stringValue(expr ast.Expr, decls map[string]ast.Expr, visiting map[string]bool) (value string, assembled, ok bool) {
+func (r resolver) stringValue(expr ast.Expr, visiting map[string]bool) (value string, assembled, ok bool) {
 	switch e := ast.Unparen(expr).(type) {
 	case *ast.BasicLit:
 		value, ok = stringLiteral(e)
@@ -742,28 +818,29 @@ func stringValue(expr ast.Expr, decls map[string]ast.Expr, visiting map[string]b
 		if e.Op != token.ADD {
 			return "", false, false
 		}
-		left, _, ok := stringValue(e.X, decls, visiting)
+		left, _, ok := r.stringValue(e.X, visiting)
 		if !ok {
 			return "", false, false
 		}
-		right, _, ok := stringValue(e.Y, decls, visiting)
+		right, _, ok := r.stringValue(e.Y, visiting)
 		return left + right, true, ok
 	case *ast.Ident:
-		decl, ok := decls[e.Name]
+		decl, ok := r.decls[e.Name]
 		if !ok || visiting[e.Name] {
 			return "", false, false
 		}
 		visiting[e.Name] = true
 		defer delete(visiting, e.Name)
-		return stringValue(decl, decls, visiting)
+		return r.stringValue(decl, visiting)
 	case *ast.CallExpr:
-		// string(k) converts without changing the text. The name is not
-		// resolved either: a directory that declares its own "string" is not
-		// one this scan needs to understand.
-		if fun, ok := e.Fun.(*ast.Ident); !ok || fun.Name != "string" || len(e.Args) != 1 {
+		// string(k) converts without changing the text — when string is the
+		// predeclared type. A directory that binds the name itself (a local
+		// func called string, say) may mean that instead, and which one a call
+		// refers to is a scoping question, so the call is left unresolved.
+		if fun, ok := ast.Unparen(e.Fun).(*ast.Ident); !ok || fun.Name != "string" || len(e.Args) != 1 || r.stringShadowed {
 			return "", false, false
 		}
-		return stringValue(e.Args[0], decls, visiting)
+		return r.stringValue(e.Args[0], visiting)
 	}
 	return "", false, false
 }
@@ -810,7 +887,8 @@ func keyPositions(file *ast.File, keyFuncs map[string]keyArgs) []ast.Expr {
 	ast.Inspect(file, func(node ast.Node) bool {
 		switch n := node.(type) {
 		case *ast.CallExpr:
-			sel, ok := n.Fun.(*ast.SelectorExpr)
+			// (attribute.String)(k, v) is the same call.
+			sel, ok := ast.Unparen(n.Fun).(*ast.SelectorExpr)
 			if !ok {
 				return true
 			}
@@ -866,8 +944,15 @@ func keyPositions(file *ast.File, keyFuncs map[string]keyArgs) []ast.Expr {
 					if isAttr(t.Key, "Key") {
 						positions = append(positions, kv.Key)
 					}
-					if isAttr(t.Value, "Key") {
+					switch {
+					case isAttr(t.Value, "Key"):
 						positions = append(positions, kv.Value)
+					case isAttr(t.Value, "KeyValue"):
+						// map[string]attribute.KeyValue{"q": {Key: k}}: elided,
+						// as in a slice.
+						if inner, ok := kv.Value.(*ast.CompositeLit); ok && inner.Type == nil {
+							keyValue(inner)
+						}
 					}
 				}
 			}

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"go/parser"
 	"go/token"
 	"os"
@@ -13,7 +14,7 @@ import (
 )
 
 func TestSemconvKeys(t *testing.T) {
-	keys, _, err := semconvKeys()
+	keys, _, err := semconvKeys(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +41,7 @@ func TestSemconvKeys(t *testing.T) {
 // are read from the pinned package's helper functions, and only from those: a
 // helper that returns a fixed key is not a template.
 func TestSemconvKeys_Templates(t *testing.T) {
-	_, templates, err := semconvKeys()
+	_, templates, err := semconvKeys(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +128,7 @@ func TestTemplatePrefix(t *testing.T) {
 // the pinned attribute package: where the key is, and which functions take
 // none.
 func TestAttributeKeyFuncs(t *testing.T) {
-	funcs, err := attributeKeyFuncs()
+	funcs, err := attributeKeyFuncs(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +152,9 @@ func TestAttributeKeyFuncs(t *testing.T) {
 
 // TestSDKOwnedKeys pins the convention the allow-list is read by: the keys in
 // the first cell of a row whose last cell begins with "SDK-owned", in a table
-// whose first column is headed "Key" — and in no other table.
+// whose first column is headed "Key" — and in no other table, nor in one inside
+// a fenced code block. A table is a header row followed by a delimiter row,
+// with or without outer pipes.
 func TestSDKOwnedKeys(t *testing.T) {
 	doc := filepath.Join(t.TempDir(), "semconv.md")
 	body := strings.Join([]string{
@@ -186,6 +189,23 @@ func TestSDKOwnedKeys(t *testing.T) {
 		"|---|---|---|",
 		"| `db.second.table` | string | SDK-owned. |",
 		"",
+		"A table inside a fenced code block is an example, and grants nothing.",
+		"",
+		"```markdown",
+		"| Key | Type | Notes |",
+		"|---|---|---|",
+		"| `db.fenced.key` | string | SDK-owned. |",
+		"```",
+		"",
+		"A table without outer pipes is still a table.",
+		"",
+		"Key | Type | Notes",
+		"--- | --- | ---",
+		"`db.bare.table` | string | SDK-owned.",
+		"",
+		"Key | a prose line with a pipe, not followed by a delimiter row",
+		"`db.not.a.table` | SDK-owned.",
+		"",
 	}, "\n")
 	if err := os.WriteFile(doc, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
@@ -203,6 +223,7 @@ func TestSDKOwnedKeys(t *testing.T) {
 	slices.Sort(got)
 	want := []string{
 		"cassandra.query.attempt",
+		"db.bare.table",
 		"db.second.table",
 		"db.thing.one",
 		"db.thing.two",
@@ -229,6 +250,16 @@ func TestSDKOwnedKeys_FailsWhenTheConventionIsNotFound(t *testing.T) {
 	}
 	if _, err := sdkOwnedKeys(filepath.Join(t.TempDir(), "missing.md")); err == nil {
 		t.Error("sdkOwnedKeys returned no error for a missing catalog")
+	}
+}
+
+// TestLoadCatalog_StopsWithItsContext pins that the package lookups run under
+// the caller's context, so cancelling it ends them.
+func TestLoadCatalog_StopsWithItsContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := loadCatalog(ctx, filepath.Join("..", catalogPath)); err == nil {
+		t.Error("loadCatalog succeeded with a cancelled context")
 	}
 }
 
@@ -270,7 +301,7 @@ func TestSDKOwnedKeys_ReadsTheRealCatalog(t *testing.T) {
 // counter's name where the attribute was meant passed the gate, while a less
 // likely slip ("attemps") was caught.
 func TestScan_RejectsAnSDKOwnedInstrumentNameAsAnAttributeKey(t *testing.T) {
-	cat, err := loadCatalog(filepath.Join("..", catalogPath))
+	cat, err := loadCatalog(t.Context(), filepath.Join("..", catalogPath))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -299,7 +330,7 @@ var (
 // positions, so the scan tests exercise the functions the gate reads.
 func testCatalog(t *testing.T) catalog {
 	t.Helper()
-	keyFuncs, err := attributeKeyFuncs()
+	keyFuncs, err := attributeKeyFuncs(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -312,6 +343,7 @@ func testCatalog(t *testing.T) catalog {
 			"db.query.text":              true,
 			"cassandra.page.size":        true,
 			"messaging.destination.name": true,
+			"http.request.method":        true,
 		},
 		[]string{"db.operation.parameter.", "http.request.header."},
 		map[string]bool{"cassandra.query.attempt": true, "db.owned.*": true},
@@ -412,6 +444,12 @@ var (
 	// Near a template, not under one: the prefix alone, and a misspelt prefix.
 	bare     = attribute.Key("db.operation.parameter")
 	misspelt = attribute.String("db.operation.parameters.limit", "10")
+	// The same call with its function in parentheses.
+	parens = (attribute.String)("db.instance.id", "x")
+	// A KeyValue literal elided as a map value.
+	mapped = map[string]attribute.KeyValue{"q": {Key: "db.cosmosdb.container"}}
+	// In the http namespace, beside the header template but not under it.
+	header = attribute.StringSlice("http.request.headers.x-id", nil)
 )
 `,
 	})
@@ -434,6 +472,9 @@ var (
 		`pkg/positions.go:18: "db.redis.database_index"` + unknown + `"db" namespace it is in`,
 		`pkg/positions.go:20: "db.operation.parameter"` + unknown + `"db" namespace it is in`,
 		`pkg/positions.go:21: "db.operation.parameters.limit"` + unknown + `"db" namespace it is in`,
+		`pkg/positions.go:23: "db.instance.id"` + unknown + `"db" namespace it is in`,
+		`pkg/positions.go:25: "db.cosmosdb.container"` + unknown + `"db" namespace it is in`,
+		`pkg/positions.go:27: "http.request.headers.x-id"` + unknown + `"http" namespace it is in`,
 	})
 }
 
@@ -618,6 +659,35 @@ var attribute fake
 
 var notTheAttributePackage = attribute.Key("db.statement")
 `,
+		// A local type with the package's name hides the import inside its
+		// function: attribute.Key there is a method expression on recorder, and
+		// its argument is the receiver, not a key.
+		"localtype/l.go": `package localtype
+
+import "go.opentelemetry.io/otel/attribute"
+
+var _ attribute.KeyValue
+
+type recorder string
+
+func (recorder) Key() string { return "" }
+
+func local() {
+	type attribute = recorder
+	_ = attribute.Key("db.example_typo")
+}
+`,
+		// A local func called string is not the conversion: the key here is
+		// what it returns, "app.query".
+		"stringfunc/s.go": `package stringfunc
+
+import "go.opentelemetry.io/otel/attribute"
+
+func f() attribute.KeyValue {
+	string := func(_ string) string { return "app.query" }
+	return attribute.String(string("db.example_typo"), "x")
+}
+`,
 	})
 
 	if len(got) != 0 {
@@ -630,7 +700,7 @@ var notTheAttributePackage = attribute.Key("db.statement")
 // here as well means a test run reports the finding next to the tests that
 // explain the rule.
 func TestRepositoryIsClean(t *testing.T) {
-	cat, err := loadCatalog(filepath.Join("..", catalogPath))
+	cat, err := loadCatalog(t.Context(), filepath.Join("..", catalogPath))
 	if err != nil {
 		t.Fatal(err)
 	}

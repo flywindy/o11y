@@ -39,12 +39,15 @@ inspection. Any exception must be recorded in the integration ADR.
    Rule 1 cannot see a key the pinned package does not declare — a spelling
    from an earlier semconv version (`db.statement`, `db.cassandra.table`) or
    a typo equals no pinned key, so the literal passes. `make semconv-check`
-   therefore also looks at every place an attribute key is written
-   (`attribute.Key(k)`, `attribute.String(k, v)` and the other constructors,
-   the key filters, a declaration typed `attribute.Key`, an
-   `attribute.KeyValue{Key: k}` literal, and `attribute.Key` slices and maps),
-   resolving a literal, a concatenation, or a string constant declared in the
-   same directory. A key found there whose first segment is a namespace the
+   therefore also looks at these attribute-key positions: `attribute.Key(k)`,
+   `attribute.String(k, v)` and the other constructors, the key filters, a
+   declaration typed `attribute.Key`, an `attribute.KeyValue{Key: k}` literal
+   (also with its type elided in a slice or as a map value), and
+   `attribute.Key` slices and maps. In those it resolves a literal, a
+   concatenation, or a string constant declared in the same directory. It
+   does not follow a variable, so a key assigned to one — including a later
+   assignment to a variable typed `attribute.Key` — is not checked, and the
+   script header lists the other forms it leaves to review. A key found there whose first segment is a namespace the
    pinned package uses (`db`, `http`, `messaging`, `cassandra`, …) must be
    a key the pinned package declares, a key it builds from a prefix and a
    caller-supplied name (`db.operation.parameter.<key>`,
@@ -59,8 +62,11 @@ inspection. Any exception must be recorded in the integration ADR.
 
    **Marking a key SDK-owned.** The gate reads the allow-list from this file:
    in an attribute table — one whose first column is headed `Key` — a row
-   whose last cell *begins with* `SDK-owned` marks every key in its first cell
-   (`cassandra.query.attempt` in the Cassandra span table, for one). A key the
+   whose last cell *begins with* `SDK-owned` marks every key written in
+   backticks in its first cell (`cassandra.query.attempt` in the Cassandra
+   span table, for one). A key without backticks is not read. A table is a
+   header row followed by a delimiter row, with or without outer pipes; one
+   inside a fenced code block is an example and marks nothing. A key the
    SDK defines inside a semconv namespace therefore needs exactly the row
    Rule 3 asks for, worded that way, and nothing in the script. "SDK-owned"
    later in a cell does not count; it also describes wrappers and instruments
