@@ -41,12 +41,18 @@ literal; do not paraphrase it:
 
 ```bash
 SEMV=v1.39.0
-SRC="$(go list -f '{{.Dir}}' "go.opentelemetry.io/otel/semconv/$SEMV")/attribute_group.go"
-test -f "$SRC" || echo "not found: $SRC"   # must print nothing before you go on
-# Find every key in a namespace you care about:
-grep -nE 'attribute\.Key\("(cassandra|db\.cassandra|elasticsearch|db\.elasticsearch|db\.)' "$SRC"
-# Or resolve a specific constant by name:
-grep -n 'CassandraConsistencyLevelKey' "$SRC"
+DIR="$(go list -f '{{.Dir}}' "go.opentelemetry.io/otel/semconv/$SEMV")"
+SRC="$DIR/attribute_group.go"
+# Search only once the lookup has found the file: a search of nothing finds
+# nothing, and that is not evidence about a key.
+if [ -n "$DIR" ] && [ -f "$SRC" ]; then
+  # Find every key in a namespace you care about:
+  grep -nE 'attribute\.Key\("(cassandra|db\.cassandra|elasticsearch|db\.elasticsearch|db\.)' "$SRC"
+  # Or resolve a specific constant by name:
+  grep -n 'CassandraConsistencyLevelKey' "$SRC"
+else
+  echo "lookup failed: no semconv $SEMV source to search" >&2
+fi
 ```
 
 Do not search the module cache by path pattern instead. The package sits under
@@ -108,9 +114,11 @@ free. String literals are only for the deviations table.
 
 `make semconv-check` enforces this, and Enforcement Rule #2 with it: a key
 written where an attribute key goes, in a namespace the pinned package uses,
-must be a pinned key or one `docs/semconv.md` marks as SDK-owned (a row whose
-last cell begins with `SDK-owned`, in a table whose first column is headed
-`Key`). So a legacy or misspelt key such as
+must be a pinned key, a key the pinned package builds from a prefix and a
+caller-supplied name (`db.operation.parameter.<key>`,
+`http.request.header.<key>` — see Enforcement Rule #2 in `docs/semconv.md`),
+or one `docs/semconv.md` marks as SDK-owned (a row whose last cell begins with
+`SDK-owned`, in a table whose first column is headed `Key`). So a legacy or misspelt key such as
 `db.statement` now fails the gate. The gate does not replace this skill: it
 tells you a key is not in the pinned package, not what the right key is, and
 it does not read ADRs, documentation or test files.
@@ -128,7 +136,11 @@ A third-party instrumentation library often **lags** semconv. Track both:
 
   ```bash
   UP="$(go list -m -f '{{.Dir}}' github.com/elastic/elastic-transport-go/v8)"
-  grep -rnE 'attribute\.Key\("|"db\.[a-z_.]+"' "$UP" --include='*.go' | grep -v _test.go
+  if [ -n "$UP" ] && [ -d "$UP" ]; then
+    grep -rnE 'attribute\.Key\("|"db\.[a-z_.]+"' "$UP" --include='*.go' | grep -v _test.go
+  else
+    echo "lookup failed: no module directory to search" >&2
+  fi
   ```
 
 Pin the **actually emitted** keys with a compatibility test and record the drift
