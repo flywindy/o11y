@@ -157,6 +157,27 @@ Nothing changes for a service that passes `obs.TracerProvider()`,
   accepts nil, and `mongo.Instrument` / `Connect` still reject it (unchanged
   here; `mongo` keeps the parameter for outbox / envelope helpers it does not
   have yet). `redis`, `cassandra` and `elasticsearch` take no propagator.
+- CI gate for ADR 0003 (`make adr-check`, `scripts/check_integrations.go`):
+  the check that SDK code sets no OpenTelemetry global missed three of the six
+  functions that do. It held one list of names and matched it against
+  `go.opentelemetry.io/otel` alone, so its `SetLoggerProvider` entry could
+  never fire (the logs global is `go.opentelemetry.io/otel/log/global`), and
+  `otel.SetErrorHandler` and `otel.SetLogger` were not listed. It now matches
+  on the package path and the function name together, and reports
+  `otel.SetTracerProvider`, `otel.SetTextMapPropagator`,
+  `otel.SetMeterProvider`, `otel.SetErrorHandler`, `otel.SetLogger` and
+  `log/global.SetLoggerProvider` — through an import alias or a dot import,
+  and as a bare reference as well as a call, including in an expression the
+  gate's per-file type check skips (a map value under a key it cannot
+  evaluate), where a local binding of the same name is honoured within its Go
+  scope. No SDK code called any of them,
+  so nothing changes at run time. The root `examples/` directory is no longer
+  scanned: its programs are applications, which ADR 0003 leaves free to set
+  globals, and the README's recommended wiring
+  (`otel.SetErrorHandler(obs.ErrorHandler())`, `otel.SetLogger(obs.Logr())`)
+  would otherwise fail the gate in an example. The script gains tests, run by the same
+  target and workflow step; ADR 0003's Decision section lists the six, and a
+  test keeps that list and the gate's identical.
 
 
 ---

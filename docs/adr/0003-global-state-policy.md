@@ -53,20 +53,62 @@ at the boundary.
 
 ## Decision
 
-**The SDK and every wrapper package it ships must not cause
-`otel.SetTracerProvider` or `otel.SetTextMapPropagator` to be invoked**,
-whether directly or transitively through a third-party constructor.
+**The SDK and every wrapper package it ships must not cause a process-wide
+OpenTelemetry value to be set**, whether directly or transitively through a
+third-party constructor. The functions that set one are:
+
+| Package | Function | What it replaces process-wide |
+|---|---|---|
+| `go.opentelemetry.io/otel` | `otel.SetTracerProvider` | the tracer provider |
+| `go.opentelemetry.io/otel` | `otel.SetTextMapPropagator` | the propagator |
+| `go.opentelemetry.io/otel` | `otel.SetMeterProvider` | the meter provider |
+| `go.opentelemetry.io/otel` | `otel.SetErrorHandler` | the handler for OpenTelemetry's internal errors |
+| `go.opentelemetry.io/otel` | `otel.SetLogger` | the logger for OpenTelemetry's internal messages |
+| `go.opentelemetry.io/otel/log/global` | `global.SetLoggerProvider` | the logger provider |
 
 Concretely:
 
 1. **Direct invocation is forbidden** in any package under
-   `github.com/flywindy/o11y/...`.
+   `github.com/flywindy/o11y/...`. `make adr-check`
+   (`scripts/check_integrations.go`, `checkNoGlobalSetters`) rejects a use of
+   any function in the table in a non-test Go file, outside the root
+   `examples/` directory (see point 3). The table and the gate's list are
+   kept identical by `TestADR0003NamesEveryGatedSetter`.
 2. **Transitive invocation** (calling a third-party constructor that internally
    calls the setters) is equally forbidden. Every third-party instrumentation
    library introduced into this repository must be verified before adoption.
 3. **Application code** (a user's `main()`) may still choose to set globals
    if they want. That is an application-level decision outside this SDK's
-   scope and is not affected by this ADR.
+   scope and is not affected by this ADR. The README shows an application
+   installing `sdk.ErrorHandler()` and `sdk.Logr()` this way; the SDK hands
+   those values out and leaves the installing to the application. The
+   programs under the root `examples/` directory are applications in this
+   sense, so the gate does not read them: an example that follows the
+   README's wiring has to be able to pass it.
+
+**Amendment (2026-11-15).** This section first named two functions,
+`otel.SetTracerProvider` and `otel.SetTextMapPropagator`. The gate went
+further and listed four names, but matched all of them against
+`go.opentelemetry.io/otel` alone, so its `SetLoggerProvider` entry could never
+fire — the logs global is `go.opentelemetry.io/otel/log/global.SetLoggerProvider`
+— and `otel.SetErrorHandler` and `otel.SetLogger`, which are process-wide like
+the rest, were not listed. No SDK code called any of them; the gap was in the
+check. The table above is the full set, and the gate now matches on the pair
+(package path, function name). Each file is type-checked on its own, and
+`go/types` skips some expressions it cannot evaluate there (a map value under
+a key that calls another package, for one); references in those are matched
+from the syntax tree against the file's imports, with a local binding of the
+same name honoured within the scope Go gives it. The adopted third-party modules in the table
+under [Approved integrations](#approved-integrations), and the client
+libraries behind the SDK-owned wrappers (`go-redis/v9` v9.9.0, `gocql` v1.7.0,
+`nats.go` v1.50.0, `mongo-driver/v2` v2.8.1), were searched at their pinned
+versions for a call to any of the six in non-test, non-example code; none has
+one. The gate does not cover reads (`otel.GetTracerProvider()`,
+`global.GetLoggerProvider()`); whether to gate those is a separate decision.
+The root `examples/` directory was in the gate's scope until this amendment.
+No example set a global, so nothing changes for the existing ones; it is
+exempt now because gating `otel.SetErrorHandler` and `otel.SetLogger` would
+otherwise reject the wiring the README recommends to applications.
 
 ---
 
@@ -118,8 +160,8 @@ is not worth the principle violation.
 
 Before introducing any `github.com/<vendor>/otel-<thing>` library, verify:
 
-1. **Read the constructor source.** Does it call `otel.SetTracerProvider`
-   or `otel.SetTextMapPropagator`? `grep -r 'otel.Set' vendor/github.com/<vendor>/otel-<thing>`
+1. **Read the constructor source.** Does it call any function in the
+   [Decision](#decision) table? `grep -rE '(otel|global)\.Set' vendor/github.com/<vendor>/otel-<thing>`
    should produce zero matches in any code path reachable from the
    constructor the wrapper uses.
 2. **Inspect option semantics.** A library that reads
@@ -153,9 +195,11 @@ in the same PR as the version change.
 
 ### Code-review checklist item
 
-> Reviewer confirms: no new call path causes
-> `otel.SetTracerProvider` / `otel.SetTextMapPropagator` to execute,
-> directly or through any imported dependency.
+> Reviewer confirms: no new call path causes a function in the
+> [Decision](#decision) table (`otel.SetTracerProvider`,
+> `otel.SetTextMapPropagator`, `otel.SetMeterProvider`,
+> `otel.SetErrorHandler`, `otel.SetLogger`, `global.SetLoggerProvider`) to
+> execute, directly or through any imported dependency.
 
 > Reviewer confirms: new instrumentation packages are T2 by default, or their
 > originating ADR enumerates which ADR 0008 checklist items failed to justify T3.

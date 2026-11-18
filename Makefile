@@ -127,6 +127,7 @@ lint: adr-check semconv-check ## Run ADR integration gate, semconv literal check
 	golangci-lint run --timeout=5m $(PKGS)
 
 adr-check: ## Run ADR 0008 integration policy gate
+	$(GO) test ./scripts/check_integrations.go ./scripts/check_integrations_test.go
 	$(GO) run ./scripts/check_integrations.go
 
 semconv-check: ## Reject semconv keys written as literals, and unknown keys in a semconv namespace

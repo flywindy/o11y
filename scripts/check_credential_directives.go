@@ -95,6 +95,7 @@ var gosecExempt = map[string]string{
 	// class is missing for them.
 	"scripts/check_credential_directives.go": "//go:build ignore standalone program",
 	"scripts/check_integrations.go":          "//go:build ignore standalone program",
+	"scripts/check_integrations_test.go":     "//go:build ignore test of check_integrations.go",
 	"scripts/check_semconv_literals.go":      "//go:build ignore standalone program",
 	"scripts/check_semconv_literals_test.go": "//go:build ignore test of check_semconv_literals.go",
 }
