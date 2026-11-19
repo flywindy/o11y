@@ -46,9 +46,12 @@ inspection. Any exception must be recorded in the integration ADR.
    `attribute.Key` slices and maps. In those it resolves a literal, a
    concatenation, or a string constant declared in the same directory. It
    does not follow a variable, so a key assigned to one — including a later
-   assignment to a variable typed `attribute.Key` — is not checked, and the
-   script header lists the other forms it leaves to review. A key found there whose first segment is a namespace the
-   pinned package uses (`db`, `http`, `messaging`, `cassandra`, …) must be
+   assignment to a variable typed `attribute.Key` — is not checked. Nor is a
+   literal passed to a parameter, field or result of type `attribute.Key`, or
+   compared against a key (`kv.Key == "…"`); the script header lists the
+   other forms it leaves to review. A key found there whose first segment is
+   a namespace the pinned package uses (`db`, `http`, `messaging`,
+   `cassandra`, `app`, …) must be
    a key the pinned package declares, a key it builds from a prefix and a
    caller-supplied name (`db.operation.parameter.<key>`,
    `http.request.header.<key>` and the other helpers of that shape, which have
@@ -57,7 +60,11 @@ inspection. Any exception must be recorded in the integration ADR.
    [`verify-semconv-attributes`](../.agents/skills/verify-semconv-attributes/SKILL.md)
    skill. A metric name, a span name or any other string outside a key
    position is not checked, and neither is a key in a namespace the pinned
-   package does not use (`object_store.*`, `redis.error.kind`). The same
+   package does not use (`object_store.*`, `redis.error.kind`). `app` is not
+   one of those: the pinned package declares `app.installation.id`,
+   `app.screen.name` and others, so an `app.*` key in SDK code is checked.
+   The application-owned keys recommended to services (`app.order.id`) are
+   written in application code, which the gate does not scan. The same
    exemptions as Rule 1 apply.
 
    **Marking a key SDK-owned.** The gate reads the allow-list from this file:
@@ -67,9 +74,11 @@ inspection. Any exception must be recorded in the integration ADR.
    span table, for one). A key without backticks is not read. A table is a
    header row followed by a delimiter row with as many cells, with or
    without outer pipes; one inside a fenced code block is an example and
-   marks nothing. A key the
-   SDK defines inside a semconv namespace therefore needs exactly the row
-   Rule 3 asks for, worded that way, and nothing in the script. "SDK-owned"
+   marks nothing. A key written as `prefix.*` marks every key under that
+   prefix, so use it only for a namespace the SDK owns outright — on a
+   semconv namespace it would switch the check off for every key in it. A
+   key the SDK defines inside a semconv namespace therefore needs exactly the
+   row Rule 3 asks for, worded that way, and nothing in the script. "SDK-owned"
    later in a cell does not count; it also describes wrappers and instruments
    in rows about semconv keys.
 

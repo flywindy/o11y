@@ -68,8 +68,10 @@ Nothing changes for a service that passes `obs.TracerProvider()`,
   - A key the SDK defines itself inside a semconv namespace
     (`cassandra.query.attempt`) is allowed when `docs/semconv.md` marks it:
     a row whose last cell begins with `SDK-owned`, in a table whose first
-    column is headed `Key`, with the key in backticks. A table inside a
-    fenced code block is not read. Instrument tables are not read either, so an SDK-owned
+    column is headed `Key`, with the key in backticks (`prefix.*` covers a
+    whole prefix). A table inside a fenced code block is not read. `app` is a
+    namespace of the pinned package, so an `app.*` key in SDK code is checked
+    too. Instrument tables are not read either, so an SDK-owned
     instrument name (`cassandra.query.attempts`) is not accepted where the
     attribute (`cassandra.query.attempt`) was meant. The catalog is the
     allow-list, so there is no second list in the script to keep in step.

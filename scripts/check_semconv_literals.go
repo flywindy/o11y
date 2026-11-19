@@ -43,8 +43,9 @@
 // In such a position the key may be a literal, a concatenation of literals, or
 // the name of a string constant declared in the same directory; all three are
 // resolved. A variable is not: it can be assigned again before it is used, and
-// what it was declared with then says nothing about the key. The functions are read from the pinned attribute
-// package, as the keys are from the pinned semconv package.
+// what it was declared with then says nothing about the key. The functions
+// are read from the pinned attribute package, as the keys are from the pinned
+// semconv package.
 //
 // The SDK-owned keys are read from docs/semconv.md, not listed here: in a table
 // whose first column is headed "Key", a row whose last cell begins with
@@ -67,13 +68,16 @@
 //	hidden dirs, testdata, vendor
 //
 // What is still left to review: a key assembled at run time or held in a
-// variable, one that comes from a constant declared in another package or from
-// a name that is also a parameter or local variable somewhere in the directory,
-// a method argument such as set.Value("k") whose receiver type only a
-// type-checker could name, a file that dot-imports the attribute package or
-// declares something else under the package's name (a variable, a parameter,
-// a local type), a string(...) call in a directory that declares its own
-// string, and a key in a namespace the pinned package does not use at all.
+// variable, one that comes from a constant declared in another package or in a
+// generated file, or from a name that is also bound somewhere else in the
+// directory, a literal passed to a parameter, field or result of type
+// attribute.Key or compared against a key (kv.Key == "..."), a KeyValue or Key
+// literal nested a level deeper than the forms above, a method argument such as
+// set.Value("k") whose receiver type only a type-checker could name, a file
+// that dot-imports the attribute package or declares something else under the
+// package's name (a variable, a parameter, a local type), a string(...) call in
+// a directory that declares its own string, and a key in a namespace the pinned
+// package does not use at all.
 package main
 
 import (
@@ -525,7 +529,8 @@ func fenceMarker(line string) string {
 	return ""
 }
 
-// isOwned reports whether key is SDK-owned, by name or under an owned prefix.
+// isOwned reports whether key is SDK-owned, by name or under an owned prefix:
+// a catalog entry written prefix.* covers every key below prefix.
 func (c catalog) isOwned(key string) bool {
 	if c.owned[key] {
 		return true
