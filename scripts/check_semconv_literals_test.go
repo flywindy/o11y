@@ -153,8 +153,8 @@ func TestAttributeKeyFuncs(t *testing.T) {
 // TestSDKOwnedKeys pins the convention the allow-list is read by: the keys in
 // the first cell of a row whose last cell begins with "SDK-owned", in a table
 // whose first column is headed "Key" — and in no other table, nor in one inside
-// a fenced code block. A table is a header row followed by a delimiter row,
-// with or without outer pipes.
+// a fenced code block. A table is a header row followed by a delimiter row
+// with as many cells, with or without outer pipes.
 func TestSDKOwnedKeys(t *testing.T) {
 	doc := filepath.Join(t.TempDir(), "semconv.md")
 	body := strings.Join([]string{
@@ -205,6 +205,12 @@ func TestSDKOwnedKeys(t *testing.T) {
 		"",
 		"Key | a prose line with a pipe, not followed by a delimiter row",
 		"`db.not.a.table` | SDK-owned.",
+		"",
+		"A header whose delimiter row has a different number of cells is not a table.",
+		"",
+		"| Key | Notes |",
+		"|---|---|---|",
+		"| `db.mismatched.width` | SDK-owned. |",
 		"",
 	}, "\n")
 	if err := os.WriteFile(doc, []byte(body), 0o644); err != nil {

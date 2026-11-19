@@ -65,8 +65,9 @@ inspection. Any exception must be recorded in the integration ADR.
    whose last cell *begins with* `SDK-owned` marks every key written in
    backticks in its first cell (`cassandra.query.attempt` in the Cassandra
    span table, for one). A key without backticks is not read. A table is a
-   header row followed by a delimiter row, with or without outer pipes; one
-   inside a fenced code block is an example and marks nothing. A key the
+   header row followed by a delimiter row with as many cells, with or
+   without outer pipes; one inside a fenced code block is an example and
+   marks nothing. A key the
    SDK defines inside a semconv namespace therefore needs exactly the row
    Rule 3 asks for, worded that way, and nothing in the script. "SDK-owned"
    later in a cell does not count; it also describes wrappers and instruments

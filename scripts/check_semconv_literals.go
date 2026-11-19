@@ -415,9 +415,9 @@ var backticked = regexp.MustCompile("`([^`]+)`")
 // every attribute in it has a row of its own in an attribute table.
 //
 // A table is recognized as GitHub renders one: a header row followed by a
-// delimiter row, with or without outer pipes. A table inside a fenced code
-// block is an example and grants nothing. Only code spans in the first cell
-// are read, so a key is written in backticks.
+// delimiter row with the same number of cells, with or without outer pipes.
+// A table inside a fenced code block is an example and grants nothing. Only
+// code spans in the first cell are read, so a key is written in backticks.
 func sdkOwnedKeys(path string) (map[string]bool, error) {
 	body, err := os.ReadFile(path)
 	if err != nil {
@@ -444,9 +444,12 @@ func sdkOwnedKeys(path string) (map[string]bool, error) {
 			continue
 		}
 		if !inTable {
-			// A table is a header row followed by a delimiter row.
-			if i+1 < len(lines) && isDelimiterRow(tableCells(lines[i+1])) {
-				inTable, keyTable = true, cells[0] == keyColumn
+			// A table is a header row followed by a delimiter row with as
+			// many cells.
+			if i+1 < len(lines) {
+				if delimiter := tableCells(lines[i+1]); len(delimiter) == len(cells) && isDelimiterRow(delimiter) {
+					inTable, keyTable = true, cells[0] == keyColumn
+				}
 			}
 			continue
 		}
