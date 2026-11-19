@@ -130,7 +130,7 @@ adr-check: ## Run ADR 0008 integration policy gate
 	$(GO) test ./scripts/check_integrations.go ./scripts/check_integrations_test.go
 	$(GO) run ./scripts/check_integrations.go
 
-semconv-check: ## Reject semconv attribute keys written as string literals in SDK code
+semconv-check: ## Reject semconv keys written as literals, and unknown keys in a semconv namespace
 	$(GO) test ./scripts/check_semconv_literals.go ./scripts/check_semconv_literals_test.go
 	$(GO) run ./scripts/check_semconv_literals.go
 
