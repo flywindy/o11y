@@ -206,6 +206,24 @@ func TestSDKOwnedKeys(t *testing.T) {
 		"Key | a prose line with a pipe, not followed by a delimiter row",
 		"`db.not.a.table` | SDK-owned.",
 		"",
+		"A fence closes only on a run of the same character, at least as long, with",
+		"nothing after it: a shorter or different run inside is part of the block.",
+		"",
+		"````",
+		"```",
+		"| Key | Notes |",
+		"|---|---|",
+		"| `db.inner.fence` | SDK-owned. |",
+		"````",
+		"",
+		"~~~",
+		"```",
+		"~~~",
+		"",
+		"| Key | Notes |",
+		"|---|---|",
+		"| `db.after.tilde` | SDK-owned. |",
+		"",
 		"A header whose delimiter row has a different number of cells is not a table.",
 		"",
 		"| Key | Notes |",
@@ -229,6 +247,7 @@ func TestSDKOwnedKeys(t *testing.T) {
 	slices.Sort(got)
 	want := []string{
 		"cassandra.query.attempt",
+		"db.after.tilde",
 		"db.bare.table",
 		"db.second.table",
 		"db.thing.one",
@@ -456,6 +475,9 @@ var (
 	mapped = map[string]attribute.KeyValue{"q": {Key: "db.cosmosdb.container"}}
 	// In the http namespace, beside the header template but not under it.
 	header = attribute.StringSlice("http.request.headers.x-id", nil)
+	// An indexed array element, and a template prefix with its trailing dot.
+	indexed = [...]attribute.Key{0: "db.indexed_key"}
+	dotted  = attribute.Key("db.operation.parameter.")
 )
 `,
 	})
@@ -481,6 +503,8 @@ var (
 		`pkg/positions.go:23: "db.instance.id"` + unknown + `"db" namespace it is in`,
 		`pkg/positions.go:25: "db.cosmosdb.container"` + unknown + `"db" namespace it is in`,
 		`pkg/positions.go:27: "http.request.headers.x-id"` + unknown + `"http" namespace it is in`,
+		`pkg/positions.go:29: "db.indexed_key"` + unknown + `"db" namespace it is in`,
+		`pkg/positions.go:30: "db.operation.parameter."` + unknown + `"db" namespace it is in`,
 	})
 }
 
@@ -583,12 +607,12 @@ func f(meter interface{ Float64Histogram(string) }, tracer interface{ Start(stri
 	_ = attribute.String("db.operation.parameter.limit", "10")
 	_ = attribute.StringSlice("http.request.header.x-request-id", nil)
 	_ = attribute.NewAllowKeysFilter("db.operation.parameter.offset")
-	_ = attribute.String("app.db.statement", "x")
+	_ = attribute.String("acme.db.statement", "x")
 	meter.Float64Histogram("db.client.operation.duration")
 	meter.Float64Histogram(metricName)
 	tracer.Start("db.statement")
 	println("db.statement was renamed to db.query.text")
-	_ = attribute.String("app.note", "db.statement")
+	_ = attribute.String("acme.note", "db.statement")
 	_ = semconv.DBSystemNameKey
 	_ = attribute.NewAllowKeysFilter(semconv.DBSystemNameKey, semconv.ServerAddressKey)
 	_ = attribute.String(name(), "x")
@@ -602,7 +626,7 @@ func g() {
 }
 
 func h() {
-	key := "app.thing"
+	key := "acme.thing"
 	_ = attribute.String(key, "x")
 }
 
@@ -615,13 +639,13 @@ const dotted = "db.statement"
 func shadowedByParam(dotted string) attribute.KeyValue { return attribute.String(dotted, "x") }
 
 func shadowedByDefine() attribute.KeyValue {
-	label := "app.label"
+	label := "acme.label"
 	return attribute.String(label, "x")
 }
 
 type lookup struct{}
 
-func (lookup) Key(string) string { return "app.resolved" }
+func (lookup) Key(string) string { return "acme.resolved" }
 
 // Not a conversion: cfg.Key looks a key up, it does not hold one.
 func viaLookup(cfg lookup) attribute.KeyValue { return attribute.String(cfg.Key("db.statement"), "x") }
@@ -630,7 +654,7 @@ func viaLookup(cfg lookup) attribute.KeyValue { return attribute.String(cfg.Key(
 var reassigned = "db.statement"
 
 func viaReassigned() attribute.KeyValue {
-	reassigned = "app.query"
+	reassigned = "acme.query"
 	return attribute.String(reassigned, "x")
 }
 `,
@@ -647,7 +671,7 @@ var legacy = attribute.Key("db.statement")
 
 import "go.opentelemetry.io/otel/attribute"
 
-var _ = attribute.Bool("app.flag", true)
+var _ = attribute.Bool("acme.flag", true)
 
 type recorder struct{}
 
@@ -683,14 +707,55 @@ func local() {
 	_ = attribute.Key("db.example_typo")
 }
 `,
+		// A range variable, a named result and a receiver each shadow the
+		// package constant of the same name, so none of these calls uses it.
+		"shadows/s.go": `package shadows
+
+import "go.opentelemetry.io/otel/attribute"
+
+const (
+	rangeKey  = "db.statement"
+	resultKey = "db.statement"
+	recvKey   = "db.statement"
+)
+
+func ranged(keys []string) {
+	for _, rangeKey := range keys {
+		_ = attribute.String(rangeKey, "x")
+	}
+}
+
+func named() (resultKey string) {
+	resultKey = "acme.result"
+	_ = attribute.String(resultKey, "x")
+	return resultKey
+}
+
+type receiver string
+
+func (recvKey receiver) use() { _ = attribute.String(string(recvKey), "x") }
+`,
+		// A package-level func called string is not the conversion either.
+		"pkgstring/s.go": `package pkgstring
+
+import (
+	"fmt"
+
+	"go.opentelemetry.io/otel/attribute"
+)
+
+func string(v any) attribute.Key { return attribute.Key(fmt.Sprint("acme.", v)) }
+
+var _ = attribute.Key(string("db.example_typo"))
+`,
 		// A local func called string is not the conversion: the key here is
-		// what it returns, "app.query".
+		// what it returns, "acme.query".
 		"stringfunc/s.go": `package stringfunc
 
 import "go.opentelemetry.io/otel/attribute"
 
 func f() attribute.KeyValue {
-	string := func(_ string) string { return "app.query" }
+	string := func(_ string) string { return "acme.query" }
 	return attribute.String(string("db.example_typo"), "x")
 }
 `,
@@ -699,6 +764,32 @@ func f() attribute.KeyValue {
 	if len(got) != 0 {
 		t.Errorf("nothing here is an unknown key in a key position, got:\n  %s", strings.Join(got, "\n  "))
 	}
+}
+
+// TestScan_AppIsAPinnedNamespace pins that app is a namespace of the pinned
+// package (app.installation.id, app.screen.name and others), so an app.* key
+// in SDK code is checked like any other. The application-owned keys the
+// project recommends to services, app.order.id among them, belong in
+// application code, which the gate does not scan.
+func TestScan_AppIsAPinnedNamespace(t *testing.T) {
+	cat, err := loadCatalog(t.Context(), filepath.Join("..", catalogPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cat.namespaces["app"] {
+		t.Fatal("app is no longer a namespace of the pinned package; revisit docs/semconv.md Rule 2")
+	}
+	got := scanTree(t, cat, map[string]string{
+		"pkg/app.go": `package pkg
+
+import "go.opentelemetry.io/otel/attribute"
+
+var _ = attribute.String("app.order.id", "x")
+`,
+	})
+	assertFindings(t, got, []string{
+		`pkg/app.go:5: "app.order.id" is not an attribute key of go.opentelemetry.io/otel/semconv/v1.39.0, whose "app" namespace it is in`,
+	})
 }
 
 // TestRepositoryIsClean runs the gate's own scan over the repository with the
