@@ -48,6 +48,44 @@ Nothing changes for a service that passes `obs.TracerProvider()`,
   rather than `propagation.TraceContext{}`. The old default sent `traceparent`
   for a caller who had passed no propagator, and without the baggage the SDK's
   own propagator carries.
+- CI gate for `docs/semconv.md` (`make semconv-check`,
+  `scripts/check_semconv_literals.go`): it now also rejects an attribute key
+  that sits in a semconv namespace without being a key of the pinned
+  `semconv/v1.39.0` package. The gate compared string literals against the
+  pinned key set, so a key the pinned package does not declare — a spelling
+  from an earlier semconv version such as `db.statement` or
+  `db.cassandra.table`, or a typo — equalled nothing and passed; that is the
+  mistake Core Principle 5 describes.
+  - Only attribute-key positions are checked (`attribute.Key(k)`, the
+    `attribute.String(k, v)` family, the key filters, declarations typed
+    `attribute.Key`, `attribute.KeyValue{Key: k}` — also with its type
+    elided in a slice or as a map value — and `attribute.Key` slices and
+    maps, with or without parentheses around the called function), so metric
+    names, span names and other dotted strings are left alone. A literal, a
+    concatenation and a string constant declared in the same directory are
+    all resolved; a variable is not followed. The positions are read from the pinned
+    `attribute` package, as the keys are from the pinned semconv package.
+  - A key the SDK defines itself inside a semconv namespace
+    (`cassandra.query.attempt`) is allowed when `docs/semconv.md` marks it:
+    a row whose last cell begins with `SDK-owned`, in a table whose first
+    column is headed `Key`, with the key in backticks (`prefix.*` covers a
+    whole prefix). A table inside a fenced code block is not read. `app` is a
+    namespace of the pinned package, so an `app.*` key in SDK code is checked
+    too. Instrument tables are not read either, so an SDK-owned
+    instrument name (`cassandra.query.attempts`) is not accepted where the
+    attribute (`cassandra.query.attempt`) was meant. The catalog is the
+    allow-list, so there is no second list in the script to keep in step.
+    The `resty.error.kind` and `resty.retry.exhausted` rows were reworded to
+    follow that convention.
+  - A pinned key assembled from parts (`"service." + "namespace"`) is
+    reported as well; no literal equals it, so the existing rule missed it.
+  - A key the pinned package builds from a prefix and a caller-supplied name
+    (`db.operation.parameter.<key>` through `DBOperationParameter`,
+    `http.request.header.<key>`, and the other helpers of that shape) is
+    accepted: the package has no constant per key, so there is nothing to
+    name it through. The prefixes are read from the pinned package too.
+  - Nothing in the tree is newly reported. `docs/semconv.md` records the
+    check as Enforcement Rule 2; the former rules 2 and 3 are now 3 and 4.
 
 ### Security
 

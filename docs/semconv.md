@@ -35,9 +35,64 @@ inspection. Any exception must be recorded in the integration ADR.
    the pinned package declares. `_test.go` files, the root `examples/`
    directory and generated files are exempt: a test pins the wire string on
    purpose.
-2. **New attribute? Update this catalog.** The PR reviewer checks that this
+2. **A key in a semconv namespace is a pinned key or an SDK-owned one.**
+   Rule 1 cannot see a key the pinned package does not declare — a spelling
+   from an earlier semconv version (`db.statement`, `db.cassandra.table`) or
+   a typo equals no pinned key, so the literal passes. `make semconv-check`
+   therefore also looks at these attribute-key positions: `attribute.Key(k)`,
+   `attribute.String(k, v)` and the other constructors, the key filters, a
+   declaration typed `attribute.Key`, an `attribute.KeyValue{Key: k}` literal
+   (also with its type elided in a slice or as a map value), and
+   `attribute.Key` slices and maps. In those it resolves a literal, a
+   concatenation, or a string constant declared in the same directory. It
+   does not follow a variable, so a key assigned to one — including a later
+   assignment to a variable typed `attribute.Key` — is not checked. Nor is a
+   literal passed to a parameter, field or result of type `attribute.Key`, or
+   compared against a key (`kv.Key == "…"`); the script header lists the
+   other forms it leaves to review. A key found there whose first segment is
+   a namespace the pinned package uses (`db`, `http`, `messaging`,
+   `cassandra`, `app`, …) must be
+   a key the pinned package declares, a key it builds from a prefix and a
+   caller-supplied name (`db.operation.parameter.<key>`,
+   `http.request.header.<key>` and the other helpers of that shape, which have
+   no constant per key), or one this catalog marks as SDK-owned. Anything else
+   is rejected: resolve the key with the
+   [`verify-semconv-attributes`](../.agents/skills/verify-semconv-attributes/SKILL.md)
+   skill. A metric name, a span name or any other string outside a key
+   position is not checked, and neither is a key in a namespace the pinned
+   package does not use (`object_store.*`, `redis.error.kind`). `app` is not
+   one of those: the pinned package declares `app.installation.id`,
+   `app.screen.name` and others, so an `app.*` key in SDK code is checked.
+   The application-owned keys recommended to services (`app.order.id`) are
+   written in application code, which the gate does not scan. The same
+   exemptions as Rule 1 apply.
+
+   **Marking a key SDK-owned.** The gate reads the allow-list from this file:
+   in an attribute table — one whose first column is headed `Key` — a row
+   whose last cell *begins with* `SDK-owned` marks every key written in
+   backticks in its first cell (`cassandra.query.attempt` in the Cassandra
+   span table, for one). A key without backticks is not read. A table is a
+   header row followed by a delimiter row with as many cells, with or
+   without outer pipes, and its rows are read in the header's columns as
+   GitHub renders them (a short row has no last cell; a cell past the last
+   column is dropped); one inside a fenced code block is an example and
+   marks nothing. A key written as `prefix.*` marks every key under that
+   prefix, so use it only for a namespace the SDK owns outright — on a
+   semconv namespace it would switch the check off for every key in it. A
+   key the SDK defines inside a semconv namespace therefore needs exactly the
+   row Rule 3 asks for, worded that way, and nothing in the script. "SDK-owned"
+   later in a cell does not count; it also describes wrappers and instruments
+   in rows about semconv keys.
+
+   Instrument tables (first column `Name`) and the Deviations table are not
+   read, although they use the same wording for SDK-owned instrument names. An
+   instrument name is not an attribute key, and the two can be one letter
+   apart: `cassandra.query.attempts` is the counter, `cassandra.query.attempt`
+   the span attribute. Keep that column heading when adding a table, or the
+   keys in it will not be recognised.
+3. **New attribute? Update this catalog.** The PR reviewer checks that this
    file lists any new key introduced in the diff.
-3. **Deviations require explicit justification** in the "Deviations"
+4. **Deviations require explicit justification** in the "Deviations"
    section below. The default answer is "no deviation".
 
 ---
@@ -141,8 +196,8 @@ Histogram boundaries use the SDK's configured latency buckets.
 | `http.request.resend_count` | int | Resty spans only; emitted on retry attempts after the first attempt. |
 | `url.full` | string | Emitted by both facades, redacted differently. **`http`**: otelhttp strips the URL's userinfo and records everything else, query string included. **`resty`**: userinfo is replaced by `redacted` and the values of seven query parameters by `[redacted]`: the four semconv v1.39.0 names for this attribute (`AWSAccessKeyId`, `Signature`, `sig`, `X-Goog-Signature`), plus three the SDK adds — `X-Amz-Signature`, `X-Amz-Credential` and `X-Amz-Security-Token`. The specification's two AWS keys are the Signature Version 2 spellings; `minio-go` and the current AWS SDKs presign with Signature Version 4, which carries the signature, the access key ID and the session token under those three names, so the specification's list alone leaves such a URL replayable from a trace until it expires (the specification says its list "is subject to change over time"). Keys are matched case-insensitively and after percent-decoding; parameter order and escaping are otherwise preserved, so the attribute still matches the upstream's access log, and a URL whose credentials cannot be accounted for (an opaque one such as `http:user:pass@host`) is replaced wholesale. Any other secret a caller puts in a URL is still recorded by either facade. |
 | `error.type` | string | Error-path metric label and span attribute. |
-| `resty.error.kind` | string | Resty spans only; SDK-owned closed enum: `client_canceled`, `client_timeout`, `server_timeout`, `tls`, `transport`, `protocol`, `unknown`. |
-| `resty.retry.exhausted` | bool | Resty spans only; set on the last failed attempt when resty's retry budget is exhausted. |
+| `resty.error.kind` | string | SDK-owned closed enum, Resty spans only: `client_canceled`, `client_timeout`, `server_timeout`, `tls`, `transport`, `protocol`, `unknown`. |
+| `resty.retry.exhausted` | bool | SDK-owned, Resty spans only: set on the last failed attempt when resty's retry budget is exhausted. |
 | `server.address` | string | Upstream host. |
 | `server.port` | int | Upstream port. |
 
