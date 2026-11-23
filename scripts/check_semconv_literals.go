@@ -419,7 +419,8 @@ var backticked = regexp.MustCompile("`([^`]+)`")
 // every attribute in it has a row of its own in an attribute table.
 //
 // A table is recognized as GitHub renders one: a header row followed by a
-// delimiter row with the same number of cells, with or without outer pipes.
+// delimiter row with the same number of cells, with or without outer pipes,
+// whose rows are read in the header's columns.
 // A table inside a fenced code block is an example and grants nothing. Only
 // code spans in the first cell are read, so a key is written in backticks.
 func sdkOwnedKeys(path string) (map[string]bool, error) {
@@ -430,6 +431,7 @@ func sdkOwnedKeys(path string) (map[string]bool, error) {
 	owned := map[string]bool{}
 	lines := strings.Split(string(body), "\n")
 	inTable, keyTable := false, false
+	width := 0  // the number of columns of the table being read
 	fence := "" // the fence a code block was opened with, while inside one
 	for i, line := range lines {
 		// A table inside a fenced code block is an example, not the catalog.
@@ -452,7 +454,7 @@ func sdkOwnedKeys(path string) (map[string]bool, error) {
 			// many cells.
 			if i+1 < len(lines) {
 				if delimiter := tableCells(lines[i+1]); len(delimiter) == len(cells) && isDelimiterRow(delimiter) {
-					inTable, keyTable = true, cells[0] == keyColumn
+					inTable, keyTable, width = true, cells[0] == keyColumn, len(cells)
 				}
 			}
 			continue
@@ -460,8 +462,14 @@ func sdkOwnedKeys(path string) (map[string]bool, error) {
 		if !keyTable || isDelimiterRow(cells) {
 			continue
 		}
-		// Emphasis around the marker does not change what the row says.
-		description := strings.TrimLeft(cells[len(cells)-1], "*_")
+		// The description is the table's last column, as GitHub lays the row
+		// out: a short row leaves it empty, and cells past the header's width
+		// are dropped. Emphasis around the marker does not change what the row
+		// says.
+		if len(cells) < width {
+			continue
+		}
+		description := strings.TrimLeft(cells[width-1], "*_")
 		if !strings.HasPrefix(description, sdkOwnedMarker) {
 			continue
 		}

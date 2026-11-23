@@ -73,7 +73,9 @@ inspection. Any exception must be recorded in the integration ADR.
    backticks in its first cell (`cassandra.query.attempt` in the Cassandra
    span table, for one). A key without backticks is not read. A table is a
    header row followed by a delimiter row with as many cells, with or
-   without outer pipes; one inside a fenced code block is an example and
+   without outer pipes, and its rows are read in the header's columns as
+   GitHub renders them (a short row has no last cell; a cell past the last
+   column is dropped); one inside a fenced code block is an example and
    marks nothing. A key written as `prefix.*` marks every key under that
    prefix, so use it only for a namespace the SDK owns outright — on a
    semconv namespace it would switch the check off for every key in it. A
