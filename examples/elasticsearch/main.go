@@ -3,7 +3,7 @@
 // go-elasticsearch's first-party OpenTelemetry instrumentation.
 //
 // The example points at a local Elasticsearch
-// (k8s/infrastructure/base/elasticsearch.yaml for the cluster spec, or
+// (k8s/infrastructure/base/components/elasticsearch for the cluster spec, or
 // `docker run -p 9200:9200 -e discovery.type=single-node \
 // -e xpack.security.enabled=false \
 // docker.elastic.co/elasticsearch/elasticsearch:8.19.3`). It loops through
