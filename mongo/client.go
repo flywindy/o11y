@@ -1,6 +1,3 @@
-// Package mongo wires the o11y SDK's TracerProvider and MeterProvider into the
-// official OpenTelemetry MongoDB driver instrumentation without relying on
-// global OpenTelemetry state.
 package mongo
 
 import (
@@ -31,10 +28,13 @@ type config struct {
 // WithPoolName sets the db.client.connection.pool.name attribute for MongoDB
 // connection-pool metrics.
 //
-// When unset, the SDK derives a bounded name from the first configured MongoDB
-// host and the ClientOptions instance identity. The option only affects
-// SDK-owned pool metrics; command spans and db.client.operation.duration
-// metrics come from otelmongo.
+// When unset, the SDK names the pool "mongo-<host>-<n>", where <host> is the
+// host (without port) of the first configured MongoDB address and <n> is a
+// process-wide sequence number that grows by one with each Instrument or
+// Connect call that leaves the name unset, so two clients on the same host get
+// separate series; with no parseable host the name is "mongo-<n>". The option
+// only affects SDK-owned pool metrics; command spans and
+// db.client.operation.duration metrics come from otelmongo.
 func WithPoolName(name string) Option {
 	return func(cfg *config) {
 		cfg.poolName = strings.TrimSpace(name)

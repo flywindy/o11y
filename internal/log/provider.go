@@ -16,7 +16,7 @@ import (
 
 // InitLogger initialises an OTLP/HTTP LoggerProvider backed by a BatchProcessor.
 // It shares the provided Resource with the TracerProvider so that service-identity
-// attributes (service.name, deployment.environment, etc.) are consistent across
+// attributes (service.name, deployment.environment.name, etc.) are consistent across
 // traces and logs without being duplicated as per-record attributes.
 // The returned provider must be shut down via Shutdown when no longer needed.
 //

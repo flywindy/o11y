@@ -197,7 +197,7 @@ Current NodePort → hostPort mappings:
 For changes that affect live infrastructure behavior, verify against the kind cluster with `kubectl` when access is available:
 
 - Inspect the live resource before or after the change with `kubectl get ... -o yaml`
-- Apply through the relevant Kustomize entry point, usually `kubectl apply -k k8s/infrastructure/base`
+- Apply through the relevant Kustomize entry point: `kubectl apply -k k8s/infrastructure/base/monitor` for the monitor stack, `kubectl apply -k k8s/infrastructure/base/components/<name>` for a datastore component, or `kubectl apply -k k8s/infrastructure/overlays/private-registry` (`k8s/infrastructure/base` itself has no `kustomization.yaml`)
 - Restart workloads that require config reloads, such as Grafana datasource provisioning
 - Wait for rollout completion with `kubectl rollout status`
 - Verify behavior through the relevant in-cluster service API when practical

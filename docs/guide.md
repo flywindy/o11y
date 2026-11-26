@@ -235,7 +235,7 @@ those traces, thinning the whole pipeline from the source.
 
 Use `obs.Logger` instead of the global `slog` package. Every log record is written to two destinations automatically:
 
-- **OTLP → Loki**: Full OTel Log Data Model. `service.name` and `deployment.environment` live in the OTel Resource (not per-record attributes). `traceId`, `spanId`, and `trace_flags` are extracted from the context by the `otelslog` bridge.
+- **OTLP → Loki**: Full OTel Log Data Model. `service.name` and `deployment.environment.name` live in the OTel Resource (not per-record attributes). `traceId`, `spanId`, and `trace_flags` are extracted from the context by the `otelslog` bridge.
 - **stdout (JSON)**: Human-readable output for local development. Includes `service.name`, `environment`, `traceId`, and `spanId` as flat JSON fields.
 - When `WithLogEnabled(false)` is set, only the stdout destination is active.
 
@@ -368,7 +368,7 @@ a deadline `Shutdown` does not wait and leaves the flush to the components'
 own shutdown. Keep calling `Shutdown` at exit: `ForceFlush`
 does not stop the exporters or the scrape server.
 
-**Exemplars** are enabled automatically (OTel SDK default trace-based filter). When Prometheus is deployed with `--enable-feature=exemplar-storage` (included in [`k8s/infrastructure/base/prometheus.yaml`](../k8s/infrastructure/base/prometheus.yaml)), Grafana can navigate from a histogram bucket directly to the correlated trace in Tempo. The measurement context must contain an active sampled span; exemplar trace IDs are stored as exemplar metadata (`trace_id` / `span_id`), not as metric labels, so they do not create high-cardinality time series. `trace_id` and `span_id` are also the only labels an exemplar carries: attributes an SDK view filters off a series are suppressed on the exemplar too, so neither a dropped attribute nor a key the reserved-label guard removed reaches the exposition, and the exemplar stays well inside the 128-rune limit OpenMetrics imposes on it.
+**Exemplars** are enabled automatically (OTel SDK default trace-based filter). When Prometheus is deployed with `--enable-feature=exemplar-storage` (included in [`k8s/infrastructure/base/monitor/prometheus.yaml`](../k8s/infrastructure/base/monitor/prometheus.yaml)), Grafana can navigate from a histogram bucket directly to the correlated trace in Tempo. The measurement context must contain an active sampled span; exemplar trace IDs are stored as exemplar metadata (`trace_id` / `span_id`), not as metric labels, so they do not create high-cardinality time series. `trace_id` and `span_id` are also the only labels an exemplar carries: attributes an SDK view filters off a series are suppressed on the exemplar too, so neither a dropped attribute nor a key the reserved-label guard removed reaches the exposition, and the exemplar stays well inside the 128-rune limit OpenMetrics imposes on it.
 
 **Kubernetes pods** must opt in to scraping with the annotation:
 
@@ -1655,7 +1655,7 @@ come from `github.com/nats-io/nats.go/jetstream` directly; callers never import
 the upstream instrumentation package. Consume callbacks and the `Messages`
 pull iterator deliver the native `jetstream.Msg` plus a `ctx` carrying the
 consumer span — the same `(ctx, msg)` shape as core `Subscribe`. (Single-message
-`Consumer.Next` is a different case — deferred, not wrapped; see below.)
+`Consumer.Next` is wrapped too but returns `(ctx, msg, err)`; see below.)
 
 ```go
 import "github.com/nats-io/nats.go/jetstream"

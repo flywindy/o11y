@@ -183,6 +183,21 @@ Nothing changes for a service that passes `obs.TracerProvider()`,
   would otherwise fail the gate in an example. The script gains tests, run by the same
   target and workflow step; ADR 0003's Decision section lists the six, and a
   test keeps that list and the gate's identical.
+- Docs: corrected statements that no longer matched the code.
+  - `docs/guide.md` said single-message JetStream `Consumer.Next` is not
+    wrapped; it is, and returns the receive-span context.
+  - The Developer Guide and the log-provider godoc named the resource
+    attribute `deployment.environment`; the SDK emits
+    `deployment.environment.name`.
+  - The README pointed `o11yhttp` users at a metric-attribute option that
+    otelhttp has deprecated; it now shows the `otelhttp.Labeler` route.
+  - The `nats.Conn` godoc listed `Request` among the methods inherited from
+    the embedded connection, while `Request` and `RequestMsg` are ctx-first
+    overrides, and it left out `Respond` and `JetStream`.
+  - The `mongo.WithPoolName` godoc described a default pool name that the
+    code does not produce; it now gives the actual `mongo-<host>-<n>` form.
+  - Two dead links: the guide's `prometheus.yaml` path and AGENTS.md's
+    `kubectl apply -k k8s/infrastructure/base`, which has no kustomization.
 
 
 ---
