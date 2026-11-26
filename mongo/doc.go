@@ -1,5 +1,7 @@
 // Package mongo provides MongoDB tracing, operation-duration metrics, and
-// SDK-owned connection-pool metrics.
+// SDK-owned connection-pool metrics. It wires the o11y SDK's TracerProvider
+// and MeterProvider into the official OpenTelemetry MongoDB driver
+// instrumentation without relying on global OpenTelemetry state.
 //
 // Issuing MongoDB operations from background or post-response work (a goroutine,
 // a deferred write, fire-and-forget)? Do not pass the request context

@@ -67,7 +67,8 @@ type FeatureToggles struct {
 type SDK struct {
 	// Logger writes structured log records to two destinations:
 	//   • stdout       – JSON with service.name, traceId, and spanId fields
-	//                    (for local development and container log collection via Fluentd)
+	//                    (for local development and container log collection: Alloy
+	//                    in the bundled kind stack, Fluentd in ADR 0001's setup)
 	//   • OTel Collector – OTLP/HTTP → Loki (full OTel Log Data Model; service
 	//                    identity comes from the shared Resource, not per-record attrs)
 	// When a span is active in the context, traceId and spanId are included

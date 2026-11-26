@@ -1,8 +1,3 @@
-// Package nats provides a tracing-aware NATS connection wrapper that wires
-// the o11y SDK's TracerProvider and Propagator into otelnats / oteljetstream.
-// All NATS connections in a service should go through this package so that
-// trace context propagates across publishers and subscribers without touching
-// global OpenTelemetry state.
 package nats
 
 import (
@@ -33,10 +28,17 @@ import (
 // trace.
 type MsgHandler func(ctx context.Context, msg *natsgo.Msg)
 
-// Conn is a tracing-aware NATS connection. It embeds *otelnats.Conn so all
-// core methods (Publish, PublishMsg, Request, Drain, Close) are available
-// directly. Subscribe and QueueSubscribe are overridden to expose the
-// simplified MsgHandler callback.
+// Conn is a tracing-aware NATS connection. It embeds *otelnats.Conn, so
+// Publish, PublishMsg, RequestWithContext, RequestMsgWithContext, Drain, Close
+// and NatsConn come straight from the embedded connection. Conn overrides or
+// adds these methods:
+//   - Subscribe and QueueSubscribe take a context and the simplified
+//     MsgHandler callback;
+//   - Request and RequestMsg shadow the embedded ctx-less forms with
+//     ctx-first ones, so the request span joins the caller's trace;
+//   - Respond replies on msg.Reply through the traced publish path (use it
+//     instead of msg.Respond when the reply must carry trace context);
+//   - JetStream returns the o11y-owned JetStream facade.
 type Conn struct {
 	*otelnats.Conn
 	policy propagationPolicy

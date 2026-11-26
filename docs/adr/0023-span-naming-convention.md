@@ -1,6 +1,9 @@
 # ADR 0023 — Cross-Package Span Naming Convention for Data-Store Integrations
 
 **Status**: Accepted (implemented)
+**Status note (2026-11-26)**: the Context's premise that the SDK is "pre-1.0
+with no tagged release" no longer holds: releases are tagged through 0.15.0.
+The decision itself is unchanged.
 **Date**: 2026-06-10
 
 **Amends** ADR 0013 (redis), ADR 0018 (minio), ADR 0021 (mongo

@@ -2,6 +2,9 @@
 
 **Status**: Accepted — implemented (Collector tail-sampling is deployment
 config, out of SDK scope)
+**Status note (2026-11-26)**: the "Dependency behavior" section was verified
+against OTel Go SDK v1.43.0; `go.mod` now pins v1.46.0, and the section has not
+been re-verified against it.
 **Date**: 2026-05-25
 **Relates to**: ADR 0002 (metrics strategy — exemplars depend on sampled spans),
 ADR 0003 (global-state policy — no global provider/sampler mutation),

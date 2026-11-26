@@ -1,6 +1,8 @@
 # ADR 0017 — Echo Integration
 
 **Status**: Accepted
+**Status note (2026-11-26)**: not implemented. No `echo/` package exists, and
+`go.mod` has no Echo dependency.
 **Date**: 2026-06-02
 
 **Applies** ADR 0008 (sourcing policy); **builds on** ADR 0009

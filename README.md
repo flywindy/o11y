@@ -217,7 +217,7 @@ _Metrics:_
 | `WithMaxUniqueRoutes(n)` | `1000` | Cap exported distinct `http.route` values; the SDK's per-stream cardinality limit is derived from it (see `WithCardinalityLimit`) |
 | `WithMaxUniqueCollections(n)` | `200` | Cap exported distinct `db.collection.name` values on the Cassandra and Elasticsearch client metrics, collapsing the overflow to `"other"` under an independent budget per integration. A Cassandra schema is DDL-fixed, so reaching this cap signals a statement shape the SDK's CQL tokenizer mis-read rather than schema growth; Elasticsearch index names often roll by date, so an `"other"` bucket there is the cue to opt the label out. To drop the label entirely instead, pass `cassandra.WithCollectionMetricLabel(false)` to `cassandra.NewSession` or `elasticsearch.WithCollectionMetricLabel(false)` to `elasticsearch.NewClient` |
 | `WithCardinalityLimit(n)` | derived: `max(2000, 4 × MaxUniqueRoutes, 4 × MaxUniqueCollections)` = `4000` | The OTel SDK's per-stream cardinality limit, applied to every instrument including the application's own: a stream holds at most `n` series, `n − 1` distinct attribute sets plus one `otel_metric_overflow="true"` series that absorbs every further set. This is the only guard against an instrument labelled by room id or user id, and the overflow series is the signal to alert on. An override below 4 is raised to 4 so the SDK's own three-series `o11y_export_failures_total` stream never overflows. Raise it only for a service whose `http.server.request.duration` legitimately carries more method × route × status combinations |
-| `WithExtraHTTPServerAttributeKeys(keys ...string)` | `nil` | Promote caller-controlled attribute keys (e.g. `app_name`, `bot_name`) onto the SDK-managed `http.server.request.duration` series. Pair with `o11ygin.WithMetricAttributesFn` / `otelhttp` equivalent to inject the values per request. Cardinality is the caller's responsibility — use enumerable, bounded keyspaces |
+| `WithExtraHTTPServerAttributeKeys(keys ...string)` | `nil` | Promote caller-controlled attribute keys (e.g. `app_name`, `bot_name`) onto the SDK-managed `http.server.request.duration` series. Inject the values per request with `o11ygin.WithMetricAttributesFn` on gin; behind `o11yhttp.NewServerHandler`, add them in the handler to the request's `otelhttp.Labeler` (`otelhttp.LabelerFromContext(r.Context())`), which imports `otelhttp` for that type only; keep building the handler with `o11yhttp.NewServerHandler` so the SDK providers stay wired. `o11yhttp.WithMetricAttributesFn` still works but is deprecated upstream in favor of the Labeler. Cardinality is the caller's responsibility — use enumerable, bounded keyspaces |
 | `WithExemplars(bool)` | `true` | Enable OpenMetrics negotiation on `/metrics` so per-bucket exemplars carry `trace_id` / `span_id` to Grafana / Tempo. Set `false` only as a temporary mitigation when migrating dashboards that hardcode integer histogram boundaries (`le="1"` → `le="1.0"` under OpenMetrics) |
 
 _Logging:_
@@ -242,14 +242,11 @@ _Per-pillar feature toggles (progressive rollout):_
 | `WithLogEnabled(bool)` | `true` | When `false`, write logs to stdout only; no OTLP log provider is started |
 | `WithProfilingEnabled(bool)` | `false` | Opt-in. When `true` **and** `WithProfilingEndpoint` is set, the SDK starts the Pyroscope profiler and installs the trace-to-profile bridge |
 
-> **Migration note (pre-1.0 API change)** — `DefaultLatencyBuckets` is now a
-> function (`o11y.DefaultLatencyBuckets()` returning a fresh copy) rather
-> than a package-level slice variable, so callers cannot accidentally mutate
-> the package defaults. `DefaultMetricsAddr` is now a `const` (was `var`);
-> `SDK.TracerProvider()` now returns `trace.TracerProvider`, and
-> `SDK.MeterProvider()` now returns `metric.MeterProvider`. Use
-> `WithMetricsAddr(":9090")` to override the metrics listener. See
-> `CHANGELOG.md` for the migration recipe.
+> Code written against the pre-0.1.0 API: the changes 0.1.0 made
+> (`DefaultLatencyBuckets()` as a function, `DefaultMetricsAddr` as a `const`,
+> interface return types on `SDK.TracerProvider()` / `SDK.MeterProvider()`)
+> are listed with their migration recipe under `[0.1.0]` in
+> [`CHANGELOG.md`](CHANGELOG.md).
 
 ### Feature Toggles (Progressive Rollout)
 
