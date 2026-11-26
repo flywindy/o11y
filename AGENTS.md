@@ -27,12 +27,16 @@ so that every log entry is automatically enriched with `traceId` and `spanId`.
 | Messaging | NATS | High-performance pub/sub |
 | Database | MongoDB | NoSQL persistence |
 | Cache | Redis / Valkey | Redis-protocol cache and data store instrumentation |
+| Search | Elasticsearch | `elasticsearch/` wires the SDK into go-elasticsearch's first-party tracing and records `db.client.operation.duration` |
+| Wide-column store | Cassandra | `cassandra/` owns `gocql` query, batch, and connection instrumentation |
+| Object storage | MinIO / S3-compatible | `minio/` wraps the `minio-go` v7 data-plane client |
+| HTTP client | Resty v2 | `resty/` instruments every attempt, retries included, through resty hooks |
 | Tracing backend | Grafana Tempo | |
 | Log backend | Grafana Loki | |
 | Metrics backend | Prometheus | Scrapes k8s pods on `:2112`; also accepts remote write from OTel Collector |
 | Visualization | Grafana | Unified traces, logs, and metrics; exemplars link histograms → Tempo traces |
 | Collector | OTel Collector | Centralized telemetry pipeline for traces, logs, and OTLP metrics |
-| Local cluster | kind (Kubernetes in Docker) | Port 4318 mapped for OTLP/HTTP (traces, logs, and metrics push) |
+| Local cluster | kind (Kubernetes in Docker) | Host ports 4318 (OTLP/HTTP for traces, logs, and metrics push), 4223 (NATS WebSocket), and 4040 (Pyroscope) mapped |
 
 ---
 
@@ -47,6 +51,11 @@ so that every log entry is automatically enriched with `traceId` and `spanId`.
 | `mongo/` | T2 facade over MongoDB driver instrumentation plus SDK-owned pool metrics |
 | `elasticsearch/` | T2 facade over go-elasticsearch's first-party OTel tracing plus an SDK-owned `db.client.operation.duration` (justified T3, ADR 0027) |
 | `redis/` | SDK-owned Redis/Valkey instrumentation over go-redis/v9 |
+| `cassandra/` | SDK-owned `gocql` query and connection observers plus the `ExecuteBatch` seams for batches (ADR 0019) |
+| `minio/` | SDK-owned method wrapper over `minio-go` v7 data-plane calls, with optional HTTP child spans through `http/` (ADR 0018) |
+| `resty/` | SDK-owned resty v2 hooks that record one span and one `http.client.request.duration` sample per attempt (ADR 0011) |
+| `obsctx/` | Context helpers (`Detach`, `DetachWithTimeout`, `Go`) that keep the trace but drop a request's cancelation for background work (ADR 0024) |
+| `o11ytest/` | Test helpers (`CanceledRequestContext`, `RequireNotCanceled`) for asserting background work is detached from the request lifecycle |
 | `internal/` | SDK-owned logging, tracing, metrics, and test utilities |
 | `examples/` | Runnable examples for supported integrations; `examples/README.md` documents how to run each |
 | `docs/guide.md` | Developer Guide — structured logging, sampling, profiling, and per-integration sub-package usage |
@@ -191,7 +200,7 @@ Current NodePort → hostPort mappings:
 | NodePort | hostPort | Service |
 |---|---|---|
 | 30000 | 4318 | otel-collector (OTLP HTTP) |
-| 30001 | 4223 | NATS |
+| 30001 | 4223 | NATS WebSocket (`nats-websocket`) |
 | 30002 | 4040 | Pyroscope |
 
 For changes that affect live infrastructure behavior, verify against the kind cluster with `kubectl` when access is available:
@@ -254,6 +263,9 @@ Full ADR documents live in [`docs/adr/`](docs/adr/).
 | Gin integration | `go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin` — wrapped by the `gin/` package | Provides canonical middleware ordering and typed `gin.error.type` events for `c.Errors`. See [ADR 0010](docs/adr/0010-gin-integration.md) |
 | Redis / Valkey integration | SDK-owned bounded T3 wrapper over `github.com/redis/go-redis/v9` | Avoids legacy `redisotel` semconv and sensitive defaults while emitting SDK-controlled spans, metrics, and views. See [ADR 0013](docs/adr/0013-redis-valkey-integration.md) |
 | Elasticsearch integration | T2 facade over `go-elasticsearch/v8`'s first-party OTel tracing (`elastic-transport-go`), plus an SDK-owned `db.client.operation.duration` recorded at the same `Instrumentation` seam | The upstream is trace-only and emits legacy span keys (accepted and pinned); the metric is SDK-owned so it carries current semconv keys, is unsampled, and shares the cross-integration histogram. `NewClient(cfg, tp, mp, opts...)`. See [ADR 0020](docs/adr/0020-elasticsearch-integration.md) and [ADR 0027](docs/adr/0027-elasticsearch-metrics.md) |
+| Resty integration | SDK-owned T3 resty hooks over `github.com/go-resty/resty/v2` — wrapped by the `resty/` package | The surveyed community `otelresty` packages failed the ADR 0008 checklist (some set globals during `New`, no recent maintenance, pre-stable attribute keys). Hooks own the span and metric lifecycle, so every retry attempt is its own sibling span. `Wrap(client, tp, mp, prop, opts...)` / `NewClient(...)`. See [ADR 0011](docs/adr/0011-resty-integration.md) |
+| MinIO integration | SDK-owned T3 method wrapper over `github.com/minio/minio-go/v7` — wrapped by the `minio/` package | `minio-go` ships no OTel instrumentation and no hook API, so a client that embeds `*minio.Client` brackets each data-plane call in one logical span; `WithHTTPChildSpans` adds per-request children through `http/`. `New(endpoint, opts, tp, mp, prop, o11yOpts...)`. See [ADR 0018](docs/adr/0018-minio-integration.md) |
+| Cassandra integration | SDK-owned justified-T3 observers over `github.com/gocql/gocql` — wrapped by the `cassandra/` package | The `otelgocql` contrib package was removed upstream and every other candidate failed ADR 0008. `NewSession` sets the query and connect observers on the cluster config; batches are traced only through the `ExecuteBatch*` seams. See [ADR 0019](docs/adr/0019-cassandra-integration.md) |
 
 ---
 
@@ -415,6 +427,8 @@ further noise such as health-check PINGs, use `o11yredis.WithIgnoredCommands("pi
 - ❌ Import `go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/v2/mongo/otelmongo` directly from services — always go through `o11ymongo.Connect` or `o11ymongo.Instrument` so SDK providers and monitor composition are wired consistently
 - ❌ Import `go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin` directly from services — always go through `o11ygin.Middleware` so SDK providers, propagator, and typed gin error events are wired consistently
 - ❌ Import `github.com/redis/go-redis/extra/redisotel/v9` directly from services — always go through `o11yredis.Wrap` so SDK-owned semconv v1.39.0 attributes, metrics, and sensitive defaults stay consistent
+- ❌ Import a community `otelresty` package (e.g. `github.com/jkratz55/otelresty`, `github.com/AmineG7/otelresty`) or install `otelhttp` as a resty client's transport — always go through `o11yresty.Wrap` or `o11yresty.NewClient`; ADR 0011 rejected those packages, and a span opened at the `RoundTripper` has already ended when resty's hooks run, so it cannot carry `resty.error.kind`, the retry-exhausted marker, or the route from context
+- ❌ Call `session.ExecuteBatch` (or `ExecuteBatchCAS` / `MapExecuteBatchCAS`) on a `*gocql.Session` directly — it emits no batch span; use `o11ycassandra.ExecuteBatch`, `o11ycassandra.ExecuteBatchCAS`, or `o11ycassandra.MapExecuteBatchCAS` on a session built by `o11ycassandra.NewSession`
 - ❌ Write MongoDB `_oteltrace` into persisted business documents through this SDK — use outbox/event-envelope propagation for asynchronous workflows instead
 - ❌ Use `msg.Respond(data)` inside a Subscribe handler when trace context must be preserved in the reply — use `conn.Respond(ctx, msg, data)` instead
 - ❌ Use `WithTeam` — it no longer exists; use `WithServiceNamespace` instead

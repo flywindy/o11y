@@ -26,6 +26,8 @@ This project provides a "Context-First" observability layer for Go applications,
   - **MongoDB**: NoSQL database for persistence
   - **Redis / Valkey**: Cache and Redis-protocol data stores
   - **Cassandra**: Wide-column store via `gocql` (SDK-owned observers, [ADR 0019](docs/adr/0019-cassandra-integration.md))
+  - **Elasticsearch**: Search engine via `go-elasticsearch/v8` (first-party tracing plus an SDK-owned duration metric, [ADR 0020](docs/adr/0020-elasticsearch-integration.md))
+  - **MinIO**: S3-compatible object storage via `minio-go/v7` (SDK-owned method wrapper, [ADR 0018](docs/adr/0018-minio-integration.md))
   - **Tempo**: Distributed tracing backend
   - **Loki**: Log aggregation system
   - **Pyroscope**: Continuous profiling backend
@@ -70,7 +72,7 @@ Before running the infrastructure, ensure you have the following installed:
 kind create cluster --config kind-config.yaml
 ```
 
-This configures a control-plane node with an extra port mapping for the OTel Collector (port `4318`).
+This configures a control-plane node with three extra port mappings: `4318` for the OTel Collector's OTLP/HTTP receiver, `4223` for NATS WebSocket, and `4040` for Pyroscope.
 
 ### 2. Deploy Infrastructure
 
@@ -375,7 +377,7 @@ metrics pillar is off. See
 
 For everything else — structured logging with trace correlation, user identity
 attributes, trace sampling, continuous profiling, and the NATS / MongoDB /
-Redis / Elasticsearch / HTTP / Resty / MinIO / gin sub-packages — see the
+Redis / Elasticsearch / Cassandra / HTTP / Resty / MinIO / gin sub-packages — see the
 **[Developer Guide](docs/guide.md)**.
 
 ### Background work & context lifecycle
@@ -406,8 +408,9 @@ See [`examples/background`](examples/background) and
 Runnable programs live in [`examples/`](examples/), organized like the
 [Developer Guide](docs/guide.md): the four pillars first (basic spans + logs,
 metrics, profiling), then integrations grouped by semantic-convention domain
-(HTTP: gin, Resty; Databases: MongoDB, Redis; Messaging: NATS Core, JetStream,
-browser WebSocket; Object Storage: MinIO). See
+(HTTP: gin, Resty; Databases: MongoDB, background work with MongoDB, Redis,
+Elasticsearch, Cassandra; Messaging: NATS Core, JetStream, browser WebSocket;
+Object Storage: MinIO). See
 **[`examples/README.md`](examples/README.md)** for the prerequisites
 (port-forwards) and the `go run` command for each one.
 
