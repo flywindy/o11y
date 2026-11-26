@@ -34,8 +34,11 @@ This project provides a "Context-First" observability layer for Go applications,
   - **OTel Collector**: Centralized pipeline — all telemetry (traces and logs) flows through it
   - **Alloy**: Log collection agent and Pyroscope ingest proxy
 
-Profiles are the one signal that bypasses the OTel Collector: applications
-push Pyroscope-format profiles to Alloy, which forwards them to Pyroscope.
+Profiles are the one signal that bypasses the OTel Collector: in-cluster
+applications push Pyroscope-format profiles to Alloy, which forwards them to
+Pyroscope. On the kind cluster, `localhost:4040` is mapped straight to the
+Pyroscope Service, so a `go run` process outside the cluster sends profiles to
+Pyroscope without passing through Alloy.
 
 ### Telemetry Flow
 
@@ -44,13 +47,15 @@ Traces:    App ──OTLP/HTTP──► OTel Collector ──► Tempo
 Logs:      App ──OTLP/HTTP──► OTel Collector ──► Loki   (primary: full OTel Log Data Model)
            App stdout ──► Alloy ──OTLP/HTTP──► OTel Collector ──► Loki  (secondary: k8s pods via Alloy)
 Metrics:   App :2112/metrics ◄──scrape── Prometheus ──► Grafana  (pull model)
-Profiles:  App ──Pyroscope ingest──► Alloy ──► Pyroscope ──► Grafana
+Profiles:  App ──Pyroscope ingest──► Alloy ──► Pyroscope ──► Grafana  (in-cluster)
+           go run ──localhost:4040──► Pyroscope ──► Grafana  (kind host port, no Alloy)
 ```
 
 Both log paths are active simultaneously. When running `go run` locally (outside the cluster),
 only the OTLP path reaches Loki; Alloy scrapes pods exclusively inside kind.
-Profiles flow through Alloy's Pyroscope receiver to the Pyroscope backend; they
-do not go through the OTel Collector because Pyroscope ingest is not OTLP.
+In-cluster, profiles flow through Alloy's Pyroscope receiver to the Pyroscope
+backend; from the host, `localhost:4040` reaches Pyroscope directly. Neither
+path goes through the OTel Collector, because Pyroscope ingest is not OTLP.
 Prometheus scraping also only works inside the cluster; locally, scrape `:2112/metrics` directly.
 
 ## Prerequisites
@@ -131,7 +136,8 @@ func main() {
         // Optional: reduce head sampling on high-throughput producers.
         // o11y.WithSamplingRatio(0.001),
         // Optional: enable continuous profiling. In-cluster, prefer
-        // "http://alloy.infra.svc.cluster.local:4040". Profiling requires
+        // "http://alloy.infra.svc.cluster.local:4040"; on the kind cluster,
+        // localhost:4040 goes straight to Pyroscope. Profiling requires
         // both the endpoint and WithProfilingEnabled(true).
         // o11y.WithProfilingEndpoint("http://localhost:4040"),
         // o11y.WithProfilingEnabled(true),

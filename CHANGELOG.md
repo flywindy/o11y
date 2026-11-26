@@ -183,6 +183,18 @@ Nothing changes for a service that passes `obs.TracerProvider()`,
   would otherwise fail the gate in an example. The script gains tests, run by the same
   target and workflow step; ADR 0003's Decision section lists the six, and a
   test keeps that list and the gate's identical.
+- Docs: local profiling instructions disagreed on where `localhost:4040` goes.
+  On the kind cluster it is a host port mapped to the Pyroscope Service, so a
+  `go run` process sends profiles straight to Pyroscope; only in-cluster
+  workloads go through Alloy. The README, the Developer Guide, the examples
+  README and the `examples/profiling` header comment now say so. The guide's
+  and the example's instruction to port-forward Alloy is removed: it competes
+  for host port 4040, which kind already maps to Pyroscope.
+- Docs: `examples/README.md` said no example passes `WithOTLPEndpoint`, so the
+  standard `OTEL_EXPORTER_OTLP_*` variables redirect them all.
+  `examples/profiling` passes its own `OTLP_ENDPOINT` variable to
+  `WithOTLPEndpoint` and `WithMetricsOTLPEndpoint`, so those variables have no
+  effect on it; the README now names the exception and the variable to set.
 
 
 ---

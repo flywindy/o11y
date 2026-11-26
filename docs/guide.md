@@ -491,8 +491,11 @@ obs, err := o11y.Init(ctx,
 )
 ```
 
-For local development, port-forward Alloy and use
-`WithProfilingEndpoint("http://localhost:4040")`. Use
+For local development against the kind cluster, use
+`WithProfilingEndpoint("http://localhost:4040")` with no port-forward:
+`kind-config.yaml` maps host port 4040 to the Pyroscope Service's node port
+(30002), so profiles from a `go run` process go straight to Pyroscope and do
+not pass through Alloy. Only in-cluster workloads take the Alloy path. Use
 `WithProfilingAuthHeaders` when the Pyroscope endpoint requires auth or
 tenant routing headers. Header values are copied defensively and are not
 logged.
