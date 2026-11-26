@@ -15,11 +15,13 @@ For SDK setup and the `Init` options reference, see the [README](../README.md).
 All `go run` commands below are run from the **repository root**.
 
 Where an example below says it sends traces and logs to
-`http://localhost:4318`, that is the SDK default: the examples do not pass
+`http://localhost:4318`, that is the SDK default: those examples do not pass
 `WithOTLPEndpoint`, so an `OTEL_EXPORTER_OTLP_ENDPOINT` (or `_TRACES_` /
 `_LOGS_`) variable exported in your shell redirects traces and logs, while
 OTLP metrics still go where `WithMetricsOTLPEndpoint` says. Unset those
-variables to follow the instructions as written.
+variables to follow the instructions as written. The profiling example is the
+exception: it passes `WithOTLPEndpoint` from its own `OTLP_ENDPOINT` variable
+(see [Profiling](#profiling)).
 
 ## Prerequisites
 
@@ -33,7 +35,7 @@ kubectl apply -k k8s/infrastructure/base/monitor
 Then port-forward the monitor services that are not already exposed via kind's extraPortMappings:
 
 ```bash
-# 4318 (otel-collector) and 4040 (alloy/pyroscope) are already bound to host
+# 4318 (otel-collector) and 4040 (pyroscope) are already bound to host
 # ports via kind-config.yaml — no port-forward needed for those.
 kubectl port-forward -n infra svc/grafana    3000:3000  # Grafana UI
 kubectl port-forward -n infra svc/prometheus 9090:9090  # Prometheus UI
@@ -78,8 +80,17 @@ go run examples/profiling/main.go
 The example starts a sampled root span every two seconds and burns CPU long
 enough for Pyroscope to capture useful samples. It sends profiles to
 `PYROSCOPE_ENDPOINT` (default `http://localhost:4040`) and traces/logs/OTLP
-metrics to `OTLP_ENDPOINT` (default `http://localhost:4318`). Keep the Alloy
-and Grafana port-forwards from the setup block running while the example runs.
+metrics to `OTLP_ENDPOINT` (default `http://localhost:4318`). On the kind
+cluster `localhost:4040` is Pyroscope itself, reached through the host port in
+`kind-config.yaml`, so profiles do not pass through Alloy and need no
+port-forward; keep the Grafana port-forward from the setup block running to
+view them.
+
+This example is the exception to the endpoint note at the top: it reads its
+own `OTLP_ENDPOINT` variable and passes it to `WithOTLPEndpoint` and
+`WithMetricsOTLPEndpoint`, so `OTEL_EXPORTER_OTLP_ENDPOINT` (and the
+`_TRACES_` / `_LOGS_` variants) have no effect on it. Set `OTLP_ENDPOINT`
+instead.
 
 ---
 
