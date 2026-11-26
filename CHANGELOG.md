@@ -86,6 +86,14 @@ Nothing changes for a service that passes `obs.TracerProvider()`,
     name it through. The prefixes are read from the pinned package too.
   - Nothing in the tree is newly reported. `docs/semconv.md` records the
     check as Enforcement Rule 2; the former rules 2 and 3 are now 3 and 4.
+- k8s: removed `k8s/infrastructure/base/cassandra.yaml` and
+  `k8s/infrastructure/base/elasticsearch.yaml`. No kustomization referenced
+  them; the deployed specs are `base/components/cassandra/` (identical) and
+  `base/components/elasticsearch/` (which had diverged: `runAsGroup: 1000`
+  against the stray copy's `0`). Apply the components with
+  `kubectl apply -k k8s/infrastructure/base/components/<name>`. The
+  `examples/elasticsearch` header comment pointed at the removed file and now
+  names the component.
 
 ### Security
 
